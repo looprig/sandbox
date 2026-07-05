@@ -1,0 +1,13 @@
+(version 1)
+(deny default)
+(allow process-fork)
+(allow process-exec*)
+(allow file-read*)
+(allow sysctl-read)
+(allow mach-lookup)
+; --- filesystem ---
+(allow file-read* (subpath "/"))
+(allow process-exec* (subpath "/"))
+(allow file-write* (subpath "/"))
+; --- network ---
+(allow network*)
