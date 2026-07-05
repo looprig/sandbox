@@ -823,6 +823,34 @@ func TestManualUnconfinedRequiresAck(t *testing.T) {
 	}
 }
 
+// TestExternalEnvScrubHonesty pins the external-executor guarantee-honesty fix
+// (same bug as the null backend, one path over): NewExternalExecutor hardcodes the
+// FULL guarantee set by deployment declaration, but EnvScrub is the one property it
+// can actually check against decl.Env. An ExternalDecl with Env.Inherit passes the
+// whole parent environment through unscrubbed, so EnvScrub must be false while the
+// other 6 (trust-by-declaration) stay true; a scrubbing decl.Env keeps all 7.
+func TestExternalEnvScrubHonesty(t *testing.T) {
+	// Inherit: EnvScrub honestly false, the other 6 still true.
+	inh := NewExternalExecutor(ExternalDecl{Boundary: "docker", Env: EnvPolicy{Inherit: true}})
+	g := inh.Guarantees()
+	if g.EnvScrub {
+		t.Error("external Inherit Guarantees().EnvScrub = true, want false (env not scrubbed)")
+	}
+	if !(g.ProcessBoundary && g.WriteBoundary && g.ReadDenies &&
+		g.NetworkBoundary && g.AddressNetwork && g.ResourceLimits) {
+		t.Errorf("external Inherit Guarantees() = %+v, want the other 6 all true", g)
+	}
+	if bits := inh.GuaranteeBits(); bits != allGuaranteeBits&^GuaranteeEnvScrub {
+		t.Errorf("external Inherit GuaranteeBits() = %#b, want all-but-EnvScrub %#b", bits, allGuaranteeBits&^GuaranteeEnvScrub)
+	}
+
+	// Scrubbing decl.Env (zero EnvPolicy = baseline scrub): all 7 true.
+	scr := NewExternalExecutor(ExternalDecl{Boundary: "docker", Env: EnvPolicy{}})
+	if bits := scr.GuaranteeBits(); bits != allGuaranteeBits {
+		t.Errorf("external scrub GuaranteeBits() = %#b, want all 7 %#b", bits, allGuaranteeBits)
+	}
+}
+
 // --- env test helpers ---
 
 func containsEnv(env []string, kv string) bool {

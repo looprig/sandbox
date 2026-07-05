@@ -294,10 +294,20 @@ func NewExecutorDynamic(src ModeSource, workspace string, popts ...PolicyOption)
 // still scrubbed from decl.Env (§11: scrubbing costs nothing and remains
 // valuable). It reports LevelExternal and the FULL guarantee set: trust by
 // explicit deployment declaration, the only source of LevelExternal.
+//
+// EnvScrub honesty: EnvScrub is the one guarantee we can actually check against
+// decl.Env rather than take on declaration. A decl.Env with Inherit passes the
+// whole parent environment through unscrubbed, so EnvScrub is cleared (guarantee
+// honesty, mirroring the null backend); the other 6 stay set by trust-by-declaration.
 func NewExternalExecutor(decl ExternalDecl) *Executor {
 	b := newNullBackend()
 	spec, _, _, _, _ := b.compile(Policy{}) // passthrough spawnSpec only
 	p := Policy{Env: decl.Env}
+
+	bits := fullGuarantees
+	if decl.Env.Inherit {
+		bits &^= GuaranteeEnvScrub // env not scrubbed under Inherit — do not claim it
+	}
 
 	// crypto/rand.Read cannot return a non-nil error on Go >= 1.24 (it panics on a
 	// catastrophic RNG failure), so this key is always valid; the ignored error is
@@ -310,7 +320,7 @@ func NewExternalExecutor(decl ExternalDecl) *Executor {
 		spec:          spec,
 		report:        CompileReport{},
 		level:         LevelExternal,
-		guaranteeBits: fullGuarantees,
+		guaranteeBits: bits,
 		env:           assembleEnv(p),
 		grantKey:      key,
 		policyGen:     1,
@@ -359,6 +369,10 @@ func (e *Executor) recompileLocked() error {
 	// Ack gate: a mode flip to Unconfined without WithAckUnconfined in popts must
 	// fail the spawn CLOSED (via resolve) rather than silently run unconfined. Keep
 	// the last good compiled state and do not advance the generation on refusal.
+	// This intentionally validates the POST-readOnlyMask policy: readOnlyMask zeroes
+	// Net (clearing Net.Open), so a ReadOnlyView of a policy that was unconfined only
+	// via Net.Open genuinely is no longer net-unconfined and correctly stops tripping
+	// the ack gate after masking.
 	if err := validatePolicy(p); err != nil {
 		return err
 	}
