@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -61,8 +62,18 @@ var (
 
 // grantPayload is the MAC-covered body of a grant token (SPEC §9.2). Every field
 // is bound by the MAC: none can be altered after minting without invalidating
-// the token. All fields are JSON-marshalable, which is what makes the on-the-wire
-// encoding deterministic.
+// the token.
+//
+// The encoding need NOT be canonical: verification MACs the payload bytes as
+// received and never re-marshals, so a future encoding change (or adding a map
+// field, whose JSON key order is unspecified) stays safe to verify. The one
+// caveat is token *equality* — do not compare two tokens byte-for-byte to decide
+// "same grant"; the §10.7 session-repeat path re-mints a fresh token rather than
+// comparing, so this never bites.
+//
+// NOTE: CmdHash currently marshals as a 32-element JSON int array (verbose). A
+// compact wire format is deferred to a future lrsx1 successor (lrsx2) version
+// bump; do not change the encoding under the lrsx1 prefix.
 type grantPayload struct {
 	// PolicyGen is the policy generation at mint time. It is bumped on any policy
 	// or mode change (including ModeSource transitions), so a token is void once
@@ -78,6 +89,9 @@ type grantPayload struct {
 	// MAC-covered specifically so the model cannot inflate the prompt.
 	Description string
 	// Expiry is the instant the token stops verifying (default TTL 15 min).
+	// Its Location() is not preserved across marshal/unmarshal — harmless, since
+	// verifyGrant compares absolute instants (After/Before); it is only a caveat
+	// if a prompt ever formats Expiry for human display.
 	Expiry time.Time
 }
 
@@ -108,18 +122,21 @@ func hashCommand(dir, command string) [32]byte {
 // The MAC is computed over the exact payload bytes that are base64-embedded, so
 // verification can recompute it over the received bytes without re-encoding. The
 // caller sets Expiry on p; mintGrant does not consult the clock.
-func mintGrant(key []byte, p grantPayload) string {
+//
+// It returns an error rather than panicking on encode failure: time.Time rejects
+// years outside [0,9999], so a caller passing a far-future/overflowing Expiry
+// (e.g. a "never expires" sentinel, or now.Add(ttl) rolling past year 9999)
+// reaches this path with attacker-influenceable data — a panic on the mint path
+// of a security primitive would be a DoS footgun.
+func mintGrant(key []byte, p grantPayload) (string, error) {
 	payloadBytes, err := json.Marshal(p)
 	if err != nil {
-		// grantPayload holds only JSON-safe types and callers pass in-range
-		// expiries, so this is unreachable in practice; panic rather than mint a
-		// corrupt token that would fail every verify.
-		panic("sandbox: grant payload marshal: " + err.Error())
+		return "", fmt.Errorf("mint grant: %w", err)
 	}
 	mac := grantMAC(key, payloadBytes)
 	return grantVersion + "." +
 		grantEnc.EncodeToString(payloadBytes) + "." +
-		grantEnc.EncodeToString(mac)
+		grantEnc.EncodeToString(mac), nil
 }
 
 // grantMAC computes HMAC-SHA256(key, payloadBytes).

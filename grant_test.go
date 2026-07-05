@@ -64,12 +64,23 @@ func flipByte(b []byte, i int) []byte {
 	return out
 }
 
+// mustMint mints a token from an in-range payload, failing the test on the
+// encode error that only an out-of-range Expiry can trigger.
+func mustMint(t *testing.T, key []byte, p grantPayload) string {
+	t.Helper()
+	token, err := mintGrant(key, p)
+	if err != nil {
+		t.Fatalf("mintGrant: %v", err)
+	}
+	return token
+}
+
 // 1. Round-trip: mint then verify with matching key/gen/cmdHash and a now before
 // expiry returns the payload with the correct Description and Delta.
 func TestGrantRoundTrip(t *testing.T) {
 	key := testGrantKey(0x11)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	if !strings.HasPrefix(token, "lrsx1.") {
 		t.Fatalf("token = %q, want lrsx1. prefix", token)
@@ -104,7 +115,7 @@ func TestGrantRoundTrip(t *testing.T) {
 func TestGrantTamperSegments(t *testing.T) {
 	key := testGrantKey(0x22)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 	parts := strings.Split(token, ".")
 
 	t.Run("wrong-version", func(t *testing.T) {
@@ -151,7 +162,7 @@ func TestGrantWrongKey(t *testing.T) {
 	key := testGrantKey(0x33)
 	other := testGrantKey(0x44)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	if _, err := verifyGrant(other, token, beforeExpiry, p.PolicyGen, p.CmdHash); !errors.Is(err, ErrGrantBadMAC) {
 		t.Errorf("verifyGrant wrong key: err = %v, want ErrGrantBadMAC", err)
@@ -166,7 +177,7 @@ func TestGrantWrongKey(t *testing.T) {
 func TestGrantExpired(t *testing.T) {
 	key := testGrantKey(0x55)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	if _, err := verifyGrant(key, token, afterExpiry, p.PolicyGen, p.CmdHash); !errors.Is(err, ErrGrantExpired) {
 		t.Errorf("verifyGrant after expiry: err = %v, want ErrGrantExpired", err)
@@ -181,7 +192,7 @@ func TestGrantExpired(t *testing.T) {
 func TestGrantWrongGeneration(t *testing.T) {
 	key := testGrantKey(0x66)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	if _, err := verifyGrant(key, token, beforeExpiry, p.PolicyGen+1, p.CmdHash); !errors.Is(err, ErrGrantWrongGeneration) {
 		t.Errorf("verifyGrant bumped generation: err = %v, want ErrGrantWrongGeneration", err)
@@ -193,7 +204,7 @@ func TestGrantWrongGeneration(t *testing.T) {
 func TestGrantWrongCommand(t *testing.T) {
 	key := testGrantKey(0x77)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	otherCmd := hashCommand(grantDir, "rm -rf /")
 	if _, err := verifyGrant(key, token, beforeExpiry, p.PolicyGen, otherCmd); !errors.Is(err, ErrGrantWrongCommand) {
@@ -207,7 +218,7 @@ func TestGrantWrongCommand(t *testing.T) {
 func TestGrantDescriptionMACCovered(t *testing.T) {
 	key := testGrantKey(0x88)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 	parts := strings.Split(token, ".")
 
 	raw := mustDecode(t, parts[1])
@@ -233,7 +244,7 @@ func TestGrantDescriptionMACCovered(t *testing.T) {
 func TestDecodeGrantForDisplay(t *testing.T) {
 	key := testGrantKey(0x99)
 	p := samplePayload()
-	token := mintGrant(key, p)
+	token := mustMint(t, key, p)
 
 	got, err := decodeGrantForDisplay(key, token)
 	if err != nil {
@@ -248,7 +259,7 @@ func TestDecodeGrantForDisplay(t *testing.T) {
 	stale := samplePayload()
 	stale.Expiry = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	stale.PolicyGen = 999
-	staleToken := mintGrant(key, stale)
+	staleToken := mustMint(t, key, stale)
 
 	got, err = decodeGrantForDisplay(key, staleToken)
 	if err != nil {
@@ -317,4 +328,80 @@ func allZero(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// mintGrant returns an error (and does NOT panic) when Expiry is out of the
+// JSON-marshalable range for time.Time (year > 9999), which is reachable from
+// caller-supplied "never expires" sentinels or an overflowing now.Add(ttl).
+func TestMintGrantEncodeError(t *testing.T) {
+	key := testGrantKey(0xC3)
+	p := samplePayload()
+	p.Expiry = time.Unix(1<<62, 0) // year far beyond 9999
+
+	var (
+		token string
+		err   error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("mintGrant panicked on out-of-range Expiry: %v", r)
+			}
+		}()
+		token, err = mintGrant(key, p)
+	}()
+
+	if err == nil {
+		t.Fatal("mintGrant out-of-range Expiry: err = nil, want non-nil error")
+	}
+	if token != "" {
+		t.Errorf("mintGrant out-of-range Expiry: token = %q, want empty", token)
+	}
+}
+
+// A grantPayload{} zero value marshals fine (Expiry is year 1, in range) and
+// round-trips: verifying at that same instant with the zero binding succeeds.
+func TestGrantZeroValuePayload(t *testing.T) {
+	key := testGrantKey(0xA1)
+	token, err := mintGrant(key, grantPayload{})
+	if err != nil {
+		t.Fatalf("mintGrant zero-value payload: %v", err)
+	}
+	// now == zero Expiry keeps it unexpired (expires-at); zero gen/cmdHash match.
+	got, err := verifyGrant(key, token, time.Time{}, 0, [32]byte{})
+	if err != nil {
+		t.Fatalf("verifyGrant zero-value payload: %v", err)
+	}
+	if got.Description != "" || got.Delta != "" || got.PolicyGen != 0 || got.CmdHash != ([32]byte{}) {
+		t.Errorf("zero-value round-trip = %+v, want all-zero fields", got)
+	}
+}
+
+// Structurally invalid token shapes all map to ErrGrantMalformed, for both full
+// verify and display decode, so a garbage token never reaches a prompt.
+func TestGrantMalformedShapes(t *testing.T) {
+	key := testGrantKey(0xB2)
+	valid := mustMint(t, key, samplePayload())
+	parts := strings.Split(valid, ".")
+
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{"empty", ""},
+		{"one-segment", "lrsx1"},
+		{"four-segments", "lrsx1.a.b.c"},
+		{"mac-not-base64", parts[0] + "." + parts[1] + ".not base64!"},
+	}
+	want := samplePayload()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := verifyGrant(key, tc.token, beforeExpiry, want.PolicyGen, want.CmdHash); !errors.Is(err, ErrGrantMalformed) {
+				t.Errorf("verifyGrant(%q): err = %v, want ErrGrantMalformed", tc.token, err)
+			}
+			if _, err := decodeGrantForDisplay(key, tc.token); !errors.Is(err, ErrGrantMalformed) {
+				t.Errorf("decodeGrantForDisplay(%q): err = %v, want ErrGrantMalformed", tc.token, err)
+			}
+		})
+	}
 }
