@@ -75,6 +75,7 @@ type execConfig struct {
 	grantTTL     time.Duration
 	cgroupParent string
 	clock        func() time.Time // nil means default time.Now
+	backend      backend          // nil means select via platformBackend (test seam)
 }
 
 // ExecOption configures a NewExecutor call (SPEC §6).
@@ -98,6 +99,19 @@ func WithCgroupParent(path string) ExecOption {
 // WithGrantTTL/WithCgroupParent only.
 func withClock(f func() time.Time) ExecOption {
 	return func(c *execConfig) { c.clock = f }
+}
+
+// withBackend forces the executor's backend, bypassing platformBackend()
+// selection. It is deliberately UNEXPORTED — a test-only seam. Once platformBackend
+// returns a real OS backend on the host (e.g. Seatbelt on darwin), the executor
+// UNIT tests that assert null-backend semantics (LevelNone, EnvScrub-only
+// guarantees, the argv-not-found spawn-error convention) would otherwise observe
+// the platform backend instead. Pinning them to newNullBackend() via this option
+// keeps those tests deterministic and platform-independent, so they still test
+// executor logic — not the enforcement backend — and pass on every OS. Production
+// construction never sets it and always goes through platformBackend().
+func withBackend(b backend) ExecOption {
+	return func(c *execConfig) { c.backend = b }
 }
 
 // Executor compiles a Policy once via the platform backend and then runs
@@ -200,7 +214,12 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 		}
 	}
 
-	b := platformBackend()
+	// Backend selection: platformBackend() for production; a test may pin one via
+	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
+	b := cfg.backend
+	if b == nil {
+		b = platformBackend()
+	}
 	spec, report, level, bits, err := b.compile(p)
 	if err != nil {
 		return nil, err

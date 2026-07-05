@@ -3,13 +3,17 @@
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // update rewrites the testdata/*.sbpl golden files from the current generator
@@ -397,6 +401,293 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 
 	if spec.configure != nil {
 		t.Error("seatbelt spawnSpec.configure should be nil (executor sets attributes)")
+	}
+}
+
+// --- Task 8b: REAL sandbox-exec enforcement (SPEC §12.1 macOS write row) ---
+//
+// These tests construct a REAL Seatbelt executor (NewExecutor(PolicyFor(Write, ws))
+// is Seatbelt on darwin, once platformBackend() selects it) and actually run
+// commands through /usr/bin/sandbox-exec, asserting the OS backend ENFORCES the
+// generated SBPL. They are the answer to the reviewer's I2: the goldens only prove
+// the generator emits byte-equal SBPL for the Go/RE2 glob translation; only a real
+// exec proves SBPL's (older, different) engine matches the FILE rules the same way.
+//
+// They REQUIRE the darwin Seatbelt backend. Under the null backend (before
+// platformBackend flips) the deny/boundary assertions FAIL by construction — null
+// enforces nothing, so a "write outside ws" or "cat ~/.ssh" succeeds — which is the
+// intended RED state proving the tests measure real enforcement, not passthrough.
+//
+// KEY macOS gotcha (a real finding, see canonTempDir): Seatbelt matches subpath/
+// regex rules against the CANONICAL (symlink-resolved) path. macOS temp dirs live
+// under /var/folders and /tmp, both symlinks into /private, so a profile compiled
+// from the raw path would deny even in-workspace writes. The tests resolve symlinks
+// so the file rules match the paths the kernel actually resolves.
+
+// requireSandboxExec capability-skips (with a recorded reason) when
+// /usr/bin/sandbox-exec is absent or not runnable here (e.g. a CI that forbids
+// nested sandboxing), so a locked-down environment yields a skip, not a false
+// failure. These tests are meaningless without a working sandbox-exec.
+func requireSandboxExec(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("sandbox-exec"); err != nil {
+		t.Skipf("sandbox-exec not available: %v", err)
+	}
+	if err := exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true").Run(); err != nil {
+		t.Skipf("sandbox-exec present but not runnable here: %v", err)
+	}
+}
+
+// canonTempDir returns a fresh temp dir with symlinks resolved. On macOS t.TempDir
+// lives under /var/folders (and TMPDIR/tmp), where /var and /tmp are symlinks into
+// /private. Seatbelt canonicalizes the accessed path before matching subpath/regex
+// rules, so a profile built from the raw /var form matches NOTHING (the kernel
+// resolves accesses to /private/var, which the /var subpath never covers) — even
+// an in-workspace write would be denied. Passing the resolved path into PolicyFor
+// makes the file rules match, mirroring what a macOS consumer must do.
+func canonTempDir(t *testing.T) string {
+	t.Helper()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(TempDir): %v", err)
+	}
+	return d
+}
+
+// TestSeatbeltEnforceWriteBoundary is the §12.1 write-boundary row: an in-workspace
+// write succeeds and lands; a write to a sibling dir that is neither the workspace
+// nor /tmp is denied (nonzero exit, file not created). The deny only holds under
+// real Seatbelt — under null the write would succeed.
+func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
+	requireSandboxExec(t)
+	ws := canonTempDir(t)
+	outside := canonTempDir(t) // a sibling temp dir: NOT ws, NOT /tmp
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	ctx := context.Background()
+
+	// Write inside ws succeeds and the file lands.
+	inside := filepath.Join(ws, "f")
+	out, code, err := e.RunCommand(ctx, ws, "echo hi > "+inside)
+	if err != nil {
+		t.Fatalf("write inside ws: unexpected spawn err %v (out=%s)", err, out)
+	}
+	if code != 0 {
+		t.Fatalf("write inside ws: exit %d, want 0 (out=%s)", code, out)
+	}
+	if b, rerr := os.ReadFile(inside); rerr != nil || !strings.Contains(string(b), "hi") {
+		t.Errorf("write inside ws: file %s = %q err=%v, want to contain 'hi'", inside, b, rerr)
+	}
+
+	// Write to a sibling dir outside ws (and not /tmp) is denied: nonzero exit and no
+	// file. This asserts the OS write boundary, which the null backend cannot provide.
+	target := filepath.Join(outside, "f")
+	out, code, err = e.RunCommand(ctx, ws, "echo hi > "+target)
+	if err != nil {
+		t.Fatalf("write outside ws: unexpected spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf("write outside ws: exit 0, want nonzero (denied). Requires the darwin Seatbelt backend; out=%s", out)
+	}
+	if _, serr := os.Stat(target); serr == nil {
+		t.Errorf("write outside ws: file %s exists, want denied/not created", target)
+	}
+}
+
+// TestSeatbeltEnforceGitCarveout is the §12.1 .git carveout row: a sandboxed write
+// into ws/.git is DENIED while a sandboxed read of an existing ws/.git file is
+// ALLOWED. This verifies the read-allow + write-deny-LAST ordering enforces under
+// real SBPL last-match-wins, not just in byte-equal goldens.
+func TestSeatbeltEnforceGitCarveout(t *testing.T) {
+	requireSandboxExec(t)
+	ws := canonTempDir(t)
+	// As the test (unsandboxed) set up .git with an existing file to read back.
+	if err := os.MkdirAll(filepath.Join(ws, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(ws, ".git", "config")
+	if err := os.WriteFile(cfg, []byte("[core]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	ctx := context.Background()
+
+	// Write into .git is denied (carveout write-deny after the ws write allow wins).
+	x := filepath.Join(ws, ".git", "x")
+	out, code, err := e.RunCommand(ctx, ws, "echo hi > "+x)
+	if err != nil {
+		t.Fatalf(".git write: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf(".git write: exit 0, want nonzero (carveout denies write); out=%s", out)
+	}
+	if _, serr := os.Stat(x); serr == nil {
+		t.Errorf(".git write: %s created, want denied", x)
+	}
+
+	// Read from .git is allowed: the carveout removes write only, not read.
+	out, code, err = e.RunCommand(ctx, ws, "cat "+cfg)
+	if err != nil {
+		t.Fatalf(".git read: spawn err %v", err)
+	}
+	if code != 0 {
+		t.Errorf(".git read: exit %d, want 0 (read allowed); out=%s", code, out)
+	}
+	if !strings.Contains(string(out), "[core]") {
+		t.Errorf(".git read: out=%q, want the file contents", out)
+	}
+}
+
+// TestSeatbeltEnforceSSHDeny is the §12.1 ~/.ssh row: a sandboxed read of a file
+// under $HOME/.ssh is DENIED. HOME is set to a temp home BEFORE NewExecutor so
+// DefaultSecretDenials compiles that home's ~/.ssh (subpath) deny into the profile.
+// Verifies the §5.3 (subpath …) secret deny enforces under real SBPL.
+func TestSeatbeltEnforceSSHDeny(t *testing.T) {
+	requireSandboxExec(t)
+	home := canonTempDir(t)
+	t.Setenv("HOME", home) // BEFORE NewExecutor: anchors ~/.ssh secret deny under this home
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(home, ".ssh", "id")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ws := canonTempDir(t)
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	out, code, err := e.RunCommand(context.Background(), ws, "cat "+secret)
+	if err != nil {
+		t.Fatalf("~/.ssh read: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf("~/.ssh read: exit 0, want nonzero (secret deny); out=%s", out)
+	}
+	if strings.Contains(string(out), "PRIVATE KEY") {
+		t.Errorf("~/.ssh read leaked the secret: %s", out)
+	}
+}
+
+// TestSeatbeltEnforceEnvGlobDeny is the §12.1 .env row and the reviewer's I2 proof:
+// a sandboxed read of ws/.env is DENIED — showing the (regex #"^.*/\.env[^/]*$")
+// deny actually MATCHES under SBPL's regex engine, not merely byte-equal to Go's
+// RE2 translation — while ws/notenv (ends in "env" but has no leading dot) is
+// READABLE, proving the glob does not over-match.
+func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
+	requireSandboxExec(t)
+	ws := canonTempDir(t)
+	envFile := filepath.Join(ws, ".env")
+	if err := os.WriteFile(envFile, []byte("TOKEN=secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notEnv := filepath.Join(ws, "notenv")
+	if err := os.WriteFile(notEnv, []byte("visible"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	ctx := context.Background()
+
+	// ws/.env read is denied: the regex deny MATCHES under SBPL's engine (I2 proof).
+	out, code, err := e.RunCommand(ctx, ws, "cat "+envFile)
+	if err != nil {
+		t.Fatalf(".env read: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf(".env read: exit 0, want nonzero (regex secret deny must MATCH); out=%s", out)
+	}
+	if strings.Contains(string(out), "secret") {
+		t.Errorf(".env read leaked: %s", out)
+	}
+
+	// ws/notenv read is allowed: the glob must not over-match a name lacking the
+	// leading dot (real-exec confirmation the regex is anchored to /\.env).
+	out, code, err = e.RunCommand(ctx, ws, "cat "+notEnv)
+	if err != nil {
+		t.Fatalf("notenv read: spawn err %v", err)
+	}
+	if code != 0 {
+		t.Errorf("notenv read: exit %d, want 0 (glob must not over-match); out=%s", code, out)
+	}
+	if !strings.Contains(string(out), "visible") {
+		t.Errorf("notenv read: out=%q, want the file contents", out)
+	}
+}
+
+// TestSeatbeltEnforceNetworkBlocked is the §12.1 network row: under write mode
+// (Net zero → default-deny egress) a sandboxed connect to a LIVE loopback listener
+// is blocked. A control dial from the test process (unsandboxed) succeeds first, so
+// a sandboxed failure is attributable to enforcement, not a dead port.
+func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
+	requireSandboxExec(t)
+	if _, err := os.Stat("/usr/bin/nc"); err != nil {
+		t.Skip("/usr/bin/nc not available for the connect probe")
+	}
+	ws := canonTempDir(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	// Control: an unsandboxed connect to the live port succeeds.
+	c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+	if derr != nil {
+		t.Fatalf("control dial to live port failed: %v", derr)
+	}
+	_ = c.Close()
+
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	// Sandboxed connect probe is denied: nc -z exits nonzero when connect is blocked.
+	out, code, err := e.RunCommand(context.Background(), ws, fmt.Sprintf("/usr/bin/nc -z -w1 127.0.0.1 %d", port))
+	if err != nil {
+		t.Fatalf("nc probe: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf("sandboxed connect: exit 0, want nonzero (egress denied under write); out=%s", out)
+	}
+}
+
+// TestSeatbeltEnforceLevelAndGuarantees asserts the compiled posture of the REAL
+// Seatbelt executor (SPEC §12.1: Level = Full): Write mode reaches LevelFull and
+// its Guarantees carry WriteBoundary, ReadDenies, EnvScrub, and NetworkBoundary,
+// with AddressNetwork false (SBPL cannot address-scope, §7.1/M1). This inspects the
+// compiled backend metadata, so it needs the darwin backend selected but does not
+// itself spawn sandbox-exec.
+func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
+	ws := canonTempDir(t)
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	if e.Level() != LevelFull {
+		t.Errorf("real Seatbelt Write Level() = %d, want LevelFull (%d)", e.Level(), LevelFull)
+	}
+	g := e.Guarantees()
+	if !(g.WriteBoundary && g.ReadDenies && g.EnvScrub && g.NetworkBoundary) {
+		t.Errorf("Guarantees() = %+v, want WriteBoundary && ReadDenies && EnvScrub && NetworkBoundary all true", g)
+	}
+	if g.AddressNetwork {
+		t.Error("Guarantees().AddressNetwork = true, want false (SBPL cannot address-scope)")
 	}
 }
 

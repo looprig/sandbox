@@ -19,7 +19,9 @@ import (
 // backend, nothing else is enforced.
 func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	// pin null: this asserts null-backend semantics (LevelNone, EnvScrub-only bits,
+	// empty report), not the platform backend that platformBackend() selects here.
+	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -291,7 +293,11 @@ func TestRunCommandContextTimeout(t *testing.T) {
 // err), the other side of the RAN-vs-failed convention for the argv path.
 func TestRunArgvNonexistentBinary(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	// pin null: this asserts null-backend spawn semantics — argv[0] is the missing
+	// binary, so exec fails with a Go spawn error. A real OS backend wraps argv[0]
+	// with sandbox-exec, which RUNS and exits nonzero (a ran-but-nonzero, not a
+	// spawn error), so the convention this test pins holds only for the null backend.
+	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -725,7 +731,11 @@ func TestUnconfinedRequiresAck(t *testing.T) {
 // child inherits everything and nothing is actually scrubbed (guarantee honesty).
 func TestUnconfinedAckedRunsWithNoGuarantees(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Unconfined, ws, WithAckUnconfined()))
+	// pin null: this asserts null-backend guarantee semantics (ALL guarantees false,
+	// bits == 0 for an Inherit/Open unconfined policy). The Seatbelt backend always
+	// sets GuaranteeProcessBoundary (sandbox-exec still wraps the spawn), so this
+	// "no guarantees" assertion is a null-backend property, not the platform's.
+	e, err := NewExecutor(PolicyFor(Unconfined, ws, WithAckUnconfined()), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor(Unconfined, ack): %v", err)
 	}
@@ -757,7 +767,10 @@ func TestUnconfinedAckedRunsWithNoGuarantees(t *testing.T) {
 // disturb the scrubbed path.
 func TestWriteStillScrubsEnv(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	// pin null: this asserts the null-backend EnvScrub-honesty semantics (a confined
+	// Write policy still asserts EnvScrub). It is a backend-derived Guarantee, so it
+	// is pinned to null to stay deterministic and platform-independent.
+	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor(Write): %v", err)
 	}
