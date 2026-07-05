@@ -172,8 +172,12 @@ Zero value = fully blocked. Domain-level allowlists are v2 (§12).
 
 `DNS` exists because `Ports{443}` alone does not make
 `curl https://example.com` work — resolution needs its own channel. It compiles
-per backend: macOS — SBPL allowance for the system resolver (mDNSResponder
-mach-lookup + outbound 53); rung 1 — nftables 53/udp+tcp in-namespace; rung 2 —
+per backend: macOS — SBPL allowance for the system resolver via the
+**mDNSResponder unix socket** (`allow network-outbound (remote unix-socket
+(path-literal "/private/var/run/mDNSResponder"))`); outbound `:53` alone does
+**not** work (macOS `getaddrinfo` delegates name resolution to the unsandboxed
+mDNSResponder daemon over that socket — verified in the Task M1 spike,
+`docs/spikes/seatbelt-net.md`); rung 1 — nftables 53/udp+tcp in-namespace; rung 2 —
 Landlock TCP:53 plus `RES_OPTIONS=use-vc` injected via EnvPolicy to force glibc
 onto TCP DNS (UDP:53 cannot be port-scoped below ABI v10; musl ignores
 `use-vc`, recorded as a narrowing). `trusted` and foreign-agent presets set
@@ -192,10 +196,15 @@ UDP DNS is unavailable on rung 2 below ABI v10; the `DNS` channel there
 compiles to Landlock TCP:53 + `RES_OPTIONS=use-vc` (below), which restores
 name-based egress for glibc programs — musl and other UDP-only resolvers remain
 broken on that rung and are recorded in the compilation report, not silently
-ignored. macOS SBPL expresses ports and
-loopback reliably; CIDR-level rules (`Private`, metadata) must be verified
-during implementation and compile to blocked if unsupported (same soundness
-rule).
+ignored. macOS SBPL expresses ports and loopback reliably (loopback via the
+`localhost` token, which matches *all of this host's own addresses*, not
+strictly `127.0.0.0/8` — a widening recorded in the CompileReport, but it never
+admits a genuine remote). CIDR/address-scoped rules (`Private`, metadata) are
+**verified unsupported** (Task M1: SBPL's network host token is `*` or
+`localhost` only — literal IP/CIDR/subnet is rejected at profile-compile time,
+not bypassable via `require-not` or precedence), so they compile to **blocked**
+(same soundness rule); the macOS `AddressNetwork` guarantee is therefore always
+false.
 
 ### 5.3 Default deny-reads
 
@@ -359,9 +368,14 @@ Generate an SBPL profile from the policy (default-deny base; `file-read*` /
 `file-write*` / `process-exec` allows per entry; deny rules for §5.3 — SBPL
 expresses deny-inside-allow natively; network section per §5.2) and spawn
 `/usr/bin/sandbox-exec -p <profile> -D<param>=<path>… -- /bin/sh -c <command>`.
-Deprecated-but-universal (Chrome, Bazel, Codex, Claude Code). Level: `LevelFull`
-(CIDR verification pending → affected net features compile to blocked with a
-`CompileReport` entry until verified, per §7.5).
+Deprecated-but-universal (Chrome, Bazel, Codex, Claude Code). Network section
+(verified in Task M1, `docs/spikes/seatbelt-net.md`): `Ports` → `(remote tcp
+"*:P")` per port; `Loopback` → `(remote ip "localhost:*")`; `DNS` → the
+mDNSResponder unix-socket allow (§5.2); `Private` and the metadata deny →
+**blocked** (SBPL cannot address-scope) with a `CompileReport{address-network,
+unenforced}` entry. Level: `LevelFull` for policies whose net needs only
+default-deny + ports + loopback + DNS; a policy requesting `Private`/metadata
+tops out at `LevelDegraded` (its `AddressNetwork` guarantee is false), per §7.5.
 
 ### 7.2 linux — pure-Go ladder, no bwrap
 
@@ -775,7 +789,7 @@ injection; foreign-agent process wrapping; External executor.
 
 | Scenario | Expected |
 |---|---|
-| macOS Seatbelt, `write` mode | writes outside ws+tmp fail; `.git` write fails; `~/.ssh` read fails; `.env` read fails; network `connect` fails; `Level ≥ Degraded` (Full once CIDR rules verified) |
+| macOS Seatbelt, `write` mode | writes outside ws+tmp fail; `.git` write fails; `~/.ssh` read fails; `.env` read fails; network `connect` fails; `Level = Full` (loopback+ports+DNS enforced; `Private`/metadata unsupported by SBPL → compile-to-blocked, so a policy needing address-scoping is `Degraded` — Task M1) |
 | Linux rung 1, `write` mode | same as macOS, plus restricted-read verified in `zerotrust`; metadata IP unreachable under `trusted`; `Level = Full` |
 | Linux rung 2, `write` mode | write boundary + `.git` carveout (enumerated allows) + fixed secret denies hold; `**/.env*` unenforced for subprocesses (ReadGuard still covers native tools); TCP limited to `Ports`; UDP blocked; `Level = Degraded`; auto-approve-bash OFF at default threshold |
 | No sandbox available (rung 3 / nil runner) | Bash runs direct exec but `trusted` posture degrades to ask-everything (interlock); nothing auto-approved |
@@ -813,8 +827,15 @@ assumptions prove wrong during implementation.
    match keys use **capability-granularity** delta descriptions (e.g. "network
    egress"), not path granularity. Sets the `GrantDeltas` encoding (§9.3, §10.7).
 
-Open — resolved during implementation, not pre-code:
+Resolved during implementation:
 
-6. Seatbelt CIDR/network-filter expressiveness — verified in Task 8b;
-   determines whether macOS `trusted` gets `Private`/metadata semantics or
-   compiles them to blocked (soundness: blocked if unsupported).
+6. **Seatbelt CIDR/network-filter expressiveness — RESOLVED (Task M1 spike,
+   `docs/spikes/seatbelt-net.md`): SBPL cannot address-scope.** Its network host
+   token is `*` or `localhost` only; literal IP/CIDR/subnet is rejected at
+   profile-compile time (not bypassable via `require-not` or precedence). So
+   macOS `trusted` does **not** get real `Private`/metadata semantics — both
+   compile to **blocked** with a `CompileReport` entry, and `AddressNetwork` is
+   always false on macOS (§7.1). Default-deny, port-scoping, loopback, and DNS
+   (via the mDNSResponder unix socket, not outbound :53 — §5.2) all work and are
+   enforced. The metadata hard-deny holds only vacuously (`:80` not in the
+   default port set), identical to Linux rung 2.
