@@ -208,6 +208,54 @@ func TestCompileSBPLLevels(t *testing.T) {
 	}
 }
 
+// TestCompileSBPLLevelAndReportPerMode asserts the §7.5 soundness fix per mode:
+// the base preamble broad-allows reads/execs, so a restricted-read policy
+// (zerotrust — no "/" grant) is compiled WIDER than intent and must be recorded
+// (restricted-read + exec-scoping, both unenforced) AND demoted to Degraded.
+// Policies that themselves grant broad root read/exec (readonly/write/trusted/
+// unconfined) stay Full unless demoted for another reason (Trusted → Private),
+// and never carry a restricted-read entry. This exercises level+report per mode,
+// which the golden test deliberately discards.
+func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
+	t.Setenv("HOME", "/home/tester")
+	cases := []struct {
+		name             string
+		mode             Mode
+		wantLevel        uint8
+		wantRestrictRead bool // restricted-read + exec-scoping entries expected
+	}{
+		{"zerotrust", ZeroTrust, LevelDegraded, true},
+		{"readonly", ReadOnly, LevelFull, false},
+		{"write", Write, LevelFull, false},
+		{"trusted", Trusted, LevelDegraded, false}, // Degraded via Private, not restricted-read
+		{"unconfined", Unconfined, LevelFull, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, report, level, _ := compileSBPL(PolicyFor(tc.mode, "/ws"))
+			if level != tc.wantLevel {
+				t.Errorf("%s level = %d, want %d (report %+v)", tc.name, level, tc.wantLevel, report.Entries)
+			}
+			gotRead := hasReportFeature(report, "restricted-read")
+			gotExec := hasReportFeature(report, "exec-scoping")
+			if gotRead != tc.wantRestrictRead {
+				t.Errorf("%s restricted-read entry present = %v, want %v (report %+v)", tc.name, gotRead, tc.wantRestrictRead, report.Entries)
+			}
+			if gotExec != tc.wantRestrictRead {
+				t.Errorf("%s exec-scoping entry present = %v, want %v (report %+v)", tc.name, gotExec, tc.wantRestrictRead, report.Entries)
+			}
+			if tc.wantRestrictRead {
+				if !hasReport(report, "restricted-read", "unenforced") {
+					t.Errorf("%s restricted-read entry not marked unenforced: %+v", tc.name, report.Entries)
+				}
+				if !hasReport(report, "exec-scoping", "unenforced") {
+					t.Errorf("%s exec-scoping entry not marked unenforced: %+v", tc.name, report.Entries)
+				}
+			}
+		})
+	}
+}
+
 // TestCompileSBPLGuarantees asserts the guarantee bitmask: AddressNetwork is
 // always false (SBPL cannot address-scope); EnvScrub tracks !Env.Inherit; and the
 // Write policy has the process/write/read/network boundaries.

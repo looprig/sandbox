@@ -73,6 +73,36 @@ func compileSBPL(p Policy) (profile string, report CompileReport, level uint8, g
 	compileNet(&b, &report, p.Net)
 
 	level = LevelFull
+
+	// Soundness (§7.5): the base preamble unconditionally broad-allows
+	// file-read*/process-exec* so the target can even start (dyld, exec, and the
+	// mach bootstrap need broad reads on macOS). For a policy that itself grants
+	// broad root read/exec (write/readonly/trusted/unconfined all carry
+	// {"/":Read|Exec}) the preamble matches intent — nothing is wider than policy.
+	// But a restricted-read policy (zerotrust grants read/exec only to
+	// MinimalSystemReadPaths + workspace, with no "/" entry) is compiled STRICTLY
+	// WIDER than intended: the command can read/exec almost the whole disk. §7.5
+	// forbids that from passing silently — it must be recorded AND demote Level(),
+	// so such a policy cannot clear a default LevelFull auto-approve gate. Detect
+	// it by asking the resolver what the policy actually grants at "/".
+	rootAccess := Resolve(p.FS, "/")
+	if rootAccess&ReadAccess == 0 {
+		report.Entries = append(report.Entries, ReportEntry{
+			Feature: "restricted-read",
+			Status:  "unenforced",
+			Detail:  "base preamble broad-allows file-read* (dyld/exec needs broad reads on macOS); per-policy read restriction not enforced — tighten via scoped system-lib reads in a later iteration",
+		})
+		level = LevelDegraded
+	}
+	if rootAccess&ExecAccess == 0 {
+		report.Entries = append(report.Entries, ReportEntry{
+			Feature: "exec-scoping",
+			Status:  "unenforced",
+			Detail:  "base preamble broad-allows process-exec* (dyld/exec needs broad reads on macOS); per-policy exec restriction not enforced — tighten via scoped system-lib reads in a later iteration",
+		})
+		level = LevelDegraded
+	}
+
 	if p.Net.Private {
 		// Private requests address-scoped egress, which SBPL cannot express
 		// (§5.2, M1): its AddressNetwork guarantee can never be satisfied, so the
