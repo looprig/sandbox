@@ -494,6 +494,20 @@ needs a helper to build a `ReadGuard` from FS rules, add a stdlib-only adapter
 interface here (not the sandbox impl). Test that native read tools honor a fake
 guard denying `.env`. Commit `feat(harness): readguard adaptation seam`.
 
+**Carry-forward from Task 4 review (sandbox side, when the adapter is built):**
+- `Resolve` (`fsresolve.go`) is **purely lexical** — the consumer MUST feed it
+  absolute, `filepath.Clean`ed, **symlink-resolved** paths (and on case-insensitive
+  macOS FS, canonical case), or a deny can be bypassed via a symlink/case variant.
+- `Resolve` recompiles deny/allow globs on every call — fine for backend
+  per-spawn use, but if the ReadGuard calls `Resolve` **per file read** on a hot
+  path, add a `Compile(entries) *Resolver` that caches `*regexp.Regexp` per glob
+  (travels with the "policy compiled per backend" model), rather than a
+  package-level cache. Precompile only if profiling shows it matters.
+- Optional defense-in-depth: `WithDenyRead`/`PolicyFor` currently accept unvalidated
+  glob strings; the resolver already fails **closed** on an uncompilable deny glob
+  (over-denies), but construction-time validation (surfaced at `NewExecutor`) would
+  turn a silent over-deny into a clear error. Consider alongside the §5.3 home guard.
+
 ### Task 20: Dependency-direction guard
 
 **Files:** Create `pkg/tool/deps_test.go` (or CI script). Assert (via `go list
