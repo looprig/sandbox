@@ -1,0 +1,39 @@
+# Compiled binaries and object files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+
+# Test binaries and coverage/profiling output
+*.test
+*.out
+*.prof
+coverage.txt
+coverage.html
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Build / dependency directories
+/bin/
+/dist/
+
+# Editor and OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Vendored dependency tree — committed in full and built offline (-mod=vendor).
+# The global ignores above (*.pem, *.key, .env.*, *.test, *.out, ...) otherwise
+# silently drop vendored files (e.g. a dependency's embedded *.pem/*.key
+# testdata), yielding a tree that fails `go build`/`go test` from a clean
+# checkout. This negation must stay LAST so it re-includes everything under
+# vendor/.
+!/vendor/**
