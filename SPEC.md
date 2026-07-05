@@ -368,6 +368,17 @@ Generate an SBPL profile from the policy (default-deny base; `file-read*` /
 `file-write*` / `process-exec` allows per entry; deny rules for §5.3 — SBPL
 expresses deny-inside-allow natively; network section per §5.2) and spawn
 `/usr/bin/sandbox-exec -p <profile> -D<param>=<path>… -- /bin/sh -c <command>`.
+**Emitted FS paths are canonicalized (`filepath.EvalSymlinks`, with a
+`filepath.Clean` fallback for not-yet-existing paths)** because Seatbelt matches
+rules against the kernel's *symlink-resolved* access path: on macOS `/tmp` →
+`/private/tmp`, `/etc` → `/private/etc`, `/var` → `/private/var`, and temp
+workspaces under `/var/folders/…` resolve into `/private/…`. Without this the
+`/tmp` (i.e. `$TMPDIR`, §5.5) and symlinked-workspace write grants silently
+**deny** everything — verified by the Task 8b real-`sandbox-exec` enforcement
+tests, which is why the golden profiles emit `/private/tmp` etc. (Residual: a
+`WithDenyRead` glob whose literal prefix sits under a symlinked root and does not
+yet exist under-matches; `DefaultSecretDenials`' `**/.env*` is prefix-free, so
+the secure defaults are unaffected.)
 Deprecated-but-universal (Chrome, Bazel, Codex, Claude Code). Network section
 (verified in Task M1, `docs/spikes/seatbelt-net.md`): `Ports` → `(remote tcp
 "*:P")` per port; `Loopback` → `(remote ip "localhost:*")`; `DNS` → the
