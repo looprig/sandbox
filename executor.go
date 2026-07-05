@@ -110,6 +110,13 @@ type Executor struct {
 	// bits from FS, forces Net blocked, and PlanGrants returns nil — the read path
 	// never escalates.
 	readOnly bool
+
+	// compileErr latches a construction-time compile failure of a ReadOnlyView
+	// (whose signature has no error return). resolve returns it thereafter so a
+	// view that never compiled fails CLOSED at spawn instead of leaving a nil
+	// spawnSpec that would panic. It is only ever set for a static view; a dynamic
+	// view re-attempts compilation on each resolve, so its failures surface live.
+	compileErr error
 }
 
 // snapshot is the compiled state a single spawn needs, read atomically so a
@@ -206,6 +213,11 @@ func ttlOrDefault(d time.Duration) time.Duration {
 // because a dynamic executor can compile non-unconfined modes (whose secret
 // deny-reads are home-anchored) at any later moment; there is no single policy to
 // exempt.
+//
+// By design (SPEC §6) this takes PolicyOptions only, not ExecOptions: a dynamic
+// executor therefore uses the default grant TTL (15 min) and clock (time.Now),
+// which are not customizable through the public API. Tests inject a clock via the
+// white-box withClock field.
 func NewExecutorDynamic(src ModeSource, workspace string, popts ...PolicyOption) (*Executor, error) {
 	if _, err := os.UserHomeDir(); err != nil {
 		return nil, fmt.Errorf("sandbox: cannot resolve home directory for secret deny-reads: %w", err)
@@ -247,10 +259,9 @@ func NewExternalExecutor(decl ExternalDecl) *Executor {
 	spec, _, _, _, _ := b.compile(Policy{}) // passthrough spawnSpec only
 	p := Policy{Env: decl.Env}
 
-	// A grant key lets PlanGrants/DescribeGrant work without panicking; crypto/rand
-	// effectively never fails, and since construction cannot fail we fall back to a
-	// nil key (HMAC over an empty key still verifies self-consistently) rather than
-	// surface an error the signature has no room for.
+	// crypto/rand.Read cannot return a non-nil error on Go >= 1.24 (it panics on a
+	// catastrophic RNG failure), so this key is always valid; the ignored error is
+	// a formality that never fires.
 	key, _ := newGrantKey()
 
 	return &Executor{
@@ -282,7 +293,10 @@ func NewExternalExecutor(decl ExternalDecl) *Executor {
 // not uniquely mean "didn't spawn" — it also arises from signal death and
 // context cancellation.
 func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte, int, error) {
-	s := e.resolve()
+	s, err := e.resolve()
+	if err != nil {
+		return nil, -1, err
+	}
 	return e.run(ctx, dir, s.spec.wrapShell(command), s)
 }
 
@@ -321,20 +335,43 @@ func (e *Executor) recompileLocked() error {
 	return nil
 }
 
-// resolve returns the compiled snapshot for a single spawn. For a static
-// executor it reads the immutable fields with no lock. For a dynamic executor it
-// takes e.mu, recompiles if the mode changed (bumping policyGen), and reads the
-// fresh snapshot under the same lock so a spawn never tears across a generation
-// change. A recompile error is ignored here — the last good snapshot is reused —
-// because construction already performed the first successful compile.
-func (e *Executor) resolve() snapshot {
+// resolve returns the compiled snapshot for a single spawn, plus an error that
+// every spawn path propagates so a never-compiled or freshly-failed executor
+// fails CLOSED rather than spawning with a nil transform.
+//
+//   - Static executor: reads the immutable fields with no lock. Returns
+//     e.compileErr, which is nil for a normally-constructed executor and non-nil
+//     only for a static ReadOnlyView whose one-time compile failed.
+//   - Dynamic executor: takes e.mu, recompiles if the mode changed (bumping
+//     policyGen), and reads the fresh snapshot under the same lock so a spawn
+//     never tears across a generation change. A live recompile failure is
+//     returned (fail-closed for this spawn); a self-healing later mode may
+//     compile cleanly.
+//
+// As a final guard the resolved spawnSpec is checked: an uncompiled spec (nil
+// wrapShell) yields an error instead of a later nil-func call.
+func (e *Executor) resolve() (snapshot, error) {
 	if e.src == nil {
-		return snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
+		s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
+		return s, e.resolveErr(e.compileErr)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	_ = e.recompileLocked()
-	return snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
+	err := e.recompileLocked()
+	s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
+	return s, e.resolveErr(err)
+}
+
+// resolveErr prefers an upstream compile error, else fails closed if the spawn
+// spec was never compiled (nil transform), else nil.
+func (e *Executor) resolveErr(compileErr error) error {
+	if compileErr != nil {
+		return compileErr
+	}
+	if e.spec.wrapShell == nil || e.spec.wrapArgv == nil {
+		return errors.New("sandbox: executor spawn spec not compiled")
+	}
+	return nil
 }
 
 // RunArgv runs a direct argv in dir under the compiled policy, with no shell
@@ -343,7 +380,10 @@ func (e *Executor) resolve() snapshot {
 // detect a process that did not complete normally (spawn failure, signal kill,
 // or context cancellation all report code -1).
 func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
-	s := e.resolve()
+	s, err := e.resolve()
+	if err != nil {
+		return nil, -1, err
+	}
 	return e.run(ctx, dir, s.spec.wrapArgv(argv), s)
 }
 
@@ -354,6 +394,11 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 // the caller (via resolve) so a concurrent dynamic recompile cannot change the
 // env or spawn transform mid-spawn.
 func (e *Executor) run(ctx context.Context, dir string, argv []string, s snapshot) ([]byte, int, error) {
+	// Fail closed if the spawn spec never compiled: resolve already guards this,
+	// but a nil transform must never reach a spawn (defense in depth).
+	if s.spec.wrapShell == nil {
+		return nil, -1, errors.New("sandbox: executor spawn spec not compiled")
+	}
 	if len(argv) == 0 {
 		return nil, -1, errors.New("sandbox: empty argv")
 	}
@@ -454,13 +499,25 @@ func netBlocked(p Policy) bool {
 // (netBlocked) a single "net" delta is offered. A ReadOnlyView never plans grants
 // — the read path never escalates — so it returns nil immediately.
 //
+// An external executor (LevelExternal) also plans nothing: its zero-Net policy
+// would trip netBlocked, but egress there is infra-handled and the boundary is
+// already fully trusted, so offering an "allow network egress" escalation would
+// be incoherent. A resolve failure (uncompiled view) likewise yields nil — no
+// escalation from a fail-closed executor.
+//
 // Task 9: a per-command classifier ("does THIS command actually need net") will
 // gate the candidate; here we plan purely from the policy-denied axes.
 func (e *Executor) PlanGrants(dir, command string) []string {
-	if e.readOnly {
+	// e.src == nil guards the e.level read: LevelExternal is only ever set on a
+	// static external executor, so a dynamic executor short-circuits before the
+	// read and never races recompileLocked's write of e.level.
+	if e.readOnly || (e.src == nil && e.level == LevelExternal) {
 		return nil
 	}
-	s := e.resolve()
+	s, err := e.resolve()
+	if err != nil {
+		return nil
+	}
 
 	var tokens []string
 	if netBlocked(s.policy) {
@@ -501,13 +558,23 @@ func (e *Executor) DescribeGrant(token string) (string, bool) {
 // there is nothing to loosen for this one spawn. On a real OS backend each
 // verified delta loosens the compiled policy for THIS spawn only (e.g. permit
 // egress) before running; that per-spawn loosening lands with the OS backends.
+//
+// A ReadOnlyView fails closed on redeem as well as on mint: the read path never
+// escalates, so even a grant its parent minted (shared key, same generation)
+// cannot loosen a view whose policy forced writes off and Net blocked.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) ([]byte, int, error) {
-	s := e.resolve()
+	if e.readOnly {
+		return nil, -1, errors.New("sandbox: granting disabled on read-only view")
+	}
+	s, err := e.resolve()
+	if err != nil {
+		return nil, -1, err
+	}
 	now := e.clock()
 	want := hashCommand(dir, command)
 	for _, tok := range grants {
-		if _, err := verifyGrant(e.grantKey, tok, now, s.policyGen, want); err != nil {
-			return nil, -1, fmt.Errorf("grant: %w", err)
+		if _, verr := verifyGrant(e.grantKey, tok, now, s.policyGen, want); verr != nil {
+			return nil, -1, fmt.Errorf("grant: %w", verr)
 		}
 	}
 	return e.run(ctx, dir, s.spec.wrapShell(command), s)
@@ -531,10 +598,17 @@ func readOnlyMask(p Policy) Policy {
 
 // ReadOnlyView returns a derived executor for read-path tools (e.g. Grep, SPEC
 // §10.1): it shares the parent's policy source (a static policy or the same
-// ModeSource) and REUSES the parent's already-probed backend and level — no
-// re-probe — but strips writes from every FS entry, forces the network blocked,
-// and disables granting (PlanGrants returns nil). For a dynamic parent the mask
-// is applied on every recompile.
+// ModeSource) and REUSES the parent's already-probed backend — no re-probe —
+// recompiling the write-stripped, Net-blocked policy through it (so its own
+// level/report/guarantees reflect the masked policy). Granting is disabled on
+// both sides: PlanGrants returns nil and RunCommandWithGrants fails closed — the
+// read path never escalates. For a dynamic parent the mask is applied on every
+// recompile.
+//
+// The signature has no error return (SPEC §6), so a construction-time compile
+// failure is latched: a static view stores it in compileErr and a dynamic view
+// re-attempts on each resolve — either way spawns fail CLOSED rather than
+// panicking on a nil spawnSpec.
 func (e *Executor) ReadOnlyView() *Executor {
 	v := &Executor{
 		backend:      e.backend, // reuse the parent's probe result; do NOT re-select
@@ -550,14 +624,20 @@ func (e *Executor) ReadOnlyView() *Executor {
 	}
 	if e.src != nil {
 		// Dynamic parent: compile the current mode through the mask now so the view
-		// is usable before its first spawn; recompiles re-apply the mask.
-		v.recompileLocked()
+		// is usable before its first spawn; recompiles re-apply the mask. A failure
+		// here re-surfaces on the next resolve (haveMode stays false), so it need
+		// not be latched.
+		_ = v.recompileLocked()
 		return v
 	}
 	// Static parent: mask the parent's compiled policy once and recompile it
-	// through the reused backend.
+	// through the reused backend. Latch any failure so resolve fails closed.
 	p := readOnlyMask(e.policy)
-	spec, report, level, bits, _ := e.backend.compile(p)
+	spec, report, level, bits, err := e.backend.compile(p)
+	if err != nil {
+		v.compileErr = err
+		return v
+	}
 	v.policy = p
 	v.spec = spec
 	v.report = report
@@ -573,7 +653,10 @@ func (e *Executor) ReadOnlyView() *Executor {
 // commands), and applies any backend spawn attributes. On the null backend this
 // effectively just replaces cmd.Env with the scrubbed environment.
 func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
-	s := e.resolve()
+	s, err := e.resolve()
+	if err != nil {
+		return nil, err
+	}
 	finalArgv := s.spec.wrapArgv(cmd.Args)
 	if len(finalArgv) == 0 {
 		return nil, errors.New("sandbox: cannot wrap a command with empty Args")

@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -401,6 +403,13 @@ func TestExternalExecutor(t *testing.T) {
 	if strings.Contains(string(out), "GITHUB_TOKEN") {
 		t.Errorf("external child leaked GITHUB_TOKEN:\n%s", out)
 	}
+
+	// An external executor never offers escalation tokens: it is fully trusted and
+	// egress is infra-handled, so a "net" candidate (which its zero-Net policy
+	// would otherwise trip) must not be minted.
+	if g := e.PlanGrants(ws, "curl https://example.com"); g != nil {
+		t.Errorf("external PlanGrants = %v, want nil (no escalation from LevelExternal)", g)
+	}
 }
 
 // TestExecutorDynamicGenBumpInvalidatesGrants is the load-bearing dynamic test:
@@ -426,8 +435,18 @@ func TestExecutorDynamicGenBumpInvalidatesGrants(t *testing.T) {
 	}
 
 	// Under the minting mode the grant verifies and the command runs.
+	genA := e.policyGen
 	if _, _, err := e.RunCommandWithGrants(context.Background(), dir, cmd, grants); err != nil {
 		t.Fatalf("RunCommandWithGrants at mode A: %v", err)
+	}
+
+	// Same-mode stability: repeated same-mode spawns must NOT bump the generation
+	// (a no-op recompile that bumped would spuriously void live grants).
+	if _, _, err := e.RunCommand(context.Background(), dir, cmd); err != nil {
+		t.Fatalf("RunCommand same mode: %v", err)
+	}
+	if e.policyGen != genA {
+		t.Errorf("policyGen bumped on a same-mode spawn: %d -> %d, want stable", genA, e.policyGen)
 	}
 
 	// Flip the mode: the next spawn recompiles and bumps policyGen, voiding the
@@ -439,6 +458,81 @@ func TestExecutorDynamicGenBumpInvalidatesGrants(t *testing.T) {
 	}
 	if !errors.Is(err, ErrGrantWrongGeneration) {
 		t.Errorf("after mode flip: err = %v, want ErrGrantWrongGeneration", err)
+	}
+	if e.policyGen == genA {
+		t.Errorf("policyGen did not bump across a mode change: still %d", e.policyGen)
+	}
+}
+
+// atomicSrc is a goroutine-safe ModeSource for the concurrency stress test. The
+// executor's mutex guards its OWN compiled state, not the ModeSource; a real
+// source is responsible for its own synchronization, so the test uses an atomic
+// one to keep the race detector focused on the executor rather than flagging the
+// test harness's own unsynchronized field.
+type atomicSrc struct{ m atomic.Uint32 }
+
+func (a *atomicSrc) Current() Mode { return Mode(a.m.Load()) }
+func (a *atomicSrc) set(mode Mode) { a.m.Store(uint32(mode)) }
+
+// TestExecutorDynamicConcurrentRace makes the dynamic-mutex claim load-bearing:
+// many goroutines hammer the spawn/plan/inspect paths of one dynamic executor
+// while another goroutine flips the mode in a tight loop. Run under -race it
+// proves the per-spawn recompile and the compiled-snapshot reads are properly
+// serialized (no torn reads, no data race, no panic).
+func TestExecutorDynamicConcurrentRace(t *testing.T) {
+	ws := t.TempDir()
+	src := &atomicSrc{}
+	src.set(Write)
+
+	e, err := NewExecutorDynamic(src, ws)
+	if err != nil {
+		t.Fatalf("NewExecutorDynamic: %v", err)
+	}
+	ctx := context.Background()
+
+	stop := make(chan struct{})
+	var flipper sync.WaitGroup
+	flipper.Add(1)
+	go func() {
+		defer flipper.Done()
+		modes := []Mode{ZeroTrust, ReadOnly, Write, Trusted}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				src.set(modes[i%len(modes)])
+			}
+		}
+	}()
+
+	const workers = 8
+	var work sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		work.Add(1)
+		go func() {
+			defer work.Done()
+			for i := 0; i < 100; i++ {
+				// Lock-heavy, cheap paths dominate; an occasional real spawn keeps
+				// the run path in the mix without spawning thousands of processes.
+				_ = e.PlanGrants(ws, "true")
+				_ = e.Level()
+				_ = e.GuaranteeBits()
+				_ = e.Report()
+				if i%20 == 0 {
+					_, _, _ = e.RunCommand(ctx, ws, "true")
+				}
+			}
+		}()
+	}
+
+	work.Wait()
+	close(stop)
+	flipper.Wait()
+
+	// Sanity: the executor is still usable and reports a valid level after the storm.
+	if lvl := e.Level(); lvl > LevelExternal {
+		t.Errorf("post-storm Level() = %d, out of range", lvl)
 	}
 }
 
@@ -519,6 +613,16 @@ func TestReadOnlyViewStatic(t *testing.T) {
 	if g := view.PlanGrants(ws, "curl https://example.com"); g != nil {
 		t.Errorf("ReadOnlyView.PlanGrants = %v, want nil (granting disabled)", g)
 	}
+
+	// Fail closed on redeem too: even a grant the PARENT minted (shared key, same
+	// generation) cannot loosen the view — the read path never escalates.
+	parentGrants := parent.PlanGrants(ws, "curl https://example.com")
+	if len(parentGrants) == 0 {
+		t.Fatal("parent PlanGrants returned no grant; expected one for net-blocked Write")
+	}
+	if _, _, err := view.RunCommandWithGrants(context.Background(), ws, "curl https://example.com", parentGrants); err == nil {
+		t.Error("ReadOnlyView.RunCommandWithGrants: err = nil, want fail-closed error")
+	}
 }
 
 // TestReadOnlyViewDynamic asserts the read-only mask is applied on each recompile
@@ -537,7 +641,10 @@ func TestReadOnlyViewDynamic(t *testing.T) {
 	}
 
 	// Force a recompile at the current mode and inspect the masked policy.
-	s := view.resolve()
+	s, err := view.resolve()
+	if err != nil {
+		t.Fatalf("view.resolve: %v", err)
+	}
 	if acc := Resolve(s.policy.FS, ws); acc&WriteAccess != 0 {
 		t.Errorf("dynamic ReadOnlyView resolved access = %v, has WriteAccess", acc)
 	}
