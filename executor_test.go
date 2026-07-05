@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -252,6 +253,98 @@ func TestExecOptions(t *testing.T) {
 // load-bearing on Linux later).
 func TestInit(t *testing.T) {
 	Init() // must not panic; no-op
+}
+
+// TestRunCommandContextTimeout asserts a deadline that fires DURING the run is a
+// visible error (ctx.Err()) with code -1, symmetric with cancel-before-start —
+// not a silent nil-error signal kill.
+func TestRunCommandContextTimeout(t *testing.T) {
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, code, err := e.RunCommand(ctx, ws, "sleep 5")
+	if err == nil {
+		t.Fatal("RunCommand under a short deadline: err = nil, want ctx.Err()")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("RunCommand timeout: err = %v, want context.DeadlineExceeded", err)
+	}
+	if code != -1 {
+		t.Errorf("RunCommand timeout: code = %d, want -1", code)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("RunCommand timeout: took %v, want the deadline to kill it promptly", elapsed)
+	}
+}
+
+// TestRunArgvNonexistentBinary asserts a missing binary is a spawn error (non-nil
+// err), the other side of the RAN-vs-failed convention for the argv path.
+func TestRunArgvNonexistentBinary(t *testing.T) {
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	_, _, err = e.RunArgv(context.Background(), ws, []string{"/no/such/bin"})
+	if err == nil {
+		t.Error("RunArgv(/no/such/bin): err = nil, want a spawn error")
+	}
+}
+
+// TestAssembleEnvBadAllowGlob asserts a malformed Allow glob fails closed:
+// path.Match returns ErrBadPattern, envNameMatches treats it as a non-match, and
+// the call neither panics nor admits anything through the bad pattern.
+func TestAssembleEnvBadAllowGlob(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "secret")
+
+	env := assembleEnv(Policy{Env: EnvPolicy{Allow: []string{"LC_["}}})
+	if env == nil {
+		t.Fatal("assembleEnv(scrub) = nil for a bad-glob scrub policy; want non-nil")
+	}
+	if hasEnvName(env, "GITHUB_TOKEN") {
+		t.Errorf("bad Allow glob admitted GITHUB_TOKEN (must fail closed): %v", env)
+	}
+}
+
+// TestAssembleEnvScrubNeverNil is the C1 fail-open regression guard: a directly
+// constructed scrub policy with no matching var and no Set must yield a non-nil,
+// empty slice — never nil, which would make exec.Cmd inherit the ENTIRE parent
+// environment and leak every secret. It also checks end-to-end that a planted
+// secret never reaches the child, without relying on PolicyFor's incidental
+// TMPDIR-in-Set masking.
+func TestAssembleEnvScrubNeverNil(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "secret")
+
+	env := assembleEnv(Policy{Env: EnvPolicy{}})
+	if env == nil {
+		t.Fatal("assembleEnv(scrub) = nil; want non-nil empty slice (nil => exec inherits ALL parent env)")
+	}
+	if hasEnvName(env, "GITHUB_TOKEN") {
+		t.Errorf("scrub env leaked GITHUB_TOKEN: %v", env)
+	}
+
+	// End-to-end: a scrub Policy with an EMPTY EnvPolicy (no TMPDIR in Set) must
+	// still keep the secret out of the child's environment.
+	ws := t.TempDir()
+	e, err := NewExecutor(Policy{Workspace: ws, Env: EnvPolicy{}})
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	out, _, err := e.RunCommand(context.Background(), ws, "env")
+	if err != nil {
+		t.Fatalf("RunCommand(env): %v", err)
+	}
+	if strings.Contains(string(out), "GITHUB_TOKEN") {
+		t.Errorf("scrub policy leaked GITHUB_TOKEN to child:\n%s", out)
+	}
 }
 
 // --- env test helpers ---

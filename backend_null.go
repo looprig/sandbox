@@ -35,5 +35,8 @@ func (nullBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, e
 // TODO(Task 8/10): build-tag per-platform selection (Seatbelt/Linux ladder)
 // replaces this — a darwin file returns the Seatbelt backend, a linux file
 // probes the namespace/Landlock ladder, and this fallback is used only where no
-// mechanism is available.
+// mechanism is available. The future windows selector must fail with
+// ErrUnsupportedPlatform (SPEC §7.3) BEFORE reaching the null backend: null's
+// spawnSpec execs the Unix "/bin/sh", which is not a valid Windows fallback, so
+// null must never be selected on Windows.
 func platformBackend() backend { return newNullBackend() }

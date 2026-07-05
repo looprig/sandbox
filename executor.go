@@ -5,8 +5,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
+	"path"
+	"slices"
 	"strings"
 	"time"
 )
@@ -104,17 +104,23 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 // directory and the assembled environment, applies any spawn attributes, and
 // runs to completion capturing combined stdout+stderr.
 //
-// Convention: if the process RAN — even with a non-zero exit — the return is
-// (output, exitCode, nil) carrying the real exit code. A non-nil error is
-// returned only on a spawn/setup failure (missing dir, binary not found), in
-// which case the exit code is a sentinel -1.
+// Convention: if the process RAN to a normal exit — even a non-zero one — the
+// return is (output, exitCode, nil) carrying the real exit code. A non-nil error
+// signals that the process did NOT complete normally: a spawn/setup failure
+// (missing dir, binary not found), a signal kill (e.g. SIGKILL), or a context
+// timeout/cancel. Callers MUST key on err (not the numeric code) to detect
+// "didn't run / was killed": the exit code is -1 in every such case, so -1 does
+// not uniquely mean "didn't spawn" — it also arises from signal death and
+// context cancellation.
 func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte, int, error) {
 	return e.run(ctx, dir, e.spec.wrapShell(command))
 }
 
 // RunArgv runs a direct argv in dir under the compiled policy, with no shell
 // interposed (SPEC §6, §10.1) — for tools that already build argv safely. Same
-// exit-code/error convention as RunCommand.
+// exit-code/error convention as RunCommand: key on err, not the numeric code, to
+// detect a process that did not complete normally (spawn failure, signal kill,
+// or context cancellation all report code -1).
 func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
 	return e.run(ctx, dir, e.spec.wrapArgv(argv))
 }
@@ -131,11 +137,27 @@ func (e *Executor) run(ctx context.Context, dir string, argv []string) ([]byte, 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = e.env
+	// Belt-and-suspenders fail-closed guard: cmd.Env == nil makes exec.Cmd
+	// inherit the entire parent environment. assembleEnv never returns nil, but a
+	// truly empty child environment must be a non-nil empty slice so a future
+	// change can never silently flip to inherit-all.
+	if cmd.Env == nil {
+		cmd.Env = []string{}
+	}
 	if e.spec.configure != nil {
 		e.spec.configure(cmd)
 	}
 
 	out, err := cmd.CombinedOutput()
+
+	// A context timeout/cancel DURING the run surfaces as a signal kill (an
+	// ExitError with code -1), which would otherwise be reported as a nil-error
+	// non-zero run. Check the context first so a deadline/cancel is a visible
+	// error, symmetric with cancel-before-start.
+	if ctx.Err() != nil {
+		return out, -1, ctx.Err()
+	}
+
 	if err != nil {
 		// A ran-but-nonzero process is not an error under our convention: surface
 		// the real exit code and a nil error.
@@ -143,8 +165,7 @@ func (e *Executor) run(ctx context.Context, dir string, argv []string) ([]byte, 
 		if errors.As(err, &ee) {
 			return out, ee.ExitCode(), nil
 		}
-		// A genuine spawn/setup failure: dir missing, binary not found, context
-		// cancelled before start, etc.
+		// A genuine spawn/setup failure: dir missing, binary not found, etc.
 		return out, -1, err
 	}
 	return out, 0, nil
@@ -189,7 +210,12 @@ func assembleEnv(p Policy) []string {
 	// fresh slice, so appending never mutates the shared preset.
 	allow := append(BaselineEnvAllowlist(), p.Env.Allow...)
 
-	var kept []string
+	// A non-nil empty slice is load-bearing: a scrub policy that admits no vars
+	// and has an empty Set must yield an empty (not nil) env, because cmd.Env ==
+	// nil makes exec.Cmd inherit the ENTIRE parent environment — a full secret
+	// leak that would invert the very guarantee (EnvScrub) this branch exists to
+	// provide. Fail closed to a truly empty child environment.
+	kept := []string{}
 	for _, kv := range os.Environ() {
 		name, _, ok := strings.Cut(kv, "=")
 		if !ok {
@@ -203,12 +229,15 @@ func assembleEnv(p Policy) []string {
 }
 
 // envNameMatches reports whether an environment variable name matches any of the
-// allowlist patterns, using filepath.Match on the NAME (so "LC_*" and "CARGO_*"
-// work). A malformed pattern fails closed: filepath.Match's error is treated as
-// a non-match, so a bad glob never widens the allowlist.
+// allowlist patterns, using path.Match on the NAME (so "LC_*" and "CARGO_*"
+// work). path.Match — not filepath.Match — is deliberate: env names are not
+// filesystem paths, and filepath.Match uses "\"-separator semantics on Windows,
+// whereas path.Match is always "/"-based, which is correct for a plain name. A
+// malformed pattern fails closed: path.Match's error is treated as a non-match,
+// so a bad glob never widens the allowlist.
 func envNameMatches(name string, patterns []string) bool {
 	for _, pat := range patterns {
-		if ok, err := filepath.Match(pat, name); err == nil && ok {
+		if ok, err := path.Match(pat, name); err == nil && ok {
 			return true
 		}
 	}
@@ -243,7 +272,7 @@ func applySet(env []string, set map[string]string) []string {
 			add = append(add, k)
 		}
 	}
-	sort.Strings(add)
+	slices.Sort(add)
 	for _, k := range add {
 		env = append(env, k+"="+set[k])
 	}
