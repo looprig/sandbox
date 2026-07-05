@@ -2,9 +2,12 @@ package sandbox
 
 import "testing"
 
-// TestPolicyZeroValues asserts every zero value in the policy and guarantee
-// types is fail-closed: the most restrictive interpretation. A caller who
-// forgets to set a field must never accidentally widen access.
+// TestPolicyZeroValues asserts the security-critical zero values in the policy
+// and guarantee types are fail-closed: the most restrictive interpretation. A
+// caller who forgets to set a field must never accidentally widen access. This
+// covers the fields where a wrong default grants authority (mode, FS access,
+// AckUnconfined, env inheritance, network, guarantees, isolation level); it is
+// not an exhaustive field-by-field check of every struct.
 func TestPolicyZeroValues(t *testing.T) {
 	if Mode(0) != ZeroTrust {
 		t.Errorf("Mode(0) = %v, want ZeroTrust (most restrictive mode)", Mode(0))
@@ -12,6 +15,15 @@ func TestPolicyZeroValues(t *testing.T) {
 
 	if FSAccess(0) != DenyAccess {
 		t.Errorf("FSAccess(0) = %v, want DenyAccess (no access)", FSAccess(0))
+	}
+
+	if (FSEntry{}).Access != DenyAccess {
+		t.Errorf("FSEntry{}.Access = %v, want DenyAccess (no access)", (FSEntry{}).Access)
+	}
+
+	// The load-bearing guard: a stray true grants full unconfined authority.
+	if (Policy{}).AckUnconfined {
+		t.Error("Policy{}.AckUnconfined must default false (fail-closed)")
 	}
 
 	if (EnvPolicy{}).Inherit {

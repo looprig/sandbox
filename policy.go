@@ -16,7 +16,8 @@ const (
 	// Write confines writes to the workspace and tmp, with gated network.
 	Write
 	// Trusted is the maximum sandboxed tier: still workspace+tmp write-confined,
-	// but with default egress to HTTPS, DNS, loopback, and RFC1918.
+	// but with default egress to HTTPS, DNS, loopback, and private networks
+	// (RFC1918 + ULA; see NetPolicy.Private).
 	Trusted
 	// Unconfined steps off the ladder entirely: no wrapper applied, full
 	// user-level authority. Constructing it requires Policy.AckUnconfined.
@@ -28,15 +29,16 @@ const (
 // bits and OR-combine.
 type FSAccess uint8
 
+// DenyAccess is the zero value: no access (fail-closed).
+const DenyAccess FSAccess = 0
+
 const (
-	// DenyAccess is the zero value: no access.
-	DenyAccess FSAccess = 0
 	// ReadAccess permits reading files and listing/traversing directories.
-	ReadAccess FSAccess = 1 << iota
+	ReadAccess FSAccess = 1 << iota // 1
 	// ExecAccess permits executing binaries (Linux requires this explicitly).
-	ExecAccess
+	ExecAccess // 2
 	// WriteAccess permits creating, modifying, and deleting.
-	WriteAccess
+	WriteAccess // 4
 )
 
 // FSEntry grants a set of filesystem accesses to a path (SPEC §5.1).
@@ -83,7 +85,8 @@ type Limits struct {
 	MaxPIDs int
 	// MaxMemBytes caps memory usage in bytes.
 	MaxMemBytes int64
-	// MaxCPUPct caps CPU usage as a percentage.
+	// MaxCPUPct caps CPU usage as a percentage of a single core (100 = one full
+	// core; may exceed 100 on multi-core hosts, e.g. 200 = two cores).
 	MaxCPUPct int
 	// Disabled is an explicit opt-out; the zero value means mode defaults apply.
 	Disabled bool
@@ -143,10 +146,27 @@ type CompileReport struct {
 	Entries []ReportEntry
 }
 
+// Isolation levels are the coarse, achieved (probed + compiled) isolation
+// rollup reported by an executor (SPEC §6). They are plain uint8 values, not a
+// named type, so harness can probe interface{ Level() uint8 } structurally
+// without importing this package. The zero value is fail-closed.
+const (
+	// LevelNone means no isolation was achieved.
+	LevelNone uint8 = iota
+	// LevelDegraded means the write boundary holds but some policy features are
+	// narrowed or unenforced.
+	LevelDegraded
+	// LevelFull means every policy feature was enforced by the mechanism.
+	LevelFull
+	// LevelExternal means the environment is the boundary, by explicit
+	// declaration (NewExternalExecutor only).
+	LevelExternal
+)
+
 // Guarantees is the machine-readable, per-property statement of what a backend
 // actually enforced (SPEC §6, §10.3). Each field is fail-closed: false unless
 // the backend genuinely enforced that property. The field order matches the
-// Guarantee* bit constants.
+// Guarantee* bit constants below.
 type Guarantees struct {
 	// ProcessBoundary: the command was spawned inside an isolating boundary
 	// (namespace / seatbelt / external).
@@ -164,23 +184,6 @@ type Guarantees struct {
 	// ResourceLimits: cgroup/ulimit limits were applied.
 	ResourceLimits bool
 }
-
-// Isolation levels are the coarse, achieved (probed + compiled) isolation
-// rollup reported by an executor (SPEC §6). They are plain uint8 values, not a
-// named type, so harness can probe interface{ Level() uint8 } structurally
-// without importing this package. The zero value is fail-closed.
-const (
-	// LevelNone means no isolation was achieved.
-	LevelNone uint8 = iota
-	// LevelDegraded means the write boundary holds but some policy features are
-	// narrowed or unenforced.
-	LevelDegraded
-	// LevelFull means every policy feature was enforced by the mechanism.
-	LevelFull
-	// LevelExternal means the environment is the boundary, by explicit
-	// declaration (NewExternalExecutor only).
-	LevelExternal
-)
 
 // Guarantee bits are the seam-facing bitmask form of Guarantees (SPEC §6,
 // §10.3). They are plain uint64 values, not a named type, so harness can probe
