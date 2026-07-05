@@ -142,12 +142,14 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 		}
 	}
 
-	// Phase 1: per-entry allows (read, exec, write) for every allow entry.
+	// Phase 1: per-entry allows (read, exec, write) for every allow entry. Paths are
+	// canonicalized (canonPath) so a rule matches the symlink-resolved path Seatbelt
+	// evaluates against — on macOS /tmp→/private/tmp, /var/folders→/private/... etc.
 	for _, e := range fs {
 		if e.Access == DenyAccess {
 			continue
 		}
-		path := sbplString(e.Path)
+		path := sbplString(canonPath(e.Path))
 		if e.Access&ReadAccess != 0 {
 			b.WriteString(`(allow file-read* (subpath "` + path + `"))` + "\n")
 		}
@@ -167,7 +169,7 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 			continue
 		}
 		if underWritableRoot(e.Path, writableRoots) {
-			b.WriteString(`(deny file-write* (subpath "` + sbplString(e.Path) + `"))` + "\n")
+			b.WriteString(`(deny file-write* (subpath "` + sbplString(canonPath(e.Path)) + `"))` + "\n")
 		}
 	}
 
@@ -191,7 +193,11 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 		if strings.ContainsAny(e.Path, globMeta) {
 			// The regex form legitimately needs its backslashes (e.g. \.env), so
 			// it must NOT go through sbplString; only the un-representable quote
-			// case falls back.
+			// case falls back. NOTE (canonPath limitation): a glob's literal prefix
+			// is NOT symlink-resolved here, so a WithDenyRead glob whose fixed prefix
+			// sits under a symlinked root would under-match. DefaultSecretDenials'
+			// only glob (**/.env*) is suffix-anchored (no literal prefix), so this
+			// does not affect the secure defaults.
 			reSrc := globToRegexp(e.Path)
 			reCompiles := globRegexp(e.Path) != nil
 			if reCompiles && !strings.Contains(reSrc, `"`) {
@@ -199,7 +205,7 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 				continue
 			}
 			broad := conservativeDenyRoot(e.Path)
-			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(broad) + `"))` + "\n")
+			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(canonPath(broad)) + `"))` + "\n")
 			detail := "untranslatable deny glob " + e.Path + " compiled to a broad conservative deny of " + broad + " (fail closed, over-deny)"
 			if reCompiles { // translated fine, but the regex would contain a quote
 				detail = `deny glob contains a quote unrepresentable in an SBPL #"..." regex; widened to a conservative subpath deny`
@@ -210,7 +216,7 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 				Detail:  detail,
 			})
 		} else {
-			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(e.Path) + `"))` + "\n")
+			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(canonPath(e.Path)) + `"))` + "\n")
 		}
 	}
 }
@@ -358,6 +364,34 @@ func conservativeDenyRoot(glob string) string {
 		return "/"
 	}
 	return prefix
+}
+
+// canonPath resolves p through any symlinks so the emitted SBPL rule matches the
+// path the kernel presents to the sandbox. Seatbelt evaluates (subpath …) rules
+// against the FULLY symlink-resolved access path, and macOS symlinks the very roots
+// a policy names — /tmp→/private/tmp, /etc→/private/etc, /var→/private/var (so a
+// workspace or temp dir under /var/folders resolves into /private). A rule emitted
+// from the raw path would therefore match NOTHING and silently deny in-policy access
+// (a raw "/tmp" write grant never fires; a /var-form workspace grant never fires).
+//
+// EvalSymlinks only resolves an EXISTING path; a non-existent one (a fixed test path
+// like /ws or /home/tester, or a not-yet-created root) falls back to filepath.Clean,
+// leaving it unchanged. That is correct for the common case where the named roots
+// are real by the time the policy compiles (workspaces, homes, /tmp, /etc all exist)
+// and for a path with no symlinked prefix (a real home like /Users/foo resolves to
+// itself whether or not the leaf exists).
+//
+// LIMITATION: the Clean fallback cannot resolve a symlinked PREFIX of a
+// non-existent leaf, so a rule for a path that does not yet exist UNDER a symlinked
+// root will not match until it does. This affects only a not-yet-created
+// WithWritable/WithDenyRead root beneath a symlinked prefix; real workspaces and
+// homes are created before use, and DefaultSecretDenials' only glob (**/.env*) is
+// suffix-anchored and needs no prefix resolution.
+func canonPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
 }
 
 // sbplString escapes a Go string for inclusion inside an SBPL (subpath "…") /

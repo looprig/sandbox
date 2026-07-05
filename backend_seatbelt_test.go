@@ -418,11 +418,13 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 // enforces nothing, so a "write outside ws" or "cat ~/.ssh" succeeds — which is the
 // intended RED state proving the tests measure real enforcement, not passthrough.
 //
-// KEY macOS gotcha (a real finding, see canonTempDir): Seatbelt matches subpath/
-// regex rules against the CANONICAL (symlink-resolved) path. macOS temp dirs live
-// under /var/folders and /tmp, both symlinks into /private, so a profile compiled
-// from the raw path would deny even in-workspace writes. The tests resolve symlinks
-// so the file rules match the paths the kernel actually resolves.
+// KEY macOS behaviour (SPEC §7.1): Seatbelt matches subpath/regex rules against the
+// CANONICAL (symlink-resolved) path. macOS symlinks the very roots a policy names —
+// /tmp→/private/tmp, /etc→/private/etc, /var→/private/var (so t.TempDir workspaces
+// under /var/folders resolve into /private). The generator therefore canonicalizes
+// every emitted FS path (compileSBPL → canonPath); these tests deliberately pass a
+// RAW t.TempDir() (symlinked under /var/folders) and rely on the backend to resolve
+// it — which is itself part of what they verify, alongside the $TMPDIR write row.
 
 // requireSandboxExec capability-skips (with a recorded reason) when
 // /usr/bin/sandbox-exec is absent or not runnable here (e.g. a CI that forbids
@@ -438,30 +440,18 @@ func requireSandboxExec(t *testing.T) {
 	}
 }
 
-// canonTempDir returns a fresh temp dir with symlinks resolved. On macOS t.TempDir
-// lives under /var/folders (and TMPDIR/tmp), where /var and /tmp are symlinks into
-// /private. Seatbelt canonicalizes the accessed path before matching subpath/regex
-// rules, so a profile built from the raw /var form matches NOTHING (the kernel
-// resolves accesses to /private/var, which the /var subpath never covers) — even
-// an in-workspace write would be denied. Passing the resolved path into PolicyFor
-// makes the file rules match, mirroring what a macOS consumer must do.
-func canonTempDir(t *testing.T) string {
-	t.Helper()
-	d, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatalf("EvalSymlinks(TempDir): %v", err)
-	}
-	return d
-}
-
 // TestSeatbeltEnforceWriteBoundary is the §12.1 write-boundary row: an in-workspace
 // write succeeds and lands; a write to a sibling dir that is neither the workspace
 // nor /tmp is denied (nonzero exit, file not created). The deny only holds under
 // real Seatbelt — under null the write would succeed.
 func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	requireSandboxExec(t)
-	ws := canonTempDir(t)
-	outside := canonTempDir(t) // a sibling temp dir: NOT ws, NOT /tmp
+	// RAW t.TempDir() (symlinked under /var/folders → /private/var). Passing it
+	// straight to PolicyFor proves the GENERATOR canonicalizes the workspace: without
+	// canonPath the emitted (subpath "/var/…") never matches the kernel's /private/…
+	// resolution and even this in-workspace write would be denied.
+	ws := t.TempDir()
+	outside := t.TempDir() // a sibling temp dir: NOT ws, NOT /tmp
 	e, err := NewExecutor(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
@@ -496,13 +486,47 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	}
 }
 
+// TestSeatbeltEnforceTmpWrite is the $TMPDIR-write payoff of the path-canonicalize
+// fix. §5.5/decision 1 forces TMPDIR=/tmp, and write mode grants write to /tmp. On
+// macOS /tmp is a symlink to /private/tmp, so the raw (subpath "/tmp") grant matched
+// NOTHING — every $TMPDIR write was DENIED, making the Seatbelt backend unusable for
+// tools that write to their temp dir. With canonPath the grant is (subpath
+// "/private/tmp") and the write succeeds. This test FAILS without the fix.
+func TestSeatbeltEnforceTmpWrite(t *testing.T) {
+	requireSandboxExec(t)
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	name := fmt.Sprintf("lrsb-tmpwrite-%d", time.Now().UnixNano())
+	target := filepath.Join("/tmp", name)
+	t.Cleanup(func() {
+		os.Remove(target)
+		os.Remove(filepath.Join("/private/tmp", name))
+	})
+
+	// The child's TMPDIR is the forced /tmp; write through $TMPDIR as a real tool would.
+	out, code, err := e.RunCommand(context.Background(), ws, `echo hi > "$TMPDIR/`+name+`"`)
+	if err != nil {
+		t.Fatalf("$TMPDIR write: spawn err %v (out=%s)", err, out)
+	}
+	if code != 0 {
+		t.Errorf("$TMPDIR (/tmp) write: exit %d, want 0 (grant must canonicalize to /private/tmp); out=%s", code, out)
+	}
+	if _, serr := os.Stat(target); serr != nil {
+		t.Errorf("$TMPDIR write: %s not created (%v); the /tmp grant did not enforce as /private/tmp", target, serr)
+	}
+}
+
 // TestSeatbeltEnforceGitCarveout is the §12.1 .git carveout row: a sandboxed write
 // into ws/.git is DENIED while a sandboxed read of an existing ws/.git file is
 // ALLOWED. This verifies the read-allow + write-deny-LAST ordering enforces under
 // real SBPL last-match-wins, not just in byte-equal goldens.
 func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 	requireSandboxExec(t)
-	ws := canonTempDir(t)
+	ws := t.TempDir()
 	// As the test (unsandboxed) set up .git with an existing file to read back.
 	if err := os.MkdirAll(filepath.Join(ws, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -550,7 +574,7 @@ func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 // Verifies the §5.3 (subpath …) secret deny enforces under real SBPL.
 func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 	requireSandboxExec(t)
-	home := canonTempDir(t)
+	home := t.TempDir()
 	t.Setenv("HOME", home) // BEFORE NewExecutor: anchors ~/.ssh secret deny under this home
 	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
 		t.Fatal(err)
@@ -560,7 +584,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ws := canonTempDir(t)
+	ws := t.TempDir()
 	e, err := NewExecutor(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
@@ -585,7 +609,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 // READABLE, proving the glob does not over-match.
 func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
 	requireSandboxExec(t)
-	ws := canonTempDir(t)
+	ws := t.TempDir()
 	envFile := filepath.Join(ws, ".env")
 	if err := os.WriteFile(envFile, []byte("TOKEN=secret"), 0o644); err != nil {
 		t.Fatal(err)
@@ -636,7 +660,7 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/nc"); err != nil {
 		t.Skip("/usr/bin/nc not available for the connect probe")
 	}
-	ws := canonTempDir(t)
+	ws := t.TempDir()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -674,7 +698,7 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 // compiled backend metadata, so it needs the darwin backend selected but does not
 // itself spawn sandbox-exec.
 func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
-	ws := canonTempDir(t)
+	ws := t.TempDir()
 	e, err := NewExecutor(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
