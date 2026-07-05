@@ -318,6 +318,17 @@ immediately on the normal path; stage-2 reads the sealed spawn spec, will apply
 `exec`s the target (mechanisms filled by 12/13/14). **Step 4:** PASS.
 **Step 5:** commit `feat(linux): stage-2 re-exec dispatch (common spawn path)`.
 
+**Carry-forward from Task 6a review — revisit the `spawnSpec` seam here.** 6a's
+`spawnSpec` is two independent, reused closures (`wrapArgv`, `configure`) with no
+per-spawn context, threaded from a spec "compiled once and reused." Linux stage-2
+needs **per-spawn** state: a fresh pipe/fd to pass the sealed spec, `ExtraFiles`
+that must match an fd referenced in the argv, `SysProcAttr.Cloneflags`, and the
+target `dir` — and concurrent spawns each need their own pipe, not a shared static
+fd. Before wiring 12/13, evaluate reshaping the seam to a single per-spawn
+`func(dir string, argv []string) (finalArgv []string, configure func(*exec.Cmd), cleanup func())`
+returning a matched argv+configure pair, rather than two reused fields. Null/Seatbelt
+are unaffected (they'd just ignore `dir` and return a nil cleanup).
+
 ### Task 12a: Rung 2 — Landlock FS via stage-2 (SPEC §7.2, §7.5)
 
 **Files:** Create `backend_landlock_linux.go`, `_test.go`.
