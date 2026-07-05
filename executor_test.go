@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -344,6 +345,254 @@ func TestAssembleEnvScrubNeverNil(t *testing.T) {
 	}
 	if strings.Contains(string(out), "GITHUB_TOKEN") {
 		t.Errorf("scrub policy leaked GITHUB_TOKEN to child:\n%s", out)
+	}
+}
+
+// --- Task 6b: external executor, dynamic mode, grants, read-only view, home guard, Wrap ---
+
+// fakeSrc is a mutable ModeSource for the dynamic-mode tests: flipping mode lets
+// a test drive a mode change between spawns and observe the policy-generation
+// bump that invalidates stale grants.
+type fakeSrc struct{ mode Mode }
+
+func (f *fakeSrc) Current() Mode { return f.mode }
+
+// allGuaranteeBits is every defined guarantee bit — the FULL posture an external
+// executor asserts by explicit deployment declaration.
+const allGuaranteeBits = GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadDenies |
+	GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeResourceLimits
+
+// TestExternalExecutor pins §11: an external executor passes commands through
+// (same as null), still scrubs the environment, reports LevelExternal, and
+// asserts the FULL set of guarantees (trust by explicit declaration).
+func TestExternalExecutor(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "secret")
+	ws := t.TempDir()
+
+	e := NewExternalExecutor(ExternalDecl{Boundary: "docker", Env: EnvPolicy{}})
+
+	if e.Level() != LevelExternal {
+		t.Errorf("Level() = %d, want LevelExternal (%d)", e.Level(), LevelExternal)
+	}
+	if bits := e.GuaranteeBits(); bits != allGuaranteeBits {
+		t.Errorf("GuaranteeBits() = %#b, want all bits %#b", bits, allGuaranteeBits)
+	}
+	g := e.Guarantees()
+	if !(g.ProcessBoundary && g.WriteBoundary && g.ReadDenies && g.EnvScrub &&
+		g.NetworkBoundary && g.AddressNetwork && g.ResourceLimits) {
+		t.Errorf("Guarantees() = %+v, want every field true", g)
+	}
+
+	// Passthrough run works.
+	out, code, err := e.RunCommand(context.Background(), ws, "echo hi")
+	if err != nil {
+		t.Fatalf("RunCommand: %v", err)
+	}
+	if code != 0 || !strings.Contains(string(out), "hi") {
+		t.Errorf("RunCommand: code=%d out=%q, want 0 / contains hi", code, out)
+	}
+
+	// Scrub still applies inside the external boundary: the baseline keeps PATH
+	// but drops harness secrets.
+	out, _, err = e.RunCommand(context.Background(), ws, "env")
+	if err != nil {
+		t.Fatalf("RunCommand(env): %v", err)
+	}
+	if strings.Contains(string(out), "GITHUB_TOKEN") {
+		t.Errorf("external child leaked GITHUB_TOKEN:\n%s", out)
+	}
+}
+
+// TestExecutorDynamicGenBumpInvalidatesGrants is the load-bearing dynamic test:
+// a grant minted under mode A verifies and runs, but after the ModeSource flips
+// to a different mode the recompile bumps the policy generation, so the SAME
+// grant now fails verification with ErrGrantWrongGeneration and does not run.
+func TestExecutorDynamicGenBumpInvalidatesGrants(t *testing.T) {
+	ws := t.TempDir()
+	src := &fakeSrc{mode: Write} // net blocked → PlanGrants offers a net delta
+
+	e, err := NewExecutorDynamic(src, ws)
+	if err != nil {
+		t.Fatalf("NewExecutorDynamic: %v", err)
+	}
+	// Deterministic time so TTL never expires mid-test (white-box injection: the
+	// dynamic constructor takes only PolicyOptions).
+	e.clock = func() time.Time { return time.Unix(1_700_000_000, 0) }
+
+	dir, cmd := ws, "true"
+	grants := e.PlanGrants(dir, cmd)
+	if len(grants) != 1 {
+		t.Fatalf("PlanGrants at Write: got %d grants, want 1 (net blocked)", len(grants))
+	}
+
+	// Under the minting mode the grant verifies and the command runs.
+	if _, _, err := e.RunCommandWithGrants(context.Background(), dir, cmd, grants); err != nil {
+		t.Fatalf("RunCommandWithGrants at mode A: %v", err)
+	}
+
+	// Flip the mode: the next spawn recompiles and bumps policyGen, voiding the
+	// grant minted under the old generation.
+	src.mode = Trusted
+	_, _, err = e.RunCommandWithGrants(context.Background(), dir, cmd, grants)
+	if err == nil {
+		t.Fatal("RunCommandWithGrants after mode flip: err = nil, want a grant error")
+	}
+	if !errors.Is(err, ErrGrantWrongGeneration) {
+		t.Errorf("after mode flip: err = %v, want ErrGrantWrongGeneration", err)
+	}
+}
+
+// TestExecutorGrantRoundTrip covers the mint→describe→run happy path plus the
+// two rejection paths: a fabricated token never describes and never runs, and an
+// expired token fails with ErrGrantExpired.
+func TestExecutorGrantRoundTrip(t *testing.T) {
+	ws := t.TempDir()
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	e, err := NewExecutor(PolicyFor(Write, ws), withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	dir, cmd := ws, "true"
+	grants := e.PlanGrants(dir, cmd)
+	if len(grants) != 1 {
+		t.Fatalf("PlanGrants: got %d grants, want 1", len(grants))
+	}
+
+	// DescribeGrant returns the MAC-bound description.
+	desc, ok := e.DescribeGrant(grants[0])
+	if !ok {
+		t.Fatal("DescribeGrant(valid) = (,false), want (,true)")
+	}
+	if !strings.Contains(desc, cmd) {
+		t.Errorf("DescribeGrant desc = %q, want to mention command %q", desc, cmd)
+	}
+
+	// A valid grant runs.
+	if _, _, err := e.RunCommandWithGrants(context.Background(), dir, cmd, grants); err != nil {
+		t.Fatalf("RunCommandWithGrants(valid): %v", err)
+	}
+
+	// A fabricated token cannot describe and cannot run.
+	if _, ok := e.DescribeGrant("lrsx1.garbage.garbage"); ok {
+		t.Error("DescribeGrant(fabricated) = (,true), want (,false)")
+	}
+	_, _, err = e.RunCommandWithGrants(context.Background(), dir, cmd, []string{"lrsx1.garbage.garbage"})
+	if err == nil {
+		t.Error("RunCommandWithGrants(fabricated): err = nil, want a grant error")
+	}
+
+	// An expired token fails with ErrGrantExpired once the clock advances past TTL.
+	now = base.Add(16 * time.Minute) // default TTL is 15m
+	_, _, err = e.RunCommandWithGrants(context.Background(), dir, cmd, grants)
+	if !errors.Is(err, ErrGrantExpired) {
+		t.Errorf("RunCommandWithGrants(expired): err = %v, want ErrGrantExpired", err)
+	}
+}
+
+// TestReadOnlyViewStatic asserts a read-only view of a Write-mode executor
+// strips writes, forces network blocked, and disables granting — the read path
+// never escalates — while reusing the parent's backend.
+func TestReadOnlyViewStatic(t *testing.T) {
+	ws := t.TempDir()
+	parent, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	view := parent.ReadOnlyView()
+
+	if view.backend != parent.backend {
+		t.Error("ReadOnlyView re-probed a backend; want the parent's backend reused")
+	}
+
+	acc := Resolve(view.policy.FS, ws)
+	if acc&WriteAccess != 0 {
+		t.Errorf("ReadOnlyView resolved access for workspace = %v, has WriteAccess (want stripped)", acc)
+	}
+	if acc&ReadAccess == 0 {
+		t.Errorf("ReadOnlyView resolved access for workspace = %v, missing ReadAccess", acc)
+	}
+	if !netBlocked(view.policy) {
+		t.Errorf("ReadOnlyView Net = %+v, want blocked", view.policy.Net)
+	}
+	if g := view.PlanGrants(ws, "curl https://example.com"); g != nil {
+		t.Errorf("ReadOnlyView.PlanGrants = %v, want nil (granting disabled)", g)
+	}
+}
+
+// TestReadOnlyViewDynamic asserts the read-only mask is applied on each recompile
+// for a dynamic parent: even at a write-capable mode the view resolves no write,
+// blocks net, and grants nothing.
+func TestReadOnlyViewDynamic(t *testing.T) {
+	ws := t.TempDir()
+	src := &fakeSrc{mode: Trusted} // write + open-ish net at the parent
+	parent, err := NewExecutorDynamic(src, ws)
+	if err != nil {
+		t.Fatalf("NewExecutorDynamic: %v", err)
+	}
+	view := parent.ReadOnlyView()
+	if view.backend != parent.backend {
+		t.Error("ReadOnlyView re-probed a backend; want the parent's backend reused")
+	}
+
+	// Force a recompile at the current mode and inspect the masked policy.
+	s := view.resolve()
+	if acc := Resolve(s.policy.FS, ws); acc&WriteAccess != 0 {
+		t.Errorf("dynamic ReadOnlyView resolved access = %v, has WriteAccess", acc)
+	}
+	if !netBlocked(s.policy) {
+		t.Errorf("dynamic ReadOnlyView Net = %+v, want blocked", s.policy.Net)
+	}
+	if g := view.PlanGrants(ws, "curl x"); g != nil {
+		t.Errorf("dynamic ReadOnlyView.PlanGrants = %v, want nil", g)
+	}
+}
+
+// TestHomeGuard pins the fail-closed home guard: with an unresolvable home a
+// non-unconfined NewExecutor refuses to build (its secret denials could not
+// materialize), unconfined is exempt (Inherit, no secret denials), and
+// NewExecutorDynamic always refuses.
+func TestHomeGuard(t *testing.T) {
+	ws := t.TempDir()
+	t.Setenv("HOME", "")
+
+	if _, err := NewExecutor(PolicyFor(Write, ws)); err == nil {
+		t.Error("NewExecutor(Write) with unresolvable HOME: err = nil, want error")
+	}
+	if _, err := NewExecutor(PolicyFor(Unconfined, ws, WithAckUnconfined())); err != nil {
+		t.Errorf("NewExecutor(Unconfined) with unresolvable HOME: err = %v, want nil (exempt)", err)
+	}
+	if _, err := NewExecutorDynamic(&fakeSrc{mode: Write}, ws); err == nil {
+		t.Error("NewExecutorDynamic with unresolvable HOME: err = nil, want error (always)")
+	}
+	// External is exempt: construction cannot fail.
+	if e := NewExternalExecutor(ExternalDecl{Boundary: "docker"}); e == nil {
+		t.Error("NewExternalExecutor with unresolvable HOME: nil, want a built executor")
+	}
+}
+
+// TestWrap asserts Wrap applies the scrubbed environment to a caller-built cmd:
+// a planted GITHUB_TOKEN is absent from the wrapped command's Env.
+func TestWrap(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "secret")
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	cmd := exec.Command("echo", "hi")
+	wrapped, err := e.Wrap(cmd)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if hasEnvName(wrapped.Env, "GITHUB_TOKEN") {
+		t.Errorf("Wrap did not scrub env; GITHUB_TOKEN present in %v", wrapped.Env)
+	}
+	// The scrubbed env is exactly the executor's assembled env.
+	if len(wrapped.Env) != len(e.env) {
+		t.Errorf("Wrap Env length = %d, want %d (executor env)", len(wrapped.Env), len(e.env))
 	}
 }
 
