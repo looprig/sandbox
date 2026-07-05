@@ -12,28 +12,39 @@ import (
 // string, so it is a faithful statement of policy intent shared by the OS
 // backends and the ReadGuard adapter.
 //
-// The reconciled model (deny > write > read, longest-path wins within a class)
-// is:
+// The reconciled model — deny overrides; otherwise the longest literal-prefix
+// match across all allow entries wins, and exact-specificity ties union their
+// bits — is:
 //
 //  1. If any deny entry (Access == DenyAccess) matches the path — a literal
 //     ancestor or a matching glob — the result is DenyAccess. Deny is a hard
 //     override; a more specific allow does not rescue it.
-//  2. Otherwise, among the matching allow entries the most specific wins.
-//     Specificity is the length of the matched literal prefix: the cleaned path
-//     for a literal entry, or the substring before the first glob metacharacter
-//     for a glob entry. On an exact specificity tie the results union (OR).
+//  2. Otherwise, among the matching allow entries the most specific wins, where
+//     specificity is the length of the matched literal prefix: the cleaned path
+//     for a literal entry, or the cleaned substring before the first glob
+//     metacharacter for a glob entry. On an exact specificity tie the results
+//     union (OR). Read/write/exec are not ranked against each other — the single
+//     longest allow decides, which is what makes the carveout below work (there
+//     is no case where a shorter writable root beats a longer read-only one).
 //  3. If nothing matches, the result is DenyAccess (fail-closed).
 //
 // This yields the §5.1 carveout: a read-only ".git" entry nested inside a
 // writable root is a longer allow than the root, so it wins and the workspace's
 // history stays read-only — while a "**/.env*" deny still overrides that same
 // writable root because deny is checked first.
+//
+// Contract: target must be an absolute, canonical, symlink-resolved path.
+// Resolve is purely lexical — it does no symlink, case-fold, or "." /".."
+// resolution beyond filepath.Clean — so resolving symlinks and case variants is
+// the caller's (ReadGuard/backend) responsibility. Passing an unresolved path
+// could let a deny be bypassed via a symlink or a case variant on macOS.
 func Resolve(entries []FSEntry, path string) FSAccess {
 	target := filepath.Clean(path)
 
-	// Rule 1: any matching deny entry is a hard override.
+	// Rule 1: any matching deny entry is a hard override. Deny matching fails
+	// closed — an uncompilable deny glob over-denies rather than leaking.
 	for _, e := range entries {
-		if e.Access == DenyAccess && entryMatches(e.Path, target) {
+		if e.Access == DenyAccess && denyMatches(e.Path, target) {
 			return DenyAccess
 		}
 	}
@@ -64,12 +75,27 @@ func Resolve(entries []FSEntry, path string) FSAccess {
 // rather than a literal path.
 const globMeta = "*?["
 
-// entryMatches reports whether an entry's Path matches an already-cleaned target
-// path, dispatching on whether the entry is a glob or a literal.
+// entryMatches reports whether an ALLOW entry's Path matches an already-cleaned
+// target path, dispatching on whether the entry is a glob or a literal. It fails
+// closed by under-granting: an uncompilable allow glob (globRegexp == nil)
+// simply grants nothing, so a malformed allow never widens access.
 func entryMatches(entryPath, target string) bool {
 	if strings.ContainsAny(entryPath, globMeta) {
 		re := globRegexp(entryPath)
 		return re != nil && re.MatchString(target)
+	}
+	return literalMatches(entryPath, target)
+}
+
+// denyMatches reports whether a DENY entry matches an already-cleaned target
+// path. Unlike entryMatches it fails closed by over-denying: an uncompilable
+// deny glob (globRegexp == nil) is treated as a MATCH so a malformed pattern
+// over-denies rather than silently letting the path through. A deny that
+// silently does not deny is the one failure mode this resolver must never have.
+func denyMatches(entryPath, target string) bool {
+	if strings.ContainsAny(entryPath, globMeta) {
+		re := globRegexp(entryPath)
+		return re == nil || re.MatchString(target)
 	}
 	return literalMatches(entryPath, target)
 }
@@ -89,21 +115,29 @@ func literalMatches(entryPath, target string) bool {
 }
 
 // entrySpecificity is the length of an entry's matched literal prefix: the
-// cleaned path for a literal, or the substring before the first glob
-// metacharacter for a glob. Longer means more specific.
+// cleaned path for a literal, or the cleaned substring before the first glob
+// metacharacter for a glob. Longer means more specific. Cleaning both forms
+// keeps the ranking symmetric so a non-canonical glob prefix cannot over-count.
 func entrySpecificity(entryPath string) int {
+	prefix := entryPath
 	if i := strings.IndexAny(entryPath, globMeta); i >= 0 {
-		return i
+		prefix = entryPath[:i]
 	}
-	return len(filepath.Clean(entryPath))
+	if prefix == "" {
+		// A glob with no literal prefix (e.g. "**/.env*") is maximally
+		// unspecific; filepath.Clean("") would misleadingly report "." (len 1).
+		return 0
+	}
+	return len(filepath.Clean(prefix))
 }
 
 // globRegexp compiles a glob pattern into an anchored regexp implementing the
 // §5.1 glob semantics: "**" crosses directory separators, "*" and "?" stay
 // within a single segment, and all other characters are matched literally. It
 // returns nil if the pattern cannot be compiled (a malformed bracket
-// expression), in which case the entry simply does not match — mirroring how
-// filepath.Match surfaces such patterns as an error rather than a match.
+// expression). The nil is not itself a match verdict: callers decide the
+// fail-closed direction — denyMatches treats nil as a match (over-deny), while
+// entryMatches treats nil as a non-match (under-grant on the allow side).
 func globRegexp(glob string) *regexp.Regexp {
 	re, err := regexp.Compile(globToRegexp(glob))
 	if err != nil {

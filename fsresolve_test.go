@@ -195,6 +195,98 @@ func TestResolveCanonicalizesTarget(t *testing.T) {
 	}
 }
 
+// TestResolveMalformedGlob pins the fail-closed contract for uncompilable glob
+// patterns. "/data/[z-a].secret" contains a bracket metacharacter (so it is
+// treated as a glob) but translates to an invalid regexp character-class range,
+// so it cannot compile. A malformed DENY glob must still deny (over-deny), and a
+// malformed ALLOW glob must grant nothing (under-grant) — fail closed both ways.
+func TestResolveMalformedGlob(t *testing.T) {
+	const bad = "/data/[z-a].secret"
+
+	// (a) The critical case: a malformed deny glob must still deny.
+	denyEntries := []FSEntry{{"/", tRX}, {bad, DenyAccess}}
+	if got := Resolve(denyEntries, "/data/x.secret"); got != DenyAccess {
+		t.Errorf("malformed deny glob: Resolve = %s, want Deny (fail closed)", accessString(got))
+	}
+
+	// (b) A malformed allow glob grants nothing.
+	allowEntries := []FSEntry{{bad, tRWX}}
+	if got := Resolve(allowEntries, "/data/x.secret"); got != DenyAccess {
+		t.Errorf("malformed allow glob: Resolve = %s, want Deny (grants nothing)", accessString(got))
+	}
+}
+
+// TestResolveGlobBranches exercises the "?" single-char and "[...]"/"[!...]"
+// bracket-class glob branches, plus the allow-glob specificity ranking against a
+// literal (tie-union and longer-prefix win).
+func TestResolveGlobBranches(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []FSEntry
+		path    string
+		want    FSAccess
+	}{
+		{
+			name:    "? matches a single char",
+			entries: []FSEntry{{"/work/?.txt", tRWX}},
+			path:    "/work/a.txt",
+			want:    tRWX,
+		},
+		{
+			name:    "? does not span two chars",
+			entries: []FSEntry{{"/work/?.txt", tRWX}},
+			path:    "/work/ab.txt",
+			want:    DenyAccess,
+		},
+		{
+			name:    "bracket class matches a member",
+			entries: []FSEntry{{"/data/[abc].log", tRWX}},
+			path:    "/data/b.log",
+			want:    tRWX,
+		},
+		{
+			name:    "bracket class rejects a non-member",
+			entries: []FSEntry{{"/data/[abc].log", tRWX}},
+			path:    "/data/d.log",
+			want:    DenyAccess,
+		},
+		{
+			name:    "negated bracket class matches outside the set",
+			entries: []FSEntry{{"/data/[!x].log", tRWX}},
+			path:    "/data/a.log",
+			want:    tRWX,
+		},
+		{
+			name:    "negated bracket class rejects a member",
+			entries: []FSEntry{{"/data/[!x].log", tRWX}},
+			path:    "/data/x.log",
+			want:    DenyAccess,
+		},
+		{
+			// Equal literal-prefix specificity: glob and literal union.
+			name:    "allow glob ties with literal and unions bits",
+			entries: []FSEntry{{"/work", ReadAccess}, {"/work/*.go", WriteAccess}},
+			path:    "/work/main.go",
+			want:    ReadAccess | WriteAccess,
+		},
+		{
+			// Longer literal prefix: the glob allow beats the shorter literal.
+			name:    "allow glob with longer prefix beats literal",
+			entries: []FSEntry{{"/work", ReadAccess}, {"/work/sub/*", WriteAccess}},
+			path:    "/work/sub/x",
+			want:    WriteAccess,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Resolve(tt.entries, tt.path); got != tt.want {
+				t.Errorf("Resolve(%v, %q) = %s, want %s",
+					tt.entries, tt.path, accessString(got), accessString(tt.want))
+			}
+		})
+	}
+}
+
 // TestResolveWithPolicyFor feeds real PolicyFor output through the resolver,
 // proving PolicyFor's emission and the resolver's precedence agree end to end.
 func TestResolveWithPolicyFor(t *testing.T) {
