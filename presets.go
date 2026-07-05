@@ -10,8 +10,11 @@ import (
 // slices rather than package-level slice variables on purpose: this is a
 // security module, and an exported mutable []string could be reassigned or
 // mutated in place to silently weaken a deny-list. Returning a copy per call
-// keeps the versioned/auditable lists (which live in the function bodies here)
-// tamper-proof from a consumer's perspective.
+// keeps the versioned/auditable lists tamper-proof from a consumer's
+// perspective. The secret-denial source lists live in the package-level vars
+// below (secretHomeRelative / secretAbsolute / secretGlobs), because
+// DefaultSecretDenials assembles them with per-call home expansion; the other
+// three presets inline their contents directly in their function bodies.
 
 // secretHomeRelative names the per-user secret stores denied in every mode
 // except unconfined (SPEC §5.3), expressed relative to the caller's home

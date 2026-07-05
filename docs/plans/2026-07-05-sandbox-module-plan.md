@@ -235,6 +235,13 @@ guaranteeBits uint64, error)`), `backend_null.go` (fallback build tag /
 - `NewExecutorDynamic(src, ws)` recompiles per `src.Current()`; a mode change
   bumps policy generation (a pre-change token now fails).
 - `ReadOnlyView()` shares source/probes; strips writes + net + granting.
+- **Fail-closed on unresolvable home (Task-3 review decision, §5.3 guard):** for a
+  **non-unconfined** policy, if `os.UserHomeDir()` errors — so `DefaultSecretDenials`
+  could not materialize the `~/.*` secret denials (`~/.ssh`, `~/.aws`, keychains,
+  browser profiles) — `NewExecutor` **returns an error** instead of building a
+  broad-read executor with the secret-read hole open. Test: force home-unresolvable
+  (`t.Setenv("HOME","")`) → `NewExecutor(PolicyFor(Write, ws))` errors; `unconfined`
+  is exempt (no secret denials expected).
 
 **Step 2:** FAIL. **Step 3:** implement. `Init()` is a no-op stub here (real body
 Task 11). Env assembly from `EnvPolicy` lives here (shared by all backends).

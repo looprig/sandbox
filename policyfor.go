@@ -35,14 +35,23 @@ type policyBuilder struct {
 	ackUnconfined bool
 }
 
+// writableTmpRoot is the single writable tmp root (SPEC §5.1). TMPDIR (§5.5) is
+// pinned to it and, in write/trusted, it is the FS grant — the const keeps the
+// two in lockstep.
+const writableTmpRoot = "/tmp"
+
 // baselineEnv is the non-unconfined environment posture: no inheritance of the
-// harness process environment, with TMPDIR forced to the writable tmp root
-// (SPEC §5.1, §5.5). The baseline allowlist (BaselineEnvAllowlist) is implicit
-// and applied at env-assembly time in a later task; it is not stored in Allow.
+// harness process environment, with TMPDIR set uniformly to /tmp
+// (writableTmpRoot) in every non-unconfined mode — regardless of whether /tmp is
+// actually writable in that mode (zerotrust/readonly set TMPDIR but grant no
+// write to /tmp) — so tools never reach for an out-of-policy $TMPDIR such as
+// macOS /var/folders/... (SPEC §5.1, §5.5). The baseline allowlist
+// (BaselineEnvAllowlist) is implicit and applied at env-assembly time in a later
+// task; it is not stored in Allow.
 func baselineEnv() EnvPolicy {
 	return EnvPolicy{
 		Inherit: false,
-		Set:     map[string]string{"TMPDIR": "/tmp"},
+		Set:     map[string]string{"TMPDIR": writableTmpRoot},
 	}
 }
 
@@ -52,17 +61,13 @@ func baselineEnv() EnvPolicy {
 // assembly, and the metadata-deny invariant belong to later tasks and backends.
 func PolicyFor(mode Mode, workspace string, opts ...PolicyOption) Policy {
 	b := &policyBuilder{
-		workspace:     workspace,
+		workspace:     filepath.Clean(workspace),
 		carveoutNames: []string{".git", ".looprig"},
 	}
 
 	switch mode {
 	case ZeroTrust:
-		b.workspaceRead = true
-		b.systemReads = true
-		b.applySecrets = true
-		b.net = NetPolicy{} // hard-deny
-		b.env = baselineEnv()
+		b.seedZeroTrust()
 	case ReadOnly:
 		b.broadRead = true
 		b.applySecrets = true
@@ -87,6 +92,11 @@ func PolicyFor(mode Mode, workspace string, opts ...PolicyOption) Policy {
 		b.applySecrets = false // no deny-reads, no metadata invariant, no carveouts
 		b.net = NetPolicy{Open: true}
 		b.env = EnvPolicy{Inherit: true}
+	default:
+		// An out-of-range Mode fails closed to ZeroTrust (the most restrictive
+		// mode), never to an all-denied policy with a zero EnvPolicy (no
+		// baseline, no TMPDIR).
+		b.seedZeroTrust()
 	}
 
 	for _, opt := range opts {
@@ -94,6 +104,16 @@ func PolicyFor(mode Mode, workspace string, opts ...PolicyOption) Policy {
 	}
 
 	return b.build()
+}
+
+// seedZeroTrust applies the ZeroTrust preset: workspace read-only, minimal
+// system reads, secret deny-reads, network hard-denied, baseline env.
+func (b *policyBuilder) seedZeroTrust() {
+	b.workspaceRead = true
+	b.systemReads = true
+	b.applySecrets = true
+	b.net = NetPolicy{} // hard-deny
+	b.env = baselineEnv()
 }
 
 // build flattens the builder's intent into an ordered FSEntry list: reads, then
@@ -126,6 +146,7 @@ func (b *policyBuilder) build() Policy {
 		writableRoots = append(writableRoots, b.workspace)
 	}
 	for _, w := range b.extraWritable {
+		w = filepath.Clean(w)
 		fs = append(fs, FSEntry{Path: w, Access: ReadAccess | WriteAccess | ExecAccess})
 		writableRoots = append(writableRoots, w)
 	}
@@ -133,7 +154,7 @@ func (b *policyBuilder) build() Policy {
 	// Writable tmp root — no carveouts (SPEC §5.1: carveouts live under project
 	// roots, not the shared tmp root).
 	if b.tmpWrite {
-		fs = append(fs, FSEntry{Path: "/tmp", Access: ReadAccess | WriteAccess | ExecAccess})
+		fs = append(fs, FSEntry{Path: writableTmpRoot, Access: ReadAccess | WriteAccess | ExecAccess})
 	}
 
 	// Carveouts: re-mask protected subpaths of each writable project root

@@ -323,12 +323,66 @@ func TestBaselineEnvAllowlist(t *testing.T) {
 	}
 }
 
+// TestPolicyForCanonicalPaths asserts writable roots and their carveouts share
+// one canonical path form, so a trailing slash cannot produce divergent keys for
+// the (later) Path-keyed FS resolver.
+func TestPolicyForCanonicalPaths(t *testing.T) {
+	p := PolicyFor(Write, "/work/repo/", WithWritable("/data/"))
+	if p.Workspace != "/work/repo" {
+		t.Errorf("Workspace = %q, want cleaned /work/repo", p.Workspace)
+	}
+	// Workspace: canonical writable entry, no trailing-slash variant.
+	if acc, ok := fsAccess(p.FS, "/work/repo"); !ok || acc != ReadAccess|WriteAccess|ExecAccess {
+		t.Errorf("/work/repo: got (%d,%v), want cleaned writable entry", acc, ok)
+	}
+	if _, ok := fsAccess(p.FS, "/work/repo/"); ok {
+		t.Error("found trailing-slash writable entry /work/repo/; paths must be canonical")
+	}
+	if acc, ok := fsAccess(p.FS, "/work/repo/.git"); !ok || acc != ReadAccess {
+		t.Errorf("/work/repo/.git: got (%d,%v), want ReadAccess carveout", acc, ok)
+	}
+	// WithWritable root: same canonicalization.
+	if _, ok := fsAccess(p.FS, "/data/"); ok {
+		t.Error("found trailing-slash writable entry /data/; paths must be canonical")
+	}
+	if acc, ok := fsAccess(p.FS, "/data"); !ok || acc != ReadAccess|WriteAccess|ExecAccess {
+		t.Errorf("/data: got (%d,%v), want cleaned writable entry", acc, ok)
+	}
+	if acc, ok := fsAccess(p.FS, "/data/.git"); !ok || acc != ReadAccess {
+		t.Errorf("/data/.git: got (%d,%v), want ReadAccess carveout", acc, ok)
+	}
+}
+
+// TestPolicyForOutOfRangeMode asserts an out-of-range Mode fails closed to
+// ZeroTrust rather than an all-denied policy with a zero (no-baseline) env.
+func TestPolicyForOutOfRangeMode(t *testing.T) {
+	bogus := Mode(200)
+	got := PolicyFor(bogus, testWS)
+	want := PolicyFor(ZeroTrust, testWS)
+	if !fsSetEqual(got.FS, want.FS) {
+		t.Error("out-of-range mode FS differs from ZeroTrust")
+	}
+	if got.Env.Set["TMPDIR"] != "/tmp" {
+		t.Errorf("out-of-range mode Env.Set[TMPDIR] = %q, want /tmp (baseline env)", got.Env.Set["TMPDIR"])
+	}
+	if got.Env.Inherit {
+		t.Error("out-of-range mode Env.Inherit = true, want false (fail-closed)")
+	}
+}
+
 // TestPolicyForOptions asserts the functional options compose.
 func TestPolicyForOptions(t *testing.T) {
 	t.Run("WithWritable", func(t *testing.T) {
 		p := PolicyFor(Write, testWS, WithWritable("/data"))
 		if acc, ok := fsAccess(p.FS, "/data"); !ok || acc != ReadAccess|WriteAccess|ExecAccess {
 			t.Errorf("/data: got (%d,%v), want Read|Write|Exec", acc, ok)
+		}
+		// A WithWritable root also gets the read-only carveouts.
+		if acc, ok := fsAccess(p.FS, "/data/.git"); !ok || acc != ReadAccess {
+			t.Errorf("/data/.git: got (%d,%v), want ReadAccess carveout", acc, ok)
+		}
+		if acc, ok := fsAccess(p.FS, "/data/.looprig"); !ok || acc != ReadAccess {
+			t.Errorf("/data/.looprig: got (%d,%v), want ReadAccess carveout", acc, ok)
 		}
 	})
 
@@ -344,6 +398,17 @@ func TestPolicyForOptions(t *testing.T) {
 		p := PolicyFor(Write, testWS, WithNet(want))
 		if !netEqual(p.Net, want) {
 			t.Errorf("Net = %+v, want %+v", p.Net, want)
+		}
+	})
+
+	t.Run("WithNetReplacesWholesale", func(t *testing.T) {
+		// Replace, not merge: a zero NetPolicy over Trusted clears everything.
+		p := PolicyFor(Trusted, testWS, WithNet(NetPolicy{}))
+		if p.Net.Loopback || p.Net.Private || p.Net.DNS || p.Net.Open {
+			t.Errorf("Net = %+v, want zero value (replace, not merge)", p.Net)
+		}
+		if len(p.Net.Ports) != 0 {
+			t.Errorf("Net.Ports = %v, want empty (replace, not merge)", p.Net.Ports)
 		}
 	})
 
@@ -364,6 +429,14 @@ func TestPolicyForOptions(t *testing.T) {
 		// The mode's TMPDIR must survive the merge.
 		if p.Env.Set["TMPDIR"] != "/tmp" {
 			t.Errorf("WithEnv clobbered TMPDIR: %q", p.Env.Set["TMPDIR"])
+		}
+	})
+
+	t.Run("WithEnvTMPDIROverrideWins", func(t *testing.T) {
+		// A caller-supplied TMPDIR overrides the mode default.
+		p := PolicyFor(Write, testWS, WithEnv(EnvPolicy{Set: map[string]string{"TMPDIR": "/custom"}}))
+		if p.Env.Set["TMPDIR"] != "/custom" {
+			t.Errorf("Env.Set[TMPDIR] = %q, want /custom (caller override wins)", p.Env.Set["TMPDIR"])
 		}
 	})
 
@@ -402,4 +475,32 @@ func TestPolicyForOptions(t *testing.T) {
 			t.Error("WithAckUnconfined did not set AckUnconfined")
 		}
 	})
+
+	t.Run("OrderIndependent", func(t *testing.T) {
+		// The relative order of accumulating options must not change the result.
+		a := PolicyFor(Write, testWS, WithWritable("/data"), WithCarveouts("node_modules"))
+		b := PolicyFor(Write, testWS, WithCarveouts("node_modules"), WithWritable("/data"))
+		if !fsSetEqual(a.FS, b.FS) {
+			t.Errorf("FS set differs by option order:\n a=%v\n b=%v", a.FS, b.FS)
+		}
+	})
+}
+
+// fsSetEqual compares two FS lists as multisets (order-independent). FSEntry is
+// comparable, so it can key a count map directly.
+func fsSetEqual(a, b []FSEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := map[FSEntry]int{}
+	for _, e := range a {
+		counts[e]++
+	}
+	for _, e := range b {
+		counts[e]--
+		if counts[e] < 0 {
+			return false
+		}
+	}
+	return true
 }
