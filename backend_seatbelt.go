@@ -65,6 +65,13 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 // DENIES for read-only entries nested in a writable root (e.g. .git under the
 // workspace), placed after the write allow so the deny wins; (3) the §5.3 secret
 // DENIES last so they override everything above.
+//
+// Verification scope: the M1 spike (docs/spikes/seatbelt-net.md) verified the
+// NETWORK section and the base preamble against a real sandbox-exec. The
+// file-rule syntax here — (subpath "…"), (regex #"…"), and file-rule
+// deny-override under last-match-wins — is NOT part of M1; the goldens only prove
+// byte-equality to the Go/RE2 glob translation, not that SBPL's engine enforces
+// it identically. Real-exec verification of the file rules is Task 8b.
 func compileSBPL(p Policy) (profile string, report CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
@@ -85,6 +92,13 @@ func compileSBPL(p Policy) (profile string, report CompileReport, level uint8, g
 	// forbids that from passing silently — it must be recorded AND demote Level(),
 	// so such a policy cannot clear a default LevelFull auto-approve gate. Detect
 	// it by asking the resolver what the policy actually grants at "/".
+	//
+	// This point-samples access AT "/" — sound for every current preset because a
+	// literal "/" read entry grants recursively, so root access implies the whole
+	// tree. A future non-recursive root-read option (e.g. a "/*" glob that reads
+	// as Full at "/" yet grants only the top level) would leave the preamble
+	// wider than a "/"-only sample can detect; revisit this probe if such an
+	// option is added.
 	rootAccess := Resolve(p.FS, "/")
 	if rootAccess&ReadAccess == 0 {
 		report.Entries = append(report.Entries, ReportEntry{
@@ -158,25 +172,43 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []FSEntry) {
 	}
 
 	// Phase 3: secret / deny-entry denies LAST so they win over every allow
-	// above. Fixed paths use (subpath ...); globs are translated to an SBPL
-	// regex; an untranslatable glob fails closed to a broad conservative deny.
+	// above. Fixed paths use (subpath ...); globs are translated to a regex. Two
+	// fail-closed fallbacks widen to a conservative subpath deny rather than emit
+	// a bad rule: (a) an untranslatable glob (does not compile), and (b) a glob
+	// whose translated regex would contain a double-quote — which an SBPL #"..."
+	// literal cannot represent (it would unbalance the delimiters), reachable via
+	// a consumer WithDenyRead of a quote-bearing path. Both over-deny, never skip.
+	//
+	// NOTE: unlike the network rules, the (regex #"...") and (subpath "...") FILE
+	// forms and file-rule deny-override are NOT part of the M1 spike — only
+	// byte-equality to Go's RE2 translation is proven here. SBPL's (older,
+	// different) regex engine matching identically is pending real-exec
+	// verification (Task 8b).
 	for _, e := range fs {
 		if e.Access != DenyAccess {
 			continue
 		}
 		if strings.ContainsAny(e.Path, globMeta) {
-			if globRegexp(e.Path) != nil {
-				b.WriteString(`(deny file-read* file-write* (regex #"` + globToRegexp(e.Path) + `"))` + "\n")
-			} else {
-				// Untranslatable glob: over-deny rather than skip (fail closed).
-				broad := conservativeDenyRoot(e.Path)
-				b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(broad) + `"))` + "\n")
-				report.Entries = append(report.Entries, ReportEntry{
-					Feature: "glob-deny",
-					Status:  "narrowed",
-					Detail:  "untranslatable deny glob " + e.Path + " compiled to a broad conservative deny of " + broad + " (fail closed, over-deny)",
-				})
+			// The regex form legitimately needs its backslashes (e.g. \.env), so
+			// it must NOT go through sbplString; only the un-representable quote
+			// case falls back.
+			reSrc := globToRegexp(e.Path)
+			reCompiles := globRegexp(e.Path) != nil
+			if reCompiles && !strings.Contains(reSrc, `"`) {
+				b.WriteString(`(deny file-read* file-write* (regex #"` + reSrc + `"))` + "\n")
+				continue
 			}
+			broad := conservativeDenyRoot(e.Path)
+			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(broad) + `"))` + "\n")
+			detail := "untranslatable deny glob " + e.Path + " compiled to a broad conservative deny of " + broad + " (fail closed, over-deny)"
+			if reCompiles { // translated fine, but the regex would contain a quote
+				detail = `deny glob contains a quote unrepresentable in an SBPL #"..." regex; widened to a conservative subpath deny`
+			}
+			report.Entries = append(report.Entries, ReportEntry{
+				Feature: "glob-deny",
+				Status:  "narrowed",
+				Detail:  detail,
+			})
 		} else {
 			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(e.Path) + `"))` + "\n")
 		}
@@ -195,14 +227,11 @@ func compileNet(b *strings.Builder, report *CompileReport, net NetPolicy) {
 		return
 	}
 
-	grantedEgress := false
 	for _, port := range net.Ports {
 		b.WriteString(`(allow network-outbound (remote tcp "*:` + strconv.Itoa(int(port)) + `"))` + "\n")
-		grantedEgress = true
 	}
 	if net.Loopback {
 		b.WriteString(`(allow network-outbound (remote ip "localhost:*"))` + "\n")
-		grantedEgress = true
 		report.Entries = append(report.Entries, ReportEntry{
 			Feature: "loopback",
 			Status:  "narrowed",
@@ -211,7 +240,6 @@ func compileNet(b *strings.Builder, report *CompileReport, net NetPolicy) {
 	}
 	if net.DNS {
 		b.WriteString(`(allow network-outbound (remote unix-socket (path-literal "` + sbplString(mDNSResponderSocket) + `")))` + "\n")
-		grantedEgress = true
 	}
 	if net.Private {
 		// Not expressible in SBPL (host token is * or localhost only); compile to
@@ -222,7 +250,10 @@ func compileNet(b *strings.Builder, report *CompileReport, net NetPolicy) {
 			Detail:  "SBPL cannot address-scope; Private compiled to blocked",
 		})
 	}
-	if grantedEgress {
+	// The metadata note is scoped to actual IP egress: metadata is only reachable
+	// over an outbound IP port, so a loopback- or DNS-socket-only policy grants no
+	// path to it and needs no note. Only Ports opens that path.
+	if len(net.Ports) > 0 {
 		// The §5.4 metadata hard-deny cannot be expressed as a positive IP deny;
 		// it holds only vacuously when :80 is not in the allowed port set.
 		entry := ReportEntry{
@@ -247,10 +278,12 @@ func compileGuarantees(p Policy) uint64 {
 	// sandbox-exec always wraps the spawn in an isolating boundary.
 	bits |= GuaranteeProcessBoundary
 
-	// Writes are confined to policy-writable roots unless the policy itself
-	// grants write to "/" (unconfined full access), in which case nothing is
-	// confined and the claim would be dishonest.
-	if !grantsRootWrite(p.FS) {
+	// Writes are confined to policy-writable roots unless the policy itself grants
+	// write at "/" (unconfined full access), in which case nothing is confined and
+	// the claim would be dishonest. Probed with the SAME resolver the level
+	// demotion uses (one consistent probe), which also catches a "/"-matching
+	// write glob that a literal-"/" scan would miss.
+	if Resolve(p.FS, "/")&WriteAccess == 0 {
 		bits |= GuaranteeWriteBoundary
 	}
 
@@ -284,17 +317,6 @@ func compileGuarantees(p Policy) uint64 {
 func underWritableRoot(path string, writableRoots []FSEntry) bool {
 	for _, w := range writableRoots {
 		if w.Path != path && literalMatches(w.Path, path) {
-			return true
-		}
-	}
-	return false
-}
-
-// grantsRootWrite reports whether any allow entry grants write to "/", meaning
-// writes are not confined at all (unconfined full access).
-func grantsRootWrite(fs []FSEntry) bool {
-	for _, e := range fs {
-		if e.Access != DenyAccess && e.Access&WriteAccess != 0 && filepath.Clean(e.Path) == "/" {
 			return true
 		}
 	}
@@ -338,9 +360,13 @@ func conservativeDenyRoot(glob string) string {
 	return prefix
 }
 
-// sbplString escapes a Go string for inclusion inside an SBPL double-quoted
-// literal: backslash and double-quote are the only characters that need
-// escaping. Absolute paths with spaces are valid inside the quotes unescaped.
+// sbplString escapes a Go string for inclusion inside an SBPL (subpath "…") /
+// path-literal double-quoted literal: backslash and double-quote are the only
+// characters that need escaping, and absolute paths with spaces are valid inside
+// the quotes unescaped. It does NOT make a string safe for the (regex #"…")
+// branch, which has different needs — its backslashes are meaningful regex
+// syntax and a contained double-quote is unrepresentable there (that case falls
+// back to a conservative subpath deny in compileFS phase 3, not to sbplString).
 func sbplString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)

@@ -3,8 +3,10 @@
 package sandbox
 
 import (
+	"errors"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -325,6 +327,39 @@ func TestCompileSBPLGlobDenyFailsClosed(t *testing.T) {
 	}
 }
 
+// TestCompileSBPLGlobDenyQuoteFailsClosed asserts a deny glob whose translated
+// regex would contain a double-quote — which an SBPL #"..." literal cannot
+// represent — falls back to a conservative subpath deny rather than emitting a
+// malformed (unbalanced-delimiter) profile. Reachable via a consumer WithDenyRead
+// of a quote-bearing path.
+func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
+	t.Setenv("HOME", "/home/tester")
+	p := PolicyFor(Write, "/ws", WithoutSecretDenials(), WithDenyRead(`/danger"x/*.env`))
+	profile, report, _, _ := compileSBPL(p)
+
+	wantDeny := `(deny file-read* file-write* (subpath "/danger\"x"))`
+	if !strings.Contains(profile, wantDeny) {
+		t.Errorf("quote-bearing deny glob not failed-closed to a conservative subpath deny %q\n%s", wantDeny, profile)
+	}
+	// No regex literal at all should be emitted for this policy (secret denials
+	// dropped, so the only deny is the quote glob → which must NOT be a #"..."
+	// literal).
+	if strings.Contains(profile, `#"`) {
+		t.Errorf("profile emitted a regex literal for a quote-bearing glob (would be malformed):\n%s", profile)
+	}
+	var found bool
+	for _, e := range report.Entries {
+		if e.Feature == "glob-deny" && strings.Contains(e.Detail, "quote") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no glob-deny/quote report entry for the fail-closed widening: %+v", report.Entries)
+	}
+	// The generated profile must still parse under the real SBPL compiler.
+	sandboxExecParses(t, profile)
+}
+
 // TestSeatbeltBackendSpawnSpec asserts the backend wraps commands and argv with
 // sandbox-exec -p <profile> -- , sets no configure hook, and returns the same
 // level/bits as compileSBPL.
@@ -398,4 +433,50 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// sandboxExecParses asserts the profile compiles under the real macOS SBPL
+// parser via `sandbox-exec -f <profile> /usr/bin/true`. It first confirms
+// sandbox-exec is present AND runnable in this environment with a known-good
+// profile, skipping otherwise — so a locked-down environment yields a skip, not a
+// false failure, while a genuinely malformed generated profile fails the test.
+// (This is a targeted parse check; the full real-exec enforcement matrix is a
+// separate follow-up.)
+func sandboxExecParses(t *testing.T, profile string) {
+	t.Helper()
+	if _, err := exec.LookPath("sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not available")
+	}
+	if rc := runSandboxExec(t, "(version 1)(allow default)\n"); rc != 0 {
+		t.Skipf("sandbox-exec present but not runnable here (known-good profile exit %d)", rc)
+	}
+	if rc := runSandboxExec(t, profile); rc != 0 {
+		t.Fatalf("generated profile did not parse under sandbox-exec (exit %d):\n%s", rc, profile)
+	}
+}
+
+// runSandboxExec writes profile to a temp file and runs it under sandbox-exec,
+// returning the process exit code (0 = compiled and ran /usr/bin/true).
+func runSandboxExec(t *testing.T, profile string) int {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "*.sbpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = exec.Command("/usr/bin/sandbox-exec", "-f", f.Name(), "/usr/bin/true").Run()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	t.Fatalf("running sandbox-exec: %v", err)
+	return -1
 }
