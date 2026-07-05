@@ -23,6 +23,37 @@ const defaultGrantTTL = 15 * time.Minute
 const fullGuarantees = GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadDenies |
 	GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeResourceLimits
 
+// ErrUnconfinedNotAcked is returned when a policy that grants unconfined access
+// is used to build (NewExecutor) or recompile (a dynamic ModeSource flipping to
+// Unconfined) an executor without Policy.AckUnconfined set (SPEC §4, §6).
+// Unconfined is stepping off the ladder — full user-level authority — so it
+// demands an explicit acknowledgement; its absence fails CLOSED. An external
+// executor is exempt: it declares deployment-level trust and never validates.
+var ErrUnconfinedNotAcked = errors.New("sandbox: unconfined policy requires AckUnconfined")
+
+// grantsUnconfined reports whether a policy leaves no meaningful confinement
+// (SPEC §4, §6). Env.Inherit (the child inherits the entire parent environment —
+// every secret) and Net.Open (unrestricted egress) are set ONLY by the Unconfined
+// preset or an explicit consumer opt-in (WithEnv(EnvPolicy{Inherit:true}) /
+// WithNet(NetPolicy{Open:true})); either flag alone means the sandbox no longer
+// confines the spawn. The FS shape is deliberately NOT consulted: a broad-read
+// policy is still confined by env scrub and network denial, so it is not
+// "unconfined".
+func grantsUnconfined(p Policy) bool { return p.Env.Inherit || p.Net.Open }
+
+// validatePolicy enforces the construction/recompile invariants shared by the
+// static and dynamic paths. Today the sole rule is the unconfined ack gate: a
+// policy that grants unconfined access MUST carry AckUnconfined (SPEC §6). It is
+// called from NewExecutor (static construction) and recompileLocked (dynamic
+// recompile, so a mode flip to Unconfined without WithAckUnconfined fails the
+// spawn closed). NewExternalExecutor never passes through it.
+func validatePolicy(p Policy) error {
+	if grantsUnconfined(p) && !p.AckUnconfined {
+		return ErrUnconfinedNotAcked
+	}
+	return nil
+}
+
 // Init is called first in the consumer's main() (SPEC §6). It is a no-op stub
 // today, but consumers MUST call it as the very first line of main() regardless:
 //
@@ -139,8 +170,13 @@ type ModeSource interface{ Current() Mode }
 // cannot compile the policy at all, or when the home directory is unresolvable
 // for a non-unconfined policy (see below); a backend that enforces less than
 // requested still constructs an executor and reports the shortfall via Level/
-// Report/Guarantees. (AckUnconfined validation is a later task; NewExecutor does
-// not perform it yet.)
+// Report/Guarantees.
+//
+// Ack gate (fail-closed): a policy that grants unconfined access (grantsUnconfined
+// — Env.Inherit or Net.Open) MUST carry AckUnconfined, or construction fails with
+// ErrUnconfinedNotAcked (SPEC §4, §6). This runs BEFORE the home guard so an
+// unacked unconfined policy is rejected regardless of home resolvability; for an
+// Inherit policy the home guard is exempt anyway, so the ack error is what surfaces.
 //
 // Home guard (fail-closed): a non-unconfined policy's §5.3 secret deny-reads are
 // anchored under the user's home (~/.ssh, ~/.aws, …). If os.UserHomeDir errors
@@ -152,6 +188,10 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 	var cfg execConfig
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	if err := validatePolicy(p); err != nil {
+		return nil, err
 	}
 
 	if !p.Env.Inherit {
@@ -315,6 +355,12 @@ func (e *Executor) recompileLocked() error {
 	p := PolicyFor(m, e.workspace, e.popts...)
 	if e.readOnly {
 		p = readOnlyMask(p)
+	}
+	// Ack gate: a mode flip to Unconfined without WithAckUnconfined in popts must
+	// fail the spawn CLOSED (via resolve) rather than silently run unconfined. Keep
+	// the last good compiled state and do not advance the generation on refusal.
+	if err := validatePolicy(p); err != nil {
+		return err
 	}
 	spec, report, level, bits, err := e.backend.compile(p)
 	if err != nil {

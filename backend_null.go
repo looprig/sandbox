@@ -16,17 +16,24 @@ func newNullBackend() *nullBackend { return &nullBackend{} }
 // compile returns a passthrough spawnSpec and the honest null posture: no OS
 // enforcement (LevelNone), an empty report (nothing was enforced OR narrowed —
 // the null backend does not attempt any feature, so there is nothing to record),
-// and GuaranteeEnvScrub as the ONLY set guarantee bit. Env scrubbing is set here
-// because it holds independently of any OS backend: the executor assembles the
-// child environment from the EnvPolicy regardless of mechanism. Every other
-// guarantee stays false (fail-closed) because nothing else is enforced.
+// and GuaranteeEnvScrub as the only guarantee bit it can set — but ONLY when the
+// policy actually scrubs the environment (!Env.Inherit). Env scrubbing holds
+// independently of any OS backend because the executor assembles the child
+// environment from the EnvPolicy regardless of mechanism; but an Env.Inherit
+// (unconfined) policy passes the whole parent environment through, so nothing is
+// scrubbed and claiming EnvScrub would be dishonest — guaranteeBits is then 0.
+// Every other guarantee stays false (fail-closed) because nothing else is enforced.
 func (nullBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	spec := spawnSpec{
 		wrapShell: func(command string) []string { return []string{"/bin/sh", "-c", command} },
 		wrapArgv:  func(argv []string) []string { return argv },
 		configure: nil,
 	}
-	return spec, CompileReport{}, LevelNone, GuaranteeEnvScrub, nil
+	var bits uint64
+	if !p.Env.Inherit {
+		bits = GuaranteeEnvScrub
+	}
+	return spec, CompileReport{}, LevelNone, bits, nil
 }
 
 // platformBackend selects the backend for the current platform. Today the null

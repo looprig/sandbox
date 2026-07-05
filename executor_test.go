@@ -703,6 +703,126 @@ func TestWrap(t *testing.T) {
 	}
 }
 
+// --- Task 7: unconfined ack gate + EnvScrub guarantee honesty ---
+
+// TestUnconfinedRequiresAck pins the construction-time gate: an Unconfined preset
+// policy WITHOUT AckUnconfined must refuse to build (SPEC §4, §6). Running
+// unconfined is stepping off the ladder — it requires an explicit acknowledgement.
+func TestUnconfinedRequiresAck(t *testing.T) {
+	ws := t.TempDir()
+	_, err := NewExecutor(PolicyFor(Unconfined, ws))
+	if err == nil {
+		t.Fatal("NewExecutor(Unconfined) without ack: err = nil, want ErrUnconfinedNotAcked")
+	}
+	if !errors.Is(err, ErrUnconfinedNotAcked) {
+		t.Errorf("NewExecutor(Unconfined) without ack: err = %v, want ErrUnconfinedNotAcked", err)
+	}
+}
+
+// TestUnconfinedAckedRunsWithNoGuarantees asserts the acked path: with
+// WithAckUnconfined the executor builds and runs a command (passthrough), and its
+// Guarantees() are ALL false — including EnvScrub, because Env.Inherit means the
+// child inherits everything and nothing is actually scrubbed (guarantee honesty).
+func TestUnconfinedAckedRunsWithNoGuarantees(t *testing.T) {
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Unconfined, ws, WithAckUnconfined()))
+	if err != nil {
+		t.Fatalf("NewExecutor(Unconfined, ack): %v", err)
+	}
+
+	out, code, err := e.RunCommand(context.Background(), ws, "echo hi")
+	if err != nil {
+		t.Fatalf("RunCommand: %v", err)
+	}
+	if code != 0 || !strings.Contains(string(out), "hi") {
+		t.Errorf("RunCommand: code=%d out=%q, want 0 / contains hi", code, out)
+	}
+
+	g := e.Guarantees()
+	if g.EnvScrub {
+		t.Error("unconfined Guarantees().EnvScrub = true, want false (Inherit => not scrubbed)")
+	}
+	if g.ProcessBoundary || g.WriteBoundary || g.ReadDenies ||
+		g.NetworkBoundary || g.AddressNetwork || g.ResourceLimits {
+		t.Errorf("unconfined Guarantees() = %+v, want ALL false", g)
+	}
+	if bits := e.GuaranteeBits(); bits != 0 {
+		t.Errorf("unconfined GuaranteeBits() = %#b, want 0 (no guarantees for unconfined)", bits)
+	}
+}
+
+// TestWriteStillScrubsEnv is the honesty-fix regression guard for the normal
+// (confined) case: a Write policy does NOT inherit, so the null backend still
+// asserts EnvScrub. This confirms making EnvScrub conditional on !Inherit did not
+// disturb the scrubbed path.
+func TestWriteStillScrubsEnv(t *testing.T) {
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor(Write): %v", err)
+	}
+	if !e.Guarantees().EnvScrub {
+		t.Error("Write Guarantees().EnvScrub = false, want true (env is scrubbed)")
+	}
+}
+
+// TestUnconfinedAckDynamicFailsClosed pins the dynamic (recompile) side of the
+// gate: a ModeSource that flips to Unconfined with NO WithAckUnconfined in popts
+// makes the spawn fail CLOSED via resolve (ErrUnconfinedNotAcked) rather than
+// silently running unconfined; with WithAckUnconfined in popts the unconfined
+// spawn succeeds.
+func TestUnconfinedAckDynamicFailsClosed(t *testing.T) {
+	ws := t.TempDir()
+
+	// Start at Write so construction succeeds, then flip to Unconfined.
+	src := &fakeSrc{mode: Write}
+	e, err := NewExecutorDynamic(src, ws) // no WithAckUnconfined in popts
+	if err != nil {
+		t.Fatalf("NewExecutorDynamic: %v", err)
+	}
+	src.mode = Unconfined
+	if _, _, err := e.RunCommand(context.Background(), ws, "echo hi"); !errors.Is(err, ErrUnconfinedNotAcked) {
+		t.Errorf("dynamic flip to Unconfined w/o ack: err = %v, want ErrUnconfinedNotAcked", err)
+	}
+
+	// With WithAckUnconfined in popts the unconfined spawn runs.
+	src2 := &fakeSrc{mode: Write}
+	e2, err := NewExecutorDynamic(src2, ws, WithAckUnconfined())
+	if err != nil {
+		t.Fatalf("NewExecutorDynamic(acked): %v", err)
+	}
+	src2.mode = Unconfined
+	out, code, err := e2.RunCommand(context.Background(), ws, "echo hi")
+	if err != nil {
+		t.Fatalf("acked unconfined spawn: %v", err)
+	}
+	if code != 0 || !strings.Contains(string(out), "hi") {
+		t.Errorf("acked unconfined spawn: code=%d out=%q, want 0 / contains hi", code, out)
+	}
+}
+
+// TestManualUnconfinedRequiresAck proves the gate catches consumer-constructed
+// policies, not just the Unconfined preset, and that grantsUnconfined is
+// Inherit OR Open (either flag alone means no meaningful confinement). Inherit
+// exempts the home guard, so the ack check is the one that fires; HOME is set so
+// the Net.Open case (which does NOT exempt the home guard) surfaces the ack error
+// too rather than a home error.
+func TestManualUnconfinedRequiresAck(t *testing.T) {
+	ws := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+
+	if _, err := NewExecutor(Policy{Workspace: ws, Env: EnvPolicy{Inherit: true}}); !errors.Is(err, ErrUnconfinedNotAcked) {
+		t.Errorf("manual Inherit without ack: err = %v, want ErrUnconfinedNotAcked", err)
+	}
+	if _, err := NewExecutor(Policy{Workspace: ws, Net: NetPolicy{Open: true}}); !errors.Is(err, ErrUnconfinedNotAcked) {
+		t.Errorf("manual Net.Open without ack: err = %v, want ErrUnconfinedNotAcked", err)
+	}
+	// With the ack, a manual Inherit policy builds fine.
+	if _, err := NewExecutor(Policy{Workspace: ws, Env: EnvPolicy{Inherit: true}, AckUnconfined: true}); err != nil {
+		t.Errorf("manual Inherit WITH ack: err = %v, want nil", err)
+	}
+}
+
 // --- env test helpers ---
 
 func containsEnv(env []string, kv string) bool {
