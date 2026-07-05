@@ -205,3 +205,49 @@ const (
 	// GuaranteeResourceLimits mirrors Guarantees.ResourceLimits.
 	GuaranteeResourceLimits
 )
+
+// guaranteesFromBits expands the seam-facing guarantee bitmask into the rich
+// Guarantees struct. It is the inverse of Guarantees.bits: the two map the same
+// seven bit positions to the same seven fields, in the same order. A backend
+// reports guarantees as a bitmask (the stdlib-only seam form, §2); the executor
+// stores those bits and expands them here for Guarantees().
+func guaranteesFromBits(bits uint64) Guarantees {
+	return Guarantees{
+		ProcessBoundary: bits&GuaranteeProcessBoundary != 0,
+		WriteBoundary:   bits&GuaranteeWriteBoundary != 0,
+		ReadDenies:      bits&GuaranteeReadDenies != 0,
+		EnvScrub:        bits&GuaranteeEnvScrub != 0,
+		NetworkBoundary: bits&GuaranteeNetworkBoundary != 0,
+		AddressNetwork:  bits&GuaranteeAddressNetwork != 0,
+		ResourceLimits:  bits&GuaranteeResourceLimits != 0,
+	}
+}
+
+// bits is the inverse of guaranteesFromBits: it folds the Guarantees struct back
+// into the seam-facing bitmask. Keeping both directions adjacent makes the
+// field/bit correspondence a single place to audit.
+func (g Guarantees) bits() uint64 {
+	var b uint64
+	if g.ProcessBoundary {
+		b |= GuaranteeProcessBoundary
+	}
+	if g.WriteBoundary {
+		b |= GuaranteeWriteBoundary
+	}
+	if g.ReadDenies {
+		b |= GuaranteeReadDenies
+	}
+	if g.EnvScrub {
+		b |= GuaranteeEnvScrub
+	}
+	if g.NetworkBoundary {
+		b |= GuaranteeNetworkBoundary
+	}
+	if g.AddressNetwork {
+		b |= GuaranteeAddressNetwork
+	}
+	if g.ResourceLimits {
+		b |= GuaranteeResourceLimits
+	}
+	return b
+}
