@@ -12,10 +12,9 @@ import (
 // into an SBPL profile string and wraps every spawn with
 // `/usr/bin/sandbox-exec -p <profile> -- ...`. The network syntax is taken
 // verbatim from the Task M1 spike (docs/spikes/seatbelt-net.md), which
-// empirically verified what SBPL can and cannot express. This file only
-// GENERATES and wraps; it does not select the backend — platformBackend() still
-// returns the null backend, and wiring the darwin selection (plus real
-// sandbox-exec enforcement tests) is a separate follow-up.
+// empirically verified what SBPL can and cannot express. This backend is selected
+// on darwin by platformBackend() (platform_darwin.go); its file-rule enforcement
+// is verified end-to-end against a real sandbox-exec (backend_seatbelt_test.go).
 
 // baseSandboxPreamble is the minimal always-on base of every generated profile
 // (SPEC §7.1). A bare `(deny default)` is fail-closed to the point of blocking
@@ -56,8 +55,11 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 
 // compileSBPL generates the SBPL profile for a policy and returns it alongside
 // the compilation report, the achieved isolation level, and the guarantee
-// bitmask. It is pure: it reasons only over the policy and emits text, making no
-// OS calls, so its output is deterministic given a fixed workspace and HOME.
+// bitmask. It performs symlink resolution on emitted filesystem paths (canonPath,
+// an OS read) so rules match the kernel's resolved view (§7.1); output is
+// deterministic given a fixed workspace and HOME on a host where the named
+// non-/private roots (/ws, /lrsbx-home/tester) do not exist while /tmp,/etc resolve
+// macOS-invariantly.
 //
 // The filesystem section relies on SBPL's last-match-wins precedence to realize
 // the resolver's deny>write>read + carveout semantics (§5.1, fsresolve.go). It
@@ -67,11 +69,11 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 // DENIES last so they override everything above.
 //
 // Verification scope: the M1 spike (docs/spikes/seatbelt-net.md) verified the
-// NETWORK section and the base preamble against a real sandbox-exec. The
-// file-rule syntax here — (subpath "…"), (regex #"…"), and file-rule
-// deny-override under last-match-wins — is NOT part of M1; the goldens only prove
-// byte-equality to the Go/RE2 glob translation, not that SBPL's engine enforces
-// it identically. Real-exec verification of the file rules is Task 8b.
+// NETWORK section and the base preamble against a real sandbox-exec; the file-rule
+// syntax — (subpath "…"), (regex #"…"), and file-rule deny-override under
+// last-match-wins — is verified end-to-end by the real-sandbox-exec enforcement
+// tests in backend_seatbelt_test.go (the goldens alone only prove byte-equality to
+// the Go/RE2 glob translation, not that SBPL's engine enforces it identically).
 func compileSBPL(p Policy) (profile string, report CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
@@ -374,24 +376,37 @@ func conservativeDenyRoot(glob string) string {
 // from the raw path would therefore match NOTHING and silently deny in-policy access
 // (a raw "/tmp" write grant never fires; a /var-form workspace grant never fires).
 //
-// EvalSymlinks only resolves an EXISTING path; a non-existent one (a fixed test path
-// like /ws or /home/tester, or a not-yet-created root) falls back to filepath.Clean,
-// leaving it unchanged. That is correct for the common case where the named roots
-// are real by the time the policy compiles (workspaces, homes, /tmp, /etc all exist)
-// and for a path with no symlinked prefix (a real home like /Users/foo resolves to
-// itself whether or not the leaf exists).
+// EvalSymlinks only resolves an EXISTING path. For a non-existent leaf (a fixed
+// test path like /ws or /lrsbx-home/tester, or a not-yet-created carveout/secret target),
+// canonPath recurses on the parent — resolving the longest EXISTING ancestor and
+// re-attaching the remainder — so a symlinked PREFIX is always resolved even when
+// the leaf does not exist yet.
 //
-// LIMITATION: the Clean fallback cannot resolve a symlinked PREFIX of a
-// non-existent leaf, so a rule for a path that does not yet exist UNDER a symlinked
-// root will not match until it does. This affects only a not-yet-created
-// WithWritable/WithDenyRead root beneath a symlinked prefix; real workspaces and
-// homes are created before use, and DefaultSecretDenials' only glob (**/.env*) is
-// suffix-anchored and needs no prefix resolution.
+// This is critical for DENY rules: the .git/.looprig carveouts and the §5.3 secret
+// denies are emitted whether or not those paths exist on disk, and on an ephemeral
+// /var/folders workspace they typically do NOT exist at compile time. Leaving such a
+// deny raw while its enclosing writable-root ALLOW resolves would let the resolved
+// write match the allow but not the raw deny — fail-OPEN — silently defeating the
+// carveout/secret protection. (An ALLOW under a symlinked prefix fails CLOSED, which
+// is merely annoying; a DENY fails OPEN, which is a security hole — hence the
+// asymmetry this resolution closes.)
+//
+// Residual (TOCTOU): the resolved path is baked into the profile once at compile and
+// reused for the executor's whole lifetime, so a path-component symlink swapped
+// externally after construction leaves a stale rule — fail-closed for allows,
+// fail-open for denies. Inherent to the compile-once, stateless-per-spawn design.
 func canonPath(p string) string {
+	if p == "" {
+		return p // absolute paths only in practice; avoid Clean("") == "."
+	}
 	if r, err := filepath.EvalSymlinks(p); err == nil {
 		return r
 	}
-	return filepath.Clean(p)
+	dir := filepath.Dir(p)
+	if dir == p { // reached the root; nothing more to resolve
+		return filepath.Clean(p)
+	}
+	return filepath.Join(canonPath(dir), filepath.Base(p))
 }
 
 // sbplString escapes a Go string for inclusion inside an SBPL (subpath "…") /

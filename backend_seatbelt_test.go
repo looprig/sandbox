@@ -39,7 +39,7 @@ var goldenModes = []struct {
 // TestCompileSBPLGolden pins the full generated profile per mode against a
 // committed golden. With -update it (re)writes the goldens instead of asserting.
 func TestCompileSBPLGolden(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	for _, tc := range goldenModes {
 		t.Run(tc.name, func(t *testing.T) {
 			profile, _, _, _ := compileSBPL(PolicyFor(tc.mode, "/ws"))
@@ -68,7 +68,7 @@ func TestCompileSBPLGolden(t *testing.T) {
 // TestCompileSBPLBase asserts the base of every profile: (version 1) then
 // (deny default), so the sandbox is fail-closed before any allow.
 func TestCompileSBPLBase(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
 	if !strings.HasPrefix(profile, "(version 1)\n(deny default)\n") {
 		t.Errorf("profile does not begin with (version 1) then (deny default):\n%s", profile)
@@ -82,11 +82,11 @@ func TestCompileSBPLBase(t *testing.T) {
 // the §5.3 secret deny for ~/.ssh is emitted AFTER the broad file-read* allow, so
 // the deny overrides the allow under SBPL's last-match-wins precedence.
 func TestCompileSBPLSecretDenyAfterBroadRead(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
 
 	broadRead := `(allow file-read* (subpath "/"))`
-	sshDeny := `(deny file-read* file-write* (subpath "/home/tester/.ssh"))`
+	sshDeny := `(deny file-read* file-write* (subpath "/lrsbx-home/tester/.ssh"))`
 
 	iAllow := strings.Index(profile, broadRead)
 	iDeny := strings.Index(profile, sshDeny)
@@ -105,7 +105,7 @@ func TestCompileSBPLSecretDenyAfterBroadRead(t *testing.T) {
 // expected anchored SBPL regex (matching fsresolve.go's glob→regexp), and that it
 // denies both read and write.
 func TestCompileSBPLEnvGlobDeny(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
 
 	want := `(deny file-read* file-write* (regex #"^.*/\.env[^/]*$"))`
@@ -118,7 +118,7 @@ func TestCompileSBPLEnvGlobDeny(t *testing.T) {
 // nested in the writable workspace root gets its write removed by a deny emitted
 // AFTER the workspace write allow (so last-match-wins makes it read-only).
 func TestCompileSBPLCarveoutWriteDeny(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
 
 	wsWrite := `(allow file-write* (subpath "/ws"))`
@@ -142,7 +142,7 @@ func TestCompileSBPLCarveoutWriteDeny(t *testing.T) {
 // localhost loopback rule, and the mDNSResponder unix-socket for DNS; Private is
 // NOT emitted (SBPL cannot address-scope) but IS reported unenforced.
 func TestCompileSBPLNetworkTrusted(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, report, _, _ := compileSBPL(PolicyFor(Trusted, "/ws"))
 
 	wantLines := []string{
@@ -174,7 +174,7 @@ func TestCompileSBPLNetworkTrusted(t *testing.T) {
 // TestCompileSBPLNetworkPorts asserts an arbitrary port compiles to the M1
 // outbound-tcp form.
 func TestCompileSBPLNetworkPorts(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	p := PolicyFor(Write, "/ws", WithNet(NetPolicy{Ports: []uint16{443, 8080}}))
 	profile, _, _, _ := compileSBPL(p)
 	for _, w := range []string{
@@ -190,7 +190,7 @@ func TestCompileSBPLNetworkPorts(t *testing.T) {
 // TestCompileSBPLNetworkOpen asserts Net.Open (unconfined) compiles to the
 // blanket network allow.
 func TestCompileSBPLNetworkOpen(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	profile, _, _, _ := compileSBPL(PolicyFor(Unconfined, "/ws"))
 	if !strings.Contains(profile, "(allow network*)") {
 		t.Errorf("Unconfined (Net.Open) profile missing (allow network*)\n%s", profile)
@@ -201,7 +201,7 @@ func TestCompileSBPLNetworkOpen(t *testing.T) {
 // needs no address-scoping is Full; requesting Private (unsatisfiable
 // AddressNetwork) tops out at Degraded.
 func TestCompileSBPLLevels(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 
 	_, _, writeLevel, _ := compileSBPL(PolicyFor(Write, "/ws"))
 	if writeLevel != LevelFull {
@@ -223,7 +223,7 @@ func TestCompileSBPLLevels(t *testing.T) {
 // and never carry a restricted-read entry. This exercises level+report per mode,
 // which the golden test deliberately discards.
 func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	cases := []struct {
 		name             string
 		mode             Mode
@@ -266,7 +266,7 @@ func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
 // always false (SBPL cannot address-scope); EnvScrub tracks !Env.Inherit; and the
 // Write policy has the process/write/read/network boundaries.
 func TestCompileSBPLGuarantees(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 
 	_, _, _, writeBits := compileSBPL(PolicyFor(Write, "/ws"))
 	if writeBits&GuaranteeAddressNetwork != 0 {
@@ -306,7 +306,7 @@ func TestCompileSBPLGuarantees(t *testing.T) {
 // skipped: it compiles to a broad conservative deny (fail closed, over-deny) and
 // is recorded in the report.
 func TestCompileSBPLGlobDenyFailsClosed(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	// "[z-a]" is a reversed range: a valid glob metacharacter run that cannot be
 	// compiled to a regexp, so the translation fails and must fall back to a broad
 	// deny rather than silently dropping the secret rule.
@@ -337,7 +337,7 @@ func TestCompileSBPLGlobDenyFailsClosed(t *testing.T) {
 // malformed (unbalanced-delimiter) profile. Reachable via a consumer WithDenyRead
 // of a quote-bearing path.
 func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	p := PolicyFor(Write, "/ws", WithoutSecretDenials(), WithDenyRead(`/danger"x/*.env`))
 	profile, report, _, _ := compileSBPL(p)
 
@@ -368,7 +368,7 @@ func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
 // sandbox-exec -p <profile> -- , sets no configure hook, and returns the same
 // level/bits as compileSBPL.
 func TestSeatbeltBackendSpawnSpec(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+	t.Setenv("HOME", "/lrsbx-home/tester")
 	p := PolicyFor(Write, "/ws")
 	b := newSeatbeltBackend()
 	spec, report, level, bits, err := b.compile(p)
@@ -599,6 +599,67 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 	}
 	if strings.Contains(string(out), "PRIVATE KEY") {
 		t.Errorf("~/.ssh read leaked the secret: %s", out)
+	}
+}
+
+// TestSeatbeltEnforceCarveoutNotPreCreated guards the C1 fail-open: a .git/.looprig
+// carveout whose target does NOT exist at NewExecutor (compile) time. On an ephemeral
+// /var/folders workspace (symlinked into /private), a raw-Clean canonPath left the
+// carveout write-deny UNRESOLVED so it never matched the kernel's resolved path — the
+// write fell through to the workspace ALLOW (fail OPEN, .git/.looprig writable). The
+// deepest-existing-ancestor resolution fixes it. The carveout dir is created AFTER
+// compile (so the write itself would succeed if not for the deny), which is exactly
+// the compile-time-nonexistent / runtime-existent case the old code got wrong.
+func TestSeatbeltEnforceCarveoutNotPreCreated(t *testing.T) {
+	requireSandboxExec(t)
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws)) // .looprig does NOT exist yet
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	// Create the carveout dir only now (post-compile) so a plain write would land.
+	if err := os.MkdirAll(filepath.Join(ws, ".looprig"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(ws, ".looprig", "x")
+	out, code, err := e.RunCommand(context.Background(), ws, "echo hi > "+x)
+	if err != nil {
+		t.Fatalf(".looprig write: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf(".looprig write: exit 0, want nonzero — carveout deny must hold even though .looprig did not exist at compile time (fail-open regression); out=%s", out)
+	}
+	if _, serr := os.Stat(x); serr == nil {
+		t.Errorf(".looprig write: %s created, want denied (fail-open regression)", x)
+	}
+}
+
+// TestSeatbeltEnforceSecretDenyCreatedAfter guards the same C1 fail-open on the
+// secret-deny side: under a symlinked temp HOME, ~/.ssh does not exist at compile
+// time and the secret is created only afterward. The §5.3 secret deny must still fire.
+func TestSeatbeltEnforceSecretDenyCreatedAfter(t *testing.T) {
+	requireSandboxExec(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home) // BEFORE NewExecutor; ~/.ssh does NOT exist yet
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+	// Create the secret only now (post-compile), under the symlinked home.
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(home, ".ssh", "id")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code, err := e.RunCommand(context.Background(), ws, "cat "+secret)
+	if err != nil {
+		t.Fatalf("secret read: spawn err %v", err)
+	}
+	if code == 0 || strings.Contains(string(out), "PRIVATE KEY") {
+		t.Errorf("secret created after compile was readable (fail-open regression): code=%d out=%s", code, out)
 	}
 }
 
