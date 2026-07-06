@@ -641,5 +641,8 @@ v0.1.0". Commit `docs: record sandbox unlock in harness/swe guides`.
 - **Deferred (SPEC §12):** SNI-peek egress proxy, MITM method filtering, seccomp
   user-notification telemetry, prompt-injection classifier, Windows backend,
   session-scoped executor daemon.
-</content>
-</invoke>
+- **cli follow-up (outside this plan's scope):** the escalation prompt shows grant
+  descriptions only if a renderer type-asserts `tool.BashRequest.Grants` and
+  displays each `.Description` (§9.3). Task 17b attaches + durably journals them in
+  harness, but the `cli` TUI (separate module) must render them for the operator to
+  actually see the escalation — track as a cli change after this plan.
