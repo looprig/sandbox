@@ -341,16 +341,6 @@ func hasDenyEntry(fs []FSEntry) bool {
 	return false
 }
 
-// containsPort reports whether ports contains p.
-func containsPort(ports []uint16, p uint16) bool {
-	for _, x := range ports {
-		if x == p {
-			return true
-		}
-	}
-	return false
-}
-
 // conservativeDenyRoot returns the broadest safe subpath to deny for an
 // untranslatable glob: its literal prefix (the substring before the first glob
 // metacharacter), or "/" when there is no usable absolute prefix. Denying a

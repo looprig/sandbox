@@ -64,6 +64,17 @@ type NetPolicy struct {
 	Open bool
 }
 
+// containsPort reports whether ports contains p. It is a platform-independent
+// helper on NetPolicy.Ports, used by the foreign-agent preset and every backend.
+func containsPort(ports []uint16, p uint16) bool {
+	for _, x := range ports {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
 // EnvPolicy controls the environment spawned commands inherit (SPEC §5.5). The
 // zero value is the baseline allowlist (fail-closed): the harness process
 // environment is not passed through.
