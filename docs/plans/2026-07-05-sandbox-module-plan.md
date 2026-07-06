@@ -558,6 +558,18 @@ spawned subagent is clamped `<=` parent (SPEC §8, §10.6). **Step 2:** FAIL.
 static modes in `BuildTools`. **Step 4:** PASS. **Step 5:** commit `feat(swe):
 security-mode knob and per-role wiring`.
 
+**Carry-forward from Task 16 review (I-2) — add a CONFORMANCE test here.** harness
+probes the sandbox executor by anonymous `interface{ GuaranteeBits() uint64 }` /
+`interface{ Level() uint8 }` / `CommandRunner`/`ArgvRunner`/`PlanGrants`/`DescribeGrant`
+(no import — structural coupling). A signature drift on `sandbox.Executor` would
+NOT fail to compile; harness would silently probe→0 and Bash auto-approve would
+quietly stop firing (fail-closed but invisible). swe imports BOTH modules, so add
+a compile-time/assertion test here that a real `*sandbox.Executor` satisfies every
+harness structural interface it must (`tool.CommandRunner`, `tool.ArgvRunner`,
+`tool.GrantedRunner`, and the `GuaranteeBits()`/`Level()`/`PlanGrants()`/`DescribeGrant()`
+anonymous interfaces the checker/tools assert). This is the only place the drift
+can be caught.
+
 ### Task 23: Foreign-agent process wrapping (SPEC §10.6)
 
 **Files:** Modify `harness/pkg/foreignloop/claude/claude.go:68` (accept an
