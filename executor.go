@@ -379,8 +379,14 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if err != nil {
 		return nil, -1, err
 	}
-	return e.run(ctx, dir, s.spec.wrapShell(command), s)
+	return e.run(ctx, dir, shellArgv(command), s)
 }
+
+// shellArgv is the universal shell-normalization: running a command STRING means
+// executing /bin/sh -c <command> under confinement, on every backend. The backend
+// wraps this inner argv (sandbox-exec prefix, stage-2 re-exec, or nothing); the
+// executor owns the shell form so the backends only ever wrap an argv.
+func shellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }
 
 // recompileLocked ensures the compiled snapshot matches src.Current() for a
 // dynamic executor, applying the read-only mask when this is a ReadOnlyView. It
@@ -441,7 +447,7 @@ func (e *Executor) recompileLocked() error {
 //     compile cleanly.
 //
 // As a final guard the resolved spawnSpec is checked: an uncompiled spec (nil
-// wrapShell) yields an error instead of a later nil-func call.
+// wrap) yields an error instead of a later nil-func call.
 func (e *Executor) resolve() (snapshot, error) {
 	if e.src == nil {
 		s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
@@ -460,7 +466,7 @@ func (e *Executor) resolveErr(compileErr error) error {
 	if compileErr != nil {
 		return compileErr
 	}
-	if e.spec.wrapShell == nil || e.spec.wrapArgv == nil {
+	if e.spec.wrap == nil {
 		return errors.New("sandbox: executor spawn spec not compiled")
 	}
 	return nil
@@ -476,23 +482,34 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 	if err != nil {
 		return nil, -1, err
 	}
-	return e.run(ctx, dir, s.spec.wrapArgv(argv), s)
+	return e.run(ctx, dir, argv, s)
 }
 
 // run is the shared execution path for RunCommand, RunArgv, and
-// RunCommandWithGrants. It builds the command from a fully wrapped argv, applies
-// the snapshot's environment and the backend's spawn attributes, and normalizes
-// the result to the (output, exit, err) convention. The snapshot is read once by
-// the caller (via resolve) so a concurrent dynamic recompile cannot change the
-// env or spawn transform mid-spawn.
-func (e *Executor) run(ctx context.Context, dir string, argv []string, s snapshot) ([]byte, int, error) {
+// RunCommandWithGrants. It hands the backend the (dir, innerArgv) via the
+// snapshot's spawnSpec.wrap to obtain the final argv plus a fresh per-spawn
+// configure/cleanup pair, builds the command, applies the snapshot's environment
+// and the backend's spawn attributes, runs it, and normalizes the result to the
+// (output, exit, err) convention. The snapshot is read once by the caller (via
+// resolve) so a concurrent dynamic recompile cannot change the env or spawn
+// transform mid-spawn; each wrap call yields its own closures, so concurrent
+// spawns never share per-spawn state.
+func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
 	// Fail closed if the spawn spec never compiled: resolve already guards this,
 	// but a nil transform must never reach a spawn (defense in depth).
-	if s.spec.wrapShell == nil {
+	if s.spec.wrap == nil {
 		return nil, -1, errors.New("sandbox: executor spawn spec not compiled")
 	}
-	if len(argv) == 0 {
+	if len(innerArgv) == 0 {
 		return nil, -1, errors.New("sandbox: empty argv")
+	}
+
+	argv, configure, cleanup := s.spec.wrap(dir, innerArgv)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if len(argv) == 0 {
+		return nil, -1, errors.New("sandbox: backend produced an empty argv")
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -506,8 +523,8 @@ func (e *Executor) run(ctx context.Context, dir string, argv []string, s snapsho
 	if cmd.Env == nil {
 		cmd.Env = []string{}
 	}
-	if s.spec.configure != nil {
-		s.spec.configure(cmd)
+	if configure != nil {
+		configure(cmd)
 	}
 
 	out, err := cmd.CombinedOutput()
@@ -670,7 +687,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string
 			return nil, -1, fmt.Errorf("grant: %w", verr)
 		}
 	}
-	return e.run(ctx, dir, s.spec.wrapShell(command), s)
+	return e.run(ctx, dir, shellArgv(command), s)
 }
 
 // readOnlyMask derives a read-only policy: every FS entry's WriteAccess bit is
@@ -745,12 +762,23 @@ func (e *Executor) ReadOnlyView() *Executor {
 // scrubbed environment (enforcing the env scrub even for externally constructed
 // commands), and applies any backend spawn attributes. On the null backend this
 // effectively just replaces cmd.Env with the scrubbed environment.
+//
+// Wrap hands the *exec.Cmd back for the caller to run, so — unlike RunCommand/
+// RunArgv — it cannot own the spawn's lifetime. A backend that allocates
+// per-spawn resources needing teardown (a non-nil cleanup from wrap) therefore
+// cannot be driven through Wrap: rather than silently leak that resource, Wrap
+// fails closed with an error. Every backend that returns a nil cleanup
+// (null, seatbelt, and Linux spawns with no transient cgroup) works through Wrap.
 func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
 	s, err := e.resolve()
 	if err != nil {
 		return nil, err
 	}
-	finalArgv := s.spec.wrapArgv(cmd.Args)
+	finalArgv, configure, cleanup := s.spec.wrap(cmd.Dir, cmd.Args)
+	if cleanup != nil {
+		cleanup() // release what wrap allocated; we cannot defer it across the caller's Run
+		return nil, errors.New("sandbox: this backend allocates per-spawn resources and cannot be used via Wrap; use RunCommand/RunArgv")
+	}
 	if len(finalArgv) == 0 {
 		return nil, errors.New("sandbox: cannot wrap a command with empty Args")
 	}
@@ -763,8 +791,8 @@ func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
 	if cmd.WaitDelay == 0 {
 		cmd.WaitDelay = spawnWaitGrace // default deadline-latency bound; the caller may override
 	}
-	if s.spec.configure != nil {
-		s.spec.configure(cmd)
+	if configure != nil {
+		configure(cmd)
 	}
 	return cmd, nil
 }

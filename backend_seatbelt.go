@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -432,15 +433,18 @@ func newSeatbeltBackend() backend { return seatbeltBackend{} }
 func (seatbeltBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	profile, report, level, bits := compileSBPL(p)
 	spec := spawnSpec{
-		wrapShell: func(command string) []string {
-			return []string{"/usr/bin/sandbox-exec", "-p", profile, "--", "/bin/sh", "-c", command}
-		},
-		wrapArgv: func(argv []string) []string {
-			wrapped := make([]string, 0, 4+len(argv))
+		// Prepend the sandbox-exec launcher to the inner argv. The executor has
+		// already shell-normalized a RunCommand to innerArgv == /bin/sh -c command,
+		// so a shell command becomes `sandbox-exec -p <profile> -- /bin/sh -c cmd`
+		// and a RunArgv becomes `sandbox-exec -p <profile> -- <argv...>`, identical
+		// to the pre-reshape wrapShell/wrapArgv. dir needs no special handling and
+		// there are no per-spawn resources, so configure and cleanup are nil.
+		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+			wrapped := make([]string, 0, 4+len(innerArgv))
 			wrapped = append(wrapped, "/usr/bin/sandbox-exec", "-p", profile, "--")
-			return append(wrapped, argv...)
+			wrapped = append(wrapped, innerArgv...)
+			return wrapped, nil, nil
 		},
-		configure: nil,
 	}
 	return spec, report, level, bits, nil
 }

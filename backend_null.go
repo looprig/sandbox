@@ -1,5 +1,7 @@
 package sandbox
 
+import "os/exec"
+
 // nullBackend is the fallback backend: it applies no OS-level enforcement. It
 // exists so the executor has a working, honest backend on every platform before
 // the real ones land, and so a platform with no available mechanism degrades to
@@ -25,9 +27,12 @@ func newNullBackend() *nullBackend { return &nullBackend{} }
 // Every other guarantee stays false (fail-closed) because nothing else is enforced.
 func (nullBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	spec := spawnSpec{
-		wrapShell: func(command string) []string { return []string{"/bin/sh", "-c", command} },
-		wrapArgv:  func(argv []string) []string { return argv },
-		configure: nil,
+		// Pure passthrough: run the inner argv exactly as given (the executor has
+		// already shell-normalized a RunCommand to /bin/sh -c command). No spawn
+		// attributes, no per-spawn resources — configure and cleanup are nil.
+		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+			return innerArgv, nil, nil
+		},
 	}
 	var bits uint64
 	if !p.Env.Inherit {

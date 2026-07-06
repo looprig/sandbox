@@ -387,20 +387,28 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 		t.Errorf("backend report entries = %d, want %d", len(report.Entries), len(wantReport.Entries))
 	}
 
-	shell := spec.wrapShell("echo hi")
+	// Shell path: the executor shell-normalizes a command string to /bin/sh -c
+	// (shellArgv) and hands that inner argv to the backend's wrap; dir is ignored.
+	shell, shellCfg, shellClean := spec.wrap("/work", shellArgv("echo hi"))
 	wantShell := []string{"/usr/bin/sandbox-exec", "-p", wantProfile, "--", "/bin/sh", "-c", "echo hi"}
 	if !equalStrings(shell, wantShell) {
-		t.Errorf("wrapShell = %v\nwant %v", shell, wantShell)
+		t.Errorf("wrap(shell) = %v\nwant %v", shell, wantShell)
+	}
+	if shellCfg != nil {
+		t.Error("seatbelt wrap configure should be nil (executor sets attributes)")
+	}
+	if shellClean != nil {
+		t.Error("seatbelt wrap cleanup should be nil (no per-spawn resources)")
 	}
 
-	argv := spec.wrapArgv([]string{"ls", "-l"})
+	// Direct argv path (RunArgv): the backend wraps the caller's argv verbatim.
+	argv, argvCfg, argvClean := spec.wrap("/work", []string{"ls", "-l"})
 	wantArgv := []string{"/usr/bin/sandbox-exec", "-p", wantProfile, "--", "ls", "-l"}
 	if !equalStrings(argv, wantArgv) {
-		t.Errorf("wrapArgv = %v\nwant %v", argv, wantArgv)
+		t.Errorf("wrap(argv) = %v\nwant %v", argv, wantArgv)
 	}
-
-	if spec.configure != nil {
-		t.Error("seatbelt spawnSpec.configure should be nil (executor sets attributes)")
+	if argvCfg != nil || argvClean != nil {
+		t.Error("seatbelt wrap should return nil configure and nil cleanup")
 	}
 }
 
