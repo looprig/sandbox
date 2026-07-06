@@ -27,20 +27,49 @@ type linuxBackend struct {
 	// ResourceLimits guarantee holds; each spawn creates its transient scope under
 	// it. Probing at construction (not per spawn) makes the guarantee a stable
 	// property of the executor: availability is measured once, the same value the
-	// per-spawn configure uses. Task 13 will widen the constructor to also carry
-	// the probed rung/linuxCaps once namespace enforcement is compiled.
+	// per-spawn configure uses.
 	cgroupPids string
+	// rung is the confinement tier this backend compiles for (Task 13, SPEC §7.2):
+	// rungTwo (Landlock + seccomp, no namespaces) or rungOne (namespaces + mount
+	// view + nftables, then Landlock + seccomp). compile branches on it. The zero
+	// value would be rungNone, but the constructors always set a re-exec rung, so a
+	// backend selected by platformBackend is never rungNone.
+	rung rung
 }
 
-// newLinuxBackend constructs the Linux backend. It keeps its no-argument
-// signature (existing callers and tests rely on it) and probes the delegated
-// cgroup v2 pids ancestor here so compile can decide the ResourceLimits guarantee
-// (SPEC §7.4). rung-2 FS confinement is still compiled from the policy alone.
+// newLinuxBackend constructs the RUNG-2 Linux backend. It keeps its no-argument
+// signature (existing callers and tests rely on it — withBackend(newLinuxBackend())
+// pins rung 2) and probes the delegated cgroup v2 pids ancestor here so compile
+// can decide the ResourceLimits guarantee (SPEC §7.4). rung-2 FS confinement is
+// compiled from the policy alone.
 func newLinuxBackend() *linuxBackend {
-	return &linuxBackend{cgroupPids: probeDelegatedPidsAncestor()}
+	return &linuxBackend{cgroupPids: probeDelegatedPidsAncestor(), rung: rungTwo}
 }
 
-// compile builds the re-exec spawnSpec and applies rung-2 FS confinement. It
+// newLinuxBackendRung1 constructs the RUNG-1 (full-isolation) Linux backend
+// (Task 13, SPEC §7.2 rung 1): user+mount+pid+net namespaces via the stage-2
+// SysProcAttr cloneflags, a bind-mount view (restricted-read + deny-by-mask),
+// in-netns nftables address filtering, then Landlock + seccomp + cgroup. It is
+// selected by platformBackend only on a host whose probe confirmed a usable
+// userns+mountns+netns (selectRung -> rungOne). It shares the cgroup probe with
+// rung 2.
+func newLinuxBackendRung1() *linuxBackend {
+	return &linuxBackend{cgroupPids: probeDelegatedPidsAncestor(), rung: rungOne}
+}
+
+// compile dispatches on the backend's rung (SPEC §7.2): rung 1 compiles the full
+// namespace/mount/nftables tier (compileRung1); rung 2 (and the no-arg
+// newLinuxBackend, which existing tests pin) compiles the Landlock+seccomp tier
+// (compileRung2). It never errors — a policy that compiles to a narrower ruleset
+// is reported via level/bits/report, not via err.
+func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if b.rung == rungOne {
+		return b.compileRung1(p)
+	}
+	return b.compileRung2(p)
+}
+
+// compileRung2 builds the re-exec spawnSpec and applies rung-2 FS confinement. It
 // distils the policy's FS axis into a compiledFS (literal allows + literal
 // denies; globs dropped), which the per-spawn wrap enumerates into a Landlock
 // allowlist. It reports LevelDegraded (rung 2 enforces the write boundary and
@@ -48,9 +77,8 @@ func newLinuxBackend() *linuxBackend {
 // subprocesses, §7.5) with GuaranteeWriteBoundary, GuaranteeReadDenies (when the
 // policy carries an enforceable fixed-path deny), and GuaranteeEnvScrub (when
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
-// unenforced. It never errors — a policy that compiles to a narrower ruleset is
-// reported via level/bits/report, not via err.
-func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+// unenforced.
+func (b linuxBackend) compileRung2(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	cfs := compileFSPolicy(p.FS)
 	cnet := compileNetPolicy(p.Net)
 	// Task 14: resolve the cgroup v2 resource-limit plan against the ancestor
@@ -84,7 +112,7 @@ func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64
 		bits |= GuaranteeResourceLimits
 	}
 
-	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet, cg)}
+	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet, cg, nil)}
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the rung-2 seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
@@ -103,6 +131,151 @@ func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64
 	// policy opt-out from absent delegation — otherwise). It never changes Level.
 	report.Entries = append(report.Entries, cgroupCompileReport(cg))
 	return spec, report, LevelDegraded, bits, nil
+}
+
+// compileRung1 builds the RUNG-1 (full-isolation) spawnSpec (SPEC §7.2 rung 1,
+// §7.5). It compiles four mechanisms that COMPOSE on the stage-2 child:
+//   - the bind-mount view (compileMountView): rw/ro binds for writable/read
+//     roots, ro re-mask binds for carveouts, empty-mask binds for fixed-path
+//     secret denies and glob-deny matches, then pivot_root — so host paths NOT
+//     bound are INVISIBLE (restricted-read, the rung-1 property rung 2 lacks);
+//   - the in-netns nftables address filter (compileNftPlan): address-scoped
+//     loopback/private, UDP+TCP DNS, and the §5.4 metadata hard-deny;
+//   - the Landlock FS allowlist (compileFSPolicy, shared with rung 2) — applied
+//     on top of the mount view as defense-in-depth (SPEC §7.2 "then Landlock");
+//   - the cgroup v2 scope (compileCgroupPolicy, shared) for resource limits.
+//
+// Because the mount view enforces the write boundary, restricted-read, fixed AND
+// glob denies, and nftables enforces the full address-scoped network semantics,
+// a rung-1 full policy reaches LevelFull with every guarantee the mechanisms
+// apply. The one accepted residual — a file the command itself creates mid-run
+// escaping a spawn-time glob mask (§7.5) — is sound (never wider than policy) and
+// does NOT demote Level. A feature the mechanism cannot reach would lower to
+// Degraded and be recorded; for the standard presets the mechanisms reach all of
+// them, so rung 1 is LevelFull. Resource limits are containment-of-cost and never
+// change Level (§7.4).
+func (b linuxBackend) compileRung1(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	cfs := compileFSPolicy(p.FS)
+	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
+	mvp := compileMountView(p)
+	nft := compileNftPlan(p.Net)
+
+	// ProcessBoundary + WriteBoundary are unconditional at rung 1: the child runs
+	// inside user+mount+pid(+net) namespaces (process boundary) and writes are
+	// confined to the rw binds + Landlock (write boundary).
+	bits := GuaranteeProcessBoundary | GuaranteeWriteBoundary
+	if mvp.hasDenies() {
+		// The mount masks enforce BOTH fixed-path and glob denies for subprocesses
+		// (unlike rung 2, which cannot express globs) — the ReadDenies guarantee.
+		bits |= GuaranteeReadDenies
+	}
+	if !p.Env.Inherit {
+		bits |= GuaranteeEnvScrub
+	}
+	if nft.confined {
+		// nftables address-scopes egress AND enforces the metadata hard-deny, so
+		// rung 1 earns BOTH the port-level network boundary and the address-network
+		// guarantee (which rung 2 can never set). An open policy sets neither.
+		bits |= GuaranteeNetworkBoundary | GuaranteeAddressNetwork
+	}
+	if cg.enforced() {
+		bits |= GuaranteeResourceLimits
+	}
+
+	r1 := &rung1Plan{mount: mvp, nft: nft}
+	// cnet is empty: rung 1 does NOT use the Landlock TCP-port net (nftables covers
+	// egress), so linuxWrap sets NetConfined=false and injects no RES_OPTIONS.
+	spec := spawnSpec{wrap: linuxWrapTransform(cfs, compiledNet{}, cg, r1)}
+	report := rung1CompileReport(p, mvp, nft)
+	report.Entries = append(report.Entries, cgroupCompileReport(cg))
+	return spec, report, LevelFull, bits, nil
+}
+
+// rung1CompileReport records how the rung-1 mechanisms compiled each policy
+// feature (SPEC §7.5). At rung 1 the mount view + nftables enforce features rung
+// 2 can only narrow or drop: restricted-read invisibility, glob denies, and
+// address-scoped network with the metadata hard-deny — all "enforced". The one
+// recorded residual is the self-created-file glob-mask gap (§7.5), which does not
+// demote Level.
+func rung1CompileReport(p Policy, mvp mountViewPlan, nft compiledNftPlan) CompileReport {
+	entries := []ReportEntry{
+		{
+			Feature: "process-boundary",
+			Status:  "enforced",
+			Detail:  "target runs in fresh user+mount+pid+net namespaces via SysProcAttr cloneflags on the stage-2 re-exec (rung 1, §7.2)",
+		},
+		{
+			Feature: "write-boundary",
+			Status:  "enforced",
+			Detail:  "writes confined to policy writable roots by rw bind mounts (read roots are ro binds) plus a Landlock allowlist, in the mount-namespace view (rung 1, §7.2)",
+		},
+		{
+			Feature: "restricted-read",
+			Status:  "enforced",
+			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the rung-1 property rung 2 cannot provide (§7.2, §7.5)",
+		},
+	}
+	if len(mvp.denyMasks) > 0 {
+		entries = append(entries, ReportEntry{
+			Feature: "fixed-path-deny",
+			Status:  "enforced",
+			Detail:  "fixed-path secret denies masked by empty read-only bind mounts on top of any covering allow (deny-inside-allow via mount re-masking, §7.5 — no sibling enumeration, unlike rung 2)",
+		})
+	}
+	if len(mvp.roBinds) > 0 {
+		entries = append(entries, ReportEntry{
+			Feature: "carveout",
+			Status:  "enforced",
+			Detail:  "read-only carveouts (.git/.looprig) enforced as ro re-mask binds applied on top of their writable root in the mount view (§7.5)",
+		})
+	}
+	if len(mvp.globDenies) > 0 {
+		entries = append(entries, ReportEntry{
+			Feature: "glob-deny",
+			Status:  "enforced",
+			Detail:  "glob denies (e.g. **/.env*) enforced by spawn-time bounded enumeration (scan workspace + $HOME to a max depth) masking each match with an empty read-only bind; the only residual is a file the command itself creates mid-run, which holds no pre-existing secret and does not demote Level (§7.5)",
+		})
+	}
+	if !p.Env.Inherit {
+		entries = append(entries, ReportEntry{
+			Feature: "env-scrub",
+			Status:  "enforced",
+			Detail:  "target execve'd with the EnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
+		})
+	}
+	entries = append(entries, rung1NetReport(nft)...)
+	return CompileReport{Entries: entries}
+}
+
+// rung1NetReport records the rung-1 network compilation (SPEC §5.2, §5.4, §7.5).
+// Confined egress earns both the port boundary and address scoping (nftables);
+// an open policy applies no filter (the netns is not even created).
+func rung1NetReport(nft compiledNftPlan) []ReportEntry {
+	if !nft.confined {
+		return []ReportEntry{{
+			Feature: "network",
+			Status:  "unenforced",
+			Detail:  "Net.Open grants unrestricted egress; the rung-1 net namespace is not created and no nftables filter is installed (unconfined passthrough, §5.2)",
+		}}
+	}
+	entries := []ReportEntry{
+		{
+			Feature: "network-boundary",
+			Status:  "enforced",
+			Detail:  "egress confined by an in-netns nftables inet filter (output chain policy DROP) to the allowed TCP ports; UDP is dropped except DNS (rung 1, §5.2)",
+		},
+		{
+			Feature: "address-network",
+			Status:  "enforced",
+			Detail:  "address-scoped rules enforced in-netns: loopback (oif lo + daddr 127/8, ::1), RFC1918/ULA private ranges, and UDP+TCP DNS — the address boundary rung 2 cannot express (§5.2, §7.2 rung 1)",
+		},
+		{
+			Feature: "metadata-deny",
+			Status:  "enforced",
+			Detail:  "cloud-metadata endpoints (169.254.0.0/16, fd00:ec2::254) hard-dropped ahead of the Private accept, so ULA-matching metadata is still denied (§5.4)",
+		},
+	}
+	return entries
 }
 
 // fsCompileReport records how the rung-2 FS compilation treated each policy
@@ -164,9 +337,9 @@ func policyHasGlobDeny(p Policy) bool {
 // load-bearing — each closes over its own (dir, innerArgv), its own enumerated
 // rules, and its own pipe, so concurrent spawns never share per-spawn state or a
 // file descriptor.
-func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup) func(string, []string) ([]string, func(*exec.Cmd), func()) {
+func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan) func(string, []string) ([]string, func(*exec.Cmd), func()) {
 	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
-		return linuxWrap(cfs, cnet, cg, dir, innerArgv)
+		return linuxWrap(cfs, cnet, cg, r1, dir, innerArgv)
 	}
 }
 
@@ -175,7 +348,13 @@ func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup) fun
 // seals THIS spawn's spec (FS allowlist + net allowlist) into the stage-2 child
 // over a private pipe, and — when the policy forces DNS over TCP — injects
 // RES_OPTIONS=use-vc into the target env.
-func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+// When r1 is non-nil the spawn is RUNG 1 (Task 13): configure enumerates the
+// bind-mount view at spawn (a fresh snapshot), sets the namespace cloneflags +
+// uid/gid maps on the SysProcAttr, and tags the spec stage2RungOne so the child
+// applies the mount view + nftables before Landlock. The cloneflags, the spec
+// pipe, and the cgroup UseCgroupFD all coexist on the one SysProcAttr. r1 == nil
+// is the rung-2 path (no namespaces), unchanged.
+func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -218,6 +397,18 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, dir string, 
 			Seccomp:     true,
 			NetConfined: cnet.confined,
 			NetTCPPorts: cnet.tcpPorts,
+			Rung:        stage2RungTwo,
+		}
+		// Task 13: a rung-1 spawn additionally enumerates the bind-mount view (a
+		// fresh snapshot, like the FS allowlist above) and carries the nftables plan.
+		// It uses nftables for egress, so it leaves NetConfined false (no Landlock TCP
+		// net) — the netns filter is the network boundary.
+		if r1 != nil {
+			spec.Rung = stage2RungOne
+			spec.MountView = enumerateMountView(r1.mount)
+			spec.NftRules = r1.nft.toNftSpec()
+			spec.NetConfined = false
+			spec.NetTCPPorts = nil
 		}
 
 		r, w, err := os.Pipe()
@@ -238,9 +429,15 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, dir string, 
 		// Add the dispatch sentinel to the CHILD's env only (after capturing the
 		// target env above), so the child's Init() runs runStage2.
 		cmd.Env = append(cmd.Env, stage2SentinelEnv+"="+stage2SentinelValue)
-		// Empty SysProcAttr for now; rung-1 Cloneflags (user/mount/net namespaces)
-		// come in Task 13.
+		// Base SysProcAttr; the cgroup join (UseCgroupFD) below extends it. For a
+		// rung-1 spawn, set the namespace cloneflags + uid/gid maps here (Task 13):
+		// user+mount+pid namespaces always, plus a net namespace only when egress is
+		// confined (an open policy must keep host networking). These coexist with the
+		// spec pipe and the cgroup fd on the one struct.
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		if r1 != nil {
+			configureRung1SysProcAttr(cmd.SysProcAttr, r1.nft.confined)
+		}
 
 		// Task 14: create this spawn's transient cgroup v2 scope and join the stage-2
 		// child to it at clone time via CLONE_INTO_CGROUP (UseCgroupFD). The scope

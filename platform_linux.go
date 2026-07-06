@@ -5,13 +5,15 @@ package sandbox
 // platformBackend selects the OS enforcement backend on Linux by PROBING the host
 // for the strongest achievable rung (SPEC §7.2) and returning the matching backend:
 //
-//   - rung 1 or rung 2 → the re-exec Linux backend (linuxBackend). Rung 1's
-//     namespace/nftables enforcement lands in Task 13; until then a rung-1-capable
-//     host runs rung-2 confinement (Landlock FS + seccomp + TCP-port net), which is
-//     SOUND (never wider than the policy — it merely enforces less than rung 1
-//     could) and is honestly reported as LevelDegraded. The probe is what keeps the
-//     selection honest: a host that cannot enforce even rung 2 does NOT get a
-//     re-exec backend claiming confinement.
+//   - rung 1 → the full-isolation re-exec backend (newLinuxBackendRung1):
+//     user+mount+pid+net namespaces + bind-mount view + in-netns nftables, then
+//     Landlock + seccomp + cgroup (Task 13, SPEC §7.2 rung 1). Selected only when
+//     the probe confirmed a usable userns+mountns+netns; it reports LevelFull.
+//   - rung 2 → the re-exec Landlock+seccomp backend (newLinuxBackend): FS by
+//     enumerated Landlock allowlist + seccomp + TCP-port net, no namespaces. Sound
+//     (never wider than policy — it enforces less than rung 1 could) and honestly
+//     reported as LevelDegraded. The probe keeps the selection honest: a host that
+//     cannot enforce even rung 2 does NOT get a re-exec backend claiming confinement.
 //   - rung none → the null backend (honest LevelNone): no Landlock/seccomp
 //     available, so no OS enforcement is claimed rather than a re-exec that would
 //     confine nothing.
@@ -38,7 +40,15 @@ func platformBackend() (backend, error) {
 // backend and needs no Init().
 func selectLinuxBackend(r rung, initCalled bool) (backend, error) {
 	switch r {
-	case rungOne, rungTwo:
+	case rungOne:
+		if !initCalled {
+			return nil, ErrInitNotCalled
+		}
+		// Task 13: the full-isolation tier — namespaces + mount view + nftables,
+		// then Landlock + seccomp + cgroup. Selected only when the probe confirmed a
+		// usable userns+mountns+netns (selectRung -> rungOne).
+		return newLinuxBackendRung1(), nil
+	case rungTwo:
 		if !initCalled {
 			return nil, ErrInitNotCalled
 		}

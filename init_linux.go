@@ -52,6 +52,16 @@ const stage2SpecFD = 3
 // clean run, and 126 matches the shell convention for "found but not executed".
 const stage2FailExitCode = 126
 
+// stage2Rung values tag the confinement tier a stage-2 spec was compiled for
+// (SPEC §7.2). runStage2 branches on it: rung 1 additionally applies the
+// bind-mount view + in-netns nftables before the shared Landlock/seccomp axes; a
+// zero/unset value is treated as rung 2 (no namespaces), the pre-Task-13 shape,
+// so an old-shaped spec can never accidentally trigger the rung-1 mount path.
+const (
+	stage2RungTwo uint8 = 2 // Landlock + seccomp, no namespaces
+	stage2RungOne uint8 = 1 // user+mount+pid+net namespaces + mount view + nftables
+)
+
 // stage2Spec is the sealed spawn description the parent hands the stage-2 child
 // over a private pipe (SPEC §7.2). It carries exactly what the child needs to
 // become the confined target: the working directory to chdir into, the target
@@ -88,7 +98,20 @@ type stage2Spec struct {
 	// slice with NetConfined denies ALL TCP connect (the fail-closed Write shape).
 	// []uint16 is gob-encodable; the rung-2 backend fills it from the NetPolicy.
 	NetTCPPorts []uint16
-	// --- Further confinement fields (namespaces) added by Task 13 go here. ---
+	// Rung tags the confinement tier (Task 13, SPEC §7.2): stage2RungOne applies
+	// the namespaces + mount view + nftables below; stage2RungTwo (or the zero
+	// value) is the no-namespace rung-2 path. A uint8 is gob-encodable.
+	Rung uint8
+	// MountView is the rung-1 bind-mount view (Task 13a/b, SPEC §7.2 rung 1, §7.5):
+	// rw/ro/ro-remask binds plus empty-mask targets (fixed denies + glob matches),
+	// enumerated at spawn and applied by the stage-2 child (applyMountView) BEFORE
+	// Landlock. Empty for a rung-2 spawn. MountViewSpec is a concrete gob type.
+	MountView MountViewSpec
+	// NftRules is the rung-1 in-netns nftables plan (Task 13c, SPEC §5.2, §5.4):
+	// address-scoped egress with the metadata hard-deny, installed by the stage-2
+	// child (applyNftRules) inside the netns BEFORE Landlock. NftSpec.Confined is
+	// false for open egress. Empty for a rung-2 spawn. NftSpec is a concrete gob type.
+	NftRules NftSpec
 }
 
 // stage2Error is a typed, fail-closed stage-2 setup failure (SPEC §7.2). Every
@@ -190,7 +213,20 @@ func stage2Setup() error {
 	//   - Task 12c: apply the Landlock TCP-port allowlist (rung-2 network boundary)
 	//     AFTER seccomp, confining TCP connect to the policy's ports (and denying
 	//     all other TCP) — stacked with the FS ruleset, inherited across execve.
-	//   - Task 13 (later): join namespaces + cgroup (rung 1) here too.
+	//   - Task 13: for a rung-1 spawn, build the bind-mount view (mount namespace)
+	//     and install the in-netns nftables address filter (net namespace) HERE,
+	//     BEFORE Landlock — both fail closed. The child was already clone'd into the
+	//     user+mount+pid(+net) namespaces by the parent's SysProcAttr; this is the
+	//     in-namespace setup. Rung 2 leaves spec.Rung != stage2RungOne and skips it.
+	if spec.Rung == stage2RungOne {
+		if err := applyMountView(spec.MountView); err != nil {
+			return err
+		}
+		if err := applyNftRules(spec.NftRules); err != nil {
+			return err
+		}
+	}
+
 	if err := applyLandlockRules(spec.FSRules); err != nil {
 		return &stage2Error{Op: "landlock", Err: err}
 	}
