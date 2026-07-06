@@ -4,13 +4,29 @@ package sandbox
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 )
+
+// initWasCalled records that Init() ran on the NORMAL path (not a re-exec'd
+// stage-2/probe child, which os.Exit before reaching it). platformBackend (linux)
+// reads it to fail construction closed when a re-exec backend would be selected
+// but the consumer never called Init() — otherwise a stage-2 child would run the
+// consumer's main() unconfined. It is atomic because, although Init() is meant to
+// run as the first line of main() (before any goroutine), a misuse that races it
+// against NewExecutor must not be a data race.
+var initWasCalled atomic.Bool
+
+// ErrInitNotCalled is returned by NewExecutor/NewExecutorDynamic on Linux when a
+// re-exec enforcement backend (rung 1/2) would be selected but sandbox.Init() was
+// not called first (SPEC §6). It is a leaf sentinel so consumers can errors.Is it.
+var ErrInitNotCalled = errors.New("sandbox: Init() was not called — call sandbox.Init() as the very first line of main() before constructing a sandboxed executor on Linux")
 
 // stage2SentinelEnv is the reserved environment variable that flags a re-exec'd
 // stage-2 helper child (SPEC §6, §7.2). The Linux backend sets it on the child's
@@ -62,8 +78,17 @@ type stage2Spec struct {
 	// the execve and dangerous syscalls (UDP/MPTCP sockets, ptrace, io_uring) are
 	// soft-denied (EACCES). A bool is gob-encodable; the rung-2 backend sets it.
 	Seccomp bool
-	// --- Further confinement fields (namespaces/net) added by Tasks 13/12c go
-	// here. ---
+	// NetConfined requests the rung-2 Landlock TCP-port allowlist (Task 12c, SPEC
+	// §7.2, §5.2). When true the stage-2 child calls applyLandlockNet(NetTCPPorts)
+	// AFTER seccomp and BEFORE chdir/execve, confining TCP connect to NetTCPPorts
+	// (and denying all other TCP) — inherited across the execve. It is false only
+	// for open/unconfined egress (NetPolicy.Open), where TCP is left unrestricted.
+	NetConfined bool
+	// NetTCPPorts are the TCP ports the target may connect to (Task 12c). An empty
+	// slice with NetConfined denies ALL TCP connect (the fail-closed Write shape).
+	// []uint16 is gob-encodable; the rung-2 backend fills it from the NetPolicy.
+	NetTCPPorts []uint16
+	// --- Further confinement fields (namespaces) added by Task 13 go here. ---
 }
 
 // stage2Error is a typed, fail-closed stage-2 setup failure (SPEC §7.2). Every
@@ -108,7 +133,11 @@ func Init() {
 	case nsProbeNet:
 		os.Exit(runNamespaceProbeChild(nsProbeNet))
 	}
-	// Neither sentinel recognized: normal process, Init is a no-op.
+	// Neither sentinel recognized: this is a normal process. Record that Init ran
+	// (the re-exec children above os.Exit and never reach here), so platformBackend
+	// can require it before handing out a re-exec enforcement backend. Init is
+	// otherwise a no-op on the normal path.
+	initWasCalled.Store(true)
 }
 
 // runStage2 is the stage-2 child body. It performs the setup that must succeed
@@ -154,10 +183,13 @@ func stage2Setup() error {
 	//   - Task 12a: install the Landlock FS allowlist (rung 2). The ruleset
 	//     restricts this process AND everything it execve's, so a rung-2 spawn is
 	//     FS-confined the moment the target starts.
-	//   - Task 12b (this task): install the seccomp-BPF filter (rung 2) AFTER
-	//     Landlock and BEFORE chdir/execve. installSeccompFilter locks the OS
-	//     thread and never unlocks it, so the filter thread is the execve thread
-	//     and the target inherits the filter (and no_new_privs) across execve.
+	//   - Task 12b: install the seccomp-BPF filter (rung 2) AFTER Landlock and
+	//     BEFORE chdir/execve. installSeccompFilter locks the OS thread and never
+	//     unlocks it, so the filter thread is the execve thread and the target
+	//     inherits the filter (and no_new_privs) across execve.
+	//   - Task 12c: apply the Landlock TCP-port allowlist (rung-2 network boundary)
+	//     AFTER seccomp, confining TCP connect to the policy's ports (and denying
+	//     all other TCP) — stacked with the FS ruleset, inherited across execve.
 	//   - Task 13 (later): join namespaces + cgroup (rung 1) here too.
 	if err := applyLandlockRules(spec.FSRules); err != nil {
 		return &stage2Error{Op: "landlock", Err: err}
@@ -170,6 +202,18 @@ func stage2Setup() error {
 	if spec.Seccomp {
 		if err := installSeccompFilter(); err != nil {
 			return &stage2Error{Op: "seccomp", Err: err}
+		}
+	}
+
+	// Task 12c: apply the Landlock TCP-port allowlist (rung-2 network boundary)
+	// AFTER seccomp and BEFORE chdir/execve. RestrictNet clears the FS handled-set,
+	// so it stacks with the Landlock FS ruleset above (both enforced), and it is
+	// inherited across the execve. seccomp does not block any Landlock syscall, so
+	// applying it here (on the pinned seccomp thread) is safe. A non-nil error
+	// fails CLOSED so the target never runs with unrestricted egress.
+	if spec.NetConfined {
+		if err := applyLandlockNet(spec.NetTCPPorts); err != nil {
+			return &stage2Error{Op: "landlock-net", Err: err}
 		}
 	}
 

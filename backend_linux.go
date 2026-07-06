@@ -43,6 +43,7 @@ func newLinuxBackend() *linuxBackend { return &linuxBackend{} }
 // reported via level/bits/report, not via err.
 func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	cfs := compileFSPolicy(p.FS)
+	cnet := compileNetPolicy(p.Net)
 
 	bits := GuaranteeWriteBoundary
 	if cfs.hasLiteralDeny() {
@@ -51,18 +52,30 @@ func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, 
 	if !p.Env.Inherit {
 		bits |= GuaranteeEnvScrub
 	}
+	// Task 12c: the TCP-port allowlist earns GuaranteeNetworkBoundary whenever the
+	// policy is net-confined (!Net.Open). The port boundary is honest because 12b's
+	// seccomp filter blocks UDP (no address scoping) and MPTCP (which Landlock's
+	// port rules do not cover), so classic TCP is the only egress path and it is
+	// confined to the allowlist. GuaranteeAddressNetwork is NOT set — rung 2 cannot
+	// address-scope (loopback/private/metadata), recorded unenforced in the report.
+	if cnet.confined {
+		bits |= GuaranteeNetworkBoundary
+	}
 
-	spec := spawnSpec{wrap: linuxWrapFS(cfs)}
+	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet)}
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the rung-2 seccomp hardening. It does not by itself earn a
-	// guarantee bit (the NetworkBoundary bit is earned in 12c when the TCP
-	// allowlist + MPTCP block together form the boundary); it hardens the
-	// confinement by soft-denying dangerous syscalls in every rung-2 target.
+	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
+	// in every rung-2 target, and load-bearingly blocks UDP/MPTCP so the 12c TCP
+	// port allowlist is a sound, non-bypassable network boundary.
 	report.Entries = append(report.Entries, ReportEntry{
 		Feature: "seccomp-hardening",
 		Status:  "enforced",
 		Detail:  "rung-2 seccomp-BPF filter denies UDP/MPTCP sockets, ptrace, and io_uring in the stage-2 target (EACCES); installed after Landlock, inherited across execve (§7.2)",
 	})
+	// Task 12c: record the rung-2 network compilation (port allowlist enforced,
+	// DNS narrowed to TCP, address scoping unenforced).
+	report.Entries = append(report.Entries, netCompileReport(p.Net, cnet)...)
 	return spec, report, LevelDegraded, bits, nil
 }
 
@@ -118,22 +131,25 @@ func policyHasGlobDeny(p Policy) bool {
 	return false
 }
 
-// linuxWrapFS returns the per-spawn transform for a compiled FS policy: it
-// re-execs /proc/self/exe and, on each spawn, enumerates cfs into a fresh
-// Landlock allowlist (a snapshot of the live filesystem) that it seals into the
-// stage-2 child. Fresh closures per call are load-bearing — each closes over its
-// own (dir, innerArgv), its own enumerated rules, and its own pipe, so concurrent
-// spawns never share per-spawn state or a file descriptor.
-func linuxWrapFS(cfs compiledFS) func(string, []string) ([]string, func(*exec.Cmd), func()) {
+// linuxWrapTransform returns the per-spawn transform for a compiled FS + net
+// policy: it re-execs /proc/self/exe and, on each spawn, enumerates cfs into a
+// fresh Landlock allowlist (a snapshot of the live filesystem) and seals it plus
+// the net allowlist (cnet) into the stage-2 child. Fresh closures per call are
+// load-bearing — each closes over its own (dir, innerArgv), its own enumerated
+// rules, and its own pipe, so concurrent spawns never share per-spawn state or a
+// file descriptor.
+func linuxWrapTransform(cfs compiledFS, cnet compiledNet) func(string, []string) ([]string, func(*exec.Cmd), func()) {
 	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
-		return linuxWrap(cfs, dir, innerArgv)
+		return linuxWrap(cfs, cnet, dir, innerArgv)
 	}
 }
 
 // linuxWrap is the per-spawn transform body. It re-execs /proc/self/exe and
-// returns a fresh configure/cleanup pair that enumerates the FS rules at spawn
-// and seals THIS spawn's spec into the stage-2 child over a private pipe.
-func linuxWrap(cfs compiledFS, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+// returns a fresh configure/cleanup pair that enumerates the FS rules at spawn,
+// seals THIS spawn's spec (FS allowlist + net allowlist) into the stage-2 child
+// over a private pipe, and — when the policy forces DNS over TCP — injects
+// RES_OPTIONS=use-vc into the target env.
+func linuxWrap(cfs compiledFS, cnet compiledNet, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -148,6 +164,13 @@ func linuxWrap(cfs compiledFS, dir string, innerArgv []string) ([]string, func(*
 		// execve'd target never observes LRSANDBOX_STAGE2. The executor has already
 		// set cmd.Env to the scrubbed child environment at this point.
 		targetEnv := append([]string(nil), cmd.Env...)
+		// Task 12c: when the policy forces DNS over TCP, ensure the target's glibc
+		// resolver uses TCP (RES_OPTIONS=use-vc) — UDP is seccomp-blocked (12b), so
+		// without this glibc's initial UDP query fails. Mutating targetEnv (a fresh
+		// copy) is safe and never touches the parent's cmd.Env.
+		if cnet.dns {
+			targetEnv = ensureResOptionsUseVC(targetEnv)
+		}
 		// Enumerate the FS allowlist NOW (per spawn) so it is a fresh snapshot of
 		// the live filesystem: a secret that exists when the command starts is
 		// carved out; a file the command later creates is not (§7.5 snapshot
@@ -157,7 +180,15 @@ func linuxWrap(cfs compiledFS, dir string, innerArgv []string) ([]string, func(*
 		// only selected when the seccomp capability was probed present (selectRung
 		// requires c.seccomp), so the stage-2 install cannot be a surprise failure.
 		// It denies UDP/MPTCP sockets, ptrace, and io_uring in the target (Task 12b).
-		spec := stage2Spec{Dir: dir, Argv: innerArgv, Env: targetEnv, FSRules: fsRules, Seccomp: true}
+		spec := stage2Spec{
+			Dir:         dir,
+			Argv:        innerArgv,
+			Env:         targetEnv,
+			FSRules:     fsRules,
+			Seccomp:     true,
+			NetConfined: cnet.confined,
+			NetTCPPorts: cnet.tcpPorts,
+		}
 
 		r, w, err := os.Pipe()
 		if err != nil {

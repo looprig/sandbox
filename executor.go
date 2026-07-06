@@ -229,9 +229,16 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 
 	// Backend selection: platformBackend() for production; a test may pin one via
 	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
+	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
+	// backend selected without Init() having been called), which fails construction
+	// closed rather than building an executor that would spawn incorrectly.
 	b := cfg.backend
 	if b == nil {
-		b = platformBackend()
+		var berr error
+		b, berr = platformBackend()
+		if berr != nil {
+			return nil, berr
+		}
 	}
 	spec, report, level, bits, err := b.compile(p)
 	if err != nil {
@@ -300,8 +307,13 @@ func NewExecutorDynamic(src ModeSource, workspace string, popts ...PolicyOption)
 		return nil, fmt.Errorf("sandbox: grant key: %w", err)
 	}
 
+	b, berr := platformBackend()
+	if berr != nil {
+		return nil, berr
+	}
+
 	e := &Executor{
-		backend:   platformBackend(),
+		backend:   b,
 		grantKey:  key,
 		policyGen: 1,
 		clock:     time.Now,

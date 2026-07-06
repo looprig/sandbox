@@ -239,6 +239,11 @@ func TestLinuxFSGuarantees(t *testing.T) {
 		{"WriteBoundary", g.WriteBoundary},
 		{"ReadDenies", g.ReadDenies},
 		{"EnvScrub", g.EnvScrub},
+		// NetworkBoundary is earned by 12c: PolicyFor(Write) is net-confined (Net{}
+		// compiles to an empty TCP allowlist = all TCP denied), so the port-level
+		// network boundary holds. AddressNetwork stays false — rung 2 cannot
+		// address-scope.
+		{"NetworkBoundary", g.NetworkBoundary},
 	}
 	for _, b := range trueBits {
 		if !b.got {
@@ -250,13 +255,12 @@ func TestLinuxFSGuarantees(t *testing.T) {
 		got  bool
 	}{
 		{"ProcessBoundary", g.ProcessBoundary},
-		{"NetworkBoundary", g.NetworkBoundary},
 		{"AddressNetwork", g.AddressNetwork},
 		{"ResourceLimits", g.ResourceLimits},
 	}
 	for _, b := range falseBits {
 		if b.got {
-			t.Errorf("Guarantees().%s = true, want false (not enforced at rung-2 FS in 12a)", b.name)
+			t.Errorf("Guarantees().%s = true, want false (not enforced at rung 2)", b.name)
 		}
 	}
 	if lvl := e.Level(); lvl != LevelDegraded {

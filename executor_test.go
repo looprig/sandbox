@@ -686,11 +686,16 @@ func TestHomeGuard(t *testing.T) {
 }
 
 // TestWrap asserts Wrap applies the scrubbed environment to a caller-built cmd:
-// a planted GITHUB_TOKEN is absent from the wrapped command's Env.
+// a planted GITHUB_TOKEN is absent from the wrapped command's Env. It pins the
+// null backend via withBackend: Wrap is only supported on backends with no
+// per-spawn cleanup (null/seatbelt/external), and on Linux the real platform
+// backend is the re-exec linuxBackend, whose wrap returns a cleanup — so Wrap
+// there fails closed by design (see TestWrapFailsClosedOnReexecBackend). This unit
+// test exercises Wrap's env-scrub logic on the null backend, backend-independently.
 func TestWrap(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "secret")
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

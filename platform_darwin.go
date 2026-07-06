@@ -12,4 +12,4 @@ package sandbox
 // would silently drop all OS enforcement). A test may still pin the null backend
 // through the unexported withBackend seam to keep executor UNIT tests
 // backend-independent.
-func platformBackend() backend { return newSeatbeltBackend() }
+func platformBackend() (backend, error) { return newSeatbeltBackend(), nil }
