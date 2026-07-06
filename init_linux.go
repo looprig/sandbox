@@ -50,7 +50,14 @@ type stage2Spec struct {
 	Dir  string   // working directory to chdir into before exec
 	Argv []string // the target argv to execve (already shell-normalized by the executor)
 	Env  []string // the scrubbed child environment the TARGET should see (KEY=VALUE)
-	// --- Confinement fields added by Tasks 12/13/14 go here. ---
+	// FSRules is the compiled, spawn-time-enumerated Landlock FS allowlist (Task
+	// 12a, SPEC §7.2 rung 2). The parent enumerates the policy's FS axis against
+	// the live filesystem at spawn (enumerateFSRules) and the stage-2 child
+	// rebuilds a go-landlock ruleset from it (applyLandlockRules) and restricts
+	// itself before chdir/execve. fsRule is a concrete, gob-encodable type.
+	FSRules []fsRule
+	// --- Further confinement fields (namespaces/seccomp/net) added by Tasks
+	// 13/14 go here. ---
 }
 
 // stage2Error is a typed, fail-closed stage-2 setup failure (SPEC §7.2). Every
@@ -134,13 +141,18 @@ func stage2Setup() error {
 		return &stage2Error{Op: "spec argv", Err: errEmptyStage2Argv}
 	}
 
-	// TODO(Tasks 12/13/14): apply confinement HERE, before chdir/execve, from the
-	// confinement fields added to stage2Spec:
-	//   - Task 13: join the target user/mount/net namespaces + cgroup (rung 1).
-	//   - Task 12: install the Landlock ruleset (FS allowlist / deny-reads).
-	//   - Task 14: install the seccomp filter.
-	// Each must fail CLOSED via a stage2Error so a confinement failure aborts the
-	// spawn rather than running the target unconfined.
+	// Apply confinement HERE, before chdir/execve, from the confinement fields on
+	// the sealed spec. Each step fails CLOSED via a stage2Error so a confinement
+	// failure aborts the spawn rather than running the target unconfined.
+	//
+	//   - Task 12a (this task): install the Landlock FS allowlist (rung 2). The
+	//     ruleset restricts this process AND everything it execve's, so a rung-2
+	//     spawn is FS-confined the moment the target starts.
+	//   - Tasks 13/14 (later): join namespaces + cgroup (rung 1) and install the
+	//     seccomp filter here too.
+	if err := applyLandlockRules(spec.FSRules); err != nil {
+		return &stage2Error{Op: "landlock", Err: err}
+	}
 
 	if err := os.Chdir(spec.Dir); err != nil {
 		return &stage2Error{Op: "chdir " + spec.Dir, Err: err}
