@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  # Format, vet, and the cgo-free -trimpath build on Linux (fast fail).
+  lint-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: files above need formatting'; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: build (cgo-free, -trimpath)
+        run: CGO_ENABLED=0 go build -trimpath ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # macOS: the Seatbelt backend runs for real.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go test -race (seatbelt)
+        run: go test -race -count=1 ./...
+
+  # Linux RUNG 2: the default GitHub runner (or any host where unprivileged
+  # userns is unavailable) exercises the Landlock + seccomp + TCP-port path.
+  # Rung-1 tests skip with a recorded reason here.
+  test-linux-rung2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go test -race (rung 2; rung 1 skips)
+        run: go test -race -count=1 ./...
+
+  # Linux RUNG 1: enable unprivileged user namespaces + load nf_conntrack so the
+  # namespace/mount-view/nftables enforcement path actually executes. This is
+  # where the rung-1 tests (skipped elsewhere) validate.
+  test-linux-rung1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: enable unprivileged userns + conntrack
+        run: |
+          # Ubuntu 24.04 restricts unprivileged userns via AppArmor; lift it for CI.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sudo modprobe nf_conntrack || true
+          sudo modprobe nf_tables || true
+      - name: go test -race (rung 1 enforcement)
+        run: go test -race -count=1 ./...
