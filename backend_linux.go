@@ -21,15 +21,24 @@ import (
 // later; until then the backend reports LevelDegraded with the write-boundary +
 // read-deny + env-scrub guarantees a rung-2 FS confinement genuinely upholds.
 type linuxBackend struct {
-	// Intentionally minimal: rung-2 FS confinement needs only the policy at
-	// compile time. Task 13 will widen the constructor to carry the probed
-	// rung/linuxCaps so compile can select namespaces vs Landlock-only.
+	// cgroupPids is the writable cgroup v2 ancestor distributing the pids
+	// controller, probed ONCE at construction (Task 14, SPEC §7.4), or "" when no
+	// such ancestor exists. It decides — at compile time — whether the
+	// ResourceLimits guarantee holds; each spawn creates its transient scope under
+	// it. Probing at construction (not per spawn) makes the guarantee a stable
+	// property of the executor: availability is measured once, the same value the
+	// per-spawn configure uses. Task 13 will widen the constructor to also carry
+	// the probed rung/linuxCaps once namespace enforcement is compiled.
+	cgroupPids string
 }
 
-// newLinuxBackend constructs the Linux backend. It takes nothing today — rung-2
-// FS confinement is compiled from the policy alone; Task 13 will widen it to
-// accept the probed rung/caps once namespace enforcement is compiled.
-func newLinuxBackend() *linuxBackend { return &linuxBackend{} }
+// newLinuxBackend constructs the Linux backend. It keeps its no-argument
+// signature (existing callers and tests rely on it) and probes the delegated
+// cgroup v2 pids ancestor here so compile can decide the ResourceLimits guarantee
+// (SPEC §7.4). rung-2 FS confinement is still compiled from the policy alone.
+func newLinuxBackend() *linuxBackend {
+	return &linuxBackend{cgroupPids: probeDelegatedPidsAncestor()}
+}
 
 // compile builds the re-exec spawnSpec and applies rung-2 FS confinement. It
 // distils the policy's FS axis into a compiledFS (literal allows + literal
@@ -41,9 +50,15 @@ func newLinuxBackend() *linuxBackend { return &linuxBackend{} }
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
 // unenforced. It never errors — a policy that compiles to a narrower ruleset is
 // reported via level/bits/report, not via err.
-func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	cfs := compileFSPolicy(p.FS)
 	cnet := compileNetPolicy(p.Net)
+	// Task 14: resolve the cgroup v2 resource-limit plan against the ancestor
+	// probed at construction. enforced() decides the ResourceLimits guarantee at
+	// COMPILE time; each spawn creates the transient scope at SPAWN time (see
+	// linuxWrap). Resource limits never change the isolation Level — they are
+	// containment-of-cost, not authority (§7.4), so LevelDegraded is unchanged.
+	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
 
 	bits := GuaranteeWriteBoundary
 	if cfs.hasLiteralDeny() {
@@ -61,8 +76,15 @@ func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, 
 	if cnet.confined {
 		bits |= GuaranteeNetworkBoundary
 	}
+	// Task 14: the ResourceLimits guarantee holds iff a transient cgroup scope will
+	// be created (cgroup v2 pids delegation available AND not policy-disabled).
+	// When unavailable the bit stays clear (fail-secure) and the spawn still runs,
+	// just uncapped — recorded below.
+	if cg.enforced() {
+		bits |= GuaranteeResourceLimits
+	}
 
-	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet)}
+	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet, cg)}
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the rung-2 seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
@@ -76,6 +98,10 @@ func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, 
 	// Task 12c: record the rung-2 network compilation (port allowlist enforced,
 	// DNS narrowed to TCP, address scoping unenforced).
 	report.Entries = append(report.Entries, netCompileReport(p.Net, cnet)...)
+	// Task 14: record the cgroup v2 resource-limit outcome (enforced when a
+	// transient pids-capped scope will be created; unenforced — distinguishing a
+	// policy opt-out from absent delegation — otherwise). It never changes Level.
+	report.Entries = append(report.Entries, cgroupCompileReport(cg))
 	return spec, report, LevelDegraded, bits, nil
 }
 
@@ -138,9 +164,9 @@ func policyHasGlobDeny(p Policy) bool {
 // load-bearing — each closes over its own (dir, innerArgv), its own enumerated
 // rules, and its own pipe, so concurrent spawns never share per-spawn state or a
 // file descriptor.
-func linuxWrapTransform(cfs compiledFS, cnet compiledNet) func(string, []string) ([]string, func(*exec.Cmd), func()) {
+func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup) func(string, []string) ([]string, func(*exec.Cmd), func()) {
 	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
-		return linuxWrap(cfs, cnet, dir, innerArgv)
+		return linuxWrap(cfs, cnet, cg, dir, innerArgv)
 	}
 }
 
@@ -149,7 +175,7 @@ func linuxWrapTransform(cfs compiledFS, cnet compiledNet) func(string, []string)
 // seals THIS spawn's spec (FS allowlist + net allowlist) into the stage-2 child
 // over a private pipe, and — when the policy forces DNS over TCP — injects
 // RES_OPTIONS=use-vc into the target env.
-func linuxWrap(cfs compiledFS, cnet compiledNet, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -158,6 +184,10 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, dir string, innerArgv []string)
 	// pipeR/pipeW are this spawn's private spec pipe, captured so cleanup can close
 	// both ends after the spawn completes.
 	var pipeR, pipeW *os.File
+	// tcg is this spawn's transient cgroup v2 scope (Task 14), captured so cleanup
+	// can tear it down unconditionally. It is nil when limits are not applied (no
+	// delegation / policy-disabled) or when scope creation failed best-effort.
+	var tcg *transientCgroup
 
 	configure := func(cmd *exec.Cmd) {
 		// Capture the TARGET environment BEFORE adding the dispatch sentinel, so the
@@ -212,6 +242,26 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, dir string, innerArgv []string)
 		// come in Task 13.
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 
+		// Task 14: create this spawn's transient cgroup v2 scope and join the stage-2
+		// child to it at clone time via CLONE_INTO_CGROUP (UseCgroupFD). The scope
+		// carries the policy's resource limits (pids.max is the fork-bomb cap), so the
+		// child — and everything it forks — is capped from its first fork. Resource
+		// limits are containment-of-cost, not authority (§7.4): if the scope cannot be
+		// created this spawn still runs, just UNCAPPED (fail-secure, best-effort — the
+		// compile-time guarantee already reflected availability). createTransientCgroup
+		// returns (nil, nil) when the plan applies no limits, so the join is simply
+		// left unset. It EXTENDS the SysProcAttr above rather than replacing it.
+		tc, cgErr := createTransientCgroup(cg)
+		switch {
+		case cgErr != nil:
+			// Best-effort: this spawn runs without a cgroup cap (§7.4); not fatal.
+			tcg = nil
+		case tc != nil:
+			tcg = tc
+			cmd.SysProcAttr.UseCgroupFD = true
+			cmd.SysProcAttr.CgroupFD = tc.fd
+		}
+
 		// Encode the spec on a goroutine: the gob payload is small (fits the pipe
 		// buffer), so this completes without blocking even before the child reads,
 		// but the goroutine keeps the spawn non-blocking regardless. Best-effort:
@@ -223,6 +273,12 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, dir string, innerArgv []string)
 	}
 
 	cleanup := func() {
+		// Task 14: tear down this spawn's transient cgroup FIRST (kill any survivors
+		// in the scope, then rmdir). Unconditional and safe — it only ever touches
+		// the scope this spawn created, and is a no-op when none was created.
+		if tcg != nil {
+			tcg.teardown()
+		}
 		// Release this spawn's pipe ends after the spawn completes. The child holds
 		// its own dup of the read end; closing the parent's copies here frees the
 		// fds. w may already be closed by the encode goroutine — a double close is a

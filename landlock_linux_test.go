@@ -224,8 +224,10 @@ func TestLinuxFSSnapshotSemantics(t *testing.T) {
 }
 
 // TestLinuxFSGuarantees asserts the rung-2 FS level/guarantee posture (§6, §7.5):
-// write boundary + fixed read-denies + env scrub enforced; process/network/
-// address/resource guarantees NOT claimed; level is Degraded.
+// write boundary + fixed read-denies + env scrub enforced; process/address
+// guarantees NOT claimed; level is Degraded. ResourceLimits is host-dependent
+// (Task 14): it holds iff cgroup v2 pids delegation is available, so it is asserted
+// against the probe rather than pinned false — and never affects the Level either way.
 func TestLinuxFSGuarantees(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
@@ -256,12 +258,17 @@ func TestLinuxFSGuarantees(t *testing.T) {
 	}{
 		{"ProcessBoundary", g.ProcessBoundary},
 		{"AddressNetwork", g.AddressNetwork},
-		{"ResourceLimits", g.ResourceLimits},
 	}
 	for _, b := range falseBits {
 		if b.got {
 			t.Errorf("Guarantees().%s = true, want false (not enforced at rung 2)", b.name)
 		}
+	}
+	// ResourceLimits (Task 14) is earned only when cgroup v2 pids delegation is
+	// available; it is orthogonal to the FS rung and must never move the Level.
+	wantResourceLimits := probeDelegatedPidsAncestor() != ""
+	if g.ResourceLimits != wantResourceLimits {
+		t.Errorf("Guarantees().ResourceLimits = %v, want %v (matches cgroup v2 pids delegation availability)", g.ResourceLimits, wantResourceLimits)
 	}
 	if lvl := e.Level(); lvl != LevelDegraded {
 		t.Errorf("Level() = %d, want LevelDegraded (%d)", lvl, LevelDegraded)
