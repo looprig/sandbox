@@ -15,8 +15,11 @@
 //		// ... rest of program
 //	}
 //
-// Init is a no-op stub today, but it becomes load-bearing on Linux, where the
-// sandbox must re-exec or reconfigure the process before any other goroutine,
-// file descriptor, or thread state is established. Wiring the call from day one
-// means consumers do not have to retrofit it when the Linux enforcement lands.
+// On Linux, Init is the load-bearing re-exec dispatch entry point: every
+// sandboxed spawn re-executes /proc/self/exe as a confinement helper (the
+// moby/reexec pattern), and Init catches that re-exec before main() runs. On
+// other platforms it is a no-op — but call it unconditionally so the code is
+// portable. If it is not called, constructing an Executor with a Linux
+// enforcement backend fails closed with ErrInitNotCalled rather than running
+// commands unconfined.
 package sandbox
