@@ -67,19 +67,19 @@ func validatePolicy(p Policy) error {
 	return nil
 }
 
-// Init is called first in the consumer's main() (SPEC §6). It is a no-op stub
-// today, but consumers MUST call it as the very first line of main() regardless:
+// Init is defined per-platform (init_linux.go / init_other.go): it is THE
+// re-exec dispatch entry point (SPEC §6). Consumers MUST call it as the very
+// first line of main(), before any goroutine, file descriptor, or thread state
+// is established:
 //
 //	func main() {
 //		sandbox.Init()
 //		// ... rest of program
 //	}
 //
-// It becomes load-bearing on Linux, where the sandbox re-executes the process as
-// a stage-2 helper (moby/reexec pattern, §7.2, Task 11) before any other
-// goroutine, file descriptor, or thread state is established. Wiring the call
-// from day one means consumers never have to retrofit it.
-func Init() {}
+// On non-Linux platforms it is a no-op. On Linux it inspects the reserved
+// re-exec sentinels and dispatches a stage-2 helper or namespace-probe child
+// (moby/reexec pattern, §7.2); in a normal process it returns immediately.
 
 // execConfig accumulates ExecOption settings before they are stored on the
 // Executor. It exists so the option functions have a single mutable target
