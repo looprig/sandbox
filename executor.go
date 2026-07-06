@@ -17,6 +17,19 @@ import (
 // not supplied (SPEC §9.2, §13 decision 5: 15 minutes).
 const defaultGrantTTL = 15 * time.Minute
 
+// spawnWaitGrace bounds how long a spawn's Wait/CombinedOutput blocks for I/O
+// AFTER the context is cancelled and the child is killed (exec.Cmd.WaitDelay,
+// Go 1.20+). It exists because on Linux a shell may FORK the target (e.g. dash
+// runs `sh -c "sleep 5"` as a child, unlike macOS's exec-replacing /bin/sh): when
+// the immediate child is SIGKILLed on a deadline, the orphaned grandchild
+// inherits the stdout/stderr pipe and holds it open, so CombinedOutput would
+// otherwise block reading that pipe until the grandchild exits on its own — well
+// past the deadline. WaitDelay makes the deadline prompt by force-closing the
+// pipes and returning after the grace. It only ever fires after the context is
+// done or the process has exited, so a live command under a healthy context is
+// never truncated. The value trades a brief I/O-flush window against promptness.
+const spawnWaitGrace = time.Second
+
 // fullGuarantees is every defined guarantee bit set — the FULL posture. Only an
 // external executor asserts it, by explicit deployment declaration (SPEC §11);
 // no probing ever mints it.
@@ -484,6 +497,7 @@ func (e *Executor) run(ctx context.Context, dir string, argv []string, s snapsho
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	cmd.WaitDelay = spawnWaitGrace // bound deadline latency when a forked grandchild holds the output pipe
 	cmd.Env = s.env
 	// Belt-and-suspenders fail-closed guard: cmd.Env == nil makes exec.Cmd
 	// inherit the entire parent environment. assembleEnv never returns nil, but a
@@ -745,6 +759,9 @@ func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
 	cmd.Env = s.env
 	if cmd.Env == nil {
 		cmd.Env = []string{} // same fail-closed guard as run
+	}
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = spawnWaitGrace // default deadline-latency bound; the caller may override
 	}
 	if s.spec.configure != nil {
 		s.spec.configure(cmd)
