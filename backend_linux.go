@@ -53,7 +53,17 @@ func (linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, 
 	}
 
 	spec := spawnSpec{wrap: linuxWrapFS(cfs)}
-	return spec, fsCompileReport(p, cfs), LevelDegraded, bits, nil
+	report := fsCompileReport(p, cfs)
+	// Task 12b: record the rung-2 seccomp hardening. It does not by itself earn a
+	// guarantee bit (the NetworkBoundary bit is earned in 12c when the TCP
+	// allowlist + MPTCP block together form the boundary); it hardens the
+	// confinement by soft-denying dangerous syscalls in every rung-2 target.
+	report.Entries = append(report.Entries, ReportEntry{
+		Feature: "seccomp-hardening",
+		Status:  "enforced",
+		Detail:  "rung-2 seccomp-BPF filter denies UDP/MPTCP sockets, ptrace, and io_uring in the stage-2 target (EACCES); installed after Landlock, inherited across execve (§7.2)",
+	})
+	return spec, report, LevelDegraded, bits, nil
 }
 
 // fsCompileReport records how the rung-2 FS compilation treated each policy
@@ -143,7 +153,11 @@ func linuxWrap(cfs compiledFS, dir string, innerArgv []string) ([]string, func(*
 		// carved out; a file the command later creates is not (§7.5 snapshot
 		// semantics). The stage-2 child rebuilds the Landlock ruleset from this.
 		fsRules := enumerateFSRules(cfs)
-		spec := stage2Spec{Dir: dir, Argv: innerArgv, Env: targetEnv, FSRules: fsRules}
+		// Seccomp is unconditionally requested for this rung-2 backend: rung 2 is
+		// only selected when the seccomp capability was probed present (selectRung
+		// requires c.seccomp), so the stage-2 install cannot be a surprise failure.
+		// It denies UDP/MPTCP sockets, ptrace, and io_uring in the target (Task 12b).
+		spec := stage2Spec{Dir: dir, Argv: innerArgv, Env: targetEnv, FSRules: fsRules, Seccomp: true}
 
 		r, w, err := os.Pipe()
 		if err != nil {

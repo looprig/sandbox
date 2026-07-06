@@ -56,8 +56,14 @@ type stage2Spec struct {
 	// rebuilds a go-landlock ruleset from it (applyLandlockRules) and restricts
 	// itself before chdir/execve. fsRule is a concrete, gob-encodable type.
 	FSRules []fsRule
-	// --- Further confinement fields (namespaces/seccomp/net) added by Tasks
-	// 13/14 go here. ---
+	// Seccomp requests the rung-2 seccomp-BPF filter (Task 12b, SPEC §7.2). When
+	// true the stage-2 child installs buildSeccompFilter() AFTER Landlock and
+	// BEFORE chdir/execve (installSeccompFilter), so the target inherits it across
+	// the execve and dangerous syscalls (UDP/MPTCP sockets, ptrace, io_uring) are
+	// soft-denied (EACCES). A bool is gob-encodable; the rung-2 backend sets it.
+	Seccomp bool
+	// --- Further confinement fields (namespaces/net) added by Tasks 13/12c go
+	// here. ---
 }
 
 // stage2Error is a typed, fail-closed stage-2 setup failure (SPEC §7.2). Every
@@ -145,13 +151,26 @@ func stage2Setup() error {
 	// the sealed spec. Each step fails CLOSED via a stage2Error so a confinement
 	// failure aborts the spawn rather than running the target unconfined.
 	//
-	//   - Task 12a (this task): install the Landlock FS allowlist (rung 2). The
-	//     ruleset restricts this process AND everything it execve's, so a rung-2
-	//     spawn is FS-confined the moment the target starts.
-	//   - Tasks 13/14 (later): join namespaces + cgroup (rung 1) and install the
-	//     seccomp filter here too.
+	//   - Task 12a: install the Landlock FS allowlist (rung 2). The ruleset
+	//     restricts this process AND everything it execve's, so a rung-2 spawn is
+	//     FS-confined the moment the target starts.
+	//   - Task 12b (this task): install the seccomp-BPF filter (rung 2) AFTER
+	//     Landlock and BEFORE chdir/execve. installSeccompFilter locks the OS
+	//     thread and never unlocks it, so the filter thread is the execve thread
+	//     and the target inherits the filter (and no_new_privs) across execve.
+	//   - Task 13 (later): join namespaces + cgroup (rung 1) here too.
 	if err := applyLandlockRules(spec.FSRules); err != nil {
 		return &stage2Error{Op: "landlock", Err: err}
+	}
+
+	// Seccomp is applied AFTER Landlock: both survive execve, so the order does
+	// not change what the target inherits; seccomp is placed last so the pinned
+	// filter thread proceeds directly to chdir/execve below on the SAME goroutine
+	// (runtime.LockOSThread), guaranteeing filter-thread == execve-thread.
+	if spec.Seccomp {
+		if err := installSeccompFilter(); err != nil {
+			return &stage2Error{Op: "seccomp", Err: err}
+		}
 	}
 
 	if err := os.Chdir(spec.Dir); err != nil {
