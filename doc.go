@@ -1,10 +1,13 @@
-// Package sandbox provides OS-level sandboxing for agent command execution.
+// Package sandbox provides standalone OS-level confinement for command
+// execution under immutable, consumer-defined access profiles.
 //
 // Harness's permission gates answer "may this tool call run?". This module
 // answers "what can it touch once it runs?". The two compose: OS-level
 // enforcement is what makes approved authority meaningful. Concretely, it
-// provides immutable consumer-defined access profiles and per-platform enforcement
-// (Seatbelt on macOS; namespaces + Landlock + seccomp + nftables on Linux).
+// provides immutable consumer-defined access profiles, single-spawn
+// post-decision grants, honest achieved guarantees, and per-platform enforcement
+// (Seatbelt on macOS; namespaces + Landlock + seccomp + nftables on Linux). It
+// does not import an approval system or read permission files.
 //
 // # Initialization
 //
@@ -21,5 +24,7 @@
 // other platforms it is a no-op — but call it unconditionally so the code is
 // portable. If it is not called, constructing an Executor with a Linux
 // enforcement backend fails closed with ErrInitNotCalled rather than running
-// commands unconfined.
+// commands unconfined. A sandboxed profile also fails closed with
+// ErrSandboxUnavailable on a host without a production backend; direct
+// execution exists only for an explicitly acknowledged Unconfined profile.
 package sandbox

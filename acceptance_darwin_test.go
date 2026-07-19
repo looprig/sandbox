@@ -36,7 +36,16 @@ func TestAcceptanceMatrixDarwin(t *testing.T) {
 	}
 
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	gitDir := filepath.Join(ws, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: ws, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+		AdditionalRoots: []RootAccess{{Path: gitDir, Read: Allow, Write: Deny}},
+	})
+	e, err := NewExecutor(profile)
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -73,9 +82,6 @@ func TestAcceptanceMatrixDarwin(t *testing.T) {
 	}
 
 	// Write into ws/.git is denied (read-only carveout).
-	if err := os.MkdirAll(filepath.Join(ws, ".git"), 0o755); err != nil {
-		t.Fatalf("mkdir .git: %v", err)
-	}
 	if out, code, rerr := e.RunCommand(ctx, ws, "echo hi > "+filepath.Join(ws, ".git", "x")); rerr != nil {
 		t.Fatalf(".git write: spawn err %v", rerr)
 	} else if code == 0 {

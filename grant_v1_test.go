@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -22,8 +23,8 @@ func (b *captureBackend) compile(policy effectivePolicy) (spawnSpec, CompileRepo
 	if b.compileErr != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, b.compileErr
 	}
-	spec, report, level, _, err := newNullBackend().compile(policy)
-	return spec, report, level, b.bits, err
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) { return argv, nil, nil }}
+	return spec, CompileReport{}, LevelNone, b.bits, nil
 }
 
 func (b *captureBackend) lastPolicy() effectivePolicy {

@@ -46,7 +46,7 @@ func TestCompileMountView(t *testing.T) {
 	}{
 		{
 			name:        "write mode: workspace+tmp rw, / ro, carveouts ro, secrets masked",
-			policy:      PolicyFor(Write, ws),
+			policy:      testPolicy(testWorkspaceWrite, ws),
 			wantRW:      []string{ws, writableTmpRoot},
 			wantRO:      []string{"/", filepath.Join(ws, ".git"), filepath.Join(ws, ".looprig")},
 			wantGlob:    []string{"**/.env*"},
@@ -54,7 +54,7 @@ func TestCompileMountView(t *testing.T) {
 		},
 		{
 			name:   "zerotrust: workspace read-only bind, no rw roots",
-			policy: PolicyFor(ZeroTrust, ws),
+			policy: testPolicy(testScopedRuntime, ws),
 			wantRO: []string{ws},
 			// zerotrust grants no writable root at all.
 			wantNotBound: []string{writableTmpRoot},
@@ -290,12 +290,12 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	}{
 		{
 			name:     "write mode: full posture incl. address network (egress confined-empty)",
-			policy:   PolicyFor(Write, ws),
+			policy:   testPolicy(testWorkspaceWrite, ws),
 			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
 		{
 			name:     "trusted mode: full posture with ports/loopback/private/dns",
-			policy:   PolicyFor(Trusted, ws),
+			policy:   testPolicy(testBroadNetwork, ws),
 			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
 	}
@@ -405,7 +405,7 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 
 	// Write mode (workspace rw, glob deny on .env). The workspace is visible/writable
 	// and the .env is masked empty; use Write so the write assertion is meaningful.
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newLinuxBackendRung1()))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newLinuxBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

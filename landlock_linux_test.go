@@ -77,7 +77,7 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 	outside := filepath.Join(home, ".lrsandbox-writeboundary-should-not-exist")
 	t.Cleanup(func() { _ = os.Remove(outside) })
 
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 
 	inside := filepath.Join(ws, "inside.txt")
 	if code := tryWrite(t, e, ws, inside); code != 0 {
@@ -100,7 +100,7 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 func TestLinuxFSTmpWritable(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 
 	tmpFile := filepath.Join("/tmp", ".lrsandbox-tmp-writable-test")
 	t.Cleanup(func() { _ = os.Remove(tmpFile) })
@@ -133,7 +133,7 @@ func TestLinuxFSGitCarveout(t *testing.T) {
 		t.Fatalf("mkdir src: %v", err)
 	}
 
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 
 	// Positive: .git/config is readable, and the pre-existing src sibling is
 	// writable.
@@ -168,7 +168,7 @@ func TestLinuxFSSecretDeny(t *testing.T) {
 		t.Fatalf("seed allowed: %v", err)
 	}
 
-	e := newFSExecutor(t, PolicyFor(Write, ws, WithDenyRead(secret)))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithDenyRead(secret)))
 
 	// Negative: the secret is unreadable (denied out of BOTH the workspace RW and
 	// the broad "/" read via enumerated sibling allows).
@@ -205,7 +205,7 @@ func TestLinuxFSSnapshotSemantics(t *testing.T) {
 		t.Fatalf("mkdir work: %v", err)
 	}
 
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 
 	// Pre-existing subdir: writable.
 	if code := tryWrite(t, e, ws, filepath.Join(work, "x")); code != 0 {
@@ -231,7 +231,7 @@ func TestLinuxFSSnapshotSemantics(t *testing.T) {
 func TestLinuxFSGuarantees(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 
 	g := e.Guarantees()
 	trueBits := []struct {
@@ -241,7 +241,7 @@ func TestLinuxFSGuarantees(t *testing.T) {
 		{"WriteBoundary", g.WriteBoundary},
 		{"ReadBoundary", g.ReadBoundary},
 		{"EnvScrub", g.EnvScrub},
-		// NetworkBoundary is earned by 12c: PolicyFor(Write) is net-confined (Net{}
+		// NetworkBoundary is earned by 12c: the fixture is net-confined (Net{}
 		// compiles to an empty TCP allowlist = all TCP denied), so the port-level
 		// network boundary holds. AddressNetwork stays false — rung 2 cannot
 		// address-scope.
@@ -507,7 +507,7 @@ func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws, WithWritable(secretDir), WithDenyRead(secretDir)), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws, WithWritable(secretDir), WithDenyRead(secretDir)), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

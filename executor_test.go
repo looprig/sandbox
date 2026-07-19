@@ -18,7 +18,7 @@ func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 	ws := t.TempDir()
 	// pin null: this asserts null-backend semantics (LevelNone, EnvScrub-only bits,
 	// empty report), not the platform backend that platformBackend() selects here.
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 // code even when non-zero; only a spawn/setup failure returns a non-nil error.
 func TestRunCommand(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRunCommand(t *testing.T) {
 // metacharacters are literal arguments rather than syntax.
 func TestRunArgv(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestRunArgv(t *testing.T) {
 // spawn/setup failure (working directory does not exist) returns a non-nil error.
 func TestRunCommandSpawnFailure(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRunCommandSpawnFailure(t *testing.T) {
 
 // TestEnvScrub is the load-bearing security test: the child sees the §5.5
 // baseline plus the forced TMPDIR, and harness secrets such as GITHUB_TOKEN are
-// absent. PolicyFor(Write) uses the baseline allowlist (no inheritance) with
+// absent. The workspace-write fixture uses the baseline allowlist (no inheritance) with
 // TMPDIR forced to /tmp.
 func TestEnvScrub(t *testing.T) {
 	if os.Getenv("PATH") == "" {
@@ -139,7 +139,7 @@ func TestEnvScrub(t *testing.T) {
 
 	ws := t.TempDir()
 	// Construct AFTER Setenv: assembleEnv snapshots os.Environ() at build time.
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 // verify construction succeeds with them applied.
 func TestExecOptions(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws),
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws),
 		WithGrantTTL(30*time.Second),
 		WithCgroupParent("/sys/fs/cgroup/looprig"),
 	)
@@ -263,7 +263,7 @@ func TestInit(t *testing.T) {
 // not a silent nil-error signal kill.
 func TestRunCommandContextTimeout(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestRunArgvNonexistentBinary(t *testing.T) {
 	// binary, so exec fails with a Go spawn error. A real OS backend wraps argv[0]
 	// with sandbox-exec, which RUNS and exits nonzero (a ran-but-nonzero, not a
 	// spawn error), so the convention this test pins holds only for the null backend.
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

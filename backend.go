@@ -1,10 +1,15 @@
 package sandbox
 
-import "os/exec"
+import (
+	"errors"
+	"os/exec"
+)
+
+var ErrSandboxUnavailable = errors.New("sandbox: OS confinement unavailable")
 
 // This file defines the internal backend seam: the shape every OS enforcement
-// backend (Seatbelt on darwin, the namespace/Landlock ladder on Linux) will
-// extend. The seam is deliberately narrow. A backend never runs a process and
+// backend (Seatbelt on darwin, the namespace/Landlock ladder on Linux) implements.
+// The seam is deliberately narrow. A backend never runs a process and
 // never assembles an environment; it only decides how a spawn is *wrapped* and
 // what spawn attributes are set. The executor owns everything stateful —
 // environment assembly, the working directory, running the *exec.Cmd, and the
@@ -44,9 +49,9 @@ type spawnSpec struct {
 // §6, §10.3), and a compilation report of what was enforced, narrowed, or left
 // unenforced (SPEC §7.5). Compilation is where the soundness invariant lives:
 // compiled enforcement is never wider than the policy, and every gap is recorded.
-// It returns an error only when a policy cannot be compiled at all; a backend
+// It returns an error when a policy cannot be compiled at all; a backend
 // that merely enforces less than requested reports that via level/bits/report,
-// not via err.
+// not via err. The direct backend accepts only Unconfined.
 type backend interface {
 	compile(p effectivePolicy) (spec spawnSpec, report CompileReport, level uint8, guaranteeBits uint64, err error)
 }

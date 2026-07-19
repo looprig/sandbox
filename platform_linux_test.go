@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // TestSelectLinuxBackend covers the rung × Init-called matrix that platformBackend
@@ -23,8 +24,8 @@ func TestSelectLinuxBackend(t *testing.T) {
 		{"rung1 with Init -> linux backend", rungOne, true, nil, "linux"},
 		{"rung2 without Init -> ErrInitNotCalled", rungTwo, false, ErrInitNotCalled, ""},
 		{"rung1 without Init -> ErrInitNotCalled", rungOne, false, ErrInitNotCalled, ""},
-		{"rung none with Init -> null backend", rungNone, true, nil, "null"},
-		{"rung none without Init -> null backend (no re-exec needed)", rungNone, false, nil, "null"},
+		{"rung none with Init -> unavailable", rungNone, true, ErrSandboxUnavailable, ""},
+		{"rung none without Init -> unavailable", rungNone, false, ErrSandboxUnavailable, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -44,12 +45,58 @@ func TestSelectLinuxBackend(t *testing.T) {
 				if _, ok := b.(*linuxBackend); !ok {
 					t.Errorf("backend = %T, want *linuxBackend", b)
 				}
-			case "null":
-				if _, ok := b.(*nullBackend); !ok {
-					t.Errorf("backend = %T, want *nullBackend", b)
-				}
 			}
 		})
+	}
+}
+
+func TestLinuxBackendsNeverClaimTargetNetwork(t *testing.T) {
+	policy := effectivePolicy{
+		Net:       effectiveNetPolicy{ProxyPort: 43123},
+		Env:       effectiveEnvPolicy{Set: map[string]string{}},
+		Isolation: Sandboxed,
+	}
+	for _, backend := range []*linuxBackend{{rung: rungOne}, {rung: rungTwo}} {
+		_, _, _, bits, err := backend.compile(policy)
+		if err != nil {
+			t.Fatalf("rung %d compile: %v", backend.rung, err)
+		}
+		if bits&GuaranteeTargetNetwork != 0 {
+			t.Errorf("rung %d claimed GuaranteeTargetNetwork for parent proxy port", backend.rung)
+		}
+	}
+}
+
+func TestLinuxTargetGrantFailsClosed(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	route, err := NewDirectEgressRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := NewExecutorSet(profile,
+		WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
+		withExecutorSetExecOptions(withBackend(&linuxBackend{rung: rungTwo}), withClock(func() time.Time { return now })),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("linux-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executor.Guarantees().TargetNetwork {
+		t.Fatal("Linux executor claimed target network enforcement")
+	}
+	_, err = executor.IssueGrant(context.Background(), "exec-linux", "true", workspace,
+		"network", "", "network.proxy-target.v1", "tcp:github.com:443", now.Add(time.Minute).UnixMilli())
+	if !errors.Is(err, ErrGrantGuaranteeMismatch) {
+		t.Fatalf("Linux target grant error = %v, want ErrGrantGuaranteeMismatch", err)
 	}
 }
 
@@ -74,7 +121,7 @@ func TestPlatformBackendLiveOnThisHost(t *testing.T) {
 func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

@@ -179,7 +179,7 @@ func requireCgroupPids(t *testing.T) {
 func runForkbombUnderSandbox(t *testing.T, pidsMax int, sleepPath string) map[string]string {
 	t.Helper()
 	ws := t.TempDir()
-	e := newFSExecutor(t, PolicyFor(Write, ws,
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws,
 		WithLimits(effectiveLimits{MaxPIDs: pidsMax}),
 		WithEnv(effectiveEnvPolicy{Set: map[string]string{
 			cgroupForkbombEnv:   "1",
@@ -275,7 +275,7 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 	requireCgroupPids(t)
 	ws := t.TempDir()
 
-	limited := newFSExecutor(t, PolicyFor(Write, ws))
+	limited := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 	if !limited.Guarantees().ResourceLimits {
 		t.Errorf("ResourceLimits guarantee = false; want true on a host with cgroup v2 pids delegation")
 	}
@@ -285,7 +285,7 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 
 	// A limits-disabled executor: no scope, no guarantee, an unenforced entry — but
 	// the SAME Level (limits never move the ladder).
-	disabled := newFSExecutor(t, PolicyFor(Write, ws, WithLimits(effectiveLimits{Disabled: true})))
+	disabled := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithLimits(effectiveLimits{Disabled: true})))
 	if disabled.Guarantees().ResourceLimits {
 		t.Errorf("disabled policy reports ResourceLimits guarantee; want false")
 	}
@@ -307,7 +307,7 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(&linuxBackend{cgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}
@@ -329,7 +329,7 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 		t.Fatalf("spawn without limits out=%q, want %q", out, "ok")
 	}
 
-	avail := newFSExecutor(t, PolicyFor(Write, ws))
+	avail := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 	if e.Level() != avail.Level() {
 		t.Errorf("Level differs by delegation availability: unavailable=%d available=%d; want equal (§7.4)", e.Level(), avail.Level())
 	}

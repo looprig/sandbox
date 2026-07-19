@@ -167,7 +167,7 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 			}
 			return nil, errors.New("sandbox: invalid egress proxy listener")
 		}
-		policy.Net = effectiveNetPolicy{Loopback: true, Ports: []uint16{uint16(port)}}
+		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
 	executor, err := newExecutorFromEffective(set.profile, policy, set.options...)
 	if err != nil {

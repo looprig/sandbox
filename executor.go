@@ -378,9 +378,7 @@ func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s sn
 }
 
 // Level reports the achieved (probed + compiled, not requested) isolation level
-// (SPEC §6). The zero value LevelNone is fail-closed. For a dynamic executor it
-// reports the last compiled mode's level (it does not itself recompile) under
-// the mutex, so it is race-free against a concurrent spawn's recompile.
+// (SPEC §6). The zero value LevelNone is fail-closed.
 func (e *Executor) Level() uint8 {
 	return e.level
 }
@@ -582,7 +580,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		if err != nil || port == 0 {
 			return nil, -1, ErrGrantUnsupported
 		}
-		policy.Net = effectiveNetPolicy{Loopback: true, Ports: []uint16{uint16(port)}}
+		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
 	spec, _, _, bits, err := e.backend.compile(policy)
 	if err != nil {
@@ -668,7 +666,7 @@ func assembleEnv(p effectivePolicy) []string {
 	}
 
 	// Baseline allowlist plus caller additions. baselineEnvAllowlist returns a
-	// fresh slice, so appending never mutates the shared preset.
+	// fresh slice, so appending never mutates shared state.
 	allow := append(baselineEnvAllowlist(), p.Env.Allow...)
 
 	// A non-nil empty slice is load-bearing: a scrub policy that admits no vars

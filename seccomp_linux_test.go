@@ -298,7 +298,7 @@ func TestLinuxSeccompDeniesInTarget(t *testing.T) {
 	// Inject the probe sentinel into the TARGET env via Env.Set, so the re-exec'd
 	// target's init() runs the probes. TMPDIR is forced by the baseline regardless.
 	e, err := newExecutorForEffectivePolicy(
-		PolicyFor(Write, ws, WithEnv(effectiveEnvPolicy{Set: map[string]string{seccompTargetEnv: "1"}})),
+		testPolicy(testWorkspaceWrite, ws, WithEnv(effectiveEnvPolicy{Set: map[string]string{seccompTargetEnv: "1"}})),
 		withBackend(newLinuxBackend()),
 	)
 	if err != nil {
@@ -357,7 +357,7 @@ func TestLinuxSeccompReportEntry(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
 	ws := t.TempDir()
-	e := newFSExecutor(t, PolicyFor(Write, ws))
+	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
 	if !reportHas(e.Report(), "seccomp-hardening", "enforced") {
 		t.Errorf("CompileReport missing seccomp-hardening/enforced entry; report=%+v", e.Report())
 	}

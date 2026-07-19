@@ -14,9 +14,8 @@ package sandbox
 //     (never wider than policy — it enforces less than rung 1 could) and honestly
 //     reported as LevelDegraded. The probe keeps the selection honest: a host that
 //     cannot enforce even rung 2 does NOT get a re-exec backend claiming confinement.
-//   - rung none → the null backend (honest LevelNone): no Landlock/seccomp
-//     available, so no OS enforcement is claimed rather than a re-exec that would
-//     confine nothing.
+//   - rung none → ErrSandboxUnavailable. Sandboxed execution never falls through
+//     to a direct backend.
 //
 // Init() gate (fail-closed): the re-exec Linux backend requires the consumer to
 // have called sandbox.Init() as the first line of main() (SPEC §6) — otherwise a
@@ -24,8 +23,7 @@ package sandbox
 // own main() instead of the confinement helper (a footgun: it would run the target
 // UNCONFINED, or the capability probe would mis-report). When a re-exec backend is
 // selected but Init() was not called, construction fails with ErrInitNotCalled
-// rather than silently building an executor that cannot actually confine. The null
-// backend needs no re-exec, so it is exempt.
+// rather than silently building an executor that cannot actually confine.
 //
 // A test may still pin a backend through the unexported withBackend seam, which
 // bypasses this selector entirely (and the package TestMain calls Init(), so the
@@ -36,8 +34,7 @@ func platformBackend() (backend, error) {
 
 // selectLinuxBackend is the pure selection logic behind platformBackend, split out
 // so the rung×Init-called matrix is unit-testable without touching the process
-// globals. A re-exec rung (1/2) requires initCalled; rung none returns the null
-// backend and needs no Init().
+// globals. A re-exec rung (1/2) requires initCalled; rung none fails closed.
 func selectLinuxBackend(r rung, initCalled bool) (backend, error) {
 	switch r {
 	case rungOne:
@@ -54,6 +51,6 @@ func selectLinuxBackend(r rung, initCalled bool) (backend, error) {
 		}
 		return newLinuxBackend(), nil
 	default: // rungNone
-		return newNullBackend(), nil
+		return nil, ErrSandboxUnavailable
 	}
 }

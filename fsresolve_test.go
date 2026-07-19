@@ -289,9 +289,9 @@ func TestResolveGlobBranches(t *testing.T) {
 
 // TestResolveWithPolicyFor feeds real PolicyFor output through the resolver,
 // proving PolicyFor's emission and the resolver's precedence agree end to end.
-func TestResolveWithPolicyFor(t *testing.T) {
+func TestResolveWithTestPolicy(t *testing.T) {
 	const ws = "/work/ws"
-	fs := PolicyFor(Write, ws).FS
+	fs := testPolicy(testWorkspaceWrite, ws).FS
 
 	cases := []struct {
 		path string
@@ -304,7 +304,7 @@ func TestResolveWithPolicyFor(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := resolveFS(fs, c.path); got != c.want {
-			t.Errorf("resolveFS(PolicyFor(Write,%q).FS, %q) = %s, want %s",
+			t.Errorf("resolveFS(testPolicy(testWorkspaceWrite,%q).FS, %q) = %s, want %s",
 				ws, c.path, accessString(got), accessString(c.want))
 		}
 	}

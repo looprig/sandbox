@@ -29,7 +29,7 @@ import (
 // no-op posture. Pinned via the unexported withBackend seam.
 func TestSandboxtestAgainstNullBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "null", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
+		e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 		if err != nil {
 			t.Fatalf("NewExecutor(null): %v", err)
 		}
@@ -44,7 +44,7 @@ func TestSandboxtestAgainstNullBackend(t *testing.T) {
 // backend's gate.
 func TestSandboxtestAgainstLiveBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "live", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+		e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 		if err != nil {
 			t.Fatalf("NewExecutor(live): %v", err)
 		}

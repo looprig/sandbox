@@ -17,36 +17,21 @@ import (
 // on darwin by platformBackend() (platform_darwin.go); its file-rule enforcement
 // is verified end-to-end against a real sandbox-exec (backend_seatbelt_test.go).
 
-// baseSandboxPreamble is the minimal always-on base of every generated profile
-// (SPEC §7.1). A bare `(deny default)` is fail-closed to the point of blocking
-// even execvp, the dyld loader, and mach bootstrap, so nothing runs at all — the
-// Task M1 spike (docs/spikes/seatbelt-net.md) confirmed `/usr/bin/true` fails
-// under a bare deny-default and runs only once these allows are present. The set
-// lets the target process fork, exec, load its dynamic libraries/dyld, read the
-// system page size (sysctl), and reach the mach bootstrap namespace.
-//
-// It grants NO file writes and NO network, so it does not weaken the write or
-// network boundaries; and because SBPL is last-match-wins, the §5.3 secret
-// deny-reads emitted at the end of the filesystem section still override the
-// broad `(allow file-read*)` here.
-//
-// HONEST LIMITATION (to be tightened by the real-exec follow-up): the
-// file-read*/process-exec* allows here are intentionally BROAD. M1 verified this
-// broad set works (including reaching the Apple-Silicon dyld shared cache, whose
-// exact path — e.g. under /System/Volumes/Preboot/Cryptexes/OS — is awkward to
-// enumerate); a tighter dyld/dylib read set could not be verified without a real
-// exec, and the task's guidance is to err toward the M1-proven set. The
-// consequence is that zerotrust restricted-read and per-entry exec-scoping are
-// not enforced by this preamble — but the write boundary, network boundary, and
-// secret deny-reads all remain intact (they never depend on withholding these
-// broad reads/execs). None of these are guarantee bits this backend claims.
+// baseSandboxPreamble is the minimal tested startup closure for every generated
+// profile. It grants no file writes, remote network, or unfiltered execution.
+// Native regression tests prove that dyld needs file-read-data on the literal
+// root directory even when every runtime tree is readable; this permits only
+// that directory object, not arbitrary descendants. /private/var/select is the
+// system shell-selector read used when sandbox-exec launches /bin/sh. Executable
+// and remaining readable paths are emitted per effective-policy entry below.
 const baseSandboxPreamble = `(version 1)
 (deny default)
 (allow process-fork)
-(allow process-exec*)
-(allow file-read*)
+(allow process-info*)
 (allow sysctl-read)
 (allow mach-lookup)
+(allow file-read-data (literal "/"))
+(allow file-read* (subpath "/private/var/select"))
 `
 
 // mDNSResponderSocket is the unix-domain socket macOS getaddrinfo hands DNS
@@ -64,10 +49,10 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 //
 // The filesystem section relies on SBPL's last-match-wins precedence to realize
 // the resolver's deny>write>read + carveout semantics (§5.1, fsresolve.go). It
-// emits, in order: (1) the per-entry read/exec/write ALLOWS; (2) carveout write
-// DENIES for read-only entries nested in a writable root (e.g. .git under the
-// workspace), placed after the write allow so the deny wins; (3) the §5.3 secret
-// DENIES last so they override everything above.
+// emits, in order: (1) literal metadata lookup for allowed-root ancestors and
+// the per-entry read/exec/write ALLOWS; (2) carveout write DENIES for read-only
+// entries nested in a writable root, placed after the write allow so the deny
+// wins; (3) fixed/glob DENIES last so they override everything above.
 //
 // Verification scope: the M1 spike (docs/spikes/seatbelt-net.md) verified the
 // NETWORK section and the base preamble against a real sandbox-exec; the file-rule
@@ -84,42 +69,6 @@ func compileSBPL(p effectivePolicy) (profile string, report CompileReport, level
 
 	level = LevelFull
 
-	// Soundness (§7.5): the base preamble unconditionally broad-allows
-	// file-read*/process-exec* so the target can even start (dyld, exec, and the
-	// mach bootstrap need broad reads on macOS). For a policy that itself grants
-	// broad root read/exec (write/readonly/trusted/unconfined all carry
-	// {"/":Read|Exec}) the preamble matches intent — nothing is wider than policy.
-	// But a restricted-read policy (zerotrust grants read/exec only to
-	// minimalRuntimeReadPaths + workspace, with no "/" entry) is compiled STRICTLY
-	// WIDER than intended: the command can read/exec almost the whole disk. §7.5
-	// forbids that from passing silently — it must be recorded AND demote Level(),
-	// so such a policy cannot clear a default LevelFull auto-approve gate. Detect
-	// it by asking the resolver what the policy actually grants at "/".
-	//
-	// This point-samples access AT "/" — sound for every current preset because a
-	// literal "/" read entry grants recursively, so root access implies the whole
-	// tree. A future non-recursive root-read option (e.g. a "/*" glob that reads
-	// as Full at "/" yet grants only the top level) would leave the preamble
-	// wider than a "/"-only sample can detect; revisit this probe if such an
-	// option is added.
-	rootAccess := resolveFS(p.FS, "/")
-	if rootAccess&readFSAccess == 0 {
-		report.Entries = append(report.Entries, ReportEntry{
-			Feature: "restricted-read",
-			Status:  "unenforced",
-			Detail:  "base preamble broad-allows file-read* (dyld/exec needs broad reads on macOS); per-policy read restriction not enforced — tighten via scoped system-lib reads in a later iteration",
-		})
-		level = LevelDegraded
-	}
-	if rootAccess&execFSAccess == 0 {
-		report.Entries = append(report.Entries, ReportEntry{
-			Feature: "exec-scoping",
-			Status:  "unenforced",
-			Detail:  "base preamble broad-allows process-exec* (dyld/exec needs broad reads on macOS); per-policy exec restriction not enforced — tighten via scoped system-lib reads in a later iteration",
-		})
-		level = LevelDegraded
-	}
-
 	if p.Net.Private {
 		// Private requests address-scoped egress, which SBPL cannot express
 		// (§5.2, M1): its AddressNetwork guarantee can never be satisfied, so the
@@ -135,6 +84,7 @@ func compileSBPL(p effectivePolicy) (profile string, report CompileReport, level
 // narrowing to report. See compileSBPL for the three-phase last-match-wins order.
 func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 	b.WriteString("; --- filesystem ---\n")
+	compileAncestorMetadata(b, fs)
 
 	// Writable roots: the entries that grant write, used to detect which
 	// read-only entries are carveouts nested inside them.
@@ -145,22 +95,24 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 		}
 	}
 
-	// Phase 1: per-entry allows (read, exec, write) for every allow entry. Paths are
-	// canonicalized (canonPath) so a rule matches the symlink-resolved path Seatbelt
-	// evaluates against — on macOS /tmp→/private/tmp, /var/folders→/private/... etc.
+	// Phase 1: per-entry allows (read, exec, write) for every allow entry. Both the
+	// canonical path and any known symlink-equivalent public spelling are emitted;
+	// macOS reports different operations through different spellings.
 	for _, e := range fs {
 		if e.Access == denyFSAccess {
 			continue
 		}
-		path := sbplString(canonPath(e.Path))
-		if e.Access&readFSAccess != 0 {
-			b.WriteString(`(allow file-read* (subpath "` + path + `"))` + "\n")
-		}
-		if e.Access&execFSAccess != 0 {
-			b.WriteString(`(allow process-exec* (subpath "` + path + `"))` + "\n")
-		}
-		if e.Access&writeFSAccess != 0 {
-			b.WriteString(`(allow file-write* (subpath "` + path + `"))` + "\n")
+		for _, candidate := range seatbeltPathAliases(e.Path) {
+			path := sbplString(candidate)
+			if e.Access&readFSAccess != 0 {
+				b.WriteString(`(allow file-read* (subpath "` + path + `"))` + "\n")
+			}
+			if e.Access&execFSAccess != 0 {
+				b.WriteString(`(allow process-exec (subpath "` + path + `"))` + "\n")
+			}
+			if e.Access&writeFSAccess != 0 {
+				b.WriteString(`(allow file-write* (subpath "` + path + `"))` + "\n")
+			}
 		}
 	}
 
@@ -172,7 +124,9 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 			continue
 		}
 		if underWritableRoot(e.Path, writableRoots) {
-			b.WriteString(`(deny file-write* (subpath "` + sbplString(canonPath(e.Path)) + `"))` + "\n")
+			for _, candidate := range seatbeltPathAliases(e.Path) {
+				b.WriteString(`(deny file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
+			}
 		}
 	}
 
@@ -208,7 +162,9 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 				continue
 			}
 			broad := conservativeDenyRoot(e.Path)
-			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(canonPath(broad)) + `"))` + "\n")
+			for _, candidate := range seatbeltPathAliases(broad) {
+				b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
+			}
 			detail := "untranslatable deny glob " + e.Path + " compiled to a broad conservative deny of " + broad + " (fail closed, over-deny)"
 			if reCompiles { // translated fine, but the regex would contain a quote
 				detail = `deny glob contains a quote unrepresentable in an SBPL #"..." regex; widened to a conservative subpath deny`
@@ -219,7 +175,32 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 				Detail:  detail,
 			})
 		} else {
-			b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(canonPath(e.Path)) + `"))` + "\n")
+			for _, candidate := range seatbeltPathAliases(e.Path) {
+				b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
+			}
+		}
+	}
+}
+
+// compileAncestorMetadata permits only metadata lookup on each configured
+// allow-root's ancestor chain. Seatbelt requires these lookups to traverse to a
+// nested writable/readable root; granting the root itself does not implicitly
+// grant lookup on its parents. This deliberately does not allow file data or
+// directory enumeration outside configured roots.
+func compileAncestorMetadata(b *strings.Builder, fs []fsEntry) {
+	seen := map[string]struct{}{string(filepath.Separator): {}}
+	for _, entry := range fs {
+		if entry.Access == denyFSAccess {
+			continue
+		}
+		for _, candidate := range seatbeltPathAliases(entry.Path) {
+			for parent := filepath.Dir(candidate); parent != string(filepath.Separator); parent = filepath.Dir(parent) {
+				if _, ok := seen[parent]; ok {
+					continue
+				}
+				seen[parent] = struct{}{}
+				b.WriteString(`(allow file-read-metadata (literal "` + sbplString(parent) + `"))` + "\n")
+			}
 		}
 	}
 }
@@ -234,6 +215,9 @@ func compileNet(b *strings.Builder, report *CompileReport, net effectiveNetPolic
 		// Unconfined only. Everything else stays default-deny.
 		b.WriteString("(allow network*)\n")
 		return
+	}
+	if net.ProxyPort != 0 {
+		b.WriteString(`(allow network-outbound (remote tcp "localhost:` + strconv.Itoa(int(net.ProxyPort)) + `"))` + "\n")
 	}
 
 	for _, port := range net.Ports {
@@ -296,10 +280,9 @@ func compileGuarantees(p effectivePolicy) uint64 {
 		bits |= GuaranteeWriteBoundary
 	}
 
-	// SBPL expresses the §5.3 secret deny-reads natively (emitted last, so they
-	// win over the broad base read). Enforced whenever the policy carries deny
-	// entries; a policy with none (unconfined) enforces nothing to claim.
-	if hasDenyEntry(p.FS) {
+	// Reads are confined whenever the effective policy does not grant broad root
+	// read. All process-exec and file-read allows are emitted per configured root.
+	if resolveFS(p.FS, "/")&readFSAccess == 0 {
 		bits |= GuaranteeReadBoundary
 	}
 
@@ -313,6 +296,9 @@ func compileGuarantees(p effectivePolicy) uint64 {
 	// port-restricted, unless the policy opens the network entirely.
 	if !p.Net.Open {
 		bits |= GuaranteeNetworkBoundary
+	}
+	if p.Net.ProxyPort != 0 && !p.Net.Open {
+		bits |= GuaranteeTargetNetwork
 	}
 
 	// AddressNetwork is FALSE always on macOS: SBPL cannot address-scope (§5.2,
@@ -398,6 +384,44 @@ func canonPath(p string) string {
 		return filepath.Clean(p)
 	}
 	return filepath.Join(canonPath(dir), filepath.Base(p))
+}
+
+// seatbeltPathAliases returns the canonical path first and, when macOS exposes
+// the caller's symlink spelling to a Seatbelt operation, the cleaned configured
+// path second. Current macOS reports some /var/folders operations through the
+// raw /var alias even though other operations use /private/var. Emitting both
+// spellings confines access to the same configured filesystem object. Deny
+// callers use this helper too, so a writable alias cannot bypass a carveout.
+func seatbeltPathAliases(p string) []string {
+	canonical := filepath.Clean(canonPath(p))
+	raw := filepath.Clean(p)
+	aliases := []string{canonical}
+	for _, pair := range [][2]string{
+		{"/private/var", "/var"},
+		{"/private/tmp", "/tmp"},
+		{"/private/etc", "/etc"},
+	} {
+		if canonical == pair[0] || strings.HasPrefix(canonical, pair[0]+string(filepath.Separator)) {
+			aliases = append(aliases, pair[1]+strings.TrimPrefix(canonical, pair[0]))
+		}
+	}
+	if raw != canonical {
+		aliases = append(aliases, raw)
+	}
+	return uniqueStrings(aliases)
+}
+
+func uniqueStrings(values []string) []string {
+	unique := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 // sbplString escapes a Go string for inclusion inside an SBPL (subpath "…") /

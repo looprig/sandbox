@@ -21,11 +21,12 @@ type fsEntry struct {
 }
 
 type effectiveNetPolicy struct {
-	Loopback bool
-	Private  bool
-	Ports    []uint16
-	DNS      bool
-	Open     bool
+	Loopback  bool
+	Private   bool
+	Ports     []uint16
+	ProxyPort uint16
+	DNS       bool
+	Open      bool
 }
 
 type effectiveEnvPolicy struct {

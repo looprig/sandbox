@@ -2,26 +2,25 @@ package sandbox
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
 // These fixtures preserve backend unit-test shapes while production profiles
 // are consumer-defined. They are not part of the package API.
-type testPolicyMode uint8
-
-type Mode = testPolicyMode
+type testPolicyShape uint8
 
 const (
-	ZeroTrust testPolicyMode = iota
-	ReadOnly
-	Write
-	Trusted
-	testUnconfined
+	testScopedRuntime testPolicyShape = iota
+	testHostRead
+	testWorkspaceWrite
+	testBroadNetwork
+	testDirect
 )
 
 type PolicyOption func(*effectivePolicy)
 
-func PolicyFor(mode testPolicyMode, workspace string, opts ...PolicyOption) effectivePolicy {
+func testPolicy(shape testPolicyShape, workspace string, opts ...PolicyOption) effectivePolicy {
 	workspace = filepath.Clean(workspace)
 	p := effectivePolicy{
 		Workspace: workspace,
@@ -29,15 +28,15 @@ func PolicyFor(mode testPolicyMode, workspace string, opts ...PolicyOption) effe
 			"TMPDIR": writableTmpRoot,
 		}},
 	}
-	switch mode {
-	case ZeroTrust:
+	switch shape {
+	case testScopedRuntime:
 		for _, path := range minimalRuntimeReadPaths() {
 			p.FS = append(p.FS, fsEntry{Path: path, Access: readFSAccess | execFSAccess})
 		}
 		p.FS = append(p.FS, fsEntry{Path: workspace, Access: readFSAccess})
-	case ReadOnly:
+	case testHostRead:
 		p.FS = append(p.FS, fsEntry{Path: "/", Access: readFSAccess | execFSAccess})
-	case Write, Trusted:
+	case testWorkspaceWrite, testBroadNetwork:
 		p.FS = append(p.FS,
 			fsEntry{Path: "/", Access: readFSAccess | execFSAccess},
 			fsEntry{Path: workspace, Access: readFSAccess | writeFSAccess | execFSAccess},
@@ -45,17 +44,17 @@ func PolicyFor(mode testPolicyMode, workspace string, opts ...PolicyOption) effe
 			fsEntry{Path: filepath.Join(workspace, ".git"), Access: readFSAccess},
 			fsEntry{Path: filepath.Join(workspace, ".looprig"), Access: readFSAccess},
 		)
-	case testUnconfined:
+	case testDirect:
 		p.FS = append(p.FS, fsEntry{Path: "/", Access: readFSAccess | writeFSAccess | execFSAccess})
 		p.Net.Open = true
 		p.Env.Inherit = true
 		p.Isolation = Unconfined
 	}
 	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess})
-	if mode != testUnconfined {
+	if shape != testDirect {
 		p.FS = append(p.FS, testSecretDenials()...)
 	}
-	if mode == Trusted {
+	if shape == testBroadNetwork {
 		p.Net = effectiveNetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}
 	}
 	for _, opt := range opts {
@@ -131,6 +130,20 @@ func WithAckUnconfined() PolicyOption { return func(*effectivePolicy) {} }
 
 func newExecutorForEffectivePolicy(p effectivePolicy, opts ...ExecOption) (*Executor, error) {
 	return newExecutorFromEffective(nil, p, opts...)
+}
+
+type testPassthroughBackend struct{}
+
+func newTestPassthroughBackend() *testPassthroughBackend { return &testPassthroughBackend{} }
+
+func (*testPassthroughBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	bits := uint64(0)
+	if !p.Env.Inherit {
+		bits = GuaranteeEnvScrub
+	}
+	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) {
+		return argv, nil, nil
+	}}, CompileReport{}, LevelNone, bits, nil
 }
 
 func containsStr(values []string, want string) bool {

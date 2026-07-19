@@ -19,7 +19,7 @@ import (
 // (deny default), so the sandbox is fail-closed before any allow.
 func TestCompileSBPLBase(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
+	profile, _, _, _ := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 	if !strings.HasPrefix(profile, "(version 1)\n(deny default)\n") {
 		t.Errorf("profile does not begin with (version 1) then (deny default):\n%s", profile)
 	}
@@ -33,7 +33,7 @@ func TestCompileSBPLBase(t *testing.T) {
 // the deny overrides the allow under SBPL's last-match-wins precedence.
 func TestCompileSBPLSecretDenyAfterBroadRead(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
+	profile, _, _, _ := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 
 	broadRead := `(allow file-read* (subpath "/"))`
 	sshDeny := `(deny file-read* file-write* (subpath "/lrsbx-home/tester/.ssh"))`
@@ -56,7 +56,7 @@ func TestCompileSBPLSecretDenyAfterBroadRead(t *testing.T) {
 // denies both read and write.
 func TestCompileSBPLEnvGlobDeny(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
+	profile, _, _, _ := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 
 	want := `(deny file-read* file-write* (regex #"^.*/\.env[^/]*$"))`
 	if !strings.Contains(profile, want) {
@@ -69,7 +69,7 @@ func TestCompileSBPLEnvGlobDeny(t *testing.T) {
 // AFTER the workspace write allow (so last-match-wins makes it read-only).
 func TestCompileSBPLCarveoutWriteDeny(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(Write, "/ws"))
+	profile, _, _, _ := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 
 	wsWrite := `(allow file-write* (subpath "/ws"))`
 	gitDeny := `(deny file-write* (subpath "/ws/.git"))`
@@ -87,13 +87,13 @@ func TestCompileSBPLCarveoutWriteDeny(t *testing.T) {
 	}
 }
 
-// TestCompileSBPLNetworkTrusted asserts the M1-verified network mapping for the
-// Trusted policy (Loopback + Private + Ports{443} + DNS): a port rule, the
+// TestCompileSBPLNetworkBroadTarget asserts the M1-verified network mapping for
+// a loopback + private + port 443 + DNS policy: a port rule, the
 // localhost loopback rule, and the mDNSResponder unix-socket for DNS; Private is
 // NOT emitted (SBPL cannot address-scope) but IS reported unenforced.
-func TestCompileSBPLNetworkTrusted(t *testing.T) {
+func TestCompileSBPLNetworkBroadTarget(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, report, _, _ := compileSBPL(PolicyFor(Trusted, "/ws"))
+	profile, report, _, _ := compileSBPL(testPolicy(testBroadNetwork, "/ws"))
 
 	wantLines := []string{
 		`(allow network-outbound (remote tcp "*:443"))`,
@@ -102,22 +102,22 @@ func TestCompileSBPLNetworkTrusted(t *testing.T) {
 	}
 	for _, w := range wantLines {
 		if !strings.Contains(profile, w) {
-			t.Errorf("Trusted profile missing %q\n%s", w, profile)
+			t.Errorf("network profile missing %q\n%s", w, profile)
 		}
 	}
 
 	// Private must NOT be compiled to any positive rule.
 	if strings.Contains(profile, "Private") || strings.Contains(profile, "10.0.0.0") || strings.Contains(profile, "rfc1918") {
-		t.Errorf("Trusted profile appears to emit a Private/address rule; SBPL cannot address-scope:\n%s", profile)
+		t.Errorf("network profile appears to emit a Private/address rule; SBPL cannot address-scope:\n%s", profile)
 	}
 
 	// ... but Private IS reported as unenforced (compile-to-blocked).
 	if !hasReport(report, "address-network", "unenforced") {
-		t.Errorf("Trusted report missing address-network/unenforced entry for Private: %+v", report.Entries)
+		t.Errorf("network report missing address-network/unenforced entry for Private: %+v", report.Entries)
 	}
 	// Loopback widening (localhost matches host's own addresses) is noted.
 	if !hasReportFeature(report, "loopback") {
-		t.Errorf("Trusted report missing loopback widening note: %+v", report.Entries)
+		t.Errorf("network report missing loopback widening note: %+v", report.Entries)
 	}
 }
 
@@ -125,7 +125,7 @@ func TestCompileSBPLNetworkTrusted(t *testing.T) {
 // outbound-tcp form.
 func TestCompileSBPLNetworkPorts(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	p := PolicyFor(Write, "/ws", WithNet(effectiveNetPolicy{Ports: []uint16{443, 8080}}))
+	p := testPolicy(testWorkspaceWrite, "/ws", WithNet(effectiveNetPolicy{Ports: []uint16{443, 8080}}))
 	profile, _, _, _ := compileSBPL(p)
 	for _, w := range []string{
 		`(allow network-outbound (remote tcp "*:443"))`,
@@ -141,7 +141,7 @@ func TestCompileSBPLNetworkPorts(t *testing.T) {
 // blanket network allow.
 func TestCompileSBPLNetworkOpen(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(testUnconfined, "/ws"))
+	profile, _, _, _ := compileSBPL(testPolicy(testDirect, "/ws"))
 	if !strings.Contains(profile, "(allow network*)") {
 		t.Errorf("Unconfined (Net.Open) profile missing (allow network*)\n%s", profile)
 	}
@@ -153,42 +153,37 @@ func TestCompileSBPLNetworkOpen(t *testing.T) {
 func TestCompileSBPLLevels(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
 
-	_, _, writeLevel, _ := compileSBPL(PolicyFor(Write, "/ws"))
+	_, _, writeLevel, _ := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 	if writeLevel != LevelFull {
 		t.Errorf("Write level = %d, want LevelFull (%d)", writeLevel, LevelFull)
 	}
 
-	_, _, trustedLevel, _ := compileSBPL(PolicyFor(Trusted, "/ws"))
+	_, _, trustedLevel, _ := compileSBPL(testPolicy(testBroadNetwork, "/ws"))
 	if trustedLevel != LevelDegraded {
-		t.Errorf("Trusted level = %d, want LevelDegraded (%d) because Private is unsatisfiable", trustedLevel, LevelDegraded)
+		t.Errorf("broad-network level = %d, want LevelDegraded (%d) because Private is unsatisfiable", trustedLevel, LevelDegraded)
 	}
 }
 
-// TestCompileSBPLLevelAndReportPerMode asserts the §7.5 soundness fix per mode:
-// the base preamble broad-allows reads/execs, so a restricted-read policy
-// (zerotrust — no "/" grant) is compiled WIDER than intent and must be recorded
-// (restricted-read + exec-scoping, both unenforced) AND demoted to Degraded.
-// Policies that themselves grant broad root read/exec (readonly/write/trusted/
-// unconfined) stay Full unless demoted for another reason (Trusted → Private),
-// and never carry a restricted-read entry. This exercises level+report per mode,
-// which the golden test deliberately discards.
+// TestCompileSBPLLevelAndReportPerMode asserts scoped reads are fully enforced;
+// only the legacy fixture requesting unexpressible private-address access is
+// degraded.
 func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
 	cases := []struct {
 		name             string
-		mode             Mode
+		shape            testPolicyShape
 		wantLevel        uint8
 		wantRestrictRead bool // restricted-read + exec-scoping entries expected
 	}{
-		{"zerotrust", ZeroTrust, LevelDegraded, true},
-		{"readonly", ReadOnly, LevelFull, false},
-		{"write", Write, LevelFull, false},
-		{"trusted", Trusted, LevelDegraded, false}, // Degraded via Private, not restricted-read
-		{"unconfined", testUnconfined, LevelFull, false},
+		{"scoped runtime", testScopedRuntime, LevelFull, false},
+		{"host read", testHostRead, LevelFull, false},
+		{"workspace write", testWorkspaceWrite, LevelFull, false},
+		{"broad network", testBroadNetwork, LevelDegraded, false},
+		{"unconfined", testDirect, LevelFull, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, report, level, _ := compileSBPL(PolicyFor(tc.mode, "/ws"))
+			_, report, level, _ := compileSBPL(testPolicy(tc.shape, "/ws"))
 			if level != tc.wantLevel {
 				t.Errorf("%s level = %d, want %d (report %+v)", tc.name, level, tc.wantLevel, report.Entries)
 			}
@@ -200,14 +195,6 @@ func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
 			if gotExec != tc.wantRestrictRead {
 				t.Errorf("%s exec-scoping entry present = %v, want %v (report %+v)", tc.name, gotExec, tc.wantRestrictRead, report.Entries)
 			}
-			if tc.wantRestrictRead {
-				if !hasReport(report, "restricted-read", "unenforced") {
-					t.Errorf("%s restricted-read entry not marked unenforced: %+v", tc.name, report.Entries)
-				}
-				if !hasReport(report, "exec-scoping", "unenforced") {
-					t.Errorf("%s exec-scoping entry not marked unenforced: %+v", tc.name, report.Entries)
-				}
-			}
 		})
 	}
 }
@@ -218,7 +205,7 @@ func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
 func TestCompileSBPLGuarantees(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
 
-	_, _, _, writeBits := compileSBPL(PolicyFor(Write, "/ws"))
+	_, _, _, writeBits := compileSBPL(testPolicy(testWorkspaceWrite, "/ws"))
 	if writeBits&GuaranteeAddressNetwork != 0 {
 		t.Error("Write AddressNetwork bit set; SBPL cannot address-scope, must always be false")
 	}
@@ -231,12 +218,18 @@ func TestCompileSBPLGuarantees(t *testing.T) {
 	}{
 		{"ProcessBoundary", GuaranteeProcessBoundary},
 		{"WriteBoundary", GuaranteeWriteBoundary},
-		{"ReadBoundary", GuaranteeReadBoundary},
 		{"NetworkBoundary", GuaranteeNetworkBoundary},
 	} {
 		if writeBits&want.bit == 0 {
 			t.Errorf("Write %s bit clear, want set", want.name)
 		}
+	}
+	if writeBits&GuaranteeReadBoundary != 0 {
+		t.Error("broad-root read fixture claimed ReadBoundary")
+	}
+	_, _, _, scopedBits := compileSBPL(testPolicy(testScopedRuntime, "/ws"))
+	if scopedBits&GuaranteeReadBoundary == 0 {
+		t.Error("scoped-read policy did not claim ReadBoundary")
 	}
 	if writeBits&GuaranteeResourceLimits != 0 {
 		t.Error("Write ResourceLimits bit set; darwin ulimit approximation is a later task, must be false")
@@ -260,7 +253,7 @@ func TestCompileSBPLGlobDenyFailsClosed(t *testing.T) {
 	// "[z-a]" is a reversed range: a valid glob metacharacter run that cannot be
 	// compiled to a regexp, so the translation fails and must fall back to a broad
 	// deny rather than silently dropping the secret rule.
-	p := PolicyFor(Write, "/ws", WithoutSecretDenials(), WithDenyRead("/secret/data/[z-a]"))
+	p := testPolicy(testWorkspaceWrite, "/ws", WithoutSecretDenials(), WithDenyRead("/secret/data/[z-a]"))
 	profile, report, _, _ := compileSBPL(p)
 
 	broad := `(deny file-read* file-write* (subpath "/secret/data"))`
@@ -288,7 +281,7 @@ func TestCompileSBPLGlobDenyFailsClosed(t *testing.T) {
 // of a quote-bearing path.
 func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	p := PolicyFor(Write, "/ws", WithoutSecretDenials(), WithDenyRead(`/danger"x/*.env`))
+	p := testPolicy(testWorkspaceWrite, "/ws", WithoutSecretDenials(), WithDenyRead(`/danger"x/*.env`))
 	profile, report, _, _ := compileSBPL(p)
 
 	wantDeny := `(deny file-read* file-write* (subpath "/danger\"x"))`
@@ -319,7 +312,7 @@ func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
 // level/bits as compileSBPL.
 func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	p := PolicyFor(Write, "/ws")
+	p := testPolicy(testWorkspaceWrite, "/ws")
 	b := newSeatbeltBackend()
 	spec, report, level, bits, err := b.compile(p)
 	if err != nil {
@@ -364,7 +357,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 
 // --- Task 8b: REAL sandbox-exec enforcement (SPEC §12.1 macOS write row) ---
 //
-// These tests construct a REAL Seatbelt executor (newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+// These tests construct a REAL Seatbelt executor (newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 // is Seatbelt on darwin, once platformBackend() selects it) and actually run
 // commands through /usr/bin/sandbox-exec, asserting the OS backend ENFORCES the
 // generated SBPL. They are the answer to the reviewer's I2: the goldens only prove
@@ -410,7 +403,7 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	// resolution and even this in-workspace write would be denied.
 	ws := t.TempDir()
 	outside := t.TempDir() // a sibling temp dir: NOT ws, NOT /tmp
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -453,7 +446,7 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -485,7 +478,7 @@ func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 func TestSeatbeltEnforceNullDevice(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -515,7 +508,7 @@ func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -564,7 +557,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 	}
 
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -592,7 +585,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 func TestSeatbeltEnforceCarveoutNotPreCreated(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws)) // .looprig does NOT exist yet
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws)) // .looprig does NOT exist yet
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -621,7 +614,7 @@ func TestSeatbeltEnforceSecretDenyCreatedAfter(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home) // BEFORE NewExecutor; ~/.ssh does NOT exist yet
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -659,7 +652,7 @@ func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -716,7 +709,7 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 	}
 	_ = c.Close()
 
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -739,7 +732,10 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 // itself spawn sandbox-exec.
 func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := NewExecutor(mustProfile(t, ProfileConfig{
+		WorkspaceRoot: ws, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+	}))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

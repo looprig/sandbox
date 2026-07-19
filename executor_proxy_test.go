@@ -49,8 +49,8 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 	policy := backend.lastPolicy()
 	_, portText, _ := net.SplitHostPort(executor.proxy.Addr())
 	port, _ := strconv.ParseUint(portText, 10, 16)
-	if !policy.Net.Loopback || policy.Net.Open || !containsPort(policy.Net.Ports, uint16(port)) {
-		t.Fatalf("proxy policy = %+v, want only listener loopback port", policy.Net)
+	if policy.Net.ProxyPort != uint16(port) || policy.Net.Open || policy.Net.Loopback || len(policy.Net.Ports) != 0 {
+		t.Fatalf("proxy policy = %+v, want exact listener port only", policy.Net)
 	}
 }
 
@@ -146,7 +146,7 @@ func TestNetworkAllowUsesExplicitRoute(t *testing.T) {
 		t.Fatalf("explicit route not injected:\n%s", out)
 	}
 	policy := backend.lastPolicy()
-	if policy.Net.Open || !policy.Net.Loopback || len(policy.Net.Ports) != 1 {
+	if policy.Net.Open || policy.Net.ProxyPort == 0 || policy.Net.Loopback || len(policy.Net.Ports) != 0 {
 		t.Fatalf("explicit route policy = %+v, want listener-only", policy.Net)
 	}
 }

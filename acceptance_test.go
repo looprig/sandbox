@@ -2,7 +2,8 @@ package sandbox
 
 // Acceptance matrix — SPEC §12.1. This file asserts the PLATFORM-INDEPENDENT rows
 // (and the sandbox-side mechanisms the harness-integration rows build on) that the
-// sandbox module can prove on its own: the null / rung-3 fallback and env scrub.
+// sandbox module can prove on its own: unavailable confinement fails closed and
+// environment scrubbing holds.
 // Grant-v1 acceptance has its own focused suite. Linux-rung rows live in
 // acceptance_linux_test.go; the macOS Seatbelt row in acceptance_darwin_test.go.
 //
@@ -15,6 +16,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -35,7 +37,7 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 		name string
 		run  func(t *testing.T)
 	}{
-		{"no-sandbox-available/rung3-null", acceptRowNullBackend},
+		{"no-sandbox-available/fails-closed", acceptRowSandboxUnavailable},
 		{"env-scrub", acceptRowEnvScrub},
 	}
 	for _, tt := range tests {
@@ -43,31 +45,12 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 	}
 }
 
-// acceptRowNullBackend — §12.1 "No sandbox available (rung 3 / nil runner)": with
-// no OS mechanism the command STILL runs (direct exec), but the executor reports
-// LevelNone with EnvScrub as its only guarantee — the honest posture the interlock
-// reads to route to ask-a-human rather than auto-approve.
-func acceptRowNullBackend(t *testing.T) {
-	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
-	if err != nil {
-		t.Fatalf("NewExecutor(null): %v", err)
-	}
-
-	if lvl := e.Level(); lvl != LevelNone {
-		t.Errorf("Level() = %d, want LevelNone (%d)", lvl, LevelNone)
-	}
-	// Per-row Guarantees(): EnvScrub only (scrub is executor-side); everything else
-	// fail-closed false because nothing is OS-enforced.
-	assertGuarantees(t, e.Guarantees(), Guarantees{EnvScrub: true})
-
-	// The command still runs.
-	out, code, err := e.RunCommand(context.Background(), ws, "printf ran")
-	if err != nil {
-		t.Fatalf("RunCommand under null: %v (out=%q)", err, out)
-	}
-	if code != 0 || string(out) != "ran" {
-		t.Errorf("null-backend run: code=%d out=%q, want 0 / %q", code, out, "ran")
+// acceptRowSandboxUnavailable proves the production direct backend cannot be
+// selected for a Sandboxed policy.
+func acceptRowSandboxUnavailable(t *testing.T) {
+	_, _, _, _, err := newNullBackend().compile(effectivePolicy{Isolation: Sandboxed})
+	if !errors.Is(err, ErrSandboxUnavailable) {
+		t.Fatalf("sandboxed direct backend error = %v, want ErrSandboxUnavailable", err)
 	}
 }
 
@@ -81,7 +64,7 @@ func acceptRowEnvScrub(t *testing.T) {
 	ws := t.TempDir()
 
 	// Construct AFTER Setenv: the executor snapshots os.Environ at build.
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
