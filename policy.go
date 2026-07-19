@@ -27,6 +27,7 @@ type Guarantees struct {
 	NetworkBoundary bool
 	AddressNetwork  bool
 	ResourceLimits  bool
+	TargetNetwork   bool
 }
 
 const (
@@ -37,6 +38,7 @@ const (
 	GuaranteeNetworkBoundary
 	GuaranteeAddressNetwork
 	GuaranteeResourceLimits
+	GuaranteeTargetNetwork
 )
 
 func guaranteesFromBits(bits uint64) Guarantees {
@@ -48,6 +50,7 @@ func guaranteesFromBits(bits uint64) Guarantees {
 		NetworkBoundary: bits&GuaranteeNetworkBoundary != 0,
 		AddressNetwork:  bits&GuaranteeAddressNetwork != 0,
 		ResourceLimits:  bits&GuaranteeResourceLimits != 0,
+		TargetNetwork:   bits&GuaranteeTargetNetwork != 0,
 	}
 }
 
@@ -73,6 +76,9 @@ func (g Guarantees) bits() uint64 {
 	}
 	if g.ResourceLimits {
 		bits |= GuaranteeResourceLimits
+	}
+	if g.TargetNetwork {
+		bits |= GuaranteeTargetNetwork
 	}
 	return bits
 }

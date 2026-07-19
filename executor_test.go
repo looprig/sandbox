@@ -195,12 +195,12 @@ func TestEnvAllowAndInherit(t *testing.T) {
 }
 
 // TestGuaranteesFromBitsRoundTrip asserts the bit<->field mapping is a faithful
-// bijection over all 7 bits, and that each single bit lights exactly its one
+// bijection over all defined bits, and that each single bit lights exactly its one
 // matching field (bit order agrees with field order).
 func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
-	// Round-trip every combination of the 7 defined bits.
+	// Round-trip every combination of the defined bits.
 	const all = GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary |
-		GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeResourceLimits
+		GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeResourceLimits | GuaranteeTargetNetwork
 	for bits := uint64(0); bits <= all; bits++ {
 		if bits&^all != 0 {
 			continue // skip values with bits outside the defined set
@@ -222,6 +222,7 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 		{GuaranteeNetworkBoundary, func(g Guarantees) bool { return g.NetworkBoundary }},
 		{GuaranteeAddressNetwork, func(g Guarantees) bool { return g.AddressNetwork }},
 		{GuaranteeResourceLimits, func(g Guarantees) bool { return g.ResourceLimits }},
+		{GuaranteeTargetNetwork, func(g Guarantees) bool { return g.TargetNetwork }},
 	}
 	for _, c := range cases {
 		g := guaranteesFromBits(c.bit)

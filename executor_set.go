@@ -3,7 +3,9 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -17,6 +19,7 @@ type executorSetConfig struct {
 	scratchRoot string
 	max         int
 	execOptions []ExecOption
+	route       *EgressRoute
 }
 
 // ExecutorSetOption configures executor ownership and resource limits.
@@ -32,6 +35,11 @@ func WithMaxExecutors(max int) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.max = max }
 }
 
+// WithEgressRoute configures the explicit route used by target-scoped grants.
+func WithEgressRoute(route EgressRoute) ExecutorSetOption {
+	return func(config *executorSetConfig) { config.route = &route }
+}
+
 func withExecutorSetExecOptions(options ...ExecOption) ExecutorSetOption {
 	return func(config *executorSetConfig) {
 		config.execOptions = append(config.execOptions, options...)
@@ -45,6 +53,7 @@ type ExecutorSet struct {
 	ownedRoot string
 	max       int
 	options   []ExecOption
+	route     *EgressRoute
 	executors map[string]*Executor
 	closed    bool
 	closeErr  error
@@ -67,6 +76,11 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 	if config.max <= 0 {
 		return nil, errors.New("sandbox: executor set maximum must be positive")
 	}
+	if config.route != nil {
+		if err := config.route.validate(); err != nil {
+			return nil, err
+		}
+	}
 	scratch, err := canonicalRoot(config.scratchRoot)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: executor set scratch root: %w", err)
@@ -82,6 +96,7 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 	return &ExecutorSet{
 		profile: profile, ownedRoot: owned, max: config.max,
 		options:   append([]ExecOption(nil), config.execOptions...),
+		route:     config.route,
 		executors: make(map[string]*Executor),
 	}, nil
 }
@@ -134,14 +149,41 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	if ownedHome {
 		policy.FS = append(policy.FS, fsEntry{Path: home, Access: readFSAccess | writeFSAccess | execFSAccess})
 	}
+	var proxy *egressProxy
+	if set.route != nil {
+		proxy, err = newEgressProxy(*set.route)
+		if err != nil {
+			if ownedHome {
+				_ = os.RemoveAll(home)
+			}
+			return nil, err
+		}
+		_, portText, splitErr := net.SplitHostPort(proxy.Addr())
+		port, parseErr := strconv.ParseUint(portText, 10, 16)
+		if splitErr != nil || parseErr != nil || port == 0 {
+			_ = proxy.Close()
+			if ownedHome {
+				_ = os.RemoveAll(home)
+			}
+			return nil, errors.New("sandbox: invalid egress proxy listener")
+		}
+		policy.Net = effectiveNetPolicy{Loopback: true, Ports: []uint16{uint16(port)}}
+	}
 	executor, err := newExecutorFromEffective(set.profile, policy, set.options...)
 	if err != nil {
+		if proxy != nil {
+			_ = proxy.Close()
+		}
 		if ownedHome {
 			_ = os.RemoveAll(home)
 		}
 		return nil, err
 	}
 	executor.home = home
+	if proxy != nil {
+		executor.proxy = proxy
+		executor.routeFingerprint = set.route.Fingerprint()
+	}
 	set.executors[key] = executor
 	return executor, nil
 }
@@ -177,5 +219,9 @@ func (e *Executor) revoke() {
 		e.grantKey[i] = 0
 	}
 	e.usedGrants = nil
+	proxy := e.proxy
 	e.grantMu.Unlock()
+	if proxy != nil {
+		_ = proxy.Close()
+	}
 }

@@ -69,6 +69,7 @@ func TestSandboxtestSeamConstantsMatch(t *testing.T) {
 		{"NetworkBoundary", GuaranteeNetworkBoundary, sandboxtest.GuaranteeNetworkBoundary},
 		{"AddressNetwork", GuaranteeAddressNetwork, sandboxtest.GuaranteeAddressNetwork},
 		{"ResourceLimits", GuaranteeResourceLimits, sandboxtest.GuaranteeResourceLimits},
+		{"TargetNetwork", GuaranteeTargetNetwork, sandboxtest.GuaranteeTargetNetwork},
 	}
 	for _, p := range bitPairs {
 		if p.orig != p.mirror {

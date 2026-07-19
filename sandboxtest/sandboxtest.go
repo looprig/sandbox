@@ -65,6 +65,7 @@ const (
 	GuaranteeNetworkBoundary
 	GuaranteeAddressNetwork
 	GuaranteeResourceLimits
+	GuaranteeTargetNetwork
 )
 
 // Isolation levels mirror the sandbox package's achieved-isolation rollup
@@ -256,7 +257,7 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 	// enforcement was achieved, so none of these may be claimed.
 	const osEnforcementBits = GuaranteeProcessBoundary | GuaranteeWriteBoundary |
 		GuaranteeReadBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork |
-		GuaranteeResourceLimits
+		GuaranteeResourceLimits | GuaranteeTargetNetwork
 
 	invariants := []struct {
 		name string
@@ -271,6 +272,10 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 			// Address-scoped network rules presuppose a network boundary.
 			name: "AddressNetwork implies NetworkBoundary",
 			ok:   !has(GuaranteeAddressNetwork) || has(GuaranteeNetworkBoundary),
+		},
+		{
+			name: "TargetNetwork implies NetworkBoundary",
+			ok:   !has(GuaranteeTargetNetwork) || has(GuaranteeNetworkBoundary),
 		},
 		{
 			// A write boundary is at least the degraded threshold (SPEC §7.5:

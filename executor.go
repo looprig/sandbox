@@ -3,12 +3,15 @@ package sandbox
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +116,7 @@ type Executor struct {
 	clock            func() time.Time
 	grantTTL         time.Duration
 	routeFingerprint string
+	proxy            *egressProxy
 	home             string
 	grantMu          sync.Mutex
 	usedGrants       map[[32]byte]struct{}
@@ -226,6 +230,13 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if err != nil {
 		return nil, -1, err
 	}
+	s, executionID, err := e.prepareAllowedRoute(s)
+	if err != nil {
+		return nil, -1, err
+	}
+	if executionID != "" {
+		defer e.proxy.Release(executionID)
+	}
 	return e.run(ctx, dir, shellArgv(command), s)
 }
 
@@ -266,7 +277,39 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 	if err != nil {
 		return nil, -1, err
 	}
+	s, executionID, err := e.prepareAllowedRoute(s)
+	if err != nil {
+		return nil, -1, err
+	}
+	if executionID != "" {
+		defer e.proxy.Release(executionID)
+	}
 	return e.run(ctx, dir, argv, s)
+}
+
+func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
+	if e.profile == nil || e.profile.network != Allow || e.proxy == nil {
+		return s, "", nil
+	}
+	random := make([]byte, 18)
+	if _, err := rand.Read(random); err != nil {
+		return snapshot{}, "", fmt.Errorf("sandbox: route execution identity: %w", err)
+	}
+	executionID := "route-" + base64.RawURLEncoding.EncodeToString(random)
+	credential, err := e.proxy.authorizeAll(executionID)
+	if err != nil {
+		return snapshot{}, "", err
+	}
+	policy := cloneEffectivePolicy(s.policy)
+	proxyURL := e.proxy.URL(executionID, credential)
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		policy.Env.Set[name] = proxyURL
+	}
+	policy.Env.Set["NO_PROXY"] = ""
+	policy.Env.Set["no_proxy"] = ""
+	s.policy = policy
+	s.env = assembleEnv(policy)
+	return s, executionID, nil
 }
 
 // run is the shared execution path for RunCommand, RunArgv, and
@@ -417,6 +460,9 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if class == "command.start.v1" && target != command {
 		return "", ErrGrantWrongCommand
 	}
+	if class == "network.proxy-target.v1" && e.proxy == nil {
+		return "", ErrGrantUnsupported
+	}
 	_ = delta
 	access, err := e.profile.AccessFor(kind, scope)
 	if err != nil {
@@ -478,6 +524,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	now := e.clock()
 	seen := make(map[[32]byte]struct{}, len(grants))
 	commandGrant := e.profile.command == Allow
+	var proxyTargets []NetworkTarget
 	for _, token := range grants {
 		id := grantID(token)
 		if _, ok := e.usedGrants[id]; ok {
@@ -513,12 +560,29 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		if delta.port != 0 && !containsPort(policy.Net.Ports, delta.port) {
 			policy.Net.Ports = append(policy.Net.Ports, delta.port)
 		}
+		if delta.target != nil {
+			proxyTargets = append(proxyTargets, *delta.target)
+		}
 	}
 	if e.profile.command == Deny {
 		return nil, -1, ErrGrantDenied
 	}
 	if !commandGrant {
 		return nil, -1, ErrGrantRequired
+	}
+	if len(proxyTargets) != 0 {
+		if e.proxy == nil {
+			return nil, -1, ErrGrantUnsupported
+		}
+		_, portText, err := net.SplitHostPort(e.proxy.Addr())
+		if err != nil {
+			return nil, -1, ErrGrantUnsupported
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil || port == 0 {
+			return nil, -1, ErrGrantUnsupported
+		}
+		policy.Net = effectiveNetPolicy{Loopback: true, Ports: []uint16{uint16(port)}}
 	}
 	spec, _, _, bits, err := e.backend.compile(policy)
 	if err != nil {
@@ -527,13 +591,33 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	if bits != e.guaranteeBits {
 		return nil, -1, ErrGrantGuaranteeMismatch
 	}
+	if len(proxyTargets) != 0 {
+		credential, err := e.proxy.Authorize(executionID, proxyTargets)
+		if err != nil {
+			return nil, -1, err
+		}
+		proxyURL := e.proxy.URL(executionID, credential)
+		for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+			policy.Env.Set[name] = proxyURL
+		}
+		policy.Env.Set["NO_PROXY"] = ""
+		policy.Env.Set["no_proxy"] = ""
+	}
 	for id := range seen {
 		e.usedGrants[id] = struct{}{}
 	}
 	s := snapshot{spec: spec, env: assembleEnv(policy), policy: policy}
 	e.grantMu.Unlock()
 	out, code, runErr := e.run(ctx, canonicalCWD, shellArgv(command), s)
+	var denial error
+	if len(proxyTargets) != 0 {
+		denial = e.proxy.Denial(executionID)
+		e.proxy.Release(executionID)
+	}
 	e.grantMu.Lock()
+	if denial != nil {
+		return out, code, &NetworkTargetDeniedError{ExitCode: code, ProcessError: runErr, denial: denial}
+	}
 	return out, code, runErr
 }
 

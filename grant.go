@@ -158,9 +158,10 @@ func validGrantText(value string) bool {
 }
 
 type grantDelta struct {
-	entry *fsEntry
-	port  uint16
-	class string
+	entry  *fsEntry
+	port   uint16
+	class  string
+	target *NetworkTarget
 }
 
 func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, error) {
@@ -216,7 +217,11 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 		if kind != "network" || scope != "" || !validGrantText(target) {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return grantDelta{}, 0, ErrGrantUnsupported
+		normalized, err := ParseNetworkTarget(target)
+		if err != nil || normalized.String() != target {
+			return grantDelta{}, 0, ErrGrantMalformed
+		}
+		return grantDelta{class: class, target: &normalized}, GuaranteeTargetNetwork, nil
 	default:
 		return grantDelta{}, 0, ErrGrantUnsupported
 	}
