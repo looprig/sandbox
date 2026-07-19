@@ -51,6 +51,20 @@ type effectivePolicy struct {
 	Home      Home
 }
 
+func cloneEffectivePolicy(p effectivePolicy) effectivePolicy {
+	clone := p
+	clone.FS = append([]fsEntry(nil), p.FS...)
+	clone.Net.Ports = append([]uint16(nil), p.Net.Ports...)
+	clone.Env.Allow = append([]string(nil), p.Env.Allow...)
+	if p.Env.Set != nil {
+		clone.Env.Set = make(map[string]string, len(p.Env.Set))
+		for key, value := range p.Env.Set {
+			clone.Env.Set[key] = value
+		}
+	}
+	return clone
+}
+
 const (
 	writableTmpRoot = "/tmp"
 	nullDevicePath  = "/dev/null"
@@ -121,6 +135,11 @@ func containsPort(ports []uint16, port uint16) bool {
 		}
 	}
 	return false
+}
+
+func netBlocked(p effectivePolicy) bool {
+	net := p.Net
+	return !net.Loopback && !net.Private && !net.DNS && !net.Open && len(net.Ports) == 0
 }
 
 func realHome() (string, error) {

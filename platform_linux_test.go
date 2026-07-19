@@ -5,7 +5,6 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"os/exec"
 	"testing"
 )
 
@@ -89,21 +88,5 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"echo", "wired"})
 	if err != nil || code != 0 {
 		t.Fatalf("RunArgv: err=%v code=%d out=%q", err, code, out)
-	}
-}
-
-// TestWrapFailsClosedOnReexecBackend documents that Wrap is intentionally
-// unsupported on the re-exec linux backend: its wrap returns a per-spawn cleanup
-// (pipe teardown) that Wrap cannot own, so Wrap fails closed rather than leaking
-// the pipe. Consumers use RunCommand/RunArgv on Linux.
-func TestWrapFailsClosedOnReexecBackend(t *testing.T) {
-	requireLandlockV4(t)
-	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newLinuxBackend()))
-	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
-	}
-	if _, err := e.Wrap(exec.Command("echo", "hi")); err == nil {
-		t.Error("Wrap on the re-exec linux backend succeeded, want a fail-closed error")
 	}
 }

@@ -2,9 +2,8 @@ package sandbox
 
 // Acceptance matrix — SPEC §12.1. This file asserts the PLATFORM-INDEPENDENT rows
 // (and the sandbox-side mechanisms the harness-integration rows build on) that the
-// sandbox module can prove on its own: the null / rung-3 fallback, env scrub,
-// dynamic-mode generation bump (the sandbox side of a ceiling downgrade), and
-// grant retry + fabricated-token rejection. Linux-rung rows live in
+// sandbox module can prove on its own: the null / rung-3 fallback and env scrub.
+// Grant-v1 acceptance has its own focused suite. Linux-rung rows live in
 // acceptance_linux_test.go; the macOS Seatbelt row in acceptance_darwin_test.go.
 //
 // The load-bearing signal on every row is the per-row Guarantees() assertion — the
@@ -16,17 +15,10 @@ package sandbox
 
 import (
 	"context"
-	"errors"
 	"os"
 	"strings"
 	"testing"
-	"time"
 )
-
-// acceptTime is a fixed instant for grant-expiry determinism (no time.Now in
-// assertions): TTLs are computed against it via withClock so a minted token never
-// expires mid-test.
-var acceptTime = time.Unix(1_700_000_000, 0)
 
 // TestAcceptanceMatrixCrossPlatform runs the §12.1 rows the sandbox module can
 // assert on any platform. Each entry mirrors one matrix scenario; a row asserts
@@ -45,7 +37,6 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 	}{
 		{"no-sandbox-available/rung3-null", acceptRowNullBackend},
 		{"env-scrub", acceptRowEnvScrub},
-		{"grant-retry-and-fabricated-token", acceptRowGrantRetry},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { tt.run(t) })
@@ -115,59 +106,6 @@ func acceptRowEnvScrub(t *testing.T) {
 	}
 	if !strings.Contains(got, "TMPDIR=/tmp") {
 		t.Errorf("child env missing TMPDIR=/tmp (writable tmp):\n%s", got)
-	}
-}
-
-// acceptRowGrantRetry — §12.1 "Grant retry (post-denial)" + the fabricated-token
-// defense: PlanGrants mints a candidate token for the net-denied policy; a genuine
-// minted token verifies and the command runs a SINGLE spawn; a fabricated/garbage
-// token returns a TYPED error and never runs (so it can never even reach a prompt).
-// Pinned to the null backend + a fixed clock for determinism.
-func acceptRowGrantRetry(t *testing.T) {
-	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws),
-		withBackend(newNullBackend()),
-		withClock(func() time.Time { return acceptTime }),
-	)
-	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
-	}
-	// Per-row Guarantees(): the null posture the grant flow runs under.
-	assertGuarantees(t, e.Guarantees(), Guarantees{EnvScrub: true})
-
-	dir, cmd := ws, "printf CONFORMANCE_RAN"
-	grants := e.PlanGrants(dir, cmd)
-	if len(grants) != 1 {
-		t.Fatalf("PlanGrants (net blocked): got %d, want 1", len(grants))
-	}
-	// The genuine token describes for the prompt.
-	if desc, ok := e.DescribeGrant(grants[0]); !ok || desc == "" {
-		t.Errorf("DescribeGrant(genuine) = (%q,%v), want a non-empty description and true", desc, ok)
-	}
-
-	// Fabricated token: no description, a typed error, and NO spawn.
-	const fabricated = "lrsx1.garbage.garbage"
-	if _, ok := e.DescribeGrant(fabricated); ok {
-		t.Error("DescribeGrant(fabricated) = (,true), want (,false) — a forged token must never reach a prompt")
-	}
-	out, code, err := e.RunCommandWithGrants(context.Background(), dir, cmd, []string{fabricated})
-	if err == nil {
-		t.Fatal("RunCommandWithGrants(fabricated): err = nil, want a typed grant error")
-	}
-	if !errors.Is(err, ErrGrantBadMAC) {
-		t.Errorf("RunCommandWithGrants(fabricated): err = %v, want ErrGrantBadMAC", err)
-	}
-	if strings.Contains(string(out), "CONFORMANCE_RAN") || code != -1 {
-		t.Errorf("fabricated token RAN the command (out=%q code=%d) — FAIL-OPEN", out, code)
-	}
-
-	// Genuine token: verifies and runs exactly one spawn.
-	out, code, err = e.RunCommandWithGrants(context.Background(), dir, cmd, grants)
-	if err != nil {
-		t.Fatalf("RunCommandWithGrants(genuine): %v (out=%q)", err, out)
-	}
-	if code != 0 || !strings.Contains(string(out), "CONFORMANCE_RAN") {
-		t.Errorf("genuine grant run: code=%d out=%q, want 0 / contains CONFORMANCE_RAN", code, out)
 	}
 }
 

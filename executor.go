@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -104,28 +106,26 @@ type Executor struct {
 	guaranteeBits uint64
 	env           []string // assembled child environment, KEY=VALUE (SPEC §5.5)
 
-	// Grant wiring (SPEC §9.2). grantKey is the per-executor HMAC key (never
-	// serialized — the instance binding); policyGen is the generation bound into
-	// minted tokens (bumped on every dynamic recompile so a mode change voids all
-	// prior tokens); clock is injectable for deterministic tests; grantTTL is the
-	// minted-token lifetime (default 15 min).
-	grantKey  []byte
-	policyGen uint64
-	clock     func() time.Time
-	grantTTL  time.Duration
+	// Grant wiring (SPEC §9.2). The HMAC key is per-executor and never serialized.
+	// Tokens also bind the immutable profile, route identity, and guarantee bits.
+	// usedGrants provides one-shot replay protection; Close revokes the key.
+	grantKey         []byte
+	clock            func() time.Time
+	grantTTL         time.Duration
+	routeFingerprint string
+	home             string
+	grantMu          sync.Mutex
+	usedGrants       map[[32]byte]struct{}
+	closed           bool
 
 	cgroupParent string // stored for the cgroup task (SPEC §7.4); unused here
 }
 
-// snapshot is the compiled state a single spawn needs, read atomically so a
-// concurrent dynamic recompile cannot tear a spawn across two generations. For a
-// static executor it mirrors the immutable fields; for a dynamic one it is read
-// under mu right after any needed recompile.
+// snapshot is the compiled state a single spawn needs.
 type snapshot struct {
-	spec      spawnSpec
-	env       []string
-	policy    effectivePolicy
-	policyGen uint64
+	spec   spawnSpec
+	env    []string
+	policy effectivePolicy
 }
 
 // NewExecutor selects a backend and compiles one immutable profile. Profile
@@ -172,19 +172,20 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 	}
 
 	return &Executor{
-		profile:       profile,
-		policy:        p,
-		backend:       b,
-		spec:          spec,
-		report:        report,
-		level:         level,
-		guaranteeBits: bits,
-		env:           assembleEnv(p),
-		grantKey:      key,
-		policyGen:     1, // static executors have a constant generation
-		clock:         clockOrDefault(cfg.clock),
-		grantTTL:      ttlOrDefault(cfg.grantTTL),
-		cgroupParent:  cfg.cgroupParent,
+		profile:          profile,
+		policy:           p,
+		backend:          b,
+		spec:             spec,
+		report:           report,
+		level:            level,
+		guaranteeBits:    bits,
+		env:              assembleEnv(p),
+		grantKey:         key,
+		clock:            clockOrDefault(cfg.clock),
+		grantTTL:         ttlOrDefault(cfg.grantTTL),
+		routeFingerprint: defaultRouteIdentity,
+		usedGrants:       make(map[[32]byte]struct{}),
+		cgroupParent:     cfg.cgroupParent,
 	}, nil
 }
 
@@ -218,6 +219,9 @@ func ttlOrDefault(d time.Duration) time.Duration {
 // not uniquely mean "didn't spawn" — it also arises from signal death and
 // context cancellation.
 func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte, int, error) {
+	if err := e.commandAccess(); err != nil {
+		return nil, -1, err
+	}
 	s, err := e.resolve()
 	if err != nil {
 		return nil, -1, err
@@ -233,7 +237,7 @@ func shellArgv(command string) []string { return []string{"/bin/sh", "-c", comma
 
 // resolve returns the immutable compiled snapshot for one spawn.
 func (e *Executor) resolve() (snapshot, error) {
-	s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
+	s := snapshot{spec: e.spec, env: e.env, policy: e.policy}
 	return s, e.resolveErr(nil)
 }
 
@@ -255,6 +259,9 @@ func (e *Executor) resolveErr(compileErr error) error {
 // detect a process that did not complete normally (spawn failure, signal kill,
 // or context cancellation all report code -1).
 func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
+	if err := e.commandAccess(); err != nil {
+		return nil, -1, err
+	}
 	s, err := e.resolve()
 	if err != nil {
 		return nil, -1, err
@@ -354,127 +361,208 @@ func (e *Executor) GuaranteeBits() uint64 {
 	return e.guaranteeBits
 }
 
-// netBlocked reports whether a policy grants no outbound network at all: no
-// address class (Loopback/Private/DNS/Open) and no explicit ports. It is the
-// signal PlanGrants uses to decide the network capability is currently denied.
-func netBlocked(p effectivePolicy) bool {
-	n := p.Net
-	return !n.Loopback && !n.Private && !n.DNS && !n.Open && len(n.Ports) == 0
-}
-
-// PlanGrants mints CANDIDATE grant tokens for capabilities the current compiled
-// policy blocks (SPEC §9.2). Each token is bound to (dir, command), the current
-// policy generation, and an expiry (clock + grantTTL), and carries a MAC-covered
-// description so the approval prompt cannot be inflated.
-//
-// For this task the only planned axis is network: when the policy blocks egress
-// (netBlocked) a single "net" delta is offered. A ReadOnlyView never plans grants
-// — the read path never escalates — so it returns nil immediately.
-//
-// Task 9: a per-command classifier ("does THIS command actually need net") will
-// gate the candidate; here we plan purely from the policy-denied axes.
-func (e *Executor) PlanGrants(dir, command string) []string {
-	s, err := e.resolve()
-	if err != nil {
+func (e *Executor) commandAccess() error {
+	if e == nil {
+		return ErrExecutorClosed
+	}
+	e.grantMu.Lock()
+	defer e.grantMu.Unlock()
+	if e.closed {
+		return ErrExecutorClosed
+	}
+	if e.profile == nil {
 		return nil
 	}
+	switch e.profile.command {
+	case Allow:
+		return nil
+	case Gated:
+		return ErrGrantRequired
+	default:
+		return ErrGrantDenied
+	}
+}
 
-	var tokens []string
-	if netBlocked(s.policy) {
-		tok, err := mintGrant(e.grantKey, grantPayload{
-			PolicyGen:   s.policyGen,
-			CmdHash:     hashCommand(dir, command),
-			Delta:       "net",
-			Description: "allow network egress for: " + command,
-			Expiry:      e.clock().Add(e.grantTTL),
-		})
-		if err == nil { // skip the candidate on a mint failure
-			tokens = append(tokens, tok)
+// GrantVersion reports the scalar grant ABI implemented by this executor.
+func (e *Executor) GrantVersion() uint16 {
+	if e == nil {
+		return 0
+	}
+	return currentGrantVersion
+}
+
+// IssueGrant mints a single-use, executor-bound capability grant.
+func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, kind, scope, class, target string, expiryUnixMilli int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if e == nil || e.profile == nil || e.profile.validate() != nil {
+		return "", ErrInvalidProfile
+	}
+	if !validGrantText(executionID) || !validGrantText(command) {
+		return "", ErrGrantMalformed
+	}
+	canonicalCWD, err := canonicalWorkingDirectory(cwd)
+	if err != nil {
+		return "", fmt.Errorf("%w: cwd: %v", ErrGrantMalformed, err)
+	}
+	scope, target, err = normalizeGrantScopeTarget(scope, class, target)
+	if err != nil {
+		return "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
+	}
+	delta, requiredBits, err := validateGrantClass(kind, scope, class, target)
+	if err != nil {
+		return "", err
+	}
+	if class == "command.start.v1" && target != command {
+		return "", ErrGrantWrongCommand
+	}
+	_ = delta
+	access, err := e.profile.AccessFor(kind, scope)
+	if err != nil {
+		return "", err
+	}
+	if Access(access) == Deny {
+		return "", ErrGrantDenied
+	}
+	if Access(access) != Gated {
+		return "", ErrGrantUnsupported
+	}
+	e.grantMu.Lock()
+	defer e.grantMu.Unlock()
+	if e.closed {
+		return "", ErrExecutorClosed
+	}
+	now := e.clock()
+	expiry := expiryFromMillis(expiryUnixMilli)
+	if !expiry.After(now) || expiry.After(now.Add(e.grantTTL)) {
+		return "", ErrGrantExpired
+	}
+	if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
+		return "", ErrGrantGuaranteeMismatch
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("sandbox: grant nonce: %w", err)
+	}
+	return mintGrant(e.grantKey, grantPayload{
+		ExecutionID: executionID, Command: command, WorkingDirectory: canonicalCWD,
+		ProfileFingerprint: e.profile.fingerprint, RouteFingerprint: e.routeFingerprint,
+		GuaranteeBits: e.guaranteeBits, Class: class, Target: target,
+		ExpiryUnixMilli: expiryUnixMilli, Nonce: nonce,
+	})
+}
+
+// RunCommandWithGrants verifies all grants, compiles their least-authority
+// deltas for this spawn, atomically consumes them, and then starts the command.
+func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string) ([]byte, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, -1, err
+	}
+	canonicalCWD, err := canonicalWorkingDirectory(dir)
+	if err != nil {
+		return nil, -1, fmt.Errorf("%w: cwd: %v", ErrGrantMalformed, err)
+	}
+	if !validGrantText(executionID) || !validGrantText(command) {
+		return nil, -1, ErrGrantMalformed
+	}
+	e.grantMu.Lock()
+	defer e.grantMu.Unlock()
+	if e.closed {
+		return nil, -1, ErrExecutorClosed
+	}
+	if e.profile == nil {
+		return nil, -1, ErrInvalidProfile
+	}
+	policy := cloneEffectivePolicy(e.policy)
+	now := e.clock()
+	seen := make(map[[32]byte]struct{}, len(grants))
+	commandGrant := e.profile.command == Allow
+	for _, token := range grants {
+		id := grantID(token)
+		if _, ok := e.usedGrants[id]; ok {
+			return nil, -1, ErrGrantReplay
+		}
+		if _, ok := seen[id]; ok {
+			return nil, -1, ErrGrantReplay
+		}
+		seen[id] = struct{}{}
+		payload, err := authenticateGrant(e.grantKey, token)
+		if err != nil {
+			return nil, -1, err
+		}
+		if err := verifyGrantBinding(payload, now, executionID, command, canonicalCWD, e.profile.fingerprint, e.routeFingerprint, e.guaranteeBits); err != nil {
+			return nil, -1, err
+		}
+		delta, requiredBits, err := validateGrantClass(classKind(payload.Class), classScope(payload.Class, payload.Target), payload.Class, payload.Target)
+		if err != nil {
+			return nil, -1, err
+		}
+		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
+			return nil, -1, ErrGrantGuaranteeMismatch
+		}
+		if delta.class == "command.start.v1" {
+			if payload.Target != command {
+				return nil, -1, ErrGrantWrongCommand
+			}
+			commandGrant = true
+		}
+		if delta.entry != nil {
+			policy.FS = append(policy.FS, *delta.entry)
+		}
+		if delta.port != 0 && !containsPort(policy.Net.Ports, delta.port) {
+			policy.Net.Ports = append(policy.Net.Ports, delta.port)
 		}
 	}
-	return tokens
-}
-
-// DescribeGrant MAC-verifies a token and returns its bound, MAC-covered
-// description for prompt display (SPEC §9.2). A fabricated or tampered token
-// fails verification and returns ("", false), so it can never even generate an
-// approval prompt. It does NOT check expiry or binding — a genuine-but-stale
-// token can still be described; never authorize a spawn on this result.
-func (e *Executor) DescribeGrant(token string) (string, bool) {
-	p, err := decodeGrantForDisplay(e.grantKey, token)
-	if err != nil {
-		return "", false
+	if e.profile.command == Deny {
+		return nil, -1, ErrGrantDenied
 	}
-	return p.Description, true
-}
-
-// RunCommandWithGrants verifies each supplied grant against the current policy
-// generation and the exact (dir, command), then — only if every grant is valid —
-// applies the deltas and runs the command (SPEC §9.2, §9.3). If ANY grant fails
-// verification it returns a typed error wrapping the sentinel (errors.Is finds
-// ErrGrantExpired/ErrGrantWrongGeneration/…) and does NOT run.
-//
-// Delta application is a NO-OP on the null backend: null enforces nothing, so
-// there is nothing to loosen for this one spawn. On a real OS backend each
-// verified delta loosens the compiled policy for THIS spawn only (e.g. permit
-// egress) before running; that per-spawn loosening lands with the OS backends.
-//
-// A ReadOnlyView fails closed on redeem as well as on mint: the read path never
-// escalates, so even a grant its parent minted (shared key, same generation)
-// cannot loosen a view whose policy forced writes off and Net blocked.
-func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) ([]byte, int, error) {
-	s, err := e.resolve()
+	if !commandGrant {
+		return nil, -1, ErrGrantRequired
+	}
+	spec, _, _, bits, err := e.backend.compile(policy)
 	if err != nil {
 		return nil, -1, err
 	}
-	now := e.clock()
-	want := hashCommand(dir, command)
-	for _, tok := range grants {
-		if _, verr := verifyGrant(e.grantKey, tok, now, s.policyGen, want); verr != nil {
-			return nil, -1, fmt.Errorf("grant: %w", verr)
-		}
+	if bits != e.guaranteeBits {
+		return nil, -1, ErrGrantGuaranteeMismatch
 	}
-	return e.run(ctx, dir, shellArgv(command), s)
+	for id := range seen {
+		e.usedGrants[id] = struct{}{}
+	}
+	s := snapshot{spec: spec, env: assembleEnv(policy), policy: policy}
+	e.grantMu.Unlock()
+	out, code, runErr := e.run(ctx, canonicalCWD, shellArgv(command), s)
+	e.grantMu.Lock()
+	return out, code, runErr
 }
 
-// Wrap applies the sandbox to a caller-built *exec.Cmd for non-harness users
-// (SPEC §6). It wraps the command's argv via the backend's spawnSpec, forces the
-// scrubbed environment (enforcing the env scrub even for externally constructed
-// commands), and applies any backend spawn attributes. On the null backend this
-// effectively just replaces cmd.Env with the scrubbed environment.
-//
-// Wrap hands the *exec.Cmd back for the caller to run, so — unlike RunCommand/
-// RunArgv — it cannot own the spawn's lifetime. A backend that allocates
-// per-spawn resources needing teardown (a non-nil cleanup from wrap) therefore
-// cannot be driven through Wrap: rather than silently leak that resource, Wrap
-// fails closed with an error. Every backend that returns a nil cleanup
-// (null, seatbelt, and Linux spawns with no transient cgroup) works through Wrap.
-func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
-	s, err := e.resolve()
-	if err != nil {
-		return nil, err
+func classKind(class string) string {
+	switch {
+	case class == "command.start.v1":
+		return "command.execute"
+	case strings.HasPrefix(class, "filesystem.") && strings.HasSuffix(class, ".read.v1"):
+		return "filesystem.read"
+	case strings.HasPrefix(class, "filesystem.") && strings.HasSuffix(class, ".write.v1"):
+		return "filesystem.write"
+	case strings.HasPrefix(class, "network."):
+		return "network"
+	default:
+		return ""
 	}
-	finalArgv, configure, cleanup := s.spec.wrap(cmd.Dir, cmd.Args)
-	if cleanup != nil {
-		cleanup() // release what wrap allocated; we cannot defer it across the caller's Run
-		return nil, errors.New("sandbox: this backend allocates per-spawn resources and cannot be used via Wrap; use RunCommand/RunArgv")
+}
+
+func classScope(class, target string) string {
+	switch {
+	case strings.Contains(class, ".host."):
+		return "host:*"
+	case strings.Contains(class, ".tree."):
+		return "tree:" + target
+	case strings.Contains(class, ".path."):
+		return target
+	default:
+		return ""
 	}
-	if len(finalArgv) == 0 {
-		return nil, errors.New("sandbox: cannot wrap a command with empty Args")
-	}
-	cmd.Path = finalArgv[0]
-	cmd.Args = finalArgv
-	cmd.Env = s.env
-	if cmd.Env == nil {
-		cmd.Env = []string{} // same fail-closed guard as run
-	}
-	if cmd.WaitDelay == 0 {
-		cmd.WaitDelay = spawnWaitGrace // default deadline-latency bound; the caller may override
-	}
-	if configure != nil {
-		configure(cmd)
-	}
-	return cmd, nil
 }
 
 // assembleEnv builds the child environment from a effectivePolicy's effectiveEnvPolicy (SPEC §5.5).
