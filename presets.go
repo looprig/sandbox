@@ -109,7 +109,7 @@ func MinimalSystemReadPaths() []string {
 		"/lib",      // shared libraries / loader
 		"/lib64",    // 64-bit loader (Linux)
 		"/etc",      // resolver, ssl certs, passwd
-		"/dev/null", // the null device
+		"/dev/null", // the null device (PolicyFor additionally grants safe writes)
 		"/System",   // macOS system frameworks and dyld
 		"/Library",  // macOS shared frameworks and support files
 	}

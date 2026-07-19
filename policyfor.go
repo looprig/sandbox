@@ -40,6 +40,12 @@ type policyBuilder struct {
 // two in lockstep.
 const writableTmpRoot = "/tmp"
 
+// nullDevicePath is process plumbing rather than persistent storage. Programs
+// commonly open it read-write during startup even when their actual work is
+// read-only, so every mode grants access without weakening a filesystem write
+// boundary.
+const nullDevicePath = "/dev/null"
+
 // baselineEnv is the non-unconfined environment posture: no inheritance of the
 // harness process environment, with TMPDIR set uniformly to /tmp
 // (writableTmpRoot) in every non-unconfined mode — regardless of whether /tmp is
@@ -137,6 +143,11 @@ func (b *policyBuilder) build() Policy {
 	if b.workspaceRead {
 		fs = append(fs, FSEntry{Path: b.workspace, Access: ReadAccess})
 	}
+
+	// The null device safely discards writes and is required by ordinary
+	// toolchains (including Git). Keep it explicit so read-only modes do not need
+	// a broad writable system path.
+	fs = append(fs, FSEntry{Path: nullDevicePath, Access: ReadAccess | WriteAccess})
 
 	// Writable project roots (workspace + WithWritable). These are the roots
 	// that carry read-only carveouts.

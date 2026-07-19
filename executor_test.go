@@ -613,6 +613,9 @@ func TestReadOnlyViewStatic(t *testing.T) {
 	if acc&ReadAccess == 0 {
 		t.Errorf("ReadOnlyView resolved access for workspace = %v, missing ReadAccess", acc)
 	}
+	if acc := Resolve(view.policy.FS, "/dev/null"); acc&WriteAccess == 0 {
+		t.Errorf("ReadOnlyView resolved access for /dev/null = %v, missing non-persistent WriteAccess", acc)
+	}
 	if !netBlocked(view.policy) {
 		t.Errorf("ReadOnlyView Net = %+v, want blocked", view.policy.Net)
 	}

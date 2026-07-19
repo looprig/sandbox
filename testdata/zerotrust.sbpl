@@ -25,6 +25,8 @@
 (allow file-read* (subpath "/Library"))
 (allow process-exec* (subpath "/Library"))
 (allow file-read* (subpath "/ws"))
+(allow file-read* (subpath "/dev/null"))
+(allow file-write* (subpath "/dev/null"))
 (deny file-read* file-write* (subpath "/lrsbx-home/tester/.ssh"))
 (deny file-read* file-write* (subpath "/lrsbx-home/tester/.aws"))
 (deny file-read* file-write* (subpath "/lrsbx-home/tester/.gnupg"))

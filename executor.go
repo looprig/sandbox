@@ -702,15 +702,19 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string
 	return e.run(ctx, dir, shellArgv(command), s)
 }
 
-// readOnlyMask derives a read-only policy: every FS entry's WriteAccess bit is
-// masked off (deny entries, whose Access is zero, are unaffected) and the network
-// is forced blocked (SPEC §6, §10.1). It returns a copy; the input is not
-// mutated, so the parent's compiled policy is untouched.
+// readOnlyMask derives a read-only policy: every persistent FS entry's
+// WriteAccess bit is masked off (deny entries, whose Access is zero, are
+// unaffected) and the network is forced blocked (SPEC §6, §10.1). The
+// non-persistent /dev/null plumbing grant remains writable so ordinary tools can
+// start. It returns a copy; the input is not mutated, so the parent's compiled
+// policy is untouched.
 func readOnlyMask(p Policy) Policy {
 	out := p
 	fs := make([]FSEntry, len(p.FS))
 	for i, entry := range p.FS {
-		entry.Access &^= WriteAccess
+		if entry.Path != nullDevicePath {
+			entry.Access &^= WriteAccess
+		}
 		fs[i] = entry
 	}
 	out.FS = fs

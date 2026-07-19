@@ -528,6 +528,27 @@ func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 	}
 }
 
+// TestSeatbeltEnforceNullDevice proves confined commands can open /dev/null
+// read-write. Git does this during startup even for read-only commands such as
+// `git status`; denying the null device therefore makes an otherwise available
+// tool fail before it can inspect the repository.
+func TestSeatbeltEnforceNullDevice(t *testing.T) {
+	requireSandboxExec(t)
+	ws := t.TempDir()
+	e, err := NewExecutor(PolicyFor(Write, ws))
+	if err != nil {
+		t.Fatalf("NewExecutor: %v", err)
+	}
+
+	out, code, err := e.RunCommand(context.Background(), ws, "exec 3<>/dev/null")
+	if err != nil {
+		t.Fatalf("open /dev/null read-write: spawn err %v (out=%s)", err, out)
+	}
+	if code != 0 {
+		t.Errorf("open /dev/null read-write: exit %d, want 0; out=%s", code, out)
+	}
+}
+
 // TestSeatbeltEnforceGitCarveout is the §12.1 .git carveout row: a sandboxed write
 // into ws/.git is DENIED while a sandboxed read of an existing ws/.git file is
 // ALLOWED. This verifies the read-allow + write-deny-LAST ordering enforces under

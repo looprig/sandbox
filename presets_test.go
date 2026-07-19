@@ -116,6 +116,13 @@ func TestPolicyForModes(t *testing.T) {
 				t.Errorf("Workspace = %q, want %q", p.Workspace, testWS)
 			}
 
+			// /dev/null is process plumbing, not persistent storage. Every mode
+			// must permit programs such as Git to open it read-write during startup.
+			nullAccess := Resolve(p.FS, "/dev/null")
+			if want := ReadAccess | WriteAccess; nullAccess&want != want {
+				t.Errorf("/dev/null access = %d, want at least Read|Write", nullAccess)
+			}
+
 			// Workspace root access.
 			if tt.wsAccess != 0 {
 				got, ok := fsAccess(p.FS, testWS)
