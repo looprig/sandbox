@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file compiles a Policy's filesystem axis into the RUNG-1 bind-mount VIEW
+// This file compiles a effectivePolicy's filesystem axis into the RUNG-1 bind-mount VIEW
 // (SPEC §7.2 rung 1, §7.5) and carries the stage-2 mechanism that materializes
 // it inside the child's mount namespace. Where rung 2 (landlock_linux.go)
 // enforces the FS axis by an ENUMERATED Landlock allowlist against the live
@@ -36,7 +36,7 @@ import (
 // unit-tested and run on every host; the actual mounting is exercised only in CI.
 //
 // Two-phase design across the re-exec, mirroring rung 2:
-//   - compile time (once, in linuxBackend.compileRung1): distil the Policy's FS
+//   - compile time (once, in linuxBackend.compileRung1): distil the effectivePolicy's FS
 //     axis into a mountViewPlan (rw/ro bind roots, literal deny masks, glob deny
 //     patterns, glob scan roots). Deny is a hard override: an allow at-or-under a
 //     literal deny is dropped (granting it would be WIDER than the policy).
@@ -72,15 +72,15 @@ const emptyMaskFile = ".lrsandbox-empty"
 // which is what makes every host path NOT bound into the new root INVISIBLE.
 const oldRootDir = ".lrsandbox-oldroot"
 
-// mountViewPlan is the rung-1 filesystem intent distilled from a Policy at
+// mountViewPlan is the rung-1 filesystem intent distilled from a effectivePolicy at
 // compile time (SPEC §7.2 rung 1, §7.5). It holds bind ROOTS and deny intent,
 // not stat'd entries: the dir/file classification and the glob scan are redone
 // per spawn (enumerateMountView) so the view is a fresh snapshot each time.
 type mountViewPlan struct {
-	// rwBinds are the writable allow roots (WriteAccess) — bound rw into the view.
+	// rwBinds are the writable allow roots (writeFSAccess) — bound rw into the view.
 	rwBinds []string
-	// roBinds are the read-only allow roots (ReadAccess, no WriteAccess) — bound
-	// ro. Carveouts (a ReadAccess allow nested under a writable root, e.g. .git)
+	// roBinds are the read-only allow roots (readFSAccess, no writeFSAccess) — bound
+	// ro. Carveouts (a readFSAccess allow nested under a writable root, e.g. .git)
 	// are ordinary roBinds; nesting is resolved by applying binds parents-first so
 	// the ro carveout re-masks the rw root it sits under.
 	roBinds []string
@@ -97,7 +97,7 @@ type mountViewPlan struct {
 }
 
 // hasDenies reports whether the plan carries any read-deny (fixed or glob) the
-// mount masks enforce — the condition for the ReadDenies guarantee at rung 1.
+// mount masks enforce — the condition for the ReadBoundary guarantee at rung 1.
 func (p mountViewPlan) hasDenies() bool {
 	return len(p.denyMasks) > 0 || len(p.globDenies) > 0
 }
@@ -110,19 +110,19 @@ type rung1Plan struct {
 	nft   compiledNftPlan
 }
 
-// compileMountView distils a Policy's FS entries into a mountViewPlan (SPEC §7.2
+// compileMountView distils a effectivePolicy's FS entries into a mountViewPlan (SPEC §7.2
 // rung 1). Literal allow roots become rw or ro binds; literal denies become
 // masks; glob denies are carried for the spawn-time scan. Allow globs (none in
 // the presets) are dropped — a mount cannot express a glob allow, and dropping
 // under-grants (fail secure). Deny is a HARD OVERRIDE: an allow at-or-under a
 // literal deny is dropped (deniedAtOrUnder), because binding it would be WIDER
 // than the policy; the denied path is still masked out of any broader allow.
-func compileMountView(p Policy) mountViewPlan {
+func compileMountView(p effectivePolicy) mountViewPlan {
 	var plan mountViewPlan
 
 	// First pass: collect the deny intent (literal masks vs glob patterns).
 	for _, e := range p.FS {
-		if e.Access != DenyAccess {
+		if e.Access != denyFSAccess {
 			continue
 		}
 		if strings.ContainsAny(e.Path, globMeta) {
@@ -134,10 +134,10 @@ func compileMountView(p Policy) mountViewPlan {
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
 	// seen order, so a path granted read then write is bound rw exactly once.
-	merged := make(map[string]FSAccess)
+	merged := make(map[string]fsAccess)
 	var order []string
 	for _, e := range p.FS {
-		if e.Access == DenyAccess || strings.ContainsAny(e.Path, globMeta) {
+		if e.Access == denyFSAccess || strings.ContainsAny(e.Path, globMeta) {
 			continue
 		}
 		clean := filepath.Clean(e.Path)
@@ -150,7 +150,7 @@ func compileMountView(p Policy) mountViewPlan {
 		if deniedAtOrUnder(path, plan.denyMasks) {
 			continue // deny wins: never bind an allow at-or-under a deny
 		}
-		if merged[path]&WriteAccess != 0 {
+		if merged[path]&writeFSAccess != 0 {
 			plan.rwBinds = append(plan.rwBinds, path)
 		} else {
 			plan.roBinds = append(plan.roBinds, path)

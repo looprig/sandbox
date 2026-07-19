@@ -62,7 +62,7 @@ func newLinuxBackendRung1() *linuxBackend {
 // newLinuxBackend, which existing tests pin) compiles the Landlock+seccomp tier
 // (compileRung2). It never errors — a policy that compiles to a narrower ruleset
 // is reported via level/bits/report, not via err.
-func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	if b.rung == rungOne {
 		return b.compileRung1(p)
 	}
@@ -74,11 +74,11 @@ func (b linuxBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64
 // denies; globs dropped), which the per-spawn wrap enumerates into a Landlock
 // allowlist. It reports LevelDegraded (rung 2 enforces the write boundary and
 // fixed-path denies but cannot express glob denies or address-scoped network for
-// subprocesses, §7.5) with GuaranteeWriteBoundary, GuaranteeReadDenies (when the
+// subprocesses, §7.5) with GuaranteeWriteBoundary, GuaranteeReadBoundary (when the
 // policy carries an enforceable fixed-path deny), and GuaranteeEnvScrub (when
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
 // unenforced.
-func (b linuxBackend) compileRung2(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung2(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	cfs := compileFSPolicy(p.FS)
 	cnet := compileNetPolicy(p.Net)
 	// Task 14: resolve the cgroup v2 resource-limit plan against the ancestor
@@ -86,11 +86,11 @@ func (b linuxBackend) compileRung2(p Policy) (spawnSpec, CompileReport, uint8, u
 	// COMPILE time; each spawn creates the transient scope at SPAWN time (see
 	// linuxWrap). Resource limits never change the isolation Level — they are
 	// containment-of-cost, not authority (§7.4), so LevelDegraded is unchanged.
-	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
+	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
 
 	bits := GuaranteeWriteBoundary
 	if cfs.hasLiteralDeny() {
-		bits |= GuaranteeReadDenies
+		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {
 		bits |= GuaranteeEnvScrub
@@ -154,9 +154,9 @@ func (b linuxBackend) compileRung2(p Policy) (spawnSpec, CompileReport, uint8, u
 // Degraded and be recorded; for the standard presets the mechanisms reach all of
 // them, so rung 1 is LevelFull. Resource limits are containment-of-cost and never
 // change Level (§7.4).
-func (b linuxBackend) compileRung1(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung1(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	cfs := compileFSPolicy(p.FS)
-	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
+	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
 	mvp := compileMountView(p)
 	nft := compileNftPlan(p.Net)
 
@@ -166,8 +166,8 @@ func (b linuxBackend) compileRung1(p Policy) (spawnSpec, CompileReport, uint8, u
 	bits := GuaranteeProcessBoundary | GuaranteeWriteBoundary
 	if mvp.hasDenies() {
 		// The mount masks enforce BOTH fixed-path and glob denies for subprocesses
-		// (unlike rung 2, which cannot express globs) — the ReadDenies guarantee.
-		bits |= GuaranteeReadDenies
+		// (unlike rung 2, which cannot express globs) — the ReadBoundary guarantee.
+		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {
 		bits |= GuaranteeEnvScrub
@@ -197,7 +197,7 @@ func (b linuxBackend) compileRung1(p Policy) (spawnSpec, CompileReport, uint8, u
 // address-scoped network with the metadata hard-deny — all "enforced". The one
 // recorded residual is the self-created-file glob-mask gap (§7.5), which does not
 // demote Level.
-func rung1CompileReport(p Policy, mvp mountViewPlan, nft compiledNftPlan) CompileReport {
+func rung1CompileReport(p effectivePolicy, mvp mountViewPlan, nft compiledNftPlan) CompileReport {
 	entries := []ReportEntry{
 		{
 			Feature: "process-boundary",
@@ -240,7 +240,7 @@ func rung1CompileReport(p Policy, mvp mountViewPlan, nft compiledNftPlan) Compil
 		entries = append(entries, ReportEntry{
 			Feature: "env-scrub",
 			Status:  "enforced",
-			Detail:  "target execve'd with the EnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
+			Detail:  "target execve'd with the effectiveEnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
 		})
 	}
 	entries = append(entries, rung1NetReport(nft)...)
@@ -284,7 +284,7 @@ func rung1NetReport(nft compiledNftPlan) []ReportEntry {
 // glob denies are unenforced (inexpressible in Landlock's additive model, left
 // to the in-process ReadGuard for native tools). It also notes that nonexistent
 // allow paths are dropped at spawn (fail secure).
-func fsCompileReport(p Policy, cfs compiledFS) CompileReport {
+func fsCompileReport(p effectivePolicy, cfs compiledFS) CompileReport {
 	entries := []ReportEntry{{
 		Feature: "write-boundary",
 		Status:  "enforced",
@@ -321,9 +321,9 @@ func fsCompileReport(p Policy, cfs compiledFS) CompileReport {
 
 // policyHasGlobDeny reports whether the policy carries any glob DENY entry, which
 // rung 2 cannot enforce for subprocesses (recorded unenforced in the report).
-func policyHasGlobDeny(p Policy) bool {
+func policyHasGlobDeny(p effectivePolicy) bool {
 	for _, e := range p.FS {
-		if e.Access == DenyAccess && strings.ContainsAny(e.Path, globMeta) {
+		if e.Access == denyFSAccess && strings.ContainsAny(e.Path, globMeta) {
 			return true
 		}
 	}

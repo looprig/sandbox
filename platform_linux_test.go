@@ -75,7 +75,7 @@ func TestPlatformBackendLiveOnThisHost(t *testing.T) {
 func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 func TestWrapFailsClosedOnReexecBackend(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

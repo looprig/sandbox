@@ -13,7 +13,7 @@ import (
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
 )
 
-// This file compiles a Policy's filesystem axis into a go-landlock ruleset for
+// This file compiles a effectivePolicy's filesystem axis into a go-landlock ruleset for
 // the rung-2 backend (SPEC §7.2, §7.5). Landlock is ADDITIVE (allowlist-only, no
 // deny rules), so a fixed-path deny compiles by ENUMERATED SIBLING ALLOWS: at
 // spawn, grant the siblings of a denied path instead of the parent, inode-pinned
@@ -21,7 +21,7 @@ import (
 // inaccessible for that command — which errs narrow, §7.5).
 //
 // Two-phase design across the re-exec:
-//   - compile time (once, in linuxBackend.compile): distil the Policy's FS axis
+//   - compile time (once, in linuxBackend.compile): distil the effectivePolicy's FS axis
 //     into a compiledFS — the literal ALLOW entries with their access bits and
 //     the literal DENY paths. Globs are not expressible at rung 2 and are
 //     dropped here (recorded in the CompileReport).
@@ -47,48 +47,48 @@ import (
 // fsRule is one compiled, spawn-time-enumerated Landlock allow. It crosses the
 // re-exec via encoding/gob, so every field is exported and a concrete type
 // (Access is a uint8 alias; IsDir a bool). The stage-2 child maps each fsRule to
-// a go-landlock RODirs/ROFiles/RWDirs/RWFiles by IsDir and the WriteAccess bit.
+// a go-landlock RODirs/ROFiles/RWDirs/RWFiles by IsDir and the writeFSAccess bit.
 type fsRule struct {
 	// Path is the absolute, cleaned path this rule grants.
 	Path string
-	// Access is the granted access; only the WriteAccess bit is consulted when
+	// Access is the granted access; only the writeFSAccess bit is consulted when
 	// rebuilding the go-landlock rule (RODirs already bundles read+exec).
-	Access FSAccess
+	Access fsAccess
 	// IsDir selects a directory rule (RODirs/RWDirs) vs a file rule
 	// (ROFiles/RWFiles), determined by an os.Stat at enumeration time.
 	IsDir bool
 }
 
 // writable reports whether the rule grants write access (RW* vs RO*).
-func (r fsRule) writable() bool { return r.Access&WriteAccess != 0 }
+func (r fsRule) writable() bool { return r.Access&writeFSAccess != 0 }
 
 // fsAllow is a single literal ALLOW entry after compile-time distillation: an
 // absolute cleaned path with its granted access bits.
 type fsAllow struct {
 	path   string
-	access FSAccess
+	access fsAccess
 }
 
 // writable reports whether the allow grants write access.
-func (a fsAllow) writable() bool { return a.access&WriteAccess != 0 }
+func (a fsAllow) writable() bool { return a.access&writeFSAccess != 0 }
 
-// compiledFS is the rung-2 filesystem intent distilled from a Policy at compile
+// compiledFS is the rung-2 filesystem intent distilled from a effectivePolicy at compile
 // time: the literal ALLOW entries and the literal DENY paths. Globs (allow or
 // deny) are not carried — Landlock cannot express them at rung 2 — and their
 // presence in the source policy is recorded separately in the CompileReport.
 type compiledFS struct {
-	// allows are the literal ALLOW entries (Access != DenyAccess), cleaned.
+	// allows are the literal ALLOW entries (Access != denyFSAccess), cleaned.
 	allows []fsAllow
-	// denies are the literal DENY paths (Access == DenyAccess), cleaned.
+	// denies are the literal DENY paths (Access == denyFSAccess), cleaned.
 	denies []string
 }
 
-// compileFSPolicy distils a Policy's FS entries into a compiledFS. Literal allow
+// compileFSPolicy distils a effectivePolicy's FS entries into a compiledFS. Literal allow
 // entries and literal deny paths are carried; glob entries (either kind) are
 // dropped — Landlock's additive model cannot express a glob deny at rung 2, and
 // a glob allow is not present in the presets. Dropping is the fail-secure
 // direction for allows (under-grant) and is separately recorded for denies.
-func compileFSPolicy(entries []FSEntry) compiledFS {
+func compileFSPolicy(entries []fsEntry) compiledFS {
 	var cfs compiledFS
 	for _, e := range entries {
 		clean := filepath.Clean(e.Path)
@@ -98,7 +98,7 @@ func compileFSPolicy(entries []FSEntry) compiledFS {
 			// in the presets) simply under-grant, which is fail secure.
 			continue
 		}
-		if e.Access == DenyAccess {
+		if e.Access == denyFSAccess {
 			cfs.denies = append(cfs.denies, clean)
 			continue
 		}
@@ -200,7 +200,7 @@ func excludesForAllow(a fsAllow, cfs compiledFS) []string {
 // excludes are == or strictly under dir. Symlinked children are skipped (never
 // follow a symlink out of the enumerated tree — fail secure; a symlink's real
 // target is granted through its own real path when the policy covers it).
-func carveGrant(dir string, access FSAccess, excludes []string, emit func(fsRule)) {
+func carveGrant(dir string, access fsAccess, excludes []string, emit func(fsRule)) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		// Cannot enumerate: grant nothing under dir (fail secure / narrow).
@@ -348,18 +348,18 @@ func landlockRule(r fsRule) landlock.Rule {
 // accessFSWrite set), with the directory-entry rights (make*/remove*) applied
 // only to a directory rule. Bits absent from the policy access are never set, so
 // a read-only entry grants no execute and no write.
-func landlockAccessSet(access FSAccess, isDir bool) landlock.AccessFSSet {
+func landlockAccessSet(access fsAccess, isDir bool) landlock.AccessFSSet {
 	var set landlock.AccessFSSet
-	if access&ReadAccess != 0 {
+	if access&readFSAccess != 0 {
 		set |= llsys.AccessFSReadFile
 		if isDir {
 			set |= llsys.AccessFSReadDir
 		}
 	}
-	if access&ExecAccess != 0 {
+	if access&execFSAccess != 0 {
 		set |= llsys.AccessFSExecute
 	}
-	if access&WriteAccess != 0 {
+	if access&writeFSAccess != 0 {
 		set |= llsys.AccessFSWriteFile | llsys.AccessFSTruncate
 		if isDir {
 			// make*/remove* operate on entries within a directory, so a writable

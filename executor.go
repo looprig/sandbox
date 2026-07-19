@@ -9,7 +9,6 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -29,43 +28,6 @@ const defaultGrantTTL = 15 * time.Minute
 // done or the process has exited, so a live command under a healthy context is
 // never truncated. The value trades a brief I/O-flush window against promptness.
 const spawnWaitGrace = time.Second
-
-// fullGuarantees is every defined guarantee bit set — the FULL posture. Only an
-// external executor asserts it, by explicit deployment declaration (SPEC §11);
-// no probing ever mints it.
-const fullGuarantees = GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadDenies |
-	GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeResourceLimits
-
-// ErrUnconfinedNotAcked is returned when a policy that grants unconfined access
-// is used to build (NewExecutor) or recompile (a dynamic ModeSource flipping to
-// Unconfined) an executor without Policy.AckUnconfined set (SPEC §4, §6).
-// Unconfined is stepping off the ladder — full user-level authority — so it
-// demands an explicit acknowledgement; its absence fails CLOSED. An external
-// executor is exempt: it declares deployment-level trust and never validates.
-var ErrUnconfinedNotAcked = errors.New("sandbox: unconfined policy requires AckUnconfined")
-
-// grantsUnconfined reports whether a policy leaves no meaningful confinement
-// (SPEC §4, §6). Env.Inherit (the child inherits the entire parent environment —
-// every secret) and Net.Open (unrestricted egress) are set ONLY by the Unconfined
-// preset or an explicit consumer opt-in (WithEnv(EnvPolicy{Inherit:true}) /
-// WithNet(NetPolicy{Open:true})); either flag alone means the sandbox no longer
-// confines the spawn. The FS shape is deliberately NOT consulted: a broad-read
-// policy is still confined by env scrub and network denial, so it is not
-// "unconfined".
-func grantsUnconfined(p Policy) bool { return p.Env.Inherit || p.Net.Open }
-
-// validatePolicy enforces the construction/recompile invariants shared by the
-// static and dynamic paths. Today the sole rule is the unconfined ack gate: a
-// policy that grants unconfined access MUST carry AckUnconfined (SPEC §6). It is
-// called from NewExecutor (static construction) and recompileLocked (dynamic
-// recompile, so a mode flip to Unconfined without WithAckUnconfined fails the
-// spawn closed). NewExternalExecutor never passes through it.
-func validatePolicy(p Policy) error {
-	if grantsUnconfined(p) && !p.AckUnconfined {
-		return ErrUnconfinedNotAcked
-	}
-	return nil
-}
 
 // Init is defined per-platform (init_linux.go / init_other.go): it is THE
 // re-exec dispatch entry point (SPEC §6). Consumers MUST call it as the very
@@ -127,13 +89,14 @@ func withBackend(b backend) ExecOption {
 	return func(c *execConfig) { c.backend = b }
 }
 
-// Executor compiles a Policy once via the platform backend and then runs
+// Executor compiles a effectivePolicy once via the platform backend and then runs
 // commands under the resulting stateless per-spawn transform (SPEC §6, §7). It
 // holds the compiled policy, the chosen backend, its spawnSpec, the compilation
 // report, the achieved level and guarantee bits, and the assembled child
 // environment — everything a spawn needs, precomputed at construction.
 type Executor struct {
-	policy        Policy
+	profile       *Profile
+	policy        effectivePolicy
 	backend       backend
 	spec          spawnSpec
 	report        CompileReport
@@ -152,29 +115,6 @@ type Executor struct {
 	grantTTL  time.Duration
 
 	cgroupParent string // stored for the cgroup task (SPEC §7.4); unused here
-
-	// Dynamic mode (SPEC §8). When src != nil the executor recompiles
-	// PolicyFor(src.Current(), workspace, popts...) per spawn, cached per mode and
-	// guarded by mu; each genuine mode change bumps policyGen. Static executors
-	// leave src nil and never recompile.
-	src       ModeSource
-	workspace string
-	popts     []PolicyOption
-	mu        sync.Mutex // guards the compiled snapshot + lastMode/haveMode for dynamic
-	lastMode  Mode       // last compiled mode (valid only when haveMode)
-	haveMode  bool       // whether a compile has happened (Mode's zero value is a valid mode)
-
-	// readOnly marks a ReadOnlyView (SPEC §10.1): every (re)compile strips write
-	// bits from FS, forces Net blocked, and PlanGrants returns nil — the read path
-	// never escalates.
-	readOnly bool
-
-	// compileErr latches a construction-time compile failure of a ReadOnlyView
-	// (whose signature has no error return). resolve returns it thereafter so a
-	// view that never compiled fails CLOSED at spawn instead of leaving a nil
-	// spawnSpec that would panic. It is only ever set for a static view; a dynamic
-	// view re-attempts compilation on each resolve, so its failures surface live.
-	compileErr error
 }
 
 // snapshot is the compiled state a single spawn needs, read atomically so a
@@ -184,47 +124,24 @@ type Executor struct {
 type snapshot struct {
 	spec      spawnSpec
 	env       []string
-	policy    Policy
+	policy    effectivePolicy
 	policyGen uint64
 }
 
-// ModeSource supplies the live mode for a dynamic executor (SPEC §6, §8). It is
-// read once per spawn; a change since the last spawn triggers a recompile.
-type ModeSource interface{ Current() Mode }
+// NewExecutor selects a backend and compiles one immutable profile. Profile
+// validation is platform-independent; backend availability is checked here.
+func NewExecutor(profile *Profile, opts ...ExecOption) (*Executor, error) {
+	p, err := compileEffectivePolicy(profile)
+	if err != nil {
+		return nil, err
+	}
+	return newExecutorFromEffective(profile, p, opts...)
+}
 
-// NewExecutor selects the platform backend, compiles the policy, and assembles
-// the child environment (SPEC §6). It returns an error only when the backend
-// cannot compile the policy at all, or when the home directory is unresolvable
-// for a non-unconfined policy (see below); a backend that enforces less than
-// requested still constructs an executor and reports the shortfall via Level/
-// Report/Guarantees.
-//
-// Ack gate (fail-closed): a policy that grants unconfined access (grantsUnconfined
-// — Env.Inherit or Net.Open) MUST carry AckUnconfined, or construction fails with
-// ErrUnconfinedNotAcked (SPEC §4, §6). This runs BEFORE the home guard so an
-// unacked unconfined policy is rejected regardless of home resolvability; for an
-// Inherit policy the home guard is exempt anyway, so the ack error is what surfaces.
-//
-// Home guard (fail-closed): a non-unconfined policy's §5.3 secret deny-reads are
-// anchored under the user's home (~/.ssh, ~/.aws, …). If os.UserHomeDir errors
-// those denials cannot materialize, so NewExecutor refuses to build a broad-read
-// executor rather than silently omitting them. Unconfined is exempt: it sets
-// Env.Inherit and emits no secret denials, so !p.Env.Inherit is the proxy for
-// "non-unconfined, has secret denials to protect".
-func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
+func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecOption) (*Executor, error) {
 	var cfg execConfig
 	for _, opt := range opts {
 		opt(&cfg)
-	}
-
-	if err := validatePolicy(p); err != nil {
-		return nil, err
-	}
-
-	if !p.Env.Inherit {
-		if _, err := os.UserHomeDir(); err != nil {
-			return nil, fmt.Errorf("sandbox: cannot resolve home directory for secret deny-reads: %w", err)
-		}
 	}
 
 	// Backend selection: platformBackend() for production; a test may pin one via
@@ -234,10 +151,14 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 	// closed rather than building an executor that would spawn incorrectly.
 	b := cfg.backend
 	if b == nil {
-		var berr error
-		b, berr = platformBackend()
-		if berr != nil {
-			return nil, berr
+		if profile != nil && profile.isolation == Unconfined {
+			b = newNullBackend()
+		} else {
+			var berr error
+			b, berr = platformBackend()
+			if berr != nil {
+				return nil, berr
+			}
 		}
 	}
 	spec, report, level, bits, err := b.compile(p)
@@ -251,6 +172,7 @@ func NewExecutor(p Policy, opts ...ExecOption) (*Executor, error) {
 	}
 
 	return &Executor{
+		profile:       profile,
 		policy:        p,
 		backend:       b,
 		spec:          spec,
@@ -282,97 +204,6 @@ func ttlOrDefault(d time.Duration) time.Duration {
 	return d
 }
 
-// NewExecutorDynamic builds a dynamic-mode executor that recompiles
-// PolicyFor(src.Current(), workspace, popts...) per spawn (SPEC §6, §8). It
-// compiles the current mode once at construction, then on each spawn re-reads
-// src.Current() and recompiles (bumping policyGen, which voids grants bound to an
-// earlier generation) whenever the mode differs from the last compiled one.
-//
-// Home guard: unlike NewExecutor this ALWAYS errors on an unresolvable home,
-// because a dynamic executor can compile non-unconfined modes (whose secret
-// deny-reads are home-anchored) at any later moment; there is no single policy to
-// exempt.
-//
-// By design (SPEC §6) this takes PolicyOptions only, not ExecOptions: a dynamic
-// executor therefore uses the default grant TTL (15 min) and clock (time.Now),
-// which are not customizable through the public API. Tests inject a clock via the
-// white-box withClock field.
-func NewExecutorDynamic(src ModeSource, workspace string, popts ...PolicyOption) (*Executor, error) {
-	if _, err := os.UserHomeDir(); err != nil {
-		return nil, fmt.Errorf("sandbox: cannot resolve home directory for secret deny-reads: %w", err)
-	}
-
-	key, err := newGrantKey()
-	if err != nil {
-		return nil, fmt.Errorf("sandbox: grant key: %w", err)
-	}
-
-	b, berr := platformBackend()
-	if berr != nil {
-		return nil, berr
-	}
-
-	e := &Executor{
-		backend:   b,
-		grantKey:  key,
-		policyGen: 1,
-		clock:     time.Now,
-		grantTTL:  defaultGrantTTL,
-		src:       src,
-		workspace: workspace,
-		popts:     popts,
-	}
-	// Compile the current mode once so Level/Guarantees are populated before the
-	// first spawn. haveMode is false here, so this initial compile does NOT bump
-	// policyGen (it stays 1); only a later mode change bumps it.
-	if err := e.recompileLocked(); err != nil {
-		return nil, err
-	}
-	return e, nil
-}
-
-// NewExternalExecutor declares that the surrounding environment is the isolation
-// boundary (SPEC §11): a container, gVisor, or microVM. Construction cannot fail
-// (there is no probe or compile), so it returns no error. The spawnSpec is a pure
-// passthrough — commands run as a plain os/exec would — but the environment is
-// still scrubbed from decl.Env (§11: scrubbing costs nothing and remains
-// valuable). It reports LevelExternal and the FULL guarantee set: trust by
-// explicit deployment declaration, the only source of LevelExternal.
-//
-// EnvScrub honesty: EnvScrub is the one guarantee we can actually check against
-// decl.Env rather than take on declaration. A decl.Env with Inherit passes the
-// whole parent environment through unscrubbed, so EnvScrub is cleared (guarantee
-// honesty, mirroring the null backend); the other 6 stay set by trust-by-declaration.
-func NewExternalExecutor(decl ExternalDecl) *Executor {
-	b := newNullBackend()
-	spec, _, _, _, _ := b.compile(Policy{}) // passthrough spawnSpec only
-	p := Policy{Env: decl.Env}
-
-	bits := fullGuarantees
-	if decl.Env.Inherit {
-		bits &^= GuaranteeEnvScrub // env not scrubbed under Inherit — do not claim it
-	}
-
-	// crypto/rand.Read cannot return a non-nil error on Go >= 1.24 (it panics on a
-	// catastrophic RNG failure), so this key is always valid; the ignored error is
-	// a formality that never fires.
-	key, _ := newGrantKey()
-
-	return &Executor{
-		policy:        p,
-		backend:       b,
-		spec:          spec,
-		report:        CompileReport{},
-		level:         LevelExternal,
-		guaranteeBits: bits,
-		env:           assembleEnv(p),
-		grantKey:      key,
-		policyGen:     1,
-		clock:         time.Now,
-		grantTTL:      defaultGrantTTL,
-	}
-}
-
 // RunCommand runs a shell command string in dir under the compiled policy (SPEC
 // §6, §10.1). It wraps the command via the backend's spawnSpec, sets the working
 // directory and the assembled environment, applies any spawn attributes, and
@@ -400,76 +231,10 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 // executor owns the shell form so the backends only ever wrap an argv.
 func shellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }
 
-// recompileLocked ensures the compiled snapshot matches src.Current() for a
-// dynamic executor, applying the read-only mask when this is a ReadOnlyView. It
-// is a no-op when the mode has not changed since the last compile. On a genuine
-// mode change (haveMode already set) it bumps policyGen so grants bound to the
-// prior generation stop verifying (SPEC §8, §9.2). The caller holds e.mu (or is
-// the single-threaded constructor). It returns the compile error; the null
-// backend never errors.
-func (e *Executor) recompileLocked() error {
-	m := e.src.Current()
-	if e.haveMode && m == e.lastMode {
-		return nil
-	}
-	p := PolicyFor(m, e.workspace, e.popts...)
-	if e.readOnly {
-		p = readOnlyMask(p)
-	}
-	// Ack gate: a mode flip to Unconfined without WithAckUnconfined in popts must
-	// fail the spawn CLOSED (via resolve) rather than silently run unconfined. Keep
-	// the last good compiled state and do not advance the generation on refusal.
-	// This intentionally validates the POST-readOnlyMask policy: readOnlyMask zeroes
-	// Net (clearing Net.Open), so a ReadOnlyView of a policy that was unconfined only
-	// via Net.Open genuinely is no longer net-unconfined and correctly stops tripping
-	// the ack gate after masking.
-	if err := validatePolicy(p); err != nil {
-		return err
-	}
-	spec, report, level, bits, err := e.backend.compile(p)
-	if err != nil {
-		// Keep the last good compiled state; do not advance the generation.
-		return err
-	}
-	if e.haveMode {
-		e.policyGen++ // a real mode change invalidates prior grants
-	}
-	e.policy = p
-	e.spec = spec
-	e.report = report
-	e.level = level
-	e.guaranteeBits = bits
-	e.env = assembleEnv(p)
-	e.lastMode = m
-	e.haveMode = true
-	return nil
-}
-
-// resolve returns the compiled snapshot for a single spawn, plus an error that
-// every spawn path propagates so a never-compiled or freshly-failed executor
-// fails CLOSED rather than spawning with a nil transform.
-//
-//   - Static executor: reads the immutable fields with no lock. Returns
-//     e.compileErr, which is nil for a normally-constructed executor and non-nil
-//     only for a static ReadOnlyView whose one-time compile failed.
-//   - Dynamic executor: takes e.mu, recompiles if the mode changed (bumping
-//     policyGen), and reads the fresh snapshot under the same lock so a spawn
-//     never tears across a generation change. A live recompile failure is
-//     returned (fail-closed for this spawn); a self-healing later mode may
-//     compile cleanly.
-//
-// As a final guard the resolved spawnSpec is checked: an uncompiled spec (nil
-// wrap) yields an error instead of a later nil-func call.
+// resolve returns the immutable compiled snapshot for one spawn.
 func (e *Executor) resolve() (snapshot, error) {
-	if e.src == nil {
-		s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
-		return s, e.resolveErr(e.compileErr)
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	err := e.recompileLocked()
 	s := snapshot{spec: e.spec, env: e.env, policy: e.policy, policyGen: e.policyGen}
-	return s, e.resolveErr(err)
+	return s, e.resolveErr(nil)
 }
 
 // resolveErr prefers an upstream compile error, else fails closed if the spawn
@@ -567,11 +332,6 @@ func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s sn
 // reports the last compiled mode's level (it does not itself recompile) under
 // the mutex, so it is race-free against a concurrent spawn's recompile.
 func (e *Executor) Level() uint8 {
-	if e.src == nil {
-		return e.level
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return e.level
 }
 
@@ -579,11 +339,6 @@ func (e *Executor) Level() uint8 {
 // (SPEC §7.5): what was enforced, narrowed, or left unenforced. See Level for the
 // dynamic-executor locking note.
 func (e *Executor) Report() CompileReport {
-	if e.src == nil {
-		return e.report
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return e.report
 }
 
@@ -596,18 +351,13 @@ func (e *Executor) Guarantees() Guarantees { return guaranteesFromBits(e.Guarant
 // consumer can probe interface{ GuaranteeBits() uint64 } without importing this
 // package (SPEC §6, §10.3). See Level for the dynamic-executor locking note.
 func (e *Executor) GuaranteeBits() uint64 {
-	if e.src == nil {
-		return e.guaranteeBits
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return e.guaranteeBits
 }
 
 // netBlocked reports whether a policy grants no outbound network at all: no
 // address class (Loopback/Private/DNS/Open) and no explicit ports. It is the
 // signal PlanGrants uses to decide the network capability is currently denied.
-func netBlocked(p Policy) bool {
+func netBlocked(p effectivePolicy) bool {
 	n := p.Net
 	return !n.Loopback && !n.Private && !n.DNS && !n.Open && len(n.Ports) == 0
 }
@@ -621,21 +371,9 @@ func netBlocked(p Policy) bool {
 // (netBlocked) a single "net" delta is offered. A ReadOnlyView never plans grants
 // — the read path never escalates — so it returns nil immediately.
 //
-// An external executor (LevelExternal) also plans nothing: its zero-Net policy
-// would trip netBlocked, but egress there is infra-handled and the boundary is
-// already fully trusted, so offering an "allow network egress" escalation would
-// be incoherent. A resolve failure (uncompiled view) likewise yields nil — no
-// escalation from a fail-closed executor.
-//
 // Task 9: a per-command classifier ("does THIS command actually need net") will
 // gate the candidate; here we plan purely from the policy-denied axes.
 func (e *Executor) PlanGrants(dir, command string) []string {
-	// e.src == nil guards the e.level read: LevelExternal is only ever set on a
-	// static external executor, so a dynamic executor short-circuits before the
-	// read and never races recompileLocked's write of e.level.
-	if e.readOnly || (e.src == nil && e.level == LevelExternal) {
-		return nil
-	}
 	s, err := e.resolve()
 	if err != nil {
 		return nil
@@ -685,9 +423,6 @@ func (e *Executor) DescribeGrant(token string) (string, bool) {
 // escalates, so even a grant its parent minted (shared key, same generation)
 // cannot loosen a view whose policy forced writes off and Net blocked.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) ([]byte, int, error) {
-	if e.readOnly {
-		return nil, -1, errors.New("sandbox: granting disabled on read-only view")
-	}
 	s, err := e.resolve()
 	if err != nil {
 		return nil, -1, err
@@ -700,77 +435,6 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, dir, command string
 		}
 	}
 	return e.run(ctx, dir, shellArgv(command), s)
-}
-
-// readOnlyMask derives a read-only policy: every persistent FS entry's
-// WriteAccess bit is masked off (deny entries, whose Access is zero, are
-// unaffected) and the network is forced blocked (SPEC §6, §10.1). The
-// non-persistent /dev/null plumbing grant remains writable so ordinary tools can
-// start. It returns a copy; the input is not mutated, so the parent's compiled
-// policy is untouched.
-func readOnlyMask(p Policy) Policy {
-	out := p
-	fs := make([]FSEntry, len(p.FS))
-	for i, entry := range p.FS {
-		if entry.Path != nullDevicePath {
-			entry.Access &^= WriteAccess
-		}
-		fs[i] = entry
-	}
-	out.FS = fs
-	out.Net = NetPolicy{} // forced blocked
-	return out
-}
-
-// ReadOnlyView returns a derived executor for read-path tools (e.g. Grep, SPEC
-// §10.1): it shares the parent's policy source (a static policy or the same
-// ModeSource) and REUSES the parent's already-probed backend — no re-probe —
-// recompiling the write-stripped, Net-blocked policy through it (so its own
-// level/report/guarantees reflect the masked policy). Granting is disabled on
-// both sides: PlanGrants returns nil and RunCommandWithGrants fails closed — the
-// read path never escalates. For a dynamic parent the mask is applied on every
-// recompile.
-//
-// The signature has no error return (SPEC §6), so a construction-time compile
-// failure is latched: a static view stores it in compileErr and a dynamic view
-// re-attempts on each resolve — either way spawns fail CLOSED rather than
-// panicking on a nil spawnSpec.
-func (e *Executor) ReadOnlyView() *Executor {
-	v := &Executor{
-		backend:      e.backend, // reuse the parent's probe result; do NOT re-select
-		grantKey:     e.grantKey,
-		policyGen:    1,
-		clock:        e.clock,
-		grantTTL:     e.grantTTL,
-		cgroupParent: e.cgroupParent,
-		readOnly:     true,
-		src:          e.src,
-		workspace:    e.workspace,
-		popts:        e.popts,
-	}
-	if e.src != nil {
-		// Dynamic parent: compile the current mode through the mask now so the view
-		// is usable before its first spawn; recompiles re-apply the mask. A failure
-		// here re-surfaces on the next resolve (haveMode stays false), so it need
-		// not be latched.
-		_ = v.recompileLocked()
-		return v
-	}
-	// Static parent: mask the parent's compiled policy once and recompile it
-	// through the reused backend. Latch any failure so resolve fails closed.
-	p := readOnlyMask(e.policy)
-	spec, report, level, bits, err := e.backend.compile(p)
-	if err != nil {
-		v.compileErr = err
-		return v
-	}
-	v.policy = p
-	v.spec = spec
-	v.report = report
-	v.level = level
-	v.guaranteeBits = bits
-	v.env = assembleEnv(p)
-	return v
 }
 
 // Wrap applies the sandbox to a caller-built *exec.Cmd for non-harness users
@@ -813,27 +477,27 @@ func (e *Executor) Wrap(cmd *exec.Cmd) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// assembleEnv builds the child environment from a Policy's EnvPolicy (SPEC §5.5).
+// assembleEnv builds the child environment from a effectivePolicy's effectiveEnvPolicy (SPEC §5.5).
 // It is shared by every backend and lives on the executor side because env
 // scrubbing holds regardless of OS mechanism.
 //
 //   - Inherit: start from the full parent environment (os.Environ), then force
 //     the Set overrides. Used by unconfined and explicit opt-in.
 //   - otherwise (the fail-closed default): keep only parent variables whose NAME
-//     matches the §5.5 baseline allowlist or one of EnvPolicy.Allow (name globs
+//     matches the §5.5 baseline allowlist or one of effectiveEnvPolicy.Allow (name globs
 //     via filepath.Match), then force the Set overrides (including TMPDIR).
 //     Everything else — GITHUB_TOKEN, AWS_*, LLM keys, SSH_AUTH_SOCK, … — is
 //     absent.
 //
 // The result is a KEY=VALUE slice suitable for exec.Cmd.Env.
-func assembleEnv(p Policy) []string {
+func assembleEnv(p effectivePolicy) []string {
 	if p.Env.Inherit {
 		return applySet(os.Environ(), p.Env.Set)
 	}
 
-	// Baseline allowlist plus caller additions. BaselineEnvAllowlist returns a
+	// Baseline allowlist plus caller additions. baselineEnvAllowlist returns a
 	// fresh slice, so appending never mutates the shared preset.
-	allow := append(BaselineEnvAllowlist(), p.Env.Allow...)
+	allow := append(baselineEnvAllowlist(), p.Env.Allow...)
 
 	// A non-nil empty slice is load-bearing: a scrub policy that admits no vars
 	// and has an empty Set must yield an empty (not nil) env, because cmd.Env ==
@@ -869,7 +533,7 @@ func envNameMatches(name string, patterns []string) bool {
 	return false
 }
 
-// applySet forces the EnvPolicy.Set values onto an assembled env slice: an
+// applySet forces the effectiveEnvPolicy.Set values onto an assembled env slice: an
 // existing KEY is overwritten in place (so no duplicate keys), and a new KEY is
 // appended. Newly appended keys are sorted for a deterministic result. env is
 // assumed to be freshly owned by the caller (os.Environ() or a freshly built

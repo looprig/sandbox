@@ -22,9 +22,9 @@ func requireLandlockV4(t *testing.T) {
 }
 
 // newFSExecutor builds an executor pinned to the rung-2 linux backend.
-func newFSExecutor(t *testing.T, p Policy) *Executor {
+func newFSExecutor(t *testing.T, p effectivePolicy) *Executor {
 	t.Helper()
-	e, err := NewExecutor(p, withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(p, withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestLinuxFSGuarantees(t *testing.T) {
 		got  bool
 	}{
 		{"WriteBoundary", g.WriteBoundary},
-		{"ReadDenies", g.ReadDenies},
+		{"ReadBoundary", g.ReadBoundary},
 		{"EnvScrub", g.EnvScrub},
 		// NetworkBoundary is earned by 12c: PolicyFor(Write) is net-confined (Net{}
 		// compiles to an empty TCP allowlist = all TCP denied), so the port-level
@@ -289,10 +289,10 @@ func TestLinuxFSFailsClosedOnUnexecutableTarget(t *testing.T) {
 	_ = home
 	// Only the workspace is granted; NOTHING under /usr or /lib, so /bin/echo and
 	// its loader cannot be opened for exec.
-	p := Policy{
+	p := effectivePolicy{
 		Workspace: ws,
-		FS:        []FSEntry{{Path: ws, Access: ReadAccess | WriteAccess | ExecAccess}},
-		Env:       EnvPolicy{Set: map[string]string{"TMPDIR": "/tmp"}},
+		FS:        []fsEntry{{Path: ws, Access: readFSAccess | writeFSAccess | execFSAccess}},
+		Env:       effectiveEnvPolicy{Set: map[string]string{"TMPDIR": "/tmp"}},
 	}
 	e := newFSExecutor(t, p)
 
@@ -373,7 +373,7 @@ func TestEnumerateFSRules(t *testing.T) {
 		}
 	}
 
-	access := func(rules []fsRule, path string) (FSAccess, bool) {
+	access := func(rules []fsRule, path string) (fsAccess, bool) {
 		for _, r := range rules {
 			if r.Path == path {
 				return r.Access, true
@@ -383,9 +383,9 @@ func TestEnumerateFSRules(t *testing.T) {
 	}
 
 	t.Run("no excludes grants the root whole", func(t *testing.T) {
-		cfs := compiledFS{allows: []fsAllow{{path: root, access: ReadAccess | WriteAccess | ExecAccess}}}
+		cfs := compiledFS{allows: []fsAllow{{path: root, access: readFSAccess | writeFSAccess | execFSAccess}}}
 		rules := enumerateFSRules(cfs)
-		if acc, ok := access(rules, root); !ok || acc&WriteAccess == 0 {
+		if acc, ok := access(rules, root); !ok || acc&writeFSAccess == 0 {
 			t.Errorf("root should be granted RW whole when nothing is carved; rules=%+v", rules)
 		}
 	})
@@ -393,7 +393,7 @@ func TestEnumerateFSRules(t *testing.T) {
 	t.Run("deny is carved out of the writable root", func(t *testing.T) {
 		secret := filepath.Join(root, "secret")
 		cfs := compiledFS{
-			allows: []fsAllow{{path: root, access: ReadAccess | WriteAccess | ExecAccess}},
+			allows: []fsAllow{{path: root, access: readFSAccess | writeFSAccess | execFSAccess}},
 			denies: []string{secret},
 		}
 		rules := enumerateFSRules(cfs)
@@ -405,7 +405,7 @@ func TestEnumerateFSRules(t *testing.T) {
 		}
 		for _, sib := range []string{"a", "b", ".git"} {
 			p := filepath.Join(root, sib)
-			if acc, ok := access(rules, p); !ok || acc&WriteAccess == 0 {
+			if acc, ok := access(rules, p); !ok || acc&writeFSAccess == 0 {
 				t.Errorf("sibling %q of the deny should be granted RW; rules=%+v", p, rules)
 			}
 		}
@@ -414,14 +414,14 @@ func TestEnumerateFSRules(t *testing.T) {
 	t.Run("read-only carveout under a writable root", func(t *testing.T) {
 		gitDir := filepath.Join(root, ".git")
 		cfs := compiledFS{allows: []fsAllow{
-			{path: root, access: ReadAccess | WriteAccess | ExecAccess},
-			{path: gitDir, access: ReadAccess},
+			{path: root, access: readFSAccess | writeFSAccess | execFSAccess},
+			{path: gitDir, access: readFSAccess},
 		}}
 		rules := enumerateFSRules(cfs)
 		// .git present as a read-only rule (from its own allow), never writable.
 		if acc, ok := access(rules, gitDir); !ok {
 			t.Errorf(".git should be granted read-only; rules=%+v", rules)
-		} else if acc&WriteAccess != 0 {
+		} else if acc&writeFSAccess != 0 {
 			t.Errorf("FAIL-OPEN: .git carveout granted write access %b; rules=%+v", acc, rules)
 		}
 		// Root not granted whole; siblings writable.
@@ -430,7 +430,7 @@ func TestEnumerateFSRules(t *testing.T) {
 		}
 		for _, sib := range []string{"a", "b", "secret"} {
 			p := filepath.Join(root, sib)
-			if acc, ok := access(rules, p); !ok || acc&WriteAccess == 0 {
+			if acc, ok := access(rules, p); !ok || acc&writeFSAccess == 0 {
 				t.Errorf("sibling %q should be granted RW; rules=%+v", p, rules)
 			}
 		}
@@ -438,11 +438,11 @@ func TestEnumerateFSRules(t *testing.T) {
 
 	t.Run("nonexistent deny does not carve (existence-gated)", func(t *testing.T) {
 		cfs := compiledFS{
-			allows: []fsAllow{{path: root, access: ReadAccess | WriteAccess | ExecAccess}},
+			allows: []fsAllow{{path: root, access: readFSAccess | writeFSAccess | execFSAccess}},
 			denies: []string{filepath.Join(root, "does-not-exist")},
 		}
 		rules := enumerateFSRules(cfs)
-		if acc, ok := access(rules, root); !ok || acc&WriteAccess == 0 {
+		if acc, ok := access(rules, root); !ok || acc&writeFSAccess == 0 {
 			t.Errorf("a nonexistent deny must not force carving; root should be granted whole; rules=%+v", rules)
 		}
 	})
@@ -472,12 +472,12 @@ func TestEnumerateDenyOverridesAllow(t *testing.T) {
 	}{
 		{
 			name:   "deny equals allow",
-			cfs:    compiledFS{allows: []fsAllow{{path: foo, access: ReadAccess | WriteAccess | ExecAccess}}, denies: []string{foo}},
+			cfs:    compiledFS{allows: []fsAllow{{path: foo, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []string{foo}},
 			denied: foo,
 		},
 		{
 			name:   "deny is ancestor of allow",
-			cfs:    compiledFS{allows: []fsAllow{{path: abchild, access: ReadAccess | WriteAccess | ExecAccess}}, denies: []string{a}},
+			cfs:    compiledFS{allows: []fsAllow{{path: abchild, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []string{a}},
 			denied: abchild,
 		},
 	}
@@ -507,7 +507,7 @@ func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 
-	e, err := NewExecutor(PolicyFor(Write, ws, WithWritable(secretDir), WithDenyRead(secretDir)), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws, WithWritable(secretDir), WithDenyRead(secretDir)), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -527,17 +527,17 @@ func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 func TestLandlockAccessSetHonorsBits(t *testing.T) {
 	tests := []struct {
 		name     string
-		access   FSAccess
+		access   fsAccess
 		isDir    bool
 		wantExec bool
 		wantRead bool
 		wantWr   bool
 	}{
-		{"read-only dir grants no execute", ReadAccess, true, false, true, false},
-		{"read+exec dir grants execute", ReadAccess | ExecAccess, true, true, true, false},
-		{"read|write|exec dir grants all", ReadAccess | WriteAccess | ExecAccess, true, true, true, true},
-		{"read-only file grants no execute", ReadAccess, false, false, true, false},
-		{"exec-only grants execute, no read", ExecAccess, false, true, false, false},
+		{"read-only dir grants no execute", readFSAccess, true, false, true, false},
+		{"read+exec dir grants execute", readFSAccess | execFSAccess, true, true, true, false},
+		{"read|write|exec dir grants all", readFSAccess | writeFSAccess | execFSAccess, true, true, true, true},
+		{"read-only file grants no execute", readFSAccess, false, false, true, false},
+		{"exec-only grants execute, no read", execFSAccess, false, true, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

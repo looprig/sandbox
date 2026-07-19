@@ -36,15 +36,15 @@ func TestAcceptanceMatrixDarwin(t *testing.T) {
 	}
 
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
 
 	// Per-row Guarantees() + Level (compile posture; no sandbox-exec needed).
 	g := e.Guarantees()
-	if !(g.ProcessBoundary && g.WriteBoundary && g.ReadDenies && g.EnvScrub && g.NetworkBoundary) {
-		t.Errorf("Guarantees() = %+v; want ProcessBoundary && WriteBoundary && ReadDenies && EnvScrub && NetworkBoundary", g)
+	if !(g.ProcessBoundary && g.WriteBoundary && g.ReadBoundary && g.EnvScrub && g.NetworkBoundary) {
+		t.Errorf("Guarantees() = %+v; want ProcessBoundary && WriteBoundary && ReadBoundary && EnvScrub && NetworkBoundary", g)
 	}
 	if g.AddressNetwork {
 		t.Errorf("Guarantees().AddressNetwork = true, want false (SBPL cannot address-scope)")

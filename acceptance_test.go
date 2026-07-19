@@ -45,7 +45,6 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 	}{
 		{"no-sandbox-available/rung3-null", acceptRowNullBackend},
 		{"env-scrub", acceptRowEnvScrub},
-		{"dynamic-downgrade/generation-bump", acceptRowDynamicDowngrade},
 		{"grant-retry-and-fabricated-token", acceptRowGrantRetry},
 	}
 	for _, tt := range tests {
@@ -59,7 +58,7 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 // reads to route to ask-a-human rather than auto-approve.
 func acceptRowNullBackend(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor(null): %v", err)
 	}
@@ -91,7 +90,7 @@ func acceptRowEnvScrub(t *testing.T) {
 	ws := t.TempDir()
 
 	// Construct AFTER Setenv: the executor snapshots os.Environ at build.
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -119,52 +118,6 @@ func acceptRowEnvScrub(t *testing.T) {
 	}
 }
 
-// acceptRowDynamicDowngrade — §12.1 "Dynamic downgrade trusted → readonly": the
-// SANDBOX-SIDE mechanism a ceiling downgrade relies on (§8, §9.2) is that any mode
-// change bumps the policy generation, so a grant minted before the change no longer
-// verifies (stale session grants become inert). Demonstrated across a genuine
-// downgrade between two net-blocked modes (Write → ReadOnly) so a mintable net
-// grant exists to be invalidated — Trusted mints none (its egress is open).
-func acceptRowDynamicDowngrade(t *testing.T) {
-	ws := t.TempDir()
-	src := &fakeSrc{mode: Write} // net blocked → a net grant can be minted
-	e, err := NewExecutorDynamic(src, ws)
-	if err != nil {
-		t.Fatalf("NewExecutorDynamic: %v", err)
-	}
-	e.clock = func() time.Time { return acceptTime } // white-box: dynamic ctor takes no ExecOption
-
-	// Env scrub holds across the flip regardless of backend — the stable per-row
-	// Guarantee to assert before and after.
-	if !e.Guarantees().EnvScrub {
-		t.Errorf("pre-downgrade Guarantees().EnvScrub = false, want true")
-	}
-
-	dir, cmd := ws, "true"
-	grants := e.PlanGrants(dir, cmd)
-	if len(grants) != 1 {
-		t.Fatalf("PlanGrants at Write: got %d grants, want 1 (net blocked)", len(grants))
-	}
-	genBefore := e.policyGen
-
-	// Downgrade Write → ReadOnly: the next spawn recompiles and bumps the
-	// generation, so the pre-downgrade grant fails verification and does NOT run.
-	src.mode = ReadOnly
-	_, _, err = e.RunCommandWithGrants(context.Background(), dir, cmd, grants)
-	if err == nil {
-		t.Fatal("RunCommandWithGrants after downgrade: err = nil, want a grant error (stale grant must be inert)")
-	}
-	if !errors.Is(err, ErrGrantWrongGeneration) {
-		t.Errorf("after downgrade: err = %v, want ErrGrantWrongGeneration", err)
-	}
-	if e.policyGen == genBefore {
-		t.Errorf("policyGen did not bump across the downgrade: still %d", e.policyGen)
-	}
-	if !e.Guarantees().EnvScrub {
-		t.Errorf("post-downgrade Guarantees().EnvScrub = false, want true")
-	}
-}
-
 // acceptRowGrantRetry — §12.1 "Grant retry (post-denial)" + the fabricated-token
 // defense: PlanGrants mints a candidate token for the net-denied policy; a genuine
 // minted token verifies and the command runs a SINGLE spawn; a fabricated/garbage
@@ -172,7 +125,7 @@ func acceptRowDynamicDowngrade(t *testing.T) {
 // Pinned to the null backend + a fixed clock for determinism.
 func acceptRowGrantRetry(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws),
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws),
 		withBackend(newNullBackend()),
 		withClock(func() time.Time { return acceptTime }),
 	)

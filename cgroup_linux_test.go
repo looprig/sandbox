@@ -180,8 +180,8 @@ func runForkbombUnderSandbox(t *testing.T, pidsMax int, sleepPath string) map[st
 	t.Helper()
 	ws := t.TempDir()
 	e := newFSExecutor(t, PolicyFor(Write, ws,
-		WithLimits(Limits{MaxPIDs: pidsMax}),
-		WithEnv(EnvPolicy{Set: map[string]string{
+		WithLimits(effectiveLimits{MaxPIDs: pidsMax}),
+		WithEnv(effectiveEnvPolicy{Set: map[string]string{
 			cgroupForkbombEnv:   "1",
 			cgroupForkbombSleep: sleepPath,
 			"GOMAXPROCS":        "1",
@@ -285,7 +285,7 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 
 	// A limits-disabled executor: no scope, no guarantee, an unenforced entry — but
 	// the SAME Level (limits never move the ladder).
-	disabled := newFSExecutor(t, PolicyFor(Write, ws, WithLimits(Limits{Disabled: true})))
+	disabled := newFSExecutor(t, PolicyFor(Write, ws, WithLimits(effectiveLimits{Disabled: true})))
 	if disabled.Guarantees().ResourceLimits {
 		t.Errorf("disabled policy reports ResourceLimits guarantee; want false")
 	}
@@ -307,7 +307,7 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(&linuxBackend{cgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}
@@ -383,7 +383,7 @@ func TestCompileCgroupPolicy(t *testing.T) {
 	const anc = "/sys/fs/cgroup/session.slice"
 	tests := []struct {
 		name         string
-		limits       Limits
+		limits       effectiveLimits
 		ancestor     string
 		wantEnforced bool
 		wantPids     int64
@@ -391,14 +391,14 @@ func TestCompileCgroupPolicy(t *testing.T) {
 		wantCPU      int
 		wantDisabled bool
 	}{
-		{"defaults apply on available ancestor", Limits{}, anc, true, defaultMaxPIDs, 0, 0, false},
-		{"explicit MaxPIDs overrides the default", Limits{MaxPIDs: 20}, anc, true, 20, 0, 0, false},
-		{"memory and cpu carried when set", Limits{MaxPIDs: 100, MaxMemBytes: 1 << 30, MaxCPUPct: 150}, anc, true, 100, 1 << 30, 150, false},
-		{"zero MaxPIDs falls back to default", Limits{MaxMemBytes: 4096}, anc, true, defaultMaxPIDs, 4096, 0, false},
-		{"disabled applies no limits (fail-secure)", Limits{MaxPIDs: 99, Disabled: true}, anc, false, 0, 0, 0, true},
-		{"disabled wins even with no ancestor", Limits{Disabled: true}, "", false, 0, 0, 0, true},
-		{"no ancestor -> unenforced (fail-secure)", Limits{MaxPIDs: 20}, "", false, 0, 0, 0, false},
-		{"negative mem/cpu ignored", Limits{MaxMemBytes: -5, MaxCPUPct: -1}, anc, true, defaultMaxPIDs, 0, 0, false},
+		{"defaults apply on available ancestor", effectiveLimits{}, anc, true, defaultMaxPIDs, 0, 0, false},
+		{"explicit MaxPIDs overrides the default", effectiveLimits{MaxPIDs: 20}, anc, true, 20, 0, 0, false},
+		{"memory and cpu carried when set", effectiveLimits{MaxPIDs: 100, MaxMemBytes: 1 << 30, MaxCPUPct: 150}, anc, true, 100, 1 << 30, 150, false},
+		{"zero MaxPIDs falls back to default", effectiveLimits{MaxMemBytes: 4096}, anc, true, defaultMaxPIDs, 4096, 0, false},
+		{"disabled applies no limits (fail-secure)", effectiveLimits{MaxPIDs: 99, Disabled: true}, anc, false, 0, 0, 0, true},
+		{"disabled wins even with no ancestor", effectiveLimits{Disabled: true}, "", false, 0, 0, 0, true},
+		{"no ancestor -> unenforced (fail-secure)", effectiveLimits{MaxPIDs: 20}, "", false, 0, 0, 0, false},
+		{"negative mem/cpu ignored", effectiveLimits{MaxMemBytes: -5, MaxCPUPct: -1}, anc, true, defaultMaxPIDs, 0, 0, false},
 	}
 	for _, tt := range tests {
 		tt := tt

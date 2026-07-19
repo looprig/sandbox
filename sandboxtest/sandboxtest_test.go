@@ -5,9 +5,7 @@ package sandboxtest_test
 // executors through the sandbox package's public API and runs the suite against
 // them. On this host the live backend is the rung-2 Landlock/seccomp ladder
 // (LevelDegraded); on a weaker kernel it degrades and the guarantee-gated suite
-// still passes at whatever level is achieved. The external-boundary target
-// exercises the LevelExternal path (mechanical write probe skipped, env scrub +
-// self-consistency enforced). The null-backend (LevelNone) target is driven from
+// still passes at whatever level is achieved. The null-backend (LevelNone) target is driven from
 // the sandbox package itself (conformance_test.go), because forcing the null
 // backend needs an unexported seam an external consumer cannot reach.
 
@@ -34,23 +32,18 @@ func TestMain(m *testing.M) {
 // enforcement path.
 func TestSuiteAgainstLivePlatformBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "live-platform", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := sandbox.NewExecutor(sandbox.PolicyFor(sandbox.Write, ws))
+		profile, err := sandbox.NewProfile(sandbox.ProfileConfig{
+			WorkspaceRoot: ws, WorkspaceRead: sandbox.Allow, WorkspaceWrite: sandbox.Allow,
+			HostRead: sandbox.Allow, HostWrite: sandbox.Deny,
+			Network: sandbox.Deny, Command: sandbox.Allow,
+		})
+		if err != nil {
+			t.Fatalf("NewProfile: %v", err)
+		}
+		e, err := sandbox.NewExecutor(profile)
 		if err != nil {
 			t.Fatalf("NewExecutor(live): %v", err)
 		}
 		return e
-	})
-}
-
-// TestSuiteAgainstExternalBackend runs the suite against an external executor
-// (LevelExternal): trust by explicit deployment declaration. The suite skips the
-// mechanical write probe (the boundary is the surrounding container, not visible
-// in-process) while still enforcing env scrub and posture self-consistency.
-func TestSuiteAgainstExternalBackend(t *testing.T) {
-	sandboxtest.RunSuite(t, "external", func(t *testing.T, ws string) sandboxtest.SUT {
-		return sandbox.NewExternalExecutor(sandbox.ExternalDecl{
-			Boundary: "docker",
-			Env:      sandbox.EnvPolicy{}, // scrub still applies inside the boundary
-		})
 	})
 }

@@ -2,8 +2,8 @@
 //
 // Harness's permission gates answer "may this tool call run?". This module
 // answers "what can it touch once it runs?". The two compose: OS-level
-// enforcement is what makes broad auto-approval safe. Concretely, it provides
-// security modes, a two-axis policy model, and per-platform enforcement
+// enforcement is what makes approved authority meaningful. Concretely, it
+// provides immutable consumer-defined access profiles and per-platform enforcement
 // (Seatbelt on macOS; namespaces + Landlock + seccomp + nftables on Linux).
 //
 // # Initialization

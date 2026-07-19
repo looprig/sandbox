@@ -37,7 +37,7 @@ func TestCompileMountView(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		policy       Policy
+		policy       effectivePolicy
 		wantRW       []string // must be present in rwBinds
 		wantRO       []string // must be present in roBinds
 		wantNotBound []string // must NOT appear in rw or ro binds
@@ -63,12 +63,12 @@ func TestCompileMountView(t *testing.T) {
 		},
 		{
 			name: "deny hard-override: an allow at-or-under a deny is dropped",
-			policy: Policy{
+			policy: effectivePolicy{
 				Workspace: ws,
-				FS: []FSEntry{
-					{Path: ws, Access: ReadAccess | WriteAccess | ExecAccess},
-					{Path: filepath.Join(ws, "secret"), Access: ReadAccess}, // under the deny below
-					{Path: filepath.Join(ws, "secret"), Access: DenyAccess},
+				FS: []fsEntry{
+					{Path: ws, Access: readFSAccess | writeFSAccess | execFSAccess},
+					{Path: filepath.Join(ws, "secret"), Access: readFSAccess}, // under the deny below
+					{Path: filepath.Join(ws, "secret"), Access: denyFSAccess},
 				},
 			},
 			wantRW:       []string{ws},
@@ -77,7 +77,7 @@ func TestCompileMountView(t *testing.T) {
 		},
 		{
 			name:   "open/full policy: single rw bind, no denies",
-			policy: Policy{Workspace: ws, FS: []FSEntry{{Path: "/", Access: ReadAccess | WriteAccess | ExecAccess}}},
+			policy: effectivePolicy{Workspace: ws, FS: []fsEntry{{Path: "/", Access: readFSAccess | writeFSAccess | execFSAccess}}},
 			wantRW: []string{"/"},
 		},
 	}
@@ -285,18 +285,18 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	ws := t.TempDir()
 	tests := []struct {
 		name     string
-		policy   Policy
+		policy   effectivePolicy
 		wantBits uint64 // bits that MUST be set
 	}{
 		{
 			name:     "write mode: full posture incl. address network (egress confined-empty)",
 			policy:   PolicyFor(Write, ws),
-			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadDenies | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
+			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
 		{
 			name:     "trusted mode: full posture with ports/loopback/private/dns",
 			policy:   PolicyFor(Trusted, ws),
-			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadDenies | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
+			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
 	}
 	for _, tt := range tests {
@@ -351,7 +351,7 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 			Loopback:      true,
 			Private:       true,
 			DNS:           true,
-			MetadataCIDRs: MetadataDenyCIDRs(),
+			MetadataCIDRs: metadataDenyCIDRs(),
 		},
 	}
 	var buf bytes.Buffer
@@ -374,7 +374,7 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 	if !got.NftRules.Confined || len(got.NftRules.TCPPorts) != 1 || got.NftRules.TCPPorts[0] != 443 {
 		t.Errorf("NftRules round-trip mismatch: %+v", got.NftRules)
 	}
-	if len(got.NftRules.MetadataCIDRs) != len(MetadataDenyCIDRs()) {
+	if len(got.NftRules.MetadataCIDRs) != len(metadataDenyCIDRs()) {
 		t.Errorf("NftRules.MetadataCIDRs round-trip mismatch: %+v", got.NftRules.MetadataCIDRs)
 	}
 }
@@ -405,7 +405,7 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 
 	// Write mode (workspace rw, glob deny on .env). The workspace is visible/writable
 	// and the .env is masked empty; use Write so the write assertion is meaningful.
-	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newLinuxBackendRung1()))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newLinuxBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

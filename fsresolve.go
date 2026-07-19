@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// Resolve computes the effective FSAccess a policy grants to an absolute target
+// resolveFS computes the effective fsAccess a policy grants to an absolute target
 // path, applying the SPEC §5.1 precedence model. It is a pure function: it makes
 // no OS or filesystem calls and only reasons over the entries and the path
 // string, so it is a faithful statement of policy intent shared by the OS
@@ -16,8 +16,8 @@ import (
 // match across all allow entries wins, and exact-specificity ties union their
 // bits — is:
 //
-//  1. If any deny entry (Access == DenyAccess) matches the path — a literal
-//     ancestor or a matching glob — the result is DenyAccess. Deny is a hard
+//  1. If any deny entry (Access == denyFSAccess) matches the path — a literal
+//     ancestor or a matching glob — the result is denyFSAccess. Deny is a hard
 //     override; a more specific allow does not rescue it.
 //  2. Otherwise, among the matching allow entries the most specific wins, where
 //     specificity is the length of the matched literal prefix: the cleaned path
@@ -26,7 +26,7 @@ import (
 //     union (OR). Read/write/exec are not ranked against each other — the single
 //     longest allow decides, which is what makes the carveout below work (there
 //     is no case where a shorter writable root beats a longer read-only one).
-//  3. If nothing matches, the result is DenyAccess (fail-closed).
+//  3. If nothing matches, the result is denyFSAccess (fail-closed).
 //
 // This yields the §5.1 carveout: a read-only ".git" entry nested inside a
 // writable root is a longer allow than the root, so it wins and the workspace's
@@ -34,27 +34,27 @@ import (
 // writable root because deny is checked first.
 //
 // Contract: target must be an absolute, canonical, symlink-resolved path.
-// Resolve is purely lexical — it does no symlink, case-fold, or "." /".."
+// resolveFS is purely lexical — it does no symlink, case-fold, or "." /".."
 // resolution beyond filepath.Clean — so resolving symlinks and case variants is
 // the caller's (ReadGuard/backend) responsibility. Passing an unresolved path
 // could let a deny be bypassed via a symlink or a case variant on macOS.
-func Resolve(entries []FSEntry, path string) FSAccess {
+func resolveFS(entries []fsEntry, path string) fsAccess {
 	target := filepath.Clean(path)
 
 	// Rule 1: any matching deny entry is a hard override. Deny matching fails
 	// closed — an uncompilable deny glob over-denies rather than leaking.
 	for _, e := range entries {
-		if e.Access == DenyAccess && denyMatches(e.Path, target) {
-			return DenyAccess
+		if e.Access == denyFSAccess && denyMatches(e.Path, target) {
+			return denyFSAccess
 		}
 	}
 
 	// Rule 2: among matching allow entries, the most specific wins; exact
 	// specificity ties union their bits.
-	var best FSAccess
+	var best fsAccess
 	bestSpec := -1
 	for _, e := range entries {
-		if e.Access == DenyAccess || !entryMatches(e.Path, target) {
+		if e.Access == denyFSAccess || !entryMatches(e.Path, target) {
 			continue
 		}
 		switch spec := entrySpecificity(e.Path); {
@@ -66,7 +66,7 @@ func Resolve(entries []FSEntry, path string) FSAccess {
 	}
 	if bestSpec < 0 {
 		// Rule 3: nothing matched — fail closed.
-		return DenyAccess
+		return denyFSAccess
 	}
 	return best
 }

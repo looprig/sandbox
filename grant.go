@@ -76,7 +76,7 @@ var (
 // bump; do not change the encoding under the lrsx1 prefix.
 type grantPayload struct {
 	// PolicyGen is the policy generation at mint time. It is bumped on any policy
-	// or mode change (including ModeSource transitions), so a token is void once
+	// profile generation change, so a token is void once
 	// policy moves on — this is the anti-replay-across-policy-changes binding.
 	PolicyGen uint64
 	// CmdHash is hashCommand(dir, command): the token is reusable only against

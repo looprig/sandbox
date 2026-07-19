@@ -23,7 +23,7 @@ import (
 // against NewExecutor must not be a data race.
 var initWasCalled atomic.Bool
 
-// ErrInitNotCalled is returned by NewExecutor/NewExecutorDynamic on Linux when a
+// ErrInitNotCalled is returned by NewExecutor on Linux when a
 // re-exec enforcement backend (rung 1/2) would be selected but sandbox.Init() was
 // not called first (SPEC §6). It is a leaf sentinel so consumers can errors.Is it.
 var ErrInitNotCalled = errors.New("sandbox: Init() was not called — call sandbox.Init() as the very first line of main() before constructing a sandboxed executor on Linux")
@@ -92,11 +92,11 @@ type stage2Spec struct {
 	// §7.2, §5.2). When true the stage-2 child calls applyLandlockNet(NetTCPPorts)
 	// AFTER seccomp and BEFORE chdir/execve, confining TCP connect to NetTCPPorts
 	// (and denying all other TCP) — inherited across the execve. It is false only
-	// for open/unconfined egress (NetPolicy.Open), where TCP is left unrestricted.
+	// for open/unconfined egress (effectiveNetPolicy.Open), where TCP is left unrestricted.
 	NetConfined bool
 	// NetTCPPorts are the TCP ports the target may connect to (Task 12c). An empty
-	// slice with NetConfined denies ALL TCP connect (the fail-closed Write shape).
-	// []uint16 is gob-encodable; the rung-2 backend fills it from the NetPolicy.
+	// slice with NetConfined denies ALL TCP connect.
+	// []uint16 is gob-encodable; the rung-2 backend fills it from the effectiveNetPolicy.
 	NetTCPPorts []uint16
 	// Rung tags the confinement tier (Task 13, SPEC §7.2): stage2RungOne applies
 	// the namespaces + mount view + nftables below; stage2RungTwo (or the zero
@@ -257,10 +257,10 @@ func stage2Setup() error {
 		return &stage2Error{Op: "chdir " + spec.Dir, Err: err}
 	}
 
-	// Resolve the executable path. syscall.Exec is a raw execve: unlike the
+	// resolveFS the executable path. syscall.Exec is a raw execve: unlike the
 	// exec.Command path that null/seatbelt use, it does NOT search PATH for a bare
 	// argv[0]. Without this, RunArgv([]string{"rg", ...}) would run on null/seatbelt
-	// but fail here — an unfaithful drop-in. Resolve a name with no slash against
+	// but fail here — an unfaithful drop-in. resolveFS a name with no slash against
 	// the TARGET's PATH (spec.Env, not the parent's), so lookups match the confined
 	// environment. argv is passed through unchanged so the target still sees its
 	// invoked name in argv[0] (execve's path and argv[0] are independent).

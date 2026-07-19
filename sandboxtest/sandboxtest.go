@@ -2,7 +2,7 @@
 // modelled on the storekit `storetest` pattern: a consumer supplies a factory
 // that builds an executor, and RunSuite asserts the core sandbox invariants hold
 // against it. It is the executor analogue of storetest — one suite any backend
-// (null / seatbelt / the Linux ladder / an external boundary) is run through, so
+// (null / seatbelt / the Linux ladder) is run through, so
 // a new or downstream backend proves the load-bearing security contract without
 // re-deriving the assertions.
 //
@@ -11,7 +11,7 @@
 // Every assertion is gated on what the executor REPORTS (Guarantees bits / Level),
 // never on the host platform. The SAME suite therefore passes against the null
 // backend (LevelNone, no OS enforcement), a rung-2 Linux executor (LevelDegraded),
-// a rung-1 executor (LevelFull), Seatbelt, and an external boundary — each is held
+// a rung-1 executor (LevelFull), and Seatbelt — each is held
 // only to the guarantees it actually claims:
 //
 //  1. Write boundary — Guarantees.WriteBoundary ⟺ writes are actually confined.
@@ -30,12 +30,6 @@
 //     boundary implies at least a degraded level; LevelFull implies a write
 //     boundary. An incoherent posture (a set bit with no honest backing) is the
 //     signal the auto-approval interlock must never trust.
-//
-// Mechanical enforcement probes (the write boundary) are SKIPPED, with a recorded
-// reason, at LevelExternal: an external boundary is the surrounding deployment
-// (container / microVM), which is not observable from inside this process, so a
-// write that succeeds within the container neither proves nor disproves the
-// boundary. Env scrub and self-consistency still apply there.
 //
 // # Dependency posture
 //
@@ -66,7 +60,7 @@ import (
 const (
 	GuaranteeProcessBoundary uint64 = 1 << iota
 	GuaranteeWriteBoundary
-	GuaranteeReadDenies
+	GuaranteeReadBoundary
 	GuaranteeEnvScrub
 	GuaranteeNetworkBoundary
 	GuaranteeAddressNetwork
@@ -79,7 +73,6 @@ const (
 	LevelNone uint8 = iota
 	LevelDegraded
 	LevelFull
-	LevelExternal
 )
 
 // SUT is the minimal structural surface the conformance suite exercises on an
@@ -94,14 +87,14 @@ type SUT interface {
 	// failure, signal, or context cancellation) — a ran-but-nonzero command
 	// returns a nil error and the real code (SPEC §6, §10.1).
 	RunCommand(ctx context.Context, dir, command string) ([]byte, int, error)
-	// Level reports the achieved isolation level (LevelNone..LevelExternal).
+	// Level reports the achieved isolation level (LevelNone..LevelFull).
 	Level() uint8
 	// GuaranteeBits reports the per-property guarantee bitmask.
 	GuaranteeBits() uint64
 }
 
 // Factory builds a fresh, WRITE-CONFINING executor for the given workspace. The
-// contract the suite relies on (the standard `Write` mode posture): the workspace
+// contract the suite relies on: the workspace
 // is a writable root, the process's $HOME is NOT writable, and the environment is
 // scrubbed (non-inherit). The factory is invoked once per sub-test — AFTER the
 // suite plants any environment it needs — because an executor snapshots the
@@ -123,7 +116,12 @@ const plantedSecretVal = "lrsandboxtest-must-not-leak"
 // A consumer typically calls it once per backend they can construct, e.g.:
 //
 //	sandboxtest.RunSuite(t, "live", func(t *testing.T, ws string) sandboxtest.SUT {
-//	    e, err := sandbox.NewExecutor(sandbox.PolicyFor(sandbox.Write, ws))
+//	    profile, err := sandbox.NewProfile(sandbox.ProfileConfig{
+//	        WorkspaceRoot: ws, WorkspaceRead: sandbox.Allow,
+//	        WorkspaceWrite: sandbox.Allow, HostWrite: sandbox.Deny,
+//	    })
+//	    if err != nil { t.Fatalf("NewProfile: %v", err) }
+//	    e, err := sandbox.NewExecutor(profile)
 //	    if err != nil { t.Fatalf("NewExecutor: %v", err) }
 //	    return e
 //	})
@@ -166,10 +164,6 @@ func RunSuite(t *testing.T, name string, newSUT Factory) {
 func checkWriteBoundary(t *testing.T, newSUT Factory) {
 	ws := t.TempDir()
 	e := newSUT(t, ws)
-
-	if e.Level() == LevelExternal {
-		t.Skipf("SKIP write-boundary probe: LevelExternal is a deployment boundary (container/microVM) not observable from inside this process; mechanical write confinement cannot be probed here (SPEC §11)")
-	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -261,7 +255,7 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 	// provides itself regardless of any OS mechanism. LevelNone means no OS
 	// enforcement was achieved, so none of these may be claimed.
 	const osEnforcementBits = GuaranteeProcessBoundary | GuaranteeWriteBoundary |
-		GuaranteeReadDenies | GuaranteeNetworkBoundary | GuaranteeAddressNetwork |
+		GuaranteeReadBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork |
 		GuaranteeResourceLimits
 
 	invariants := []struct {
@@ -291,10 +285,10 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 			ok:   lvl != LevelFull || has(GuaranteeWriteBoundary),
 		},
 		{
-			// The level is a defined value; a value above LevelExternal is an
+			// The level is a defined value; a value above LevelFull is an
 			// uninitialized/garbage posture and must never be trusted.
 			name: "Level is a defined value",
-			ok:   lvl <= LevelExternal,
+			ok:   lvl <= LevelFull,
 		},
 	}
 	for _, inv := range invariants {

@@ -21,11 +21,11 @@ func newNullBackend() *nullBackend { return &nullBackend{} }
 // and GuaranteeEnvScrub as the only guarantee bit it can set — but ONLY when the
 // policy actually scrubs the environment (!Env.Inherit). Env scrubbing holds
 // independently of any OS backend because the executor assembles the child
-// environment from the EnvPolicy regardless of mechanism; but an Env.Inherit
+// environment from the effectiveEnvPolicy regardless of mechanism; but an Env.Inherit
 // (unconfined) policy passes the whole parent environment through, so nothing is
 // scrubbed and claiming EnvScrub would be dishonest — guaranteeBits is then 0.
 // Every other guarantee stays false (fail-closed) because nothing else is enforced.
-func (nullBackend) compile(p Policy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (nullBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
 	spec := spawnSpec{
 		// Pure passthrough: run the inner argv exactly as given (the executor has
 		// already shell-normalized a RunCommand to /bin/sh -c command). No spawn

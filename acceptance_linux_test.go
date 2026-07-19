@@ -36,7 +36,7 @@ func TestAcceptanceMatrixLinux(t *testing.T) {
 
 // acceptLinuxRung2Write — §12.1 "Linux rung 2, write mode" (RUNS here): the write
 // boundary + .git carveout + a fixed secret deny hold; TCP is limited to Ports;
-// Level = Degraded; the guarantee posture is WriteBoundary && ReadDenies &&
+// Level = Degraded; the guarantee posture is WriteBoundary && ReadBoundary &&
 // EnvScrub && NetworkBoundary with AddressNetwork == false.
 func acceptLinuxRung2Write(t *testing.T) {
 	requireLandlockV4(t)
@@ -75,8 +75,8 @@ func acceptLinuxRung2Write(t *testing.T) {
 
 	// Per-row Guarantees() + Level.
 	g := e.Guarantees()
-	if !(g.WriteBoundary && g.ReadDenies && g.EnvScrub && g.NetworkBoundary) {
-		t.Errorf("Guarantees() = %+v; want WriteBoundary && ReadDenies && EnvScrub && NetworkBoundary", g)
+	if !(g.WriteBoundary && g.ReadBoundary && g.EnvScrub && g.NetworkBoundary) {
+		t.Errorf("Guarantees() = %+v; want WriteBoundary && ReadBoundary && EnvScrub && NetworkBoundary", g)
 	}
 	if g.ProcessBoundary || g.AddressNetwork {
 		t.Errorf("Guarantees() = %+v; want ProcessBoundary=false && AddressNetwork=false (not enforced at rung 2)", g)
@@ -86,7 +86,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 	}
 
 	// --- TCP limited to Ports: allowlisted port permitted, others denied ---
-	got := runNetProbe(t, WithNet(NetPolicy{Ports: []uint16{netProbeAllowP}}))
+	got := runNetProbe(t, WithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
 	if got[netKeyPortA] != netValAllowed {
 		t.Errorf("allowlisted port %d = %q, want %q", netProbeAllowP, got[netKeyPortA], netValAllowed)
 	}
@@ -108,7 +108,7 @@ func acceptLinuxRung1Write(t *testing.T) {
 	requireSeccomp(t)
 
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws)) // platformBackend selects rung 1 here
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws)) // platformBackend selects rung 1 here
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -116,7 +116,7 @@ func acceptLinuxRung1Write(t *testing.T) {
 		t.Errorf("Level() = %d, want LevelFull (%d) for rung 1", lvl, LevelFull)
 	}
 	g := e.Guarantees()
-	if !(g.ProcessBoundary && g.AddressNetwork && g.WriteBoundary && g.ReadDenies && g.EnvScrub && g.NetworkBoundary) {
+	if !(g.ProcessBoundary && g.AddressNetwork && g.WriteBoundary && g.ReadBoundary && g.EnvScrub && g.NetworkBoundary) {
 		t.Errorf("Guarantees() = %+v; want the full rung-1 posture incl. ProcessBoundary && AddressNetwork", g)
 	}
 }
@@ -165,7 +165,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := NewExecutor(PolicyFor(Write, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(&linuxBackend{cgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}

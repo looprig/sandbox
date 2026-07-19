@@ -297,8 +297,8 @@ func TestLinuxSeccompDeniesInTarget(t *testing.T) {
 	ws := t.TempDir()
 	// Inject the probe sentinel into the TARGET env via Env.Set, so the re-exec'd
 	// target's init() runs the probes. TMPDIR is forced by the baseline regardless.
-	e, err := NewExecutor(
-		PolicyFor(Write, ws, WithEnv(EnvPolicy{Set: map[string]string{seccompTargetEnv: "1"}})),
+	e, err := newExecutorForEffectivePolicy(
+		PolicyFor(Write, ws, WithEnv(effectiveEnvPolicy{Set: map[string]string{seccompTargetEnv: "1"}})),
 		withBackend(newLinuxBackend()),
 	)
 	if err != nil {

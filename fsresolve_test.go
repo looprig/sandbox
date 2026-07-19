@@ -7,23 +7,23 @@ import (
 
 // Access-bit shorthands for readable test tables.
 const (
-	tRWX = ReadAccess | WriteAccess | ExecAccess
-	tRX  = ReadAccess | ExecAccess
+	tRWX = readFSAccess | writeFSAccess | execFSAccess
+	tRX  = readFSAccess | execFSAccess
 )
 
-// accessString renders an FSAccess for legible failure messages.
-func accessString(a FSAccess) string {
-	if a == DenyAccess {
+// accessString renders an fsAccess for legible failure messages.
+func accessString(a fsAccess) string {
+	if a == denyFSAccess {
 		return "Deny"
 	}
 	s := ""
-	if a&ReadAccess != 0 {
+	if a&readFSAccess != 0 {
 		s += "R"
 	}
-	if a&WriteAccess != 0 {
+	if a&writeFSAccess != 0 {
 		s += "W"
 	}
-	if a&ExecAccess != 0 {
+	if a&execFSAccess != 0 {
 		s += "X"
 	}
 	return s
@@ -37,34 +37,34 @@ func TestResolve(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		entries []FSEntry
+		entries []fsEntry
 		path    string
-		want    FSAccess
+		want    fsAccess
 	}{
 		{
 			// 1. Empty policy denies everything (fail-closed).
 			name:    "empty entries fail closed",
 			entries: nil,
 			path:    "/anything/at/all",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			// 2. Broad read root matches any path.
 			name:    "root broad read matches everything",
-			entries: []FSEntry{{"/", tRX}},
+			entries: []fsEntry{{"/", tRX}},
 			path:    "/usr/bin/sh",
 			want:    tRX,
 		},
 		{
 			// 3. Longest allow wins: writable root beats the broad read.
 			name:    "writable root beats broad read",
-			entries: []FSEntry{{"/", tRX}, {ws, tRWX}},
+			entries: []fsEntry{{"/", tRX}, {ws, tRWX}},
 			path:    ws + "/foo",
 			want:    tRWX,
 		},
 		{
 			name:    "outside writable root falls back to broad read",
-			entries: []FSEntry{{"/", tRX}, {ws, tRWX}},
+			entries: []fsEntry{{"/", tRX}, {ws, tRWX}},
 			path:    "/etc/hosts",
 			want:    tRX,
 		},
@@ -72,100 +72,100 @@ func TestResolve(t *testing.T) {
 			// 4. Carveout: the longer allow (.git, read-only) beats the writable
 			// root it sits inside.
 			name:    "carveout git dir is read-only inside writable root",
-			entries: []FSEntry{{ws, tRWX}, {ws + "/.git", ReadAccess}},
+			entries: []fsEntry{{ws, tRWX}, {ws + "/.git", readFSAccess}},
 			path:    ws + "/.git/config",
-			want:    ReadAccess,
+			want:    readFSAccess,
 		},
 		{
 			name:    "carveout sibling stays writable",
-			entries: []FSEntry{{ws, tRWX}, {ws + "/.git", ReadAccess}},
+			entries: []fsEntry{{ws, tRWX}, {ws + "/.git", readFSAccess}},
 			path:    ws + "/src/a.go",
 			want:    tRWX,
 		},
 		{
 			// 5. Secret deny wins over the broad read that also matches.
 			name:    "secret deny under broad read",
-			entries: []FSEntry{{"/", tRX}, {"/home/u/.ssh", DenyAccess}},
+			entries: []fsEntry{{"/", tRX}, {"/home/u/.ssh", denyFSAccess}},
 			path:    "/home/u/.ssh/id_rsa",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "non-secret sibling keeps broad read",
-			entries: []FSEntry{{"/", tRX}, {"/home/u/.ssh", DenyAccess}},
+			entries: []fsEntry{{"/", tRX}, {"/home/u/.ssh", denyFSAccess}},
 			path:    "/home/u/.bashrc",
 			want:    tRX,
 		},
 		{
 			// 6. Glob deny is a hard override even inside a writable root.
 			name:    "glob deny overrides writable root .env",
-			entries: []FSEntry{{ws, tRWX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{ws, tRWX}, {"**/.env*", denyFSAccess}},
 			path:    ws + "/.env",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "glob deny overrides nested .env.local",
-			entries: []FSEntry{{ws, tRWX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{ws, tRWX}, {"**/.env*", denyFSAccess}},
 			path:    ws + "/sub/.env.local",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "glob deny matches at filesystem root",
-			entries: []FSEntry{{"/", tRX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{"/", tRX}, {"**/.env*", denyFSAccess}},
 			path:    "/.env",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "glob deny leaves ordinary file writable",
-			entries: []FSEntry{{ws, tRWX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{ws, tRWX}, {"**/.env*", denyFSAccess}},
 			path:    ws + "/main.go",
 			want:    tRWX,
 		},
 		{
 			name:    "glob deny requires the dot: env has none",
-			entries: []FSEntry{{ws, tRWX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{ws, tRWX}, {"**/.env*", denyFSAccess}},
 			path:    ws + "/env",
 			want:    tRWX,
 		},
 		{
 			name:    "glob deny does not match notenv",
-			entries: []FSEntry{{ws, tRWX}, {"**/.env*", DenyAccess}},
+			entries: []fsEntry{{ws, tRWX}, {"**/.env*", denyFSAccess}},
 			path:    ws + "/notenv",
 			want:    tRWX,
 		},
 		{
 			// 7. Path boundary: prefix that is not a path segment must not match.
 			name:    "path boundary rejects repository under repo",
-			entries: []FSEntry{{"/work/repo", tRWX}},
+			entries: []fsEntry{{"/work/repo", tRWX}},
 			path:    "/work/repository",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "path boundary accepts nested under repo",
-			entries: []FSEntry{{"/work/repo", tRWX}},
+			entries: []fsEntry{{"/work/repo", tRWX}},
 			path:    "/work/repo/src",
 			want:    tRWX,
 		},
 		{
 			// 8. Exact match returns the entry's access.
 			name:    "exact match returns entry access",
-			entries: []FSEntry{{"/work/repo", tRWX}},
+			entries: []fsEntry{{"/work/repo", tRWX}},
 			path:    "/work/repo",
 			want:    tRWX,
 		},
 		{
 			// 9. Deny is a hard override even over a more specific allow.
 			name:    "deny overrides more specific allow",
-			entries: []FSEntry{{ws + "/secret", tRWX}, {ws, DenyAccess}},
+			entries: []fsEntry{{ws + "/secret", tRWX}, {ws, denyFSAccess}},
 			path:    ws + "/secret/key",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Resolve(tt.entries, tt.path)
+			got := resolveFS(tt.entries, tt.path)
 			if got != tt.want {
-				t.Errorf("Resolve(%v, %q) = %s, want %s",
+				t.Errorf("resolveFS(%v, %q) = %s, want %s",
 					tt.entries, tt.path, accessString(got), accessString(tt.want))
 			}
 		})
@@ -175,12 +175,12 @@ func TestResolve(t *testing.T) {
 // TestResolveTieUnion pins the rule 2 tie-break: two allow entries with the same
 // specificity union their access bits.
 func TestResolveTieUnion(t *testing.T) {
-	entries := []FSEntry{
-		{"/work/ws", ReadAccess},
-		{"/work/ws", WriteAccess | ExecAccess},
+	entries := []fsEntry{
+		{"/work/ws", readFSAccess},
+		{"/work/ws", writeFSAccess | execFSAccess},
 	}
-	got := Resolve(entries, "/work/ws/file")
-	want := ReadAccess | WriteAccess | ExecAccess
+	got := resolveFS(entries, "/work/ws/file")
+	want := readFSAccess | writeFSAccess | execFSAccess
 	if got != want {
 		t.Errorf("union tie = %s, want %s", accessString(got), accessString(want))
 	}
@@ -189,9 +189,9 @@ func TestResolveTieUnion(t *testing.T) {
 // TestResolveCanonicalizesTarget confirms the target path is cleaned before
 // matching, so lexical noise resolves the same as its canonical form.
 func TestResolveCanonicalizesTarget(t *testing.T) {
-	entries := []FSEntry{{"/work/ws", tRWX}}
-	if got := Resolve(entries, "/work/ws/./src/../a.go"); got != tRWX {
-		t.Errorf("Resolve on noisy path = %s, want RWX", accessString(got))
+	entries := []fsEntry{{"/work/ws", tRWX}}
+	if got := resolveFS(entries, "/work/ws/./src/../a.go"); got != tRWX {
+		t.Errorf("resolveFS on noisy path = %s, want RWX", accessString(got))
 	}
 }
 
@@ -204,15 +204,15 @@ func TestResolveMalformedGlob(t *testing.T) {
 	const bad = "/data/[z-a].secret"
 
 	// (a) The critical case: a malformed deny glob must still deny.
-	denyEntries := []FSEntry{{"/", tRX}, {bad, DenyAccess}}
-	if got := Resolve(denyEntries, "/data/x.secret"); got != DenyAccess {
-		t.Errorf("malformed deny glob: Resolve = %s, want Deny (fail closed)", accessString(got))
+	denyEntries := []fsEntry{{"/", tRX}, {bad, denyFSAccess}}
+	if got := resolveFS(denyEntries, "/data/x.secret"); got != denyFSAccess {
+		t.Errorf("malformed deny glob: resolveFS = %s, want Deny (fail closed)", accessString(got))
 	}
 
 	// (b) A malformed allow glob grants nothing.
-	allowEntries := []FSEntry{{bad, tRWX}}
-	if got := Resolve(allowEntries, "/data/x.secret"); got != DenyAccess {
-		t.Errorf("malformed allow glob: Resolve = %s, want Deny (grants nothing)", accessString(got))
+	allowEntries := []fsEntry{{bad, tRWX}}
+	if got := resolveFS(allowEntries, "/data/x.secret"); got != denyFSAccess {
+		t.Errorf("malformed allow glob: resolveFS = %s, want Deny (grants nothing)", accessString(got))
 	}
 }
 
@@ -222,65 +222,65 @@ func TestResolveMalformedGlob(t *testing.T) {
 func TestResolveGlobBranches(t *testing.T) {
 	tests := []struct {
 		name    string
-		entries []FSEntry
+		entries []fsEntry
 		path    string
-		want    FSAccess
+		want    fsAccess
 	}{
 		{
 			name:    "? matches a single char",
-			entries: []FSEntry{{"/work/?.txt", tRWX}},
+			entries: []fsEntry{{"/work/?.txt", tRWX}},
 			path:    "/work/a.txt",
 			want:    tRWX,
 		},
 		{
 			name:    "? does not span two chars",
-			entries: []FSEntry{{"/work/?.txt", tRWX}},
+			entries: []fsEntry{{"/work/?.txt", tRWX}},
 			path:    "/work/ab.txt",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "bracket class matches a member",
-			entries: []FSEntry{{"/data/[abc].log", tRWX}},
+			entries: []fsEntry{{"/data/[abc].log", tRWX}},
 			path:    "/data/b.log",
 			want:    tRWX,
 		},
 		{
 			name:    "bracket class rejects a non-member",
-			entries: []FSEntry{{"/data/[abc].log", tRWX}},
+			entries: []fsEntry{{"/data/[abc].log", tRWX}},
 			path:    "/data/d.log",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			name:    "negated bracket class matches outside the set",
-			entries: []FSEntry{{"/data/[!x].log", tRWX}},
+			entries: []fsEntry{{"/data/[!x].log", tRWX}},
 			path:    "/data/a.log",
 			want:    tRWX,
 		},
 		{
 			name:    "negated bracket class rejects a member",
-			entries: []FSEntry{{"/data/[!x].log", tRWX}},
+			entries: []fsEntry{{"/data/[!x].log", tRWX}},
 			path:    "/data/x.log",
-			want:    DenyAccess,
+			want:    denyFSAccess,
 		},
 		{
 			// Equal literal-prefix specificity: glob and literal union.
 			name:    "allow glob ties with literal and unions bits",
-			entries: []FSEntry{{"/work", ReadAccess}, {"/work/*.go", WriteAccess}},
+			entries: []fsEntry{{"/work", readFSAccess}, {"/work/*.go", writeFSAccess}},
 			path:    "/work/main.go",
-			want:    ReadAccess | WriteAccess,
+			want:    readFSAccess | writeFSAccess,
 		},
 		{
 			// Longer literal prefix: the glob allow beats the shorter literal.
 			name:    "allow glob with longer prefix beats literal",
-			entries: []FSEntry{{"/work", ReadAccess}, {"/work/sub/*", WriteAccess}},
+			entries: []fsEntry{{"/work", readFSAccess}, {"/work/sub/*", writeFSAccess}},
 			path:    "/work/sub/x",
-			want:    WriteAccess,
+			want:    writeFSAccess,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := Resolve(tt.entries, tt.path); got != tt.want {
-				t.Errorf("Resolve(%v, %q) = %s, want %s",
+			if got := resolveFS(tt.entries, tt.path); got != tt.want {
+				t.Errorf("resolveFS(%v, %q) = %s, want %s",
 					tt.entries, tt.path, accessString(got), accessString(tt.want))
 			}
 		})
@@ -295,16 +295,16 @@ func TestResolveWithPolicyFor(t *testing.T) {
 
 	cases := []struct {
 		path string
-		want FSAccess
+		want fsAccess
 	}{
-		{filepath.Join(ws, "main.go"), tRWX},              // workspace file: writable
-		{filepath.Join(ws, ".git", "config"), ReadAccess}, // carveout: read-only
-		{filepath.Join(ws, ".env"), DenyAccess},           // secret glob: denied
-		{"/etc/hosts", tRX},                               // broad host read
+		{filepath.Join(ws, "main.go"), tRWX},                // workspace file: writable
+		{filepath.Join(ws, ".git", "config"), readFSAccess}, // carveout: read-only
+		{filepath.Join(ws, ".env"), denyFSAccess},           // secret glob: denied
+		{"/etc/hosts", tRX},                                 // broad host read
 	}
 	for _, c := range cases {
-		if got := Resolve(fs, c.path); got != c.want {
-			t.Errorf("Resolve(PolicyFor(Write,%q).FS, %q) = %s, want %s",
+		if got := resolveFS(fs, c.path); got != c.want {
+			t.Errorf("resolveFS(PolicyFor(Write,%q).FS, %q) = %s, want %s",
 				ws, c.path, accessString(got), accessString(c.want))
 		}
 	}

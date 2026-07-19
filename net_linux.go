@@ -8,7 +8,7 @@ import (
 	"github.com/landlock-lsm/go-landlock/landlock"
 )
 
-// This file compiles a Policy's network axis into a go-landlock TCP-port
+// This file compiles a effectivePolicy's network axis into a go-landlock TCP-port
 // allowlist for the rung-2 backend (SPEC §7.2, §5.2, §7.5), completing rung 2's
 // network boundary (Task 12c). Landlock's net rules are PORT-based, not
 // address-based: V4.RestrictNet(ConnectTCP(port), ...) confines TCP connect to
@@ -36,7 +36,7 @@ import (
 // `dns`/`narrowed` report entry — DNS is not claimed to work universally.
 
 // dnsTCPPort is the TCP port DNS-over-TCP resolution uses. Added to the net
-// allowlist whenever NetPolicy.DNS is set, alongside the RES_OPTIONS=use-vc env
+// allowlist whenever effectiveNetPolicy.DNS is set, alongside the RES_OPTIONS=use-vc env
 // injection that forces glibc to use it.
 const dnsTCPPort uint16 = 53
 
@@ -48,38 +48,38 @@ const resOptionsEnvKey = "RES_OPTIONS"
 // resOptionUseVC is the glibc resolver option that forces DNS over TCP.
 const resOptionUseVC = "use-vc"
 
-// compiledNet is the rung-2 network intent distilled from a NetPolicy at compile
+// compiledNet is the rung-2 network intent distilled from a effectiveNetPolicy at compile
 // time: whether to apply a Landlock net restriction at all, the TCP ports the
 // target may connect to, and whether DNS-over-TCP env forcing is requested. It
 // crosses no boundary itself (the wrap closure closes over it); its fields flow
 // into the gob-encoded stage2Spec (NetConfined/NetTCPPorts) and the target env.
 type compiledNet struct {
 	// confined reports whether the stage-2 child applies RestrictNet at all. It is
-	// true whenever the policy does NOT grant open egress (!NetPolicy.Open); false
+	// true whenever the policy does NOT grant open egress (!effectiveNetPolicy.Open); false
 	// leaves TCP unrestricted (the unconfined/trusted-with-open passthrough).
 	confined bool
 	// tcpPorts are the TCP ports ConnectTCP is granted for. Empty (with confined)
 	// means the allowlist is empty and ALL TCP connect is denied — the fail-closed
-	// direction (never wider than policy). Nil/empty is the Write/ZeroTrust shape.
+	// direction (never wider than policy).
 	tcpPorts []uint16
 	// dns reports whether DNS-over-TCP forcing is requested (port 53 already folded
 	// into tcpPorts; this drives the RES_OPTIONS=use-vc target-env injection).
 	dns bool
 }
 
-// compileNetPolicy distils a NetPolicy into a compiledNet (SPEC §5.2, §7.2). The
+// compileNetPolicy distils a effectiveNetPolicy into a compiledNet (SPEC §5.2, §7.2). The
 // mapping is deliberately fail-closed — never WIDER than the policy:
 //
-//   - Open egress (NetPolicy.Open): confined=false. The stage-2 child does NOT
+//   - Open egress (effectiveNetPolicy.Open): confined=false. The stage-2 child does NOT
 //     call RestrictNet, leaving TCP unrestricted. This is the unconfined case
 //     (Open is set only by the Unconfined preset or an explicit opt-in), so the
 //     backend does not claim a network boundary for it.
-//   - Otherwise: confined=true. The TCP allowlist is NetPolicy.Ports, plus port
-//     53 when NetPolicy.DNS (DNS over TCP). An empty result denies all TCP —
-//     exactly the Write/ZeroTrust posture. Loopback/Private are NOT foldable into
+//   - Otherwise: confined=true. The TCP allowlist is effectiveNetPolicy.Ports, plus port
+//     53 when effectiveNetPolicy.DNS (DNS over TCP). An empty result denies all TCP —
+//     a completely blocked posture. Loopback/Private are NOT foldable into
 //     a port allowlist (they are address predicates), so they do not widen the
 //     ports; they are recorded unenforced by netCompileReport.
-func compileNetPolicy(n NetPolicy) compiledNet {
+func compileNetPolicy(n effectiveNetPolicy) compiledNet {
 	if n.Open {
 		return compiledNet{confined: false}
 	}
@@ -150,7 +150,7 @@ func ensureResOptionsUseVC(env []string) []string {
 //     loopback/private/metadata are not address-scopable at rung 2 (§7.5); use
 //     rung 1 for real address boundaries.
 //   - DNS: forced over TCP, glibc-dependent (dns / narrowed).
-func netCompileReport(n NetPolicy, cnet compiledNet) []ReportEntry {
+func netCompileReport(n effectiveNetPolicy, cnet compiledNet) []ReportEntry {
 	var entries []ReportEntry
 	if !cnet.confined {
 		entries = append(entries, ReportEntry{

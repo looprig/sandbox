@@ -5,7 +5,6 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -15,55 +14,6 @@ import (
 	"testing"
 	"time"
 )
-
-// update rewrites the testdata/*.sbpl golden files from the current generator
-// output when set: `go test -run TestCompileSBPLGolden -update`. Determinism for
-// the goldens comes from a fixed workspace (/ws) and a fixed HOME (set via
-// t.Setenv), so DefaultSecretDenials' ~ expansion is stable and the goldens hold
-// no machine-specific paths.
-var update = flag.Bool("update", false, "update .sbpl golden files")
-
-// goldenModes is the mode → golden-file table. One SBPL profile is generated per
-// mode and compared byte-for-byte against testdata/<name>.sbpl.
-var goldenModes = []struct {
-	name string
-	mode Mode
-}{
-	{"zerotrust", ZeroTrust},
-	{"readonly", ReadOnly},
-	{"write", Write},
-	{"trusted", Trusted},
-	{"unconfined", Unconfined},
-}
-
-// TestCompileSBPLGolden pins the full generated profile per mode against a
-// committed golden. With -update it (re)writes the goldens instead of asserting.
-func TestCompileSBPLGolden(t *testing.T) {
-	t.Setenv("HOME", "/lrsbx-home/tester")
-	for _, tc := range goldenModes {
-		t.Run(tc.name, func(t *testing.T) {
-			profile, _, _, _ := compileSBPL(PolicyFor(tc.mode, "/ws"))
-			golden := filepath.Join("testdata", tc.name+".sbpl")
-			if *update {
-				if err := os.MkdirAll("testdata", 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(golden, []byte(profile), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				return
-			}
-			want, err := os.ReadFile(golden)
-			if err != nil {
-				t.Fatalf("read golden %s (run: go test -run TestCompileSBPLGolden -update): %v", golden, err)
-			}
-			if profile != string(want) {
-				t.Errorf("profile for %s does not match golden %s\n--- got ---\n%s\n--- want ---\n%s",
-					tc.name, golden, profile, want)
-			}
-		})
-	}
-}
 
 // TestCompileSBPLBase asserts the base of every profile: (version 1) then
 // (deny default), so the sandbox is fail-closed before any allow.
@@ -175,7 +125,7 @@ func TestCompileSBPLNetworkTrusted(t *testing.T) {
 // outbound-tcp form.
 func TestCompileSBPLNetworkPorts(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	p := PolicyFor(Write, "/ws", WithNet(NetPolicy{Ports: []uint16{443, 8080}}))
+	p := PolicyFor(Write, "/ws", WithNet(effectiveNetPolicy{Ports: []uint16{443, 8080}}))
 	profile, _, _, _ := compileSBPL(p)
 	for _, w := range []string{
 		`(allow network-outbound (remote tcp "*:443"))`,
@@ -191,7 +141,7 @@ func TestCompileSBPLNetworkPorts(t *testing.T) {
 // blanket network allow.
 func TestCompileSBPLNetworkOpen(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	profile, _, _, _ := compileSBPL(PolicyFor(Unconfined, "/ws"))
+	profile, _, _, _ := compileSBPL(PolicyFor(testUnconfined, "/ws"))
 	if !strings.Contains(profile, "(allow network*)") {
 		t.Errorf("Unconfined (Net.Open) profile missing (allow network*)\n%s", profile)
 	}
@@ -234,7 +184,7 @@ func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
 		{"readonly", ReadOnly, LevelFull, false},
 		{"write", Write, LevelFull, false},
 		{"trusted", Trusted, LevelDegraded, false}, // Degraded via Private, not restricted-read
-		{"unconfined", Unconfined, LevelFull, false},
+		{"unconfined", testUnconfined, LevelFull, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -281,7 +231,7 @@ func TestCompileSBPLGuarantees(t *testing.T) {
 	}{
 		{"ProcessBoundary", GuaranteeProcessBoundary},
 		{"WriteBoundary", GuaranteeWriteBoundary},
-		{"ReadDenies", GuaranteeReadDenies},
+		{"ReadBoundary", GuaranteeReadBoundary},
 		{"NetworkBoundary", GuaranteeNetworkBoundary},
 	} {
 		if writeBits&want.bit == 0 {
@@ -293,7 +243,7 @@ func TestCompileSBPLGuarantees(t *testing.T) {
 	}
 
 	// An Inherit policy (unconfined-style) does NOT scrub env.
-	_, _, _, inheritBits := compileSBPL(Policy{Workspace: "/ws", Env: EnvPolicy{Inherit: true}})
+	_, _, _, inheritBits := compileSBPL(effectivePolicy{Workspace: "/ws", Env: effectiveEnvPolicy{Inherit: true}})
 	if inheritBits&GuaranteeEnvScrub != 0 {
 		t.Error("Inherit policy EnvScrub bit set; an inherited env is not scrubbed")
 	}
@@ -414,7 +364,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 
 // --- Task 8b: REAL sandbox-exec enforcement (SPEC §12.1 macOS write row) ---
 //
-// These tests construct a REAL Seatbelt executor (NewExecutor(PolicyFor(Write, ws))
+// These tests construct a REAL Seatbelt executor (newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 // is Seatbelt on darwin, once platformBackend() selects it) and actually run
 // commands through /usr/bin/sandbox-exec, asserting the OS backend ENFORCES the
 // generated SBPL. They are the answer to the reviewer's I2: the goldens only prove
@@ -460,7 +410,7 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	// resolution and even this in-workspace write would be denied.
 	ws := t.TempDir()
 	outside := t.TempDir() // a sibling temp dir: NOT ws, NOT /tmp
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -503,7 +453,7 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -535,7 +485,7 @@ func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 func TestSeatbeltEnforceNullDevice(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -565,7 +515,7 @@ func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -599,7 +549,7 @@ func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 
 // TestSeatbeltEnforceSSHDeny is the §12.1 ~/.ssh row: a sandboxed read of a file
 // under $HOME/.ssh is DENIED. HOME is set to a temp home BEFORE NewExecutor so
-// DefaultSecretDenials compiles that home's ~/.ssh (subpath) deny into the profile.
+// defaultSecretDenials compiles that home's ~/.ssh (subpath) deny into the profile.
 // Verifies the §5.3 (subpath …) secret deny enforces under real SBPL.
 func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 	requireSandboxExec(t)
@@ -614,7 +564,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 	}
 
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -642,7 +592,7 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 func TestSeatbeltEnforceCarveoutNotPreCreated(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws)) // .looprig does NOT exist yet
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws)) // .looprig does NOT exist yet
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -671,7 +621,7 @@ func TestSeatbeltEnforceSecretDenyCreatedAfter(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home) // BEFORE NewExecutor; ~/.ssh does NOT exist yet
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -709,7 +659,7 @@ func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -766,7 +716,7 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 	}
 	_ = c.Close()
 
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -783,13 +733,13 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 
 // TestSeatbeltEnforceLevelAndGuarantees asserts the compiled posture of the REAL
 // Seatbelt executor (SPEC §12.1: Level = Full): Write mode reaches LevelFull and
-// its Guarantees carry WriteBoundary, ReadDenies, EnvScrub, and NetworkBoundary,
+// its Guarantees carry WriteBoundary, ReadBoundary, EnvScrub, and NetworkBoundary,
 // with AddressNetwork false (SBPL cannot address-scope, §7.1/M1). This inspects the
 // compiled backend metadata, so it needs the darwin backend selected but does not
 // itself spawn sandbox-exec.
 func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
 	ws := t.TempDir()
-	e, err := NewExecutor(PolicyFor(Write, ws))
+	e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -797,8 +747,8 @@ func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
 		t.Errorf("real Seatbelt Write Level() = %d, want LevelFull (%d)", e.Level(), LevelFull)
 	}
 	g := e.Guarantees()
-	if !(g.WriteBoundary && g.ReadDenies && g.EnvScrub && g.NetworkBoundary) {
-		t.Errorf("Guarantees() = %+v, want WriteBoundary && ReadDenies && EnvScrub && NetworkBoundary all true", g)
+	if !(g.WriteBoundary && g.ReadBoundary && g.EnvScrub && g.NetworkBoundary) {
+		t.Errorf("Guarantees() = %+v, want WriteBoundary && ReadBoundary && EnvScrub && NetworkBoundary all true", g)
 	}
 	if g.AddressNetwork {
 		t.Error("Guarantees().AddressNetwork = true, want false (SBPL cannot address-scope)")

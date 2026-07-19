@@ -29,7 +29,7 @@ import (
 // no-op posture. Pinned via the unexported withBackend seam.
 func TestSandboxtestAgainstNullBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "null", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := NewExecutor(PolicyFor(Write, ws), withBackend(newNullBackend()))
+		e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws), withBackend(newNullBackend()))
 		if err != nil {
 			t.Fatalf("NewExecutor(null): %v", err)
 		}
@@ -44,7 +44,7 @@ func TestSandboxtestAgainstNullBackend(t *testing.T) {
 // backend's gate.
 func TestSandboxtestAgainstLiveBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "live", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := NewExecutor(PolicyFor(Write, ws))
+		e, err := newExecutorForEffectivePolicy(PolicyFor(Write, ws))
 		if err != nil {
 			t.Fatalf("NewExecutor(live): %v", err)
 		}
@@ -64,7 +64,7 @@ func TestSandboxtestSeamConstantsMatch(t *testing.T) {
 	}{
 		{"ProcessBoundary", GuaranteeProcessBoundary, sandboxtest.GuaranteeProcessBoundary},
 		{"WriteBoundary", GuaranteeWriteBoundary, sandboxtest.GuaranteeWriteBoundary},
-		{"ReadDenies", GuaranteeReadDenies, sandboxtest.GuaranteeReadDenies},
+		{"ReadBoundary", GuaranteeReadBoundary, sandboxtest.GuaranteeReadBoundary},
 		{"EnvScrub", GuaranteeEnvScrub, sandboxtest.GuaranteeEnvScrub},
 		{"NetworkBoundary", GuaranteeNetworkBoundary, sandboxtest.GuaranteeNetworkBoundary},
 		{"AddressNetwork", GuaranteeAddressNetwork, sandboxtest.GuaranteeAddressNetwork},
@@ -83,7 +83,6 @@ func TestSandboxtestSeamConstantsMatch(t *testing.T) {
 		{"LevelNone", LevelNone, sandboxtest.LevelNone},
 		{"LevelDegraded", LevelDegraded, sandboxtest.LevelDegraded},
 		{"LevelFull", LevelFull, sandboxtest.LevelFull},
-		{"LevelExternal", LevelExternal, sandboxtest.LevelExternal},
 	}
 	for _, p := range levelPairs {
 		if p.orig != p.mirror {
