@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -17,6 +18,43 @@ import (
 
 type failingGrantPathBackend struct {
 	handles []*grantPathHandle
+}
+
+type trackingGrantPathBackend struct {
+	rung          rung
+	grantCompiles int
+	configures    int
+	handles       []*grantPathHandle
+	spec          stage2Spec
+}
+
+func (backend *trackingGrantPathBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	return (&linuxBackend{rung: backend.rung}).compile(policy)
+}
+
+func (backend *trackingGrantPathBackend) compileWithGrantPaths(policy effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+	backend.grantCompiles++
+	backend.handles = append([]*grantPathHandle(nil), handles...)
+	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).compileWithGrantPaths(policy, handles)
+	if err != nil {
+		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+	}
+	_, configure, cleanup := spawn.wrap(policy.Workspace, []string{"/bin/true"})
+	cmd := exec.Command("/proc/self/exe")
+	cmd.Env = []string{}
+	if err := configure(cmd); err != nil {
+		cleanup()
+		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+	}
+	backend.configures++
+	backend.spec, err = decodeStage2Spec(cmd.ExtraFiles[0])
+	cleanup()
+	if err != nil {
+		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+	}
+	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+		return argv, nil, nil
+	}}, report, level, bits, nil
 }
 
 func (backend *failingGrantPathBackend) compile(effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
@@ -160,6 +198,222 @@ func TestLinuxGrantHandleClosesWhenSpawnCompilationFails(t *testing.T) {
 	fd := int(backend.handles[0].file.Fd())
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("grant handle fd %d remains open after compile failure: %v", fd, err)
+	}
+}
+
+func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T) {
+	for _, rung := range []rung{rungTwo, rungOne} {
+		for _, order := range []struct {
+			name    string
+			classes []string
+		}{
+			{name: "read-then-write", classes: []string{"filesystem.tree.read.v1", "filesystem.tree.write.v1"}},
+			{name: "write-then-read", classes: []string{"filesystem.tree.write.v1", "filesystem.tree.read.v1"}},
+		} {
+			t.Run("rung-"+strconv.Itoa(int(rung))+"/"+order.name, func(t *testing.T) {
+				now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+				workspace := mustCanonicalGrantRoot(t, t.TempDir())
+				target := filepath.Join(workspace, "target")
+				inodeA := target + ".inode-a"
+				inodeB := target + ".inode-b"
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "identity"), []byte("A"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				profile := mustProfile(t, ProfileConfig{
+					WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Gated,
+					HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
+				})
+				backend := &trackingGrantPathBackend{rung: rung}
+				executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+				if err != nil {
+					t.Fatal(err)
+				}
+				readToken := issueTestGrant(t, executor, now, "same-target-mismatch", "true", workspace,
+					"filesystem.read", "tree:"+target, "filesystem.tree.read.v1", target)
+				if err := os.Rename(target, inodeA); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "identity"), []byte("B"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				writeToken := issueTestGrant(t, executor, now, "same-target-mismatch", "true", workspace,
+					"filesystem.write", "tree:"+target, "filesystem.tree.write.v1", target)
+				if err := os.Rename(target, inodeB); err != nil {
+					t.Fatal(err)
+				}
+
+				tokens := map[string]string{
+					"filesystem.tree.read.v1":  readToken,
+					"filesystem.tree.write.v1": writeToken,
+				}
+				paths := map[string]string{
+					"filesystem.tree.read.v1":  inodeA,
+					"filesystem.tree.write.v1": inodeB,
+				}
+				var acquiredFDs []int
+				acquire := func(binding *grantPathBinding, canonicalTarget string, exact bool) (*grantPathHandle, error) {
+					if err := os.Rename(paths[order.classes[len(acquiredFDs)]], target); err != nil {
+						return nil, err
+					}
+					handle, err := acquireGrantPathHandle(binding, canonicalTarget, exact)
+					if err != nil {
+						return nil, err
+					}
+					acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
+					if err := os.Rename(target, paths[order.classes[len(acquiredFDs)-1]]); err != nil {
+						_ = handle.Close()
+						return nil, err
+					}
+					return handle, nil
+				}
+				orderedTokens := []string{tokens[order.classes[0]], tokens[order.classes[1]]}
+				_, _, err = executor.runCommandWithGrants(context.Background(), "same-target-mismatch", workspace, "true", orderedTokens, acquire)
+				if !errors.Is(err, ErrGrantTargetChanged) {
+					t.Fatalf("RunCommandWithGrants error = %v, want ErrGrantTargetChanged", err)
+				}
+				if backend.grantCompiles != 0 || backend.configures != 0 {
+					t.Fatalf("backend reached before identity rejection: compiles=%d configures=%d", backend.grantCompiles, backend.configures)
+				}
+				if len(acquiredFDs) != 2 {
+					t.Fatalf("acquired FDs = %v, want two handles", acquiredFDs)
+				}
+				for _, fd := range acquiredFDs {
+					if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+						t.Fatalf("mismatched grant handle fd %d remains open: %v", fd, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
+	for _, rung := range []rung{rungTwo, rungOne} {
+		for _, reverse := range []bool{false, true} {
+			name := "read-then-write"
+			if reverse {
+				name = "write-then-read"
+			}
+			t.Run("rung-"+strconv.Itoa(int(rung))+"/"+name, func(t *testing.T) {
+				now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+				workspace := mustCanonicalGrantRoot(t, t.TempDir())
+				target := filepath.Join(workspace, "target")
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				profile := mustProfile(t, ProfileConfig{
+					WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Gated,
+					HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
+				})
+				backend := &trackingGrantPathBackend{rung: rung}
+				executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+				if err != nil {
+					t.Fatal(err)
+				}
+				readToken := issueTestGrant(t, executor, now, "same-target-match", "true", workspace,
+					"filesystem.read", "tree:"+target, "filesystem.tree.read.v1", target)
+				writeToken := issueTestGrant(t, executor, now, "same-target-match", "true", workspace,
+					"filesystem.write", "tree:"+target, "filesystem.tree.write.v1", target)
+				tokens := []string{readToken, writeToken}
+				if reverse {
+					tokens[0], tokens[1] = tokens[1], tokens[0]
+				}
+				var acquiredFDs []int
+				acquire := func(binding *grantPathBinding, canonicalTarget string, exact bool) (*grantPathHandle, error) {
+					handle, err := acquireGrantPathHandle(binding, canonicalTarget, exact)
+					if handle != nil {
+						acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
+					}
+					return handle, err
+				}
+				if _, _, err := executor.runCommandWithGrants(context.Background(), "same-target-match", workspace, "true", tokens, acquire); err != nil {
+					t.Fatalf("RunCommandWithGrants: %v", err)
+				}
+				if backend.grantCompiles != 1 || backend.configures != 1 {
+					t.Fatalf("backend calls = compiles %d configures %d, want 1/1", backend.grantCompiles, backend.configures)
+				}
+				if len(backend.handles) != 1 {
+					t.Fatalf("compiled handles = %d, want one coalesced target", len(backend.handles))
+				}
+				if backend.handles[0].target != target || backend.handles[0].access != allFSAccess {
+					t.Fatalf("coalesced handle = target %q access %#x, want %q all axes", backend.handles[0].target, backend.handles[0].access, target)
+				}
+				if got, want := backend.spec.GrantFDs, []int{firstGrantPathChildFD}; !slices.Equal(got, want) {
+					t.Fatalf("GrantFDs = %v, want canonical collision-free %v", got, want)
+				}
+				for _, rule := range backend.spec.FSRules {
+					if rule.Target == target && (rule.ParentFD == 0 || rule.ParentFD != firstGrantPathChildFD) {
+						t.Fatalf("same-target rule used zero sentinel or collided: %+v", rule)
+					}
+				}
+				if len(acquiredFDs) != 2 {
+					t.Fatalf("acquired FDs = %v, want two handles before coalescing", acquiredFDs)
+				}
+				for _, fd := range acquiredFDs {
+					if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+						t.Fatalf("successful grant handle fd %d remains open: %v", fd, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxGrantHandleSetSortsCanonicalTargetsAndPreservesLongestAncestor(t *testing.T) {
+	root := t.TempDir()
+	targets := []string{
+		filepath.Join(root, "a-distinct"),
+		filepath.Join(root, "m-outer"),
+		filepath.Join(root, "m-outer", "inner"),
+		filepath.Join(root, "z-distinct"),
+	}
+	for _, target := range targets {
+		if err := os.MkdirAll(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var set grantPathHandleSet
+	var acquiredFDs []int
+	for i := len(targets) - 1; i >= 0; i-- {
+		binding, err := captureGrantPathBinding(targets[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, err := acquireGrantPathHandle(&binding, targets[i], false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
+		if err := set.add(handle); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handles := set.sorted()
+	if len(handles) != len(targets) {
+		t.Fatalf("distinct handles = %d, want %d", len(handles), len(targets))
+	}
+	for i, target := range targets {
+		if handles[i].target != target {
+			t.Fatalf("canonical handle order = %q at %d, want %q", handles[i].target, i, target)
+		}
+	}
+	descendant := filepath.Join(targets[2], "leaf")
+	if got := matchingGrantPathIdentityAncestor(handles, descendant); got != 2 {
+		t.Fatalf("longest ancestor index = %d, want inner target at canonical index 2", got)
+	}
+	set.close()
+	for _, fd := range acquiredFDs {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+			t.Fatalf("ordered distinct handle fd %d remains open: %v", fd, err)
+		}
 	}
 }
 

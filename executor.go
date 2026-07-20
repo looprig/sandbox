@@ -558,6 +558,12 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 // RunCommandWithGrants verifies all grants, compiles their least-authority
 // deltas for this spawn, atomically consumes them, and then starts the command.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string) ([]byte, int, error) {
+	return e.runCommandWithGrants(ctx, executionID, dir, command, grants, acquireGrantPathHandle)
+}
+
+type grantPathAcquirer func(*grantPathBinding, string, bool) (*grantPathHandle, error)
+
+func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string, acquire grantPathAcquirer) ([]byte, int, error) {
 	lease, err := e.beginExecution(ctx)
 	if err != nil {
 		return nil, -1, err
@@ -587,8 +593,8 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	commandGrant := e.profile.command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
-	var pathHandles []*grantPathHandle
-	defer func() { closeGrantPathHandles(pathHandles) }()
+	var pathHandles grantPathHandleSet
+	defer pathHandles.close()
 	for _, token := range grants {
 		id := grantID(token)
 		if _, ok := e.usedGrants[id]; ok {
@@ -613,13 +619,15 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, ErrGrantGuaranteeMismatch
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-			handle, err := acquireGrantPathHandle(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
+			handle, err := acquire(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
 			if err != nil {
 				return nil, -1, err
 			}
 			if handle != nil {
 				handle.access = delta.entry.Access
-				pathHandles = append(pathHandles, handle)
+				if err := pathHandles.add(handle); err != nil {
+					return nil, -1, err
+				}
 			}
 		}
 		if delta.class == "command.start.v1" {
@@ -667,7 +675,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		}
 		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
-	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, policy, pathHandles)
+	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, policy, pathHandles.sorted())
 	if err != nil {
 		return nil, -1, err
 	}

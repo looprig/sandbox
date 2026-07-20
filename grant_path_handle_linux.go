@@ -56,5 +56,7 @@ func acquireGrantPathHandle(binding *grantPathBinding, target string, exact bool
 		_ = file.Close()
 		return nil, ErrGrantUnsupported
 	}
-	return &grantPathHandle{file: file, target: target, exact: exact, isDir: info.IsDir()}, nil
+	return &grantPathHandle{
+		file: file, target: target, exact: exact, isDir: info.IsDir(), identity: identity,
+	}, nil
 }
