@@ -358,8 +358,8 @@ func policyHasGlobDeny(p effectivePolicy) bool {
 // load-bearing — each closes over its own (dir, innerArgv), its own enumerated
 // rules, and its own pipe, so concurrent spawns never share per-spawn state or a
 // file descriptor.
-func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle) func(string, []string) ([]string, func(*exec.Cmd), func()) {
-	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle) func(string, []string) ([]string, func(*exec.Cmd) error, func()) {
+	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return linuxWrap(cfs, cnet, cg, r1, handles, dir, innerArgv)
 	}
 }
@@ -375,7 +375,7 @@ func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 
 // applies the mount view + nftables before Landlock. The cloneflags, the spec
 // pipe, and the cgroup UseCgroupFD all coexist on the one SysProcAttr. r1 == nil
 // is the rung-2 path (no namespaces), unchanged.
-func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -389,7 +389,8 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 	// delegation / policy-disabled) or when scope creation failed best-effort.
 	var tcg *transientCgroup
 
-	configure := func(cmd *exec.Cmd) {
+	var grantRuleFiles []*os.File
+	configure := func(cmd *exec.Cmd) error {
 		// Capture the TARGET environment BEFORE adding the dispatch sentinel, so the
 		// execve'd target never observes LRSANDBOX_STAGE2. The executor has already
 		// set cmd.Env to the scrubbed child environment at this point.
@@ -405,7 +406,11 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		// the live filesystem: a secret that exists when the command starts is
 		// carved out; a file the command later creates is not (§7.5 snapshot
 		// semantics). The stage-2 child rebuilds the Landlock ruleset from this.
-		fsRules := enumerateFSRules(cfs)
+		fsRules, relativeFiles, err := enumerateFSRulesWithGrantPaths(cfs, handles)
+		if err != nil {
+			return err
+		}
+		grantRuleFiles = relativeFiles
 		// Seccomp is unconditionally requested for this rung-2 backend: rung 2 is
 		// only selected when the seccomp capability was probed present (selectRung
 		// requires c.seccomp), so the stage-2 install cannot be a surprise failure.
@@ -423,13 +428,16 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		for index := range handles {
 			spec.GrantFDs = append(spec.GrantFDs, firstGrantPathChildFD+index)
 		}
+		for index := range grantRuleFiles {
+			spec.GrantFDs = append(spec.GrantFDs, firstGrantPathChildFD+len(handles)+index)
+		}
 		// Task 13: a rung-1 spawn additionally enumerates the bind-mount view (a
 		// fresh snapshot, like the FS allowlist above) and carries the nftables plan.
 		// It uses nftables for egress, so it leaves NetConfined false (no Landlock TCP
 		// net) — the netns filter is the network boundary.
 		if r1 != nil {
 			spec.Rung = stage2RungOne
-			spec.MountView = enumerateMountView(r1.mount)
+			spec.MountView = enumerateMountViewWithGrantRules(r1.mount, fsRules)
 			spec.NftRules = r1.nft.toNftSpec()
 			spec.NetConfined = false
 			spec.NetTCPPorts = nil
@@ -443,7 +451,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 			// path instead of running the re-exec'd program as itself.
 			cmd.Env = append(cmd.Env, stage2SentinelEnv+"="+stage2SentinelValue)
 			cmd.SysProcAttr = &syscall.SysProcAttr{}
-			return
+			return nil
 		}
 		pipeR, pipeW = r, w
 
@@ -453,6 +461,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		for _, handle := range handles {
 			cmd.ExtraFiles = append(cmd.ExtraFiles, handle.file)
 		}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, grantRuleFiles...)
 		// Add the dispatch sentinel to the CHILD's env only (after capturing the
 		// target env above), so the child's Init() runs runStage2.
 		cmd.Env = append(cmd.Env, stage2SentinelEnv+"="+stage2SentinelValue)
@@ -494,6 +503,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 			_ = encodeStage2Spec(w, spec)
 			_ = w.Close() // signal EOF so the child's gob decode terminates
 		}()
+		return nil
 	}
 
 	cleanup := func() {
@@ -513,6 +523,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		if pipeW != nil {
 			_ = pipeW.Close()
 		}
+		closeGrantRuleFiles(grantRuleFiles)
 	}
 
 	return finalArgv, configure, cleanup

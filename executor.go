@@ -347,9 +347,8 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 // snapshot's spawnSpec.wrap to obtain the final argv plus a fresh per-spawn
 // configure/cleanup pair, builds the command, applies the snapshot's environment
 // and the backend's spawn attributes, runs it, and normalizes the result to the
-// (output, exit, err) convention. The snapshot is read once by the caller (via
-// resolve) so a concurrent dynamic recompile cannot change the env or spawn
-// transform mid-spawn; each wrap call yields its own closures, so concurrent
+// (output, exit, err) convention. The caller supplies one immutable snapshot for
+// the whole spawn, and each wrap call yields its own closures, so concurrent
 // spawns never share per-spawn state.
 func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
 	// Fail closed if the spawn spec never compiled: resolve already guards this,
@@ -381,17 +380,31 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		cmd.Env = []string{}
 	}
 	if configure != nil {
-		configure(cmd)
+		if err := configure(cmd); err != nil {
+			return nil, -1, err
+		}
 	}
+	tree, err := newProcessTree(cmd)
+	if err != nil {
+		return nil, -1, err
+	}
+	defer tree.close()
 
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
-	err := lease.start(cmd)
+	err = lease.start(cmd, tree)
 	if err == nil {
 		err = cmd.Wait()
 	}
+	treeErr := tree.terminateAndWait()
+	if treeErr != nil {
+		err = treeErr
+	}
 	out := output.Bytes()
+	if treeErr != nil {
+		return out, -1, treeErr
+	}
 
 	// A context timeout/cancel DURING the run surfaces as a signal kill (an
 	// ExitError with code -1), which would otherwise be reported as a nil-error

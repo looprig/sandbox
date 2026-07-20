@@ -144,7 +144,7 @@ func (*testPassthroughBackend) compile(p effectivePolicy) (spawnSpec, CompileRep
 	if !p.Env.Inherit {
 		bits = GuaranteeEnvScrub
 	}
-	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) {
+	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, nil, nil
 	}}, CompileReport{}, LevelNone, bits, nil
 }

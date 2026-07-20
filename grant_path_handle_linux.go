@@ -10,8 +10,18 @@ import (
 )
 
 func acquireGrantPathHandle(binding *grantPathBinding, target string, exact bool) (*grantPathHandle, error) {
-	if binding == nil || binding.CanonicalPath != target || binding.ExistingPath != target {
+	if binding == nil || binding.CanonicalPath != target {
 		return nil, ErrGrantTargetChanged
+	}
+	if binding.ExistingPath != target {
+		// Revalidation distinguishes an unchanged missing suffix from one that
+		// appeared or changed since approval. Landlock cannot represent an exact
+		// nonexistent object, so unchanged absence is unsupported; any suffix drift
+		// remains a target-change error.
+		if err := revalidateGrantPathBinding(binding, target); err != nil {
+			return nil, err
+		}
+		return nil, ErrGrantUnsupported
 	}
 	how := &unix.OpenHow{
 		Flags: uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC),

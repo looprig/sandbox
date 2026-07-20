@@ -34,7 +34,7 @@ func (b *boundaryBackend) compile(policy effectivePolicy) (spawnSpec, CompileRep
 	if resolveFS(policy.FS, string(os.PathSeparator))&writeFSAccess != 0 {
 		bits &^= GuaranteeWriteBoundary
 	}
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) { return argv, nil, nil }}
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
 	return spec, CompileReport{}, LevelFull, bits, nil
 }
 
@@ -45,7 +45,7 @@ func (b *captureBackend) compile(policy effectivePolicy) (spawnSpec, CompileRepo
 	if b.compileErr != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, b.compileErr
 	}
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) { return argv, nil, nil }}
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
 	return spec, CompileReport{}, LevelNone, b.bits, nil
 }
 

@@ -469,7 +469,7 @@ func (seatbeltBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uin
 		// and a RunArgv becomes `sandbox-exec -p <profile> -- <argv...>`, identical
 		// to the pre-reshape wrapShell/wrapArgv. dir needs no special handling and
 		// there are no per-spawn resources, so configure and cleanup are nil.
-		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 			wrapped := make([]string, 0, 4+len(innerArgv))
 			wrapped = append(wrapped, "/usr/bin/sandbox-exec", "-p", profile, "--")
 			wrapped = append(wrapped, innerArgv...)

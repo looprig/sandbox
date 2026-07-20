@@ -146,6 +146,7 @@ func pathUnder(parent, path string) bool {
 
 type fsRule struct {
 	Path           string
+	Target         string
 	ParentFD       int
 	Access         fsAccess
 	LandlockAccess uint64
@@ -155,7 +156,14 @@ type fsRule struct {
 func (rule fsRule) writable() bool { return rule.Access&writeFSAccess != 0 }
 
 func enumerateFSRules(compiled compiledFS) []fsRule {
+	rules, files, _ := enumerateFSRulesWithGrantPaths(compiled, nil)
+	closeGrantRuleFiles(files)
+	return rules
+}
+
+func enumerateFSRulesWithGrantPaths(compiled compiledFS, handles []*grantPathHandle) ([]fsRule, []*os.File, error) {
 	accumulator := ruleAcc{seen: make(map[string]fsRule)}
+	var files []*os.File
 	for _, allow := range compiled.allows {
 		for _, bit := range []fsAccess{readFSAccess, execFSAccess, writeFSAccess} {
 			if allow.access&bit == 0 || deniedAtSamePath(allow, bit, compiled.denies) {
@@ -163,14 +171,33 @@ func enumerateFSRules(compiled compiledFS) []fsRule {
 			}
 			excludes := excludesForAllowAxis(allow.path, bit, compiled.denies)
 			if allow.grantFD != 0 {
-				if len(excludes) != 0 {
+				index := allow.grantFD - firstGrantPathChildFD
+				if index < 0 || index >= len(handles) || handles[index] == nil {
+					closeGrantRuleFiles(files)
+					return nil, nil, ErrGrantUnsupported
+				}
+				if len(excludes) == 0 {
+					accumulator.add(fsRule{
+						Target:   allow.path,
+						ParentFD: allow.grantFD,
+						Access:   bit,
+						IsDir:    !allow.exact,
+					})
 					continue
 				}
-				accumulator.add(fsRule{
-					ParentFD: allow.grantFD,
-					Access:   bit,
-					IsDir:    !allow.exact,
-				})
+				rules, children, err := enumerateGrantPathHandle(
+					handles[index], allow.path, bit, excludes,
+					firstGrantPathChildFD+len(handles)+len(files),
+				)
+				if err != nil {
+					closeGrantRuleFiles(children)
+					closeGrantRuleFiles(files)
+					return nil, nil, err
+				}
+				files = append(files, children...)
+				for _, rule := range rules {
+					accumulator.add(rule)
+				}
 				continue
 			}
 			if len(excludes) == 0 {
@@ -183,7 +210,13 @@ func enumerateFSRules(compiled compiledFS) []fsRule {
 			carveGrant(allow.path, bit, excludes, accumulator.add)
 		}
 	}
-	return accumulator.sorted()
+	return accumulator.sorted(), files, nil
+}
+
+func closeGrantRuleFiles(files []*os.File) {
+	for _, file := range files {
+		_ = file.Close()
+	}
 }
 
 func deniedAtSamePath(allow fsAllow, bit fsAccess, denies []fsDeny) bool {
@@ -198,7 +231,7 @@ func deniedAtSamePath(allow fsAllow, bit fsAccess, denies []fsDeny) bool {
 func excludesForAllowAxis(path string, bit fsAccess, denies []fsDeny) []string {
 	var excludes []string
 	for _, deny := range denies {
-		if deny.access&bit != 0 && pathUnder(path, deny.path) && pathExists(deny.path) {
+		if deny.access&bit != 0 && pathUnder(path, deny.path) {
 			excludes = append(excludes, deny.path)
 		}
 	}
@@ -240,11 +273,6 @@ func excludesUnder(excludes []string, parent string) []string {
 	return nested
 }
 
-func pathExists(path string) bool {
-	_, err := os.Lstat(path)
-	return err == nil
-}
-
 type ruleAcc struct{ seen map[string]fsRule }
 
 func (accumulator ruleAcc) add(rule fsRule) {
@@ -254,6 +282,9 @@ func (accumulator ruleAcc) add(rule fsRule) {
 	}
 	if previous, ok := accumulator.seen[key]; ok {
 		previous.Access |= rule.Access
+		if previous.Target == "" {
+			previous.Target = rule.Target
+		}
 		accumulator.seen[key] = previous
 		return
 	}

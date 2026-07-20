@@ -58,7 +58,7 @@ func (e *Executor) beginExecution(caller context.Context) (*executionLease, erro
 	return lease, nil
 }
 
-func (lease *executionLease) start(cmd *exec.Cmd) error {
+func (lease *executionLease) start(cmd *exec.Cmd, tree *processTree) error {
 	if lease == nil || lease.lifecycle == nil {
 		return ErrExecutorClosed
 	}
@@ -71,7 +71,7 @@ func (lease *executionLease) start(cmd *exec.Cmd) error {
 	if err := lease.ctx.Err(); err != nil {
 		return err
 	}
-	return cmd.Start()
+	return tree.start(cmd)
 }
 
 func (lease *executionLease) finish() {

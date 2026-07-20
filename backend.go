@@ -39,9 +39,10 @@ type spawnSpec struct {
 	// closes over THIS spawn's (dir, innerArgv), so concurrent spawns never share
 	// per-spawn state. configure may be nil (no attributes to set) and cleanup may
 	// be nil (nothing to release); null/seatbelt return nil for both and ignore
-	// dir. The executor applies configure to the assembled *exec.Cmd and, if
-	// cleanup is non-nil, calls it after the spawn completes.
-	wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd), cleanup func())
+	// dir. The executor applies configure to the assembled *exec.Cmd; a configure
+	// error fails before Start. If cleanup is non-nil, the executor calls it after
+	// configure or spawn completes.
+	wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
 }
 
 // backend compiles a effectivePolicy into a reusable spawnSpec plus the achieved isolation

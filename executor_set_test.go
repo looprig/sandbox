@@ -20,10 +20,11 @@ type blockingConfigureBackend struct {
 }
 
 func (b *blockingConfigureBackend) compile(effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) {
-		return argv, func(*exec.Cmd) {
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+		return argv, func(*exec.Cmd) error {
 			b.once.Do(func() { close(b.entered) })
 			<-b.release
+			return nil
 		}, nil
 	}}
 	return spec, CompileReport{}, LevelNone, b.bits, nil

@@ -21,7 +21,7 @@ func (nullBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, 
 		// Pure passthrough: run the inner argv exactly as given (the executor has
 		// already shell-normalized a RunCommand to /bin/sh -c command). No spawn
 		// attributes, no per-spawn resources — configure and cleanup are nil.
-		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd), func()) {
+		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 			return innerArgv, nil, nil
 		},
 	}

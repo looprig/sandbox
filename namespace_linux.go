@@ -173,7 +173,7 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 		}
 		merged[clean] |= e.Access
 		if e.Canonical {
-			if index := matchingGrantPathHandle(handles, clean, e.Exact, e.Access); index >= 0 {
+			if index := matchingGrantPathTarget(handles, clean, e.Exact); index >= 0 {
 				plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].isDir}
 			}
 		}
@@ -242,16 +242,13 @@ type MountViewSpec struct {
 // fresh mask snapshot. It walks the live filesystem but touches no namespaces,
 // so it runs on every host and is unit-testable.
 func enumerateMountView(plan mountViewPlan) MountViewSpec {
+	return enumerateMountViewWithGrantRules(plan, nil)
+}
+
+func enumerateMountViewWithGrantRules(plan mountViewPlan, grantRules []fsRule) MountViewSpec {
 	var spec MountViewSpec
 	add := func(path string, ro bool) {
-		if grant, ok := plan.grantBinds[path]; ok {
-			childFD := firstGrantPathChildFD + grant.index
-			spec.Binds = append(spec.Binds, BindSpec{
-				Source:   "/proc/self/fd/" + strconv.Itoa(childFD),
-				Target:   path,
-				ReadOnly: ro,
-				IsDir:    grant.isDir,
-			})
+		if _, ok := plan.grantBinds[path]; ok {
 			return
 		}
 		st, err := os.Stat(path)
@@ -271,6 +268,32 @@ func enumerateMountView(plan mountViewPlan) MountViewSpec {
 	for _, p := range plan.roBinds {
 		add(p, true)
 	}
+	grantBindByTarget := make(map[string]BindSpec)
+	for root := range plan.grantBinds {
+		for _, rule := range grantRules {
+			if rule.ParentFD == 0 || rule.Target == "" || rule.Target != root && !pathUnder(root, rule.Target) {
+				continue
+			}
+			current, ok := grantBindByTarget[rule.Target]
+			if !ok || rule.ParentFD < procFDNumber(current.Source) {
+				grantBindByTarget[rule.Target] = BindSpec{
+					Source: "/proc/self/fd/" + strconv.Itoa(rule.ParentFD),
+					Target: rule.Target,
+					IsDir:  rule.IsDir,
+				}
+			}
+		}
+	}
+	for target, bind := range grantBindByTarget {
+		bind.ReadOnly = true
+		for _, rule := range grantRules {
+			if rule.Access&writeFSAccess != 0 && (rule.Target == target || rule.IsDir && pathUnder(rule.Target, target)) {
+				bind.ReadOnly = false
+				break
+			}
+		}
+		spec.Binds = append(spec.Binds, bind)
+	}
 	// Parents-first: a lexical path sort places a parent before its children (the
 	// parent is a prefix), so a nested ro carveout is bound AFTER — re-masking —
 	// the rw root beneath it, and a rw root is bound after a broader ro root.
@@ -286,6 +309,14 @@ func enumerateMountView(plan mountViewPlan) MountViewSpec {
 	spec.Masks = append(spec.Masks, scanGlobDenies(plan.scanRoots, plan.globDenies, globScanMaxDepth)...)
 	slices.SortFunc(spec.Masks, func(a, b MaskSpec) int { return strings.Compare(a.Target, b.Target) })
 	return spec
+}
+
+func procFDNumber(path string) int {
+	value, err := strconv.Atoi(strings.TrimPrefix(path, "/proc/self/fd/"))
+	if err != nil {
+		return int(^uint(0) >> 1)
+	}
+	return value
 }
 
 // scanGlobDenies bounded-walks each root to maxDepth, masking every entry whose
