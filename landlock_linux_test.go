@@ -424,9 +424,10 @@ func TestEnumerateFSRules(t *testing.T) {
 		} else if acc&writeFSAccess != 0 {
 			t.Errorf("FAIL-OPEN: .git carveout granted write access %b; rules=%+v", acc, rules)
 		}
-		// Root not granted whole; siblings writable.
-		if _, ok := access(rules, root); ok {
-			t.Errorf("carved root must not be granted whole; rules=%+v", rules)
+		// Root may retain its independent read/exec axes, but must not receive
+		// write access that would re-include the carveout.
+		if acc, ok := access(rules, root); ok && acc&writeFSAccess != 0 {
+			t.Errorf("carved root must not retain write access; rules=%+v", rules)
 		}
 		for _, sib := range []string{"a", "b", "secret"} {
 			p := filepath.Join(root, sib)

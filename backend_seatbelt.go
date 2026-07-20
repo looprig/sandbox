@@ -267,7 +267,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net effectiveNetPolic
 
 // compileGuarantees derives the seam-facing guarantee bitmask from what the
 // Seatbelt profile actually enforces for this policy. Each bit is fail-closed:
-// set only when genuinely enforced (SPEC §6, §10.3, §7.5 soundness).
+// set only when genuinely enforced.
 func compileGuarantees(p effectivePolicy) uint64 {
 	var bits uint64
 

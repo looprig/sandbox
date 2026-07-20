@@ -55,8 +55,10 @@ type ExecutorSet struct {
 	options   []ExecOption
 	route     *EgressRoute
 	executors map[string]*Executor
+	lifecycle *executorLifecycle
 	closed    bool
 	closeErr  error
+	closeDone chan struct{}
 }
 
 // NewExecutorSet creates one owner-only child beneath a required scratch root.
@@ -98,6 +100,8 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 		options:   append([]ExecOption(nil), config.execOptions...),
 		route:     config.route,
 		executors: make(map[string]*Executor),
+		lifecycle: newExecutorLifecycle(),
+		closeDone: make(chan struct{}),
 	}, nil
 }
 
@@ -186,7 +190,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		}
 		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
-	executor, err := newExecutorFromEffective(set.profile, policy, set.options...)
+	execOptions := append([]ExecOption(nil), set.options...)
+	execOptions = append(execOptions, withExecutorLifecycle(set.lifecycle))
+	executor, err := newExecutorFromEffective(set.profile, policy, execOptions...)
 	if err != nil {
 		if proxy != nil {
 			_ = proxy.Close()
@@ -215,16 +221,34 @@ func (set *ExecutorSet) Close() error {
 	}
 	set.mu.Lock()
 	if set.closed {
+		done := set.closeDone
+		set.mu.Unlock()
+		<-done
+		set.mu.Lock()
 		err := set.closeErr
 		set.mu.Unlock()
 		return err
 	}
 	set.closed = true
+	executors := make([]*Executor, 0, len(set.executors))
 	for _, executor := range set.executors {
-		executor.revoke()
+		executors = append(executors, executor)
+	}
+	set.mu.Unlock()
+
+	set.lifecycle.beginClose()
+	for _, executor := range executors {
+		executor.markClosed()
+	}
+	set.lifecycle.wait()
+	for _, executor := range executors {
+		executor.revokeResources()
 	}
 	err := os.RemoveAll(set.ownedRoot)
+
+	set.mu.Lock()
 	set.closeErr = err
+	close(set.closeDone)
 	set.mu.Unlock()
 	return err
 }
@@ -233,8 +257,26 @@ func (e *Executor) revoke() {
 	if e == nil {
 		return
 	}
+	e.lifecycle.beginClose()
+	e.markClosed()
+	e.lifecycle.wait()
+	e.revokeResources()
+}
+
+func (e *Executor) markClosed() {
+	if e == nil {
+		return
+	}
 	e.grantMu.Lock()
 	e.closed = true
+	e.grantMu.Unlock()
+}
+
+func (e *Executor) revokeResources() {
+	if e == nil {
+		return
+	}
+	e.grantMu.Lock()
 	for i := range e.grantKey {
 		e.grantKey[i] = 0
 	}

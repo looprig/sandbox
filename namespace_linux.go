@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -94,6 +95,14 @@ type mountViewPlan struct {
 	// scanRoots are the roots scanned for globDenies (workspace + writable roots +
 	// $HOME, §7.5). Bounded to globScanMaxDepth.
 	scanRoots []string
+	// grantBinds maps a granted canonical target to the inherited descriptor
+	// index and type captured atomically by the executor.
+	grantBinds map[string]grantMountSource
+}
+
+type grantMountSource struct {
+	index int
+	isDir bool
 }
 
 // hasDenies reports whether the plan carries any read-deny (fixed or glob) the
@@ -117,7 +126,12 @@ type rung1Plan struct {
 // express a glob allow, and dropping under-grants (fail secure). Landlock is
 // layered over the mount view to enforce partial-axis and restored descendants.
 func compileMountView(p effectivePolicy) mountViewPlan {
+	return compileMountViewWithGrantPaths(p, nil)
+}
+
+func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandle) mountViewPlan {
 	var plan mountViewPlan
+	plan.grantBinds = make(map[string]grantMountSource)
 
 	// First pass: collect full-path deny intent that the mount view can hide
 	// without swallowing a more-specific allow. Partial-axis denies are enforced
@@ -158,6 +172,11 @@ func compileMountView(p effectivePolicy) mountViewPlan {
 			order = append(order, clean)
 		}
 		merged[clean] |= e.Access
+		if e.Canonical {
+			if index := matchingGrantPathHandle(handles, clean, e.Exact, e.Access); index >= 0 {
+				plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].isDir}
+			}
+		}
 	}
 	for _, path := range order {
 		if merged[path]&writeFSAccess != 0 {
@@ -225,6 +244,16 @@ type MountViewSpec struct {
 func enumerateMountView(plan mountViewPlan) MountViewSpec {
 	var spec MountViewSpec
 	add := func(path string, ro bool) {
+		if grant, ok := plan.grantBinds[path]; ok {
+			childFD := firstGrantPathChildFD + grant.index
+			spec.Binds = append(spec.Binds, BindSpec{
+				Source:   "/proc/self/fd/" + strconv.Itoa(childFD),
+				Target:   path,
+				ReadOnly: ro,
+				IsDir:    grant.isDir,
+			})
+			return
+		}
 		st, err := os.Stat(path)
 		if err != nil {
 			return // nonexistent root: drop (fail secure — never bind what is absent)

@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -19,7 +20,7 @@ import (
 )
 
 // defaultGrantTTL is the lifetime of a minted grant token when WithGrantTTL is
-// not supplied (SPEC §9.2, §13 decision 5: 15 minutes).
+// not supplied (15 minutes).
 const defaultGrantTTL = 15 * time.Minute
 
 // spawnWaitGrace bounds how long a spawn's Wait/CombinedOutput blocks for I/O
@@ -57,6 +58,7 @@ type execConfig struct {
 	cgroupParent string
 	clock        func() time.Time // nil means default time.Now
 	backend      backend          // nil means select via platformBackend (test seam)
+	lifecycle    *executorLifecycle
 }
 
 // ExecOption configures executors created by an ExecutorSet (SPEC §6).
@@ -95,6 +97,10 @@ func withBackend(b backend) ExecOption {
 	return func(c *execConfig) { c.backend = b }
 }
 
+func withExecutorLifecycle(lifecycle *executorLifecycle) ExecOption {
+	return func(c *execConfig) { c.lifecycle = lifecycle }
+}
+
 // Executor compiles a effectivePolicy once via the platform backend and then runs
 // commands under the resulting stateless per-spawn transform (SPEC §6, §7). It
 // holds the compiled policy, the chosen backend, its spawnSpec, the compilation
@@ -123,6 +129,7 @@ type Executor struct {
 	grantMu          sync.Mutex
 	usedGrants       map[[32]byte]struct{}
 	closed           bool
+	lifecycle        *executorLifecycle
 
 	cgroupParent string // stored for the cgroup task (SPEC §7.4); unused here
 }
@@ -183,6 +190,10 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 		return nil, fmt.Errorf("sandbox: grant key: %w", err)
 	}
 
+	lifecycle := cfg.lifecycle
+	if lifecycle == nil {
+		lifecycle = newExecutorLifecycle()
+	}
 	return &Executor{
 		profile:          profile,
 		policy:           p,
@@ -197,6 +208,7 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 		grantTTL:         ttlOrDefault(cfg.grantTTL),
 		routeFingerprint: defaultRouteIdentity,
 		usedGrants:       make(map[[32]byte]struct{}),
+		lifecycle:        lifecycle,
 		cgroupParent:     cfg.cgroupParent,
 	}, nil
 }
@@ -218,7 +230,7 @@ func ttlOrDefault(d time.Duration) time.Duration {
 }
 
 // RunCommand runs a shell command string in dir under the compiled policy (SPEC
-// §6, §10.1). It wraps the command via the backend's spawnSpec, sets the working
+// It wraps the command via the backend's spawnSpec, sets the working
 // directory and the assembled environment, applies any spawn attributes, and
 // runs to completion capturing combined stdout+stderr.
 //
@@ -231,6 +243,11 @@ func ttlOrDefault(d time.Duration) time.Duration {
 // not uniquely mean "didn't spawn" — it also arises from signal death and
 // context cancellation.
 func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte, int, error) {
+	lease, err := e.beginExecution(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+	defer lease.finish()
 	if err := e.commandAccess(); err != nil {
 		return nil, -1, err
 	}
@@ -245,7 +262,7 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if executionID != "" {
 		defer e.proxy.Release(executionID)
 	}
-	return e.run(ctx, dir, shellArgv(command), s)
+	return e.run(lease, dir, shellArgv(command), s)
 }
 
 // shellArgv is the universal shell-normalization: running a command STRING means
@@ -273,11 +290,16 @@ func (e *Executor) resolveErr(compileErr error) error {
 }
 
 // RunArgv runs a direct argv in dir under the compiled policy, with no shell
-// interposed (SPEC §6, §10.1) — for tools that already build argv safely. Same
+// interposed — for tools that already build argv safely. Same
 // exit-code/error convention as RunCommand: key on err, not the numeric code, to
 // detect a process that did not complete normally (spawn failure, signal kill,
 // or context cancellation all report code -1).
 func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
+	lease, err := e.beginExecution(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+	defer lease.finish()
 	if err := e.commandAccess(); err != nil {
 		return nil, -1, err
 	}
@@ -292,7 +314,7 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 	if executionID != "" {
 		defer e.proxy.Release(executionID)
 	}
-	return e.run(ctx, dir, argv, s)
+	return e.run(lease, dir, argv, s)
 }
 
 func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
@@ -329,7 +351,7 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 // resolve) so a concurrent dynamic recompile cannot change the env or spawn
 // transform mid-spawn; each wrap call yields its own closures, so concurrent
 // spawns never share per-spawn state.
-func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
+func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
 	// Fail closed if the spawn spec never compiled: resolve already guards this,
 	// but a nil transform must never reach a spawn (defense in depth).
 	if s.spec.wrap == nil {
@@ -347,7 +369,7 @@ func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s sn
 		return nil, -1, errors.New("sandbox: backend produced an empty argv")
 	}
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(lease.ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.WaitDelay = spawnWaitGrace // bound deadline latency when a forked grandchild holds the output pipe
 	cmd.Env = s.env
@@ -362,14 +384,24 @@ func (e *Executor) run(ctx context.Context, dir string, innerArgv []string, s sn
 		configure(cmd)
 	}
 
-	out, err := cmd.CombinedOutput()
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := lease.start(cmd)
+	if err == nil {
+		err = cmd.Wait()
+	}
+	out := output.Bytes()
 
 	// A context timeout/cancel DURING the run surfaces as a signal kill (an
 	// ExitError with code -1), which would otherwise be reported as a nil-error
 	// non-zero run. Check the context first so a deadline/cancel is a visible
 	// error, symmetric with cancel-before-start.
-	if ctx.Err() != nil {
-		return out, -1, ctx.Err()
+	if lease.ctx.Err() != nil {
+		if lease.caller.Err() != nil {
+			return out, -1, lease.caller.Err()
+		}
+		return out, -1, ErrExecutorClosed
 	}
 
 	if err != nil {
@@ -392,20 +424,18 @@ func (e *Executor) Level() uint8 {
 }
 
 // Report returns the per-feature compilation outcomes for the chosen backend
-// (SPEC §7.5): what was enforced, narrowed, or left unenforced. See Level for the
-// dynamic-executor locking note.
+// what was enforced, narrowed, or left unenforced.
 func (e *Executor) Report() CompileReport {
 	return e.report
 }
 
 // Guarantees returns the rich per-property statement of what the backend
-// actually enforced (SPEC §6, §10.3). Each field is fail-closed. See Level for
-// the dynamic-executor locking note.
+// actually enforced. Each field is fail-closed.
 func (e *Executor) Guarantees() Guarantees { return guaranteesFromBits(e.GuaranteeBits()) }
 
 // GuaranteeBits returns the same guarantees as the seam-facing bitmask so a
 // consumer can probe interface{ GuaranteeBits() uint64 } without importing this
-// package (SPEC §6, §10.3). See Level for the dynamic-executor locking note.
+// package.
 func (e *Executor) GuaranteeBits() uint64 {
 	return e.guaranteeBits
 }
@@ -515,6 +545,11 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 // RunCommandWithGrants verifies all grants, compiles their least-authority
 // deltas for this spawn, atomically consumes them, and then starts the command.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string) ([]byte, int, error) {
+	lease, err := e.beginExecution(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+	defer lease.finish()
 	if err := ctx.Err(); err != nil {
 		return nil, -1, err
 	}
@@ -539,6 +574,8 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	commandGrant := e.profile.command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
+	var pathHandles []*grantPathHandle
+	defer func() { closeGrantPathHandles(pathHandles) }()
 	for _, token := range grants {
 		id := grantID(token)
 		if _, ok := e.usedGrants[id]; ok {
@@ -563,8 +600,13 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, ErrGrantGuaranteeMismatch
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-			if err := revalidateGrantPathBinding(payload.PathBinding, delta.entry.Path); err != nil {
+			handle, err := acquireGrantPathHandle(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
+			if err != nil {
 				return nil, -1, err
+			}
+			if handle != nil {
+				handle.access = delta.entry.Access
+				pathHandles = append(pathHandles, handle)
 			}
 		}
 		if delta.class == "command.start.v1" {
@@ -612,7 +654,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		}
 		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
-	spec, _, _, bits, err := e.backend.compile(policy)
+	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, policy, pathHandles)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -637,7 +679,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	s := snapshot{spec: spec, env: assembleEnv(policy), policy: policy}
 	e.grantMu.Unlock()
-	out, code, runErr := e.run(ctx, canonicalCWD, shellArgv(command), s)
+	out, code, runErr := e.run(lease, canonicalCWD, shellArgv(command), s)
 	var denial error
 	if len(proxyTargets) != 0 {
 		denial = e.proxy.Denial(executionID)
@@ -648,6 +690,19 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		return out, code, &NetworkTargetDeniedError{ExitCode: code, ProcessError: runErr, denial: denial}
 	}
 	return out, code, runErr
+}
+
+type grantPathBackend interface {
+	compileWithGrantPaths(effectivePolicy, []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error)
+}
+
+func compileBackendWithGrantPaths(b backend, policy effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if len(handles) != 0 {
+		if pathBackend, ok := b.(grantPathBackend); ok {
+			return pathBackend.compileWithGrantPaths(policy, handles)
+		}
+	}
+	return b.compile(policy)
 }
 
 func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {

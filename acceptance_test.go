@@ -1,6 +1,6 @@
 package sandbox
 
-// Acceptance matrix — SPEC §12.1. This file asserts the PLATFORM-INDEPENDENT rows
+// This file asserts the platform-independent acceptance rows
 // (and the sandbox-side mechanisms the harness-integration rows build on) that the
 // sandbox module can prove on its own: unavailable confinement fails closed and
 // environment scrubbing holds.
@@ -8,11 +8,8 @@ package sandbox
 // acceptance_linux_test.go; the macOS Seatbelt row in acceptance_darwin_test.go.
 //
 // The load-bearing signal on every row is the per-row Guarantees() assertion — the
-// machine-readable posture the auto-approval interlock (§10.3) gates on. The
-// harness-integration rows of §12.1 (journaled ceiling command, pre-ask
-// BuildRequest wiring, foreign-agent launch) are Phase 4/5 and are NOT in this
-// module; where a mechanism is genuinely absent here a row t.Skips with a RECORDED
-// reason rather than passing silently.
+// machine-readable posture consumers gate on. Where a mechanism is genuinely
+// absent here, a row skips with a recorded reason rather than passing silently.
 
 import (
 	"context"
@@ -22,12 +19,12 @@ import (
 	"testing"
 )
 
-// TestAcceptanceMatrixCrossPlatform runs the §12.1 rows the sandbox module can
+// TestAcceptanceMatrixCrossPlatform runs the rows the sandbox module can
 // assert on any platform. Each entry mirrors one matrix scenario; a row asserts
 // its mechanism AND its Guarantees() posture.
 func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
-	// Several rows build non-inherit executors, whose §5.3 secret deny-reads are
-	// home-anchored, so NewExecutor/NewExecutorDynamic require a resolvable home.
+	// Several rows build non-inherit executors whose policy is home-anchored, so
+	// executor construction requires a resolvable home.
 	// Provide one when the host leaves it unset (matches TestEnvScrub). Set at the
 	// non-parallel parent so t.Setenv is safe.
 	if os.Getenv("HOME") == "" {
@@ -54,7 +51,7 @@ func acceptRowSandboxUnavailable(t *testing.T) {
 	}
 }
 
-// acceptRowEnvScrub — §12.1 "Env scrub": a child sees the baseline env only;
+// acceptRowEnvScrub proves a child sees the baseline env only;
 // GITHUB_TOKEN and ANTHROPIC_API_KEY are absent; TMPDIR points into the writable
 // tmp. Runs through the live platform backend (rung 2 here) so the scrub is
 // proven end-to-end, not just in assembleEnv.

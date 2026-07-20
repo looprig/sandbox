@@ -3,8 +3,14 @@
 package sandbox
 
 import (
+	"errors"
+	"fmt"
+	"runtime"
+	"syscall"
+
 	"github.com/landlock-lsm/go-landlock/landlock"
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
+	"golang.org/x/sys/unix"
 )
 
 // This file compiles a effectivePolicy's filesystem axis into a go-landlock ruleset for
@@ -47,11 +53,72 @@ import (
 // removed between enumeration and application (TOCTOU) is skipped (narrower)
 // rather than aborting the whole ruleset.
 func applyLandlockRules(rules []fsRule) error {
-	landRules := make([]landlock.Rule, 0, len(rules))
-	for _, r := range rules {
-		landRules = append(landRules, landlockRule(r))
+	abi, err := llsys.LandlockGetABIVersion()
+	if err != nil || abi < 4 {
+		return fmt.Errorf("Landlock ABI v4 unavailable: ABI=%d err=%w", abi, err)
 	}
-	return landlock.V4.RestrictPaths(landRules...)
+	const handledAccessFS = (1 << 15) - 1
+	ruleset, err := llsys.LandlockCreateRuleset(&llsys.RulesetAttr{HandledAccessFS: handledAccessFS}, 0)
+	if err != nil {
+		return fmt.Errorf("landlock_create_ruleset: %w", err)
+	}
+	defer syscall.Close(ruleset)
+
+	rules = append(rules, landlockThreadWorkaroundRules()...)
+	for _, r := range rules {
+		if err := addLandlockFSRule(ruleset, r); err != nil {
+			return err
+		}
+	}
+	if abi >= 8 {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", err)
+		}
+		if err := llsys.LandlockRestrictSelf(ruleset, llsys.FlagRestrictSelfTSync); err != nil {
+			return fmt.Errorf("landlock_restrict_self(TSYNC): %w", err)
+		}
+		return nil
+	}
+	if err := llsys.AllThreadsPrctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", err)
+	}
+	if err := llsys.AllThreadsLandlockRestrictSelf(ruleset, 0); err != nil {
+		return fmt.Errorf("landlock_restrict_self: %w", err)
+	}
+	return nil
+}
+
+func addLandlockFSRule(ruleset int, rule fsRule) error {
+	access := uint64(landlockAccessSet(rule.Access, rule.IsDir))
+	if rule.LandlockAccess != 0 {
+		access = rule.LandlockAccess
+	}
+	if access == 0 {
+		return nil
+	}
+	parentFD := rule.ParentFD
+	owned := false
+	if parentFD == 0 {
+		fd, err := unix.Open(rule.Path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("open Landlock path %q: %w", rule.Path, err)
+		}
+		parentFD = fd
+		owned = true
+	}
+	if owned {
+		defer unix.Close(parentFD)
+	}
+	attr := llsys.PathBeneathAttr{ParentFd: parentFD, AllowedAccess: access}
+	if err := llsys.LandlockAddPathBeneathRule(ruleset, &attr, 0); err != nil {
+		return fmt.Errorf("add Landlock rule path=%q fd=%d: %w", rule.Path, rule.ParentFD, err)
+	}
+	return nil
 }
 
 // landlockRule maps one fsRule to a go-landlock rule via PathAccess, honoring

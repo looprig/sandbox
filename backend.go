@@ -46,7 +46,7 @@ type spawnSpec struct {
 
 // backend compiles a effectivePolicy into a reusable spawnSpec plus the achieved isolation
 // rollup: the coarse level (SPEC §6), the per-property guarantee bitmask (SPEC
-// §6, §10.3), and a compilation report of what was enforced, narrowed, or left
+// and a compilation report of what was enforced, narrowed, or left
 // unenforced (SPEC §7.5). Compilation is where the soundness invariant lives:
 // compiled enforcement is never wider than the policy, and every gap is recorded.
 // It returns an error when a policy cannot be compiled at all; a backend

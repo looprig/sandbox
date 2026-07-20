@@ -325,7 +325,7 @@ func TestAssembleEnvBadAllowGlob(t *testing.T) {
 // constructed scrub policy with no matching var and no Set must yield a non-nil,
 // empty slice — never nil, which would make exec.Cmd inherit the ENTIRE parent
 // environment and leak every secret. It also checks end-to-end that a planted
-// secret never reaches the child, without relying on PolicyFor's incidental
+// secret never reaches the child, without relying on an incidental
 // TMPDIR-in-Set masking.
 func TestAssembleEnvScrubNeverNil(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "secret")

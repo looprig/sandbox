@@ -170,10 +170,10 @@ func TestCompileSBPLLevels(t *testing.T) {
 	}
 }
 
-// TestCompileSBPLLevelAndReportPerMode asserts scoped reads are fully enforced;
+// TestCompileSBPLLevelAndReportByPolicyShape asserts scoped reads are fully enforced;
 // only the legacy fixture requesting unexpressible private-address access is
 // degraded.
-func TestCompileSBPLLevelAndReportPerMode(t *testing.T) {
+func TestCompileSBPLLevelAndReportByPolicyShape(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
 	cases := []struct {
 		name             string
@@ -363,7 +363,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 	}
 }
 
-// --- Task 8b: REAL sandbox-exec enforcement (SPEC §12.1 macOS write row) ---
+// --- Real sandbox-exec enforcement ---
 //
 // These tests construct a REAL Seatbelt executor (newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 // is Seatbelt on darwin, once platformBackend() selects it) and actually run
@@ -399,15 +399,15 @@ func requireSandboxExec(t *testing.T) {
 	}
 }
 
-// TestSeatbeltEnforceWriteBoundary is the §12.1 write-boundary row: an in-workspace
+// TestSeatbeltEnforceWriteBoundary proves an in-workspace
 // write succeeds and lands; a write to a sibling dir that is neither the workspace
 // nor /tmp is denied (nonzero exit, file not created). The deny only holds under
 // real Seatbelt — under null the write would succeed.
 func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	requireSandboxExec(t)
 	// RAW t.TempDir() (symlinked under /var/folders → /private/var). Passing it
-	// straight to PolicyFor proves the GENERATOR canonicalizes the workspace: without
-	// canonPath the emitted (subpath "/var/…") never matches the kernel's /private/…
+	// straight to the effective-policy fixture proves the generator canonicalizes
+	// the workspace: without canonPath the emitted (subpath "/var/…") never matches the kernel's /private/…
 	// resolution and even this in-workspace write would be denied.
 	ws := t.TempDir()
 	outside := t.TempDir() // a sibling temp dir: NOT ws, NOT /tmp
@@ -500,7 +500,7 @@ func TestSeatbeltEnforceNullDevice(t *testing.T) {
 	}
 }
 
-// TestSeatbeltEnforceGitCarveout is the §12.1 .git carveout row: a sandboxed write
+// TestSeatbeltEnforceGitCarveout proves a sandboxed write
 // into ws/.git is DENIED while a sandboxed read of an existing ws/.git file is
 // ALLOWED. This verifies the read-allow + write-deny-LAST ordering enforces under
 // real SBPL last-match-wins, not just in byte-equal goldens.
@@ -548,7 +548,7 @@ func TestSeatbeltEnforceGitCarveout(t *testing.T) {
 	}
 }
 
-// TestSeatbeltEnforceSSHDeny is the §12.1 ~/.ssh row: a sandboxed read of a file
+// TestSeatbeltEnforceSSHDeny proves a sandboxed read of a file
 // under $HOME/.ssh is DENIED. HOME is set to a temp home BEFORE NewExecutor so
 // defaultSecretDenials compiles that home's ~/.ssh (subpath) deny into the profile.
 // Verifies the §5.3 (subpath …) secret deny enforces under real SBPL.
@@ -643,7 +643,7 @@ func TestSeatbeltEnforceSecretDenyCreatedAfter(t *testing.T) {
 	}
 }
 
-// TestSeatbeltEnforceEnvGlobDeny is the §12.1 .env row and the reviewer's I2 proof:
+// TestSeatbeltEnforceEnvGlobDeny proves that
 // a sandboxed read of ws/.env is DENIED — showing the (regex #"^.*/\.env[^/]*$")
 // deny actually MATCHES under SBPL's regex engine, not merely byte-equal to Go's
 // RE2 translation — while ws/notenv (ends in "env" but has no leading dot) is
@@ -692,7 +692,7 @@ func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
 	}
 }
 
-// TestSeatbeltEnforceNetworkBlocked is the §12.1 network row: under write mode
+// TestSeatbeltEnforceNetworkBlocked proves that under a network-denied policy
 // (Net zero → default-deny egress) a sandboxed connect to a LIVE loopback listener
 // is blocked. A control dial from the test process (unsandboxed) succeeds first, so
 // a sandboxed failure is attributable to enforcement, not a dead port.
@@ -733,7 +733,7 @@ func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {
 }
 
 // TestSeatbeltEnforceLevelAndGuarantees asserts the compiled posture of the REAL
-// Seatbelt executor (SPEC §12.1: Level = Full): Write mode reaches LevelFull and
+// Seatbelt executor: a writable sandboxed profile reaches LevelFull and
 // its Guarantees carry WriteBoundary, ReadBoundary, EnvScrub, and NetworkBoundary,
 // with AddressNetwork false (SBPL cannot address-scope, §7.1/M1). This inspects the
 // compiled backend metadata, so it needs the darwin backend selected but does not

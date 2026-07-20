@@ -9,9 +9,18 @@ import (
 	"strings"
 )
 
-func validateLandlockExactPaths(entries []fsEntry) error {
+// firstGrantPathChildFD is fd 4: stdio occupies 0-2 and Linux reserves fd 3
+// for the sealed stage-2 spec. Keeping this constant next to fsRule compilation
+// makes descriptor collision impossible even though this pure compiler is also
+// built on non-Linux hosts.
+const firstGrantPathChildFD = 4
+
+func validateLandlockExactPaths(entries []fsEntry, handles []*grantPathHandle) error {
 	for _, entry := range entries {
 		if !entry.Exact || !entry.Canonical || entry.Access == 0 {
+			continue
+		}
+		if matchingGrantPathHandle(handles, filepath.Clean(entry.Path), true, entry.Access) >= 0 {
 			continue
 		}
 		info, err := os.Lstat(entry.Path)
@@ -32,6 +41,10 @@ type fsAllow struct {
 	path   string
 	access fsAccess
 	exact  bool
+	// grantFD is the inherited child O_PATH descriptor, or zero for an ordinary
+	// profile/runtime pathname. Zero keeps the struct's natural default safe for
+	// tests and other compiler inputs that construct fsAllow directly.
+	grantFD int
 }
 
 func (a fsAllow) writable() bool { return a.access&writeFSAccess != 0 }
@@ -48,6 +61,10 @@ type compiledFS struct {
 }
 
 func compileFSPolicy(entries []fsEntry) compiledFS {
+	return compileFSPolicyWithGrantPaths(entries, nil)
+}
+
+func compileFSPolicyWithGrantPaths(entries []fsEntry, handles []*grantPathHandle) compiledFS {
 	var compiled compiledFS
 	for _, entry := range entries {
 		if strings.ContainsAny(entry.Path, globMeta) {
@@ -55,13 +72,37 @@ func compileFSPolicy(entries []fsEntry) compiledFS {
 		}
 		path := filepath.Clean(entry.Path)
 		if entry.Access != 0 {
-			compiled.allows = append(compiled.allows, fsAllow{path: path, access: entry.Access, exact: entry.Exact})
+			grantFD := 0
+			if index := matchingGrantPathTarget(handles, path, entry.Exact); index >= 0 {
+				grantFD = firstGrantPathChildFD + index
+			}
+			compiled.allows = append(compiled.allows, fsAllow{
+				path: path, access: entry.Access, exact: entry.Exact, grantFD: grantFD,
+			})
 		}
 		if denied := normalizedDenied(entry); denied != 0 {
 			compiled.denies = append(compiled.denies, fsDeny{path: path, access: denied, exact: entry.Exact})
 		}
 	}
 	return compiled
+}
+
+func matchingGrantPathHandle(handles []*grantPathHandle, path string, exact bool, access fsAccess) int {
+	for index, handle := range handles {
+		if handle != nil && handle.target == path && handle.exact == exact && handle.access == access {
+			return index
+		}
+	}
+	return -1
+}
+
+func matchingGrantPathTarget(handles []*grantPathHandle, path string, exact bool) int {
+	for index, handle := range handles {
+		if handle != nil && handle.target == path && handle.exact == exact {
+			return index
+		}
+	}
+	return -1
 }
 
 func (compiled compiledFS) resolve(path string) fsAccess {
@@ -104,9 +145,11 @@ func pathUnder(parent, path string) bool {
 }
 
 type fsRule struct {
-	Path   string
-	Access fsAccess
-	IsDir  bool
+	Path           string
+	ParentFD       int
+	Access         fsAccess
+	LandlockAccess uint64
+	IsDir          bool
 }
 
 func (rule fsRule) writable() bool { return rule.Access&writeFSAccess != 0 }
@@ -119,6 +162,17 @@ func enumerateFSRules(compiled compiledFS) []fsRule {
 				continue
 			}
 			excludes := excludesForAllowAxis(allow.path, bit, compiled.denies)
+			if allow.grantFD != 0 {
+				if len(excludes) != 0 {
+					continue
+				}
+				accumulator.add(fsRule{
+					ParentFD: allow.grantFD,
+					Access:   bit,
+					IsDir:    !allow.exact,
+				})
+				continue
+			}
 			if len(excludes) == 0 {
 				info, err := os.Stat(allow.path)
 				if err == nil {
@@ -194,12 +248,16 @@ func pathExists(path string) bool {
 type ruleAcc struct{ seen map[string]fsRule }
 
 func (accumulator ruleAcc) add(rule fsRule) {
-	if previous, ok := accumulator.seen[rule.Path]; ok {
+	key := rule.Path
+	if rule.ParentFD != 0 {
+		key = fmt.Sprintf("fd:%d", rule.ParentFD)
+	}
+	if previous, ok := accumulator.seen[key]; ok {
 		previous.Access |= rule.Access
-		accumulator.seen[rule.Path] = previous
+		accumulator.seen[key] = previous
 		return
 	}
-	accumulator.seen[rule.Path] = rule
+	accumulator.seen[key] = rule
 }
 
 func (accumulator ruleAcc) sorted() []fsRule {
@@ -207,6 +265,11 @@ func (accumulator ruleAcc) sorted() []fsRule {
 	for _, rule := range accumulator.seen {
 		rules = append(rules, rule)
 	}
-	slices.SortFunc(rules, func(left, right fsRule) int { return strings.Compare(left.Path, right.Path) })
+	slices.SortFunc(rules, func(left, right fsRule) int {
+		if left.ParentFD != right.ParentFD {
+			return left.ParentFD - right.ParentFD
+		}
+		return strings.Compare(left.Path, right.Path)
+	})
 	return rules
 }

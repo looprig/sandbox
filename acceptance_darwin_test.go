@@ -2,7 +2,7 @@
 
 package sandbox
 
-// Acceptance matrix — SPEC §12.1, the macOS Seatbelt row. This file compiles on
+// macOS Seatbelt acceptance coverage. This file compiles on
 // every platform's darwin cross-build (GOOS=darwin go test -c) but only RUNS on
 // macOS, where /usr/bin/sandbox-exec is present. The compile-time posture
 // (Level/Guarantees) is asserted unconditionally; the runtime enforcement checks
@@ -16,7 +16,7 @@ import (
 	"testing"
 )
 
-// TestAcceptanceMatrixDarwin runs the §12.1 "macOS Seatbelt, write mode" row: the
+// TestAcceptanceMatrixDarwin runs the macOS Seatbelt writable-profile row: the
 // write boundary + .git carveout hold, a ~/.ssh read is denied, Level = Full
 // (loopback+ports+DNS enforced; Private/metadata compile-to-blocked, so a policy
 // needing address-scoping would be Degraded), and AddressNetwork is always false

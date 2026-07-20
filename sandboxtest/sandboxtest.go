@@ -54,7 +54,7 @@ import (
 )
 
 // Guarantee bits mirror the sandbox package's seam-facing bitmask (SPEC §6,
-// §10.3). Bit order matches sandbox.Guarantee* exactly; a drift guard in the
+// Bit order matches sandbox.Guarantee* exactly; a drift guard in the
 // sandbox package pins the correspondence. They are the machine-readable posture
 // the suite gates every assertion on.
 const (
@@ -86,7 +86,7 @@ type SUT interface {
 	// and returns combined output, the process exit code, and an error that is
 	// non-nil only when the process did not complete normally (spawn/setup
 	// failure, signal, or context cancellation) — a ran-but-nonzero command
-	// returns a nil error and the real code (SPEC §6, §10.1).
+	// returns a nil error and the real code.
 	RunCommand(ctx context.Context, dir, command string) ([]byte, int, error)
 	// Level reports the achieved isolation level (LevelNone..LevelFull).
 	Level() uint8

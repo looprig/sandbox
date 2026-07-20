@@ -96,7 +96,7 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 		{name: "exact nonexistent unsupported", entries: []fsEntry{{Path: filepath.Join(root, "future"), Access: writeFSAccess, Exact: true, Canonical: true}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateLandlockExactPaths(test.entries)
+			err := validateLandlockExactPaths(test.entries, nil)
 			if test.wantErr && !errors.Is(err, ErrGrantUnsupported) {
 				t.Fatalf("error = %v, want ErrGrantUnsupported", err)
 			}

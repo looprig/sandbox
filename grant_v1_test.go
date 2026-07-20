@@ -179,6 +179,9 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())
 	target := workspace + "/generated.txt"
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	profile := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,

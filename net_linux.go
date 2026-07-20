@@ -72,7 +72,7 @@ type compiledNet struct {
 //
 //   - Open egress (effectiveNetPolicy.Open): confined=false. The stage-2 child does NOT
 //     call RestrictNet, leaving TCP unrestricted. This is the unconfined case
-//     (Open is set only by the Unconfined preset or an explicit opt-in), so the
+//     (Open is set only by an explicitly acknowledged unconfined profile), so the
 //     backend does not claim a network boundary for it.
 //   - Otherwise: confined=true. The TCP allowlist is effectiveNetPolicy.Ports, plus port
 //     53 when effectiveNetPolicy.DNS (DNS over TCP). An empty result denies all TCP —

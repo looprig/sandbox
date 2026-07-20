@@ -1,12 +1,33 @@
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+type blockingConfigureBackend struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	bits    uint64
+}
+
+func (b *blockingConfigureBackend) compile(effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) {
+		return argv, func(*exec.Cmd) {
+			b.once.Do(func() { close(b.entered) })
+			<-b.release
+		}, nil
+	}}
+	return spec, CompileReport{}, LevelNone, b.bits, nil
+}
 
 func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	workspace := t.TempDir()
@@ -148,6 +169,131 @@ func TestExecutorSetPartialConstructionCleanup(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("partial construction left %d entries in owned root", len(entries))
 	}
+}
+
+func TestExecutorSetCloseBlocksCommandsBeforeStart(t *testing.T) {
+	for _, commandAccess := range []Access{Allow, Gated} {
+		commandAccess := commandAccess
+		name := map[Access]string{Allow: "allowed", Gated: "granted"}[commandAccess]
+		t.Run(name, func(t *testing.T) {
+			workspace := t.TempDir()
+			backend := &blockingConfigureBackend{
+				entered: make(chan struct{}),
+				release: make(chan struct{}),
+				bits:    GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+			}
+			profile := mustProfile(t, ProfileConfig{
+				WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+				HostRead: Allow, HostWrite: Deny, Network: Deny, Command: commandAccess,
+			})
+			set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+				withExecutorSetExecOptions(withBackend(backend)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor, err := set.For("executor")
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(workspace, "started")
+			command := "printf started > " + marker
+			runDone := make(chan error, 1)
+			go func() {
+				if commandAccess == Allow {
+					_, _, err = executor.RunCommand(context.Background(), workspace, command)
+				} else {
+					now := time.Now()
+					token := issueTestGrant(t, executor, now, "pre-start", command, workspace,
+						"command.execute", "", "command.start.v1", command)
+					_, _, err = executor.RunCommandWithGrants(context.Background(), "pre-start", workspace, command, []string{token})
+				}
+				runDone <- err
+			}()
+			<-backend.entered
+
+			closeDone := make(chan error, 1)
+			go func() { closeDone <- set.Close() }()
+			select {
+			case err := <-closeDone:
+				close(backend.release)
+				<-runDone
+				t.Fatalf("Close returned before the admitted pre-start command terminated: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(backend.release)
+			if err := <-closeDone; err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if err := <-runDone; !errors.Is(err, ErrExecutorClosed) && !errors.Is(err, context.Canceled) {
+				t.Fatalf("pre-start run error = %v, want executor closed or context canceled", err)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("command started after Close began: marker stat = %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutorSetCloseCancelsAndWaitsForActiveCommand(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetExecOptions(withBackend(&captureBackend{
+			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := set.For("active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(workspace, "started")
+	completed := filepath.Join(workspace, "completed")
+	var returned atomic.Bool
+	runDone := make(chan error, 1)
+	go func() {
+		_, _, err := executor.RunCommand(context.Background(), workspace,
+			"printf started > "+started+"; sleep 30; printf completed > "+completed)
+		returned.Store(true)
+		runDone <- err
+	}()
+	waitForPath(t, started)
+
+	const closers = 8
+	closeResults := make(chan error, closers)
+	for range closers {
+		go func() { closeResults <- set.Close() }()
+	}
+	for range closers {
+		if err := <-closeResults; err != nil {
+			t.Fatalf("concurrent Close: %v", err)
+		}
+	}
+	if !returned.Load() {
+		t.Fatal("Close returned before the active command's Wait completed")
+	}
+	if err := <-runDone; !errors.Is(err, ErrExecutorClosed) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("active run error = %v, want executor closed or context canceled", err)
+	}
+	if _, err := os.Stat(completed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled command reached completion marker: %v", err)
+	}
+}
+
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q", path)
 }
 
 func assertOwnerOnlyDir(t *testing.T, path string) {

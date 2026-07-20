@@ -2,7 +2,7 @@
 
 package sandbox
 
-// Acceptance matrix — SPEC §12.1, the Linux-rung rows. On THIS host Landlock ABI
+// Linux-rung acceptance coverage. On THIS host Landlock ABI
 // v4 is live (rung 2 RUNS) and userns is BLOCKED (rung-1 rows SKIP with a recorded
 // reason). Each row asserts its mechanism AND its Guarantees() posture — the
 // matrix's load-bearing auto-approval signal. Rows reuse the enforcement helpers
@@ -16,7 +16,7 @@ import (
 	"testing"
 )
 
-// TestAcceptanceMatrixLinux runs the §12.1 Linux rows. Absent-mechanism rows
+// TestAcceptanceMatrixLinux runs the Linux rows. Absent-mechanism rows
 // t.Skip with a recorded reason — never a silent pass.
 func TestAcceptanceMatrixLinux(t *testing.T) {
 	tests := []struct {
@@ -34,8 +34,8 @@ func TestAcceptanceMatrixLinux(t *testing.T) {
 	}
 }
 
-// acceptLinuxRung2Write — §12.1 "Linux rung 2, write mode" (RUNS here): the write
-// boundary + .git carveout + a fixed secret deny hold; TCP is limited to Ports;
+// acceptLinuxRung2Write proves the rung-2 boundary when prerequisites exist:
+// workspace writes, a read-only carveout, and a fixed deny hold; TCP is limited to Ports;
 // Level = Degraded; the guarantee posture is WriteBoundary && ReadBoundary &&
 // EnvScrub && NetworkBoundary with AddressNetwork == false.
 func acceptLinuxRung2Write(t *testing.T) {
@@ -95,7 +95,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 	}
 }
 
-// acceptLinuxRung1Write — §12.1 "Linux rung 1, write mode". Rung 1 needs a usable
+// acceptLinuxRung1Write proves the rung-1 write boundary. Rung 1 needs a usable
 // user namespace (userns+mountns/netns). This host has userns BLOCKED, so the row
 // SKIPS with a recorded reason; on a userns-enabled host (CI) it asserts the
 // rung-1 distinguishers: Level = Full plus the ProcessBoundary and AddressNetwork
@@ -121,7 +121,7 @@ func acceptLinuxRung1Write(t *testing.T) {
 	}
 }
 
-// acceptLinuxDNSUnderTrusted — §12.1 "DNS under trusted (rung 2)" (RUNS here): a
+// acceptLinuxDNSUnderTrusted proves DNS behavior under broad network access: a
 // DNS-enabled policy forces resolution over TCP by injecting RES_OPTIONS=use-vc
 // into the target env (asserted by running the real `env` under the sandbox) and
 // records the dns/narrowed report entry. Guarantee posture: NetworkBoundary true,
@@ -156,7 +156,7 @@ func acceptLinuxDNSUnderTrusted(t *testing.T) {
 	}
 }
 
-// acceptLinuxCgroupUnavailable — §12.1 "cgroup v2 unavailable" (RUNS here): with
+// acceptLinuxCgroupUnavailable proves behavior when cgroup v2 is unavailable: with
 // pids delegation pinned absent, the command still runs sandboxed, the report
 // records resource-limits/unenforced, Level is unchanged, and the ResourceLimits
 // guarantee is cleared (limits are containment-of-cost, not authority).
@@ -191,7 +191,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 	}
 }
 
-// acceptLinuxMetadataUnderTrusted — §12.1 "Metadata fetch under trusted (rung 1)".
+// acceptLinuxMetadataUnderTrusted proves metadata denial under broad network access.
 // The cloud-metadata hard-deny (curl 169.254.169.254 fails; curl example.com
 // succeeds) is a rung-1 netns+nftables address rule. userns is BLOCKED here so
 // there is no netns to install it into; and it needs live external egress anyway.

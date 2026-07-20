@@ -112,6 +112,11 @@ type stage2Spec struct {
 	// child (applyNftRules) inside the netns BEFORE Landlock. NftSpec.Confined is
 	// false for open egress. Empty for a rung-2 spawn. NftSpec is a concrete gob type.
 	NftRules NftSpec
+	// GrantFDs are inherited O_PATH descriptors, numbered after the sealed-spec
+	// fd. Landlock consumes them directly; rung 1 may also bind from their
+	// /proc/self/fd entries. Stage 2 closes them after filesystem confinement is
+	// installed and before the target execs.
+	GrantFDs []int
 }
 
 // stage2Error is a typed, fail-closed stage-2 setup failure (SPEC §7.2). Every
@@ -229,6 +234,14 @@ func stage2Setup() error {
 
 	if err := applyLandlockRules(spec.FSRules); err != nil {
 		return &stage2Error{Op: "landlock", Err: err}
+	}
+	for _, fd := range spec.GrantFDs {
+		if fd <= stage2SpecFD {
+			return &stage2Error{Op: "grant fd", Err: syscall.EBADF}
+		}
+		if err := syscall.Close(fd); err != nil {
+			return &stage2Error{Op: "close grant fd", Err: err}
+		}
 	}
 
 	// Seccomp is applied AFTER Landlock: both survive execve, so the order does
