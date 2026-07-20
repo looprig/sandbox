@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -22,7 +23,7 @@ func TestProxyAuthenticationExactTargetAndPrivateDenial(t *testing.T) {
 	_, port, _ := net.SplitHostPort(origin.Listener.Addr().String())
 	route, _ := NewDirectEgressRoute()
 	var dials atomic.Int32
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.10")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.10")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		dials.Add(1)
 		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
@@ -105,11 +106,116 @@ func TestProxyAuthenticationExactTargetAndPrivateDenial(t *testing.T) {
 	}
 }
 
+func TestPublicDestinationRejectsSpecialUsePrefixes(t *testing.T) {
+	for _, prefix := range deniedDestinationPrefixes {
+		for _, address := range []netip.Addr{prefix.Addr(), lastPrefixAddress(prefix)} {
+			raw := address.String()
+			t.Run("table-boundary/"+prefix.String()+"/"+raw, func(t *testing.T) {
+				if publicDestination(net.IP(address.AsSlice())) {
+					t.Fatalf("publicDestination(%s) = true at boundary of denied %s", raw, prefix)
+				}
+			})
+		}
+	}
+
+	denied := []struct {
+		name string
+		ips  []string
+	}{
+		{"IPv4 this network", []string{"0.0.0.0", "0.255.255.255"}},
+		{"IPv4 private 10/8", []string{"10.0.0.0", "10.255.255.255"}},
+		{"IPv4 shared CGNAT", []string{"100.64.0.0", "100.100.100.200", "100.127.255.255"}},
+		{"IPv4 loopback", []string{"127.0.0.0", "127.255.255.255"}},
+		{"IPv4 link local and metadata", []string{"169.254.0.0", "169.254.169.254", "169.254.255.255"}},
+		{"IPv4 private 172.16/12", []string{"172.16.0.0", "172.31.255.255"}},
+		{"IPv4 protocol assignments", []string{"192.0.0.0", "192.0.0.170", "192.0.0.255"}},
+		{"IPv4 documentation TEST-NET-1", []string{"192.0.2.0", "192.0.2.255"}},
+		{"IPv4 AS112", []string{"192.31.196.0", "192.31.196.255", "192.175.48.0", "192.175.48.255"}},
+		{"IPv4 AMT", []string{"192.52.193.0", "192.52.193.255"}},
+		{"IPv4 deprecated 6to4 relay", []string{"192.88.99.0", "192.88.99.255"}},
+		{"IPv4 private 192.168/16", []string{"192.168.0.0", "192.168.255.255"}},
+		{"IPv4 benchmarking", []string{"198.18.0.0", "198.19.255.255"}},
+		{"IPv4 documentation TEST-NET-2", []string{"198.51.100.0", "198.51.100.255"}},
+		{"IPv4 documentation TEST-NET-3", []string{"203.0.113.0", "203.0.113.255"}},
+		{"IPv4 multicast", []string{"224.0.0.0", "239.255.255.255"}},
+		{"IPv4 reserved", []string{"240.0.0.0", "255.255.255.255"}},
+		{"IPv6 unspecified and compatible", []string{"::", "::192.0.2.1"}},
+		{"IPv6 loopback", []string{"::1"}},
+		{"IPv6 NAT64 well-known", []string{"64:ff9b::", "64:ff9b::ffff:ffff"}},
+		{"IPv6 NAT64 local-use", []string{"64:ff9b:1::", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 discard-only", []string{"100::", "100::ffff:ffff:ffff:ffff"}},
+		{"IPv6 IETF protocol assignments", []string{"2001::", "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 Teredo", []string{"2001::", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 benchmarking", []string{"2001:2::", "2001:2:0:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 ORCHID", []string{"2001:10::", "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 documentation", []string{"2001:db8::", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 6to4", []string{"2002::", "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 AS112", []string{"2620:4f:8000::", "2620:4f:8000:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 documentation 3fff", []string{"3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 segment-routing SIDs", []string{"5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 unique-local", []string{"fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 link-local", []string{"fe80::", "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 deprecated site-local", []string{"fec0::", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv6 multicast", []string{"ff00::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}},
+		{"IPv4-mapped normalization", []string{"::ffff:10.0.0.1", "::ffff:100.100.100.200", "::ffff:203.0.113.1"}},
+	}
+	for _, family := range denied {
+		for _, raw := range family.ips {
+			t.Run(family.name+"/"+raw, func(t *testing.T) {
+				if publicDestination(net.ParseIP(raw)) {
+					t.Fatalf("publicDestination(%s) = true, want false", raw)
+				}
+			})
+		}
+	}
+
+	for _, raw := range []string{"1.1.1.1", "8.8.8.8", "2001:4860:4860::8888", "2606:4700:4700::1111", "::ffff:8.8.8.8"} {
+		t.Run("public/"+raw, func(t *testing.T) {
+			if !publicDestination(net.ParseIP(raw)) {
+				t.Fatalf("publicDestination(%s) = false, want true", raw)
+			}
+		})
+	}
+}
+
+func lastPrefixAddress(prefix netip.Prefix) netip.Addr {
+	bytes := prefix.Masked().Addr().AsSlice()
+	for bit := prefix.Bits(); bit < len(bytes)*8; bit++ {
+		bytes[bit/8] |= byte(1 << (7 - bit%8))
+	}
+	address, _ := netip.AddrFromSlice(bytes)
+	return address
+}
+
+func TestDirectRouteRefusesSpecialUseBeforeDial(t *testing.T) {
+	route, err := NewDirectEgressRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !route.AddressGuarantee() {
+		t.Fatal("direct route does not claim its address guarantee")
+	}
+	route.lookup = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("100.100.100.200")}, nil
+	}
+	var dials atomic.Int32
+	route.dial = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, errors.New("unexpected dial")
+	}
+	if _, err := route.dialTarget(context.Background(), mustTarget(t, "tcp:metadata.example:80")); !errors.Is(err, errNetworkAddressDenied) {
+		t.Fatalf("dialTarget error = %v, want errNetworkAddressDenied", err)
+	}
+	if got := dials.Load(); got != 0 {
+		t.Fatalf("special-use target reached dial %d times", got)
+	}
+}
+
 func TestProxyCONNECTIsByteTunnelWithoutTLSTermination(t *testing.T) {
 	echo := newEchoServer(t)
 	_, port, _ := net.SplitHostPort(echo.Addr().String())
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.8")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.8")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
 	}
@@ -148,7 +254,7 @@ func TestProxyCloseTerminatesActiveTunnel(t *testing.T) {
 	echo := newEchoServer(t)
 	_, port, _ := net.SplitHostPort(echo.Addr().String())
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.9")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.9")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
 	}
@@ -185,7 +291,7 @@ func TestProxyReleaseTerminatesOnlyMatchingCONNECTTunnel(t *testing.T) {
 	echo := newEchoServer(t)
 	_, port, _ := net.SplitHostPort(echo.Addr().String())
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.10")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.10")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
 	}
@@ -225,7 +331,7 @@ func TestProxyReleaseWinsCONNECTAuthorizationRegisterRace(t *testing.T) {
 	echo := newEchoServer(t)
 	_, port, _ := net.SplitHostPort(echo.Addr().String())
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.11")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.11")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
 	}
@@ -256,7 +362,7 @@ func TestProxyIgnoresNOProxyAndCleansUp(t *testing.T) {
 	origin := newHTTPOrigin(t)
 	_, port, _ := net.SplitHostPort(origin.Listener.Addr().String())
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.11")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.12")}, nil }
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
 	}
@@ -284,7 +390,7 @@ func TestProxyIgnoresNOProxyAndCleansUp(t *testing.T) {
 
 func TestProxyRequestCancellation(t *testing.T) {
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.12")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.13")}, nil }
 	started := make(chan struct{})
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		close(started)
@@ -316,9 +422,285 @@ func TestProxyRequestCancellation(t *testing.T) {
 	}
 }
 
+func TestUpstreamCONNECTHandshakeCancellationClosesBlockedConnection(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		peer func(net.Conn, chan<- struct{})
+	}{
+		{
+			name: "request write",
+			peer: func(connection net.Conn, ready chan<- struct{}) {
+				close(ready)
+				_, _ = io.Copy(io.Discard, connection)
+			},
+		},
+		{
+			name: "silent response",
+			peer: func(connection net.Conn, ready chan<- struct{}) {
+				request, err := http.ReadRequest(bufio.NewReader(connection))
+				if err == nil {
+					_ = request.Body.Close()
+				}
+				close(ready)
+				_, _ = io.Copy(io.Discard, connection)
+			},
+		},
+		{
+			name: "partial response",
+			peer: func(connection net.Conn, ready chan<- struct{}) {
+				request, err := http.ReadRequest(bufio.NewReader(connection))
+				if err == nil {
+					_ = request.Body.Close()
+				}
+				_, _ = io.WriteString(connection, "HTTP/1.1 200")
+				close(ready)
+				_, _ = io.Copy(io.Discard, connection)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, peer := net.Pipe()
+			defer peer.Close()
+			route, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			route.dial = func(context.Context, string, string) (net.Conn, error) {
+				return client, nil
+			}
+			proxy := &egressProxy{route: route}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ready := make(chan struct{})
+			peerDone := make(chan struct{})
+			go func() {
+				defer close(peerDone)
+				test.peer(peer, ready)
+			}()
+			done := make(chan error, 1)
+			go func() {
+				connection, err := proxy.dialTunnel(ctx, mustTarget(t, "tcp:service.example:443"))
+				if connection != nil {
+					_ = connection.Close()
+				}
+				done <- err
+			}()
+			<-ready
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("canceled upstream CONNECT handshake succeeded")
+				}
+			case <-time.After(300 * time.Millisecond):
+				_ = peer.Close()
+				err := <-done
+				t.Fatalf("cancellation did not unblock upstream CONNECT handshake (cleanup error %v)", err)
+			}
+			_ = peer.Close()
+			select {
+			case <-peerDone:
+			case <-time.After(time.Second):
+				t.Fatal("upstream peer goroutine survived canceled handshake")
+			}
+		})
+	}
+}
+
+func TestUpstreamCONNECTHandshakeTimeoutAndSuccessfulDeadlineClear(t *testing.T) {
+	t.Run("silent upstream times out and closes socket", func(t *testing.T) {
+		client, peer := net.Pipe()
+		defer peer.Close()
+		route, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		route.dial = func(context.Context, string, string) (net.Conn, error) { return client, nil }
+		proxy := &egressProxy{route: route, connectHandshakeTimeout: 30 * time.Millisecond}
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			request, readErr := http.ReadRequest(bufio.NewReader(peer))
+			if readErr == nil {
+				_ = request.Body.Close()
+			}
+			_, _ = io.Copy(io.Discard, peer)
+		}()
+		started := time.Now()
+		connection, err := proxy.dialTunnel(context.Background(), mustTarget(t, "tcp:timeout.example:443"))
+		if connection != nil {
+			_ = connection.Close()
+		}
+		if err == nil {
+			t.Fatal("silent upstream CONNECT handshake succeeded")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("upstream CONNECT timeout took %v", elapsed)
+		}
+		select {
+		case <-peerDone:
+		case <-time.After(time.Second):
+			t.Fatal("timed-out upstream socket remained open")
+		}
+	})
+
+	t.Run("complete 200 clears deadline and cancellation retains ownership", func(t *testing.T) {
+		client, peer := net.Pipe()
+		defer peer.Close()
+		route, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		route.dial = func(context.Context, string, string) (net.Conn, error) { return client, nil }
+		const handshakeTimeout = 25 * time.Millisecond
+		proxy := &egressProxy{route: route, connectHandshakeTimeout: handshakeTimeout}
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			request, readErr := http.ReadRequest(bufio.NewReader(peer))
+			if readErr != nil {
+				return
+			}
+			_ = request.Body.Close()
+			if _, writeErr := io.WriteString(peer, "HTTP/1.1 200 Connection Established\r\n\r\n"); writeErr != nil {
+				return
+			}
+			buffer := make([]byte, 4)
+			if _, readErr := io.ReadFull(peer, buffer); readErr != nil {
+				return
+			}
+			_, _ = peer.Write([]byte("pong"))
+			_, _ = io.Copy(io.Discard, peer)
+		}()
+		ctx, cancel := context.WithCancel(context.Background())
+		connection, err := proxy.dialTunnel(ctx, mustTarget(t, "tcp:success.example:443"))
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		time.Sleep(2 * handshakeTimeout)
+		if _, err := connection.Write([]byte("ping")); err != nil {
+			cancel()
+			t.Fatalf("post-handshake write retained deadline: %v", err)
+		}
+		response := make([]byte, 4)
+		if _, err := io.ReadFull(connection, response); err != nil || string(response) != "pong" {
+			cancel()
+			t.Fatalf("post-handshake response = %q, %v", response, err)
+		}
+		cancel()
+		_ = connection.SetDeadline(time.Now().Add(time.Second))
+		if _, err := connection.Read(make([]byte, 1)); err == nil {
+			t.Fatal("successful upstream connection survived context cancellation")
+		}
+		_ = connection.Close()
+		select {
+		case <-peerDone:
+		case <-time.After(time.Second):
+			t.Fatal("successful upstream peer survived tunnel teardown")
+		}
+	})
+}
+
+func TestExecutorSetCloseUnblocksSilentUpstreamCONNECT(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var activeSockets atomic.Int32
+	upstreamReady := make(chan struct{})
+	upstreamDone := make(chan struct{})
+	go func() {
+		defer close(upstreamDone)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		activeSockets.Add(1)
+		defer func() {
+			activeSockets.Add(-1)
+			_ = connection.Close()
+		}()
+		request, readErr := http.ReadRequest(bufio.NewReader(connection))
+		if readErr == nil {
+			_ = request.Body.Close()
+		}
+		close(upstreamReady)
+		_, _ = io.Copy(io.Discard, connection)
+	}()
+
+	route, err := NewUpstreamEgressRoute("http://"+listener.Addr().String(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dials atomic.Int32
+	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
+		withExecutorSetConfig(withBackend(&captureBackend{
+			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeTargetNetwork | GuaranteeEnvScrub,
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := set.For("silent-upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := executor.proxy.Authorize("silent-handshake", []NetworkTarget{mustTarget(t, "tcp:service.example:443")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := net.Dial("tcp", executor.proxy.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	auth := base64.StdEncoding.EncodeToString([]byte("silent-handshake:" + credential))
+	_, _ = fmt.Fprintf(child, "CONNECT service.example:443 HTTP/1.1\r\nHost: service.example:443\r\nProxy-Authorization: Basic %s\r\n\r\n", auth)
+	<-upstreamReady
+	if got := activeSockets.Load(); got != 1 {
+		t.Fatalf("active upstream sockets = %d, want 1", got)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- set.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("ExecutorSet.Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = listener.Close()
+		t.Fatal("ExecutorSet.Close did not unblock silent upstream CONNECT")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(time.Second):
+		t.Fatal("upstream handler/socket survived ExecutorSet.Close")
+	}
+	if got := activeSockets.Load(); got != 0 {
+		t.Fatalf("active upstream sockets after Close = %d, want 0", got)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("upstream dial count = %d, want exactly 1 and no fallback", got)
+	}
+	_ = child.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.Copy(io.Discard, child); err != nil {
+		t.Fatalf("child proxy socket did not reach EOF after ExecutorSet.Close: %v", err)
+	}
+}
+
 func TestProxyReleaseCancelsActiveForwardRequest(t *testing.T) {
 	route, _ := NewDirectEgressRoute()
-	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.13")}, nil }
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.14")}, nil }
 	started := make(chan struct{})
 	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		close(started)

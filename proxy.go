@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -41,9 +42,10 @@ func (err *NetworkTargetDeniedError) Error() string {
 func (err *NetworkTargetDeniedError) Unwrap() error { return ErrNetworkTargetDenied }
 
 const (
-	proxyHeaderTimeout = 10 * time.Second
-	proxyIdleTimeout   = 30 * time.Second
-	proxyMaxHeader     = 64 << 10
+	proxyHeaderTimeout           = 10 * time.Second
+	proxyCONNECTHandshakeTimeout = 10 * time.Second
+	proxyIdleTimeout             = 30 * time.Second
+	proxyMaxHeader               = 64 << 10
 )
 
 type proxyAuthorization struct {
@@ -66,6 +68,10 @@ type egressProxy struct {
 	closeOnce  sync.Once
 	closeErr   error
 
+	// connectHandshakeTimeout is an unexported deterministic timeout seam.
+	// Production proxies use proxyCONNECTHandshakeTimeout.
+	connectHandshakeTimeout time.Duration
+
 	// beforeTunnelRegister is an unexported deterministic race seam used only by
 	// tests; production proxies leave it nil.
 	beforeTunnelRegister func()
@@ -84,7 +90,10 @@ func newEgressProxy(route EgressRoute) (*egressProxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: listen for egress proxy: %w", err)
 	}
-	proxy := &egressProxy{route: route, listener: listener, executions: make(map[string]*proxyAuthorization), tunnels: make(map[*proxyTunnel]struct{})}
+	proxy := &egressProxy{
+		route: route, listener: listener, executions: make(map[string]*proxyAuthorization),
+		tunnels: make(map[*proxyTunnel]struct{}), connectHandshakeTimeout: proxyCONNECTHandshakeTimeout,
+	}
 	proxy.server = &http.Server{
 		Handler: proxy, ReadHeaderTimeout: proxyHeaderTimeout,
 		IdleTimeout: proxyIdleTimeout, MaxHeaderBytes: proxyMaxHeader,
@@ -349,27 +358,68 @@ func (proxy *egressProxy) dialTunnel(ctx context.Context, target NetworkTarget) 
 	if err != nil {
 		return nil, err
 	}
+	owned := newContextOwnedConn(ctx, upstream)
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = owned.Close()
+		}
+	}()
+	timeout := proxy.connectHandshakeTimeout
+	if timeout <= 0 {
+		timeout = proxyCONNECTHandshakeTimeout
+	}
+	if err := owned.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
 	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target.address()}, Host: target.address(), Header: make(http.Header)}
 	if proxy.route.upstream.User != nil {
 		username := proxy.route.upstream.User.Username()
 		password, _ := proxy.route.upstream.User.Password()
 		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
 	}
-	if err := request.Write(upstream); err != nil {
-		_ = upstream.Close()
+	if err := request.Write(owned); err != nil {
 		return nil, err
 	}
-	response, err := http.ReadResponse(bufio.NewReader(upstream), request)
+	response, err := http.ReadResponse(bufio.NewReader(owned), request)
 	if err != nil {
-		_ = upstream.Close()
 		return nil, err
 	}
 	if response.StatusCode != http.StatusOK {
 		_ = response.Body.Close()
-		_ = upstream.Close()
 		return nil, errors.New("sandbox: upstream proxy rejected CONNECT")
 	}
-	return upstream, nil
+	if err := owned.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	succeeded = true
+	return owned, nil
+}
+
+// contextOwnedConn keeps cancellation ownership attached to a successful
+// upstream connection until tunnel teardown. Closing it stops the callback on
+// normal exit; cancellation closes the underlying connection to unblock any
+// handshake or tunnel I/O.
+type contextOwnedConn struct {
+	net.Conn
+	stop context.CancelFunc
+	once sync.Once
+	err  error
+}
+
+func newContextOwnedConn(ctx context.Context, connection net.Conn) *contextOwnedConn {
+	owned := &contextOwnedConn{Conn: connection}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	owned.stop = func() { stop() }
+	return owned
+}
+
+func (connection *contextOwnedConn) Close() error {
+	connection.once.Do(func() {
+		connection.stop()
+		connection.err = connection.Conn.Close()
+	})
+	return connection.err
 }
 
 type idleTimeoutConn struct {
@@ -408,9 +458,63 @@ func (route EgressRoute) dialTarget(ctx context.Context, target NetworkTarget) (
 	return nil, fmt.Errorf("sandbox: target connection failed: %w", lastErr)
 }
 
+// deniedDestinationPrefixes is deliberately explicit and conservative. A
+// direct route claims address-class enforcement, so an ambiguous IANA
+// special-purpose destination is denied rather than treated as public. Keep
+// this table auditable alongside TestPublicDestinationRejectsSpecialUsePrefixes.
+var deniedDestinationPrefixes = []netip.Prefix{
+	// IPv4 special-purpose, local, metadata, documentation, and reserved space.
+	netip.MustParsePrefix("0.0.0.0/8"),          // this network
+	netip.MustParsePrefix("10.0.0.0/8"),         // private-use
+	netip.MustParsePrefix("100.64.0.0/10"),      // shared address space / CGNAT
+	netip.MustParsePrefix("100.100.100.200/32"), // known cloud metadata endpoint
+	netip.MustParsePrefix("127.0.0.0/8"),        // loopback
+	netip.MustParsePrefix("169.254.0.0/16"),     // link-local and common metadata
+	netip.MustParsePrefix("172.16.0.0/12"),      // private-use
+	netip.MustParsePrefix("192.0.0.0/24"),       // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),       // TEST-NET-1
+	netip.MustParsePrefix("192.31.196.0/24"),    // AS112-v4
+	netip.MustParsePrefix("192.52.193.0/24"),    // AMT
+	netip.MustParsePrefix("192.88.99.0/24"),     // deprecated 6to4 relay anycast
+	netip.MustParsePrefix("192.168.0.0/16"),     // private-use
+	netip.MustParsePrefix("192.175.48.0/24"),    // AS112 direct delegation
+	netip.MustParsePrefix("198.18.0.0/15"),      // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"),    // TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),     // TEST-NET-3
+	netip.MustParsePrefix("224.0.0.0/4"),        // multicast
+	netip.MustParsePrefix("240.0.0.0/4"),        // reserved and limited broadcast
+
+	// IPv6 special-purpose, transition, local, documentation, and multicast.
+	netip.MustParsePrefix("::/96"),             // unspecified/IPv4-compatible
+	netip.MustParsePrefix("::1/128"),           // loopback
+	netip.MustParsePrefix("::ffff:0:0:0/96"),   // IPv4-translated
+	netip.MustParsePrefix("64:ff9b::/96"),      // NAT64 well-known prefix
+	netip.MustParsePrefix("64:ff9b:1::/48"),    // NAT64 local-use prefix
+	netip.MustParsePrefix("100::/64"),          // discard-only
+	netip.MustParsePrefix("2001::/23"),         // IETF protocol assignments
+	netip.MustParsePrefix("2001:db8::/32"),     // documentation
+	netip.MustParsePrefix("2002::/16"),         // 6to4
+	netip.MustParsePrefix("2620:4f:8000::/48"), // AS112 direct delegation
+	netip.MustParsePrefix("3fff::/20"),         // documentation
+	netip.MustParsePrefix("5f00::/16"),         // segment-routing SIDs
+	netip.MustParsePrefix("fc00::/7"),          // unique-local
+	netip.MustParsePrefix("fe80::/10"),         // link-local
+	netip.MustParsePrefix("fec0::/10"),         // deprecated site-local
+	netip.MustParsePrefix("ff00::/8"),          // multicast
+}
+
 func publicDestination(ip net.IP) bool {
-	return ip != nil && !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsPrivate() &&
-		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	address = address.Unmap()
+	for _, denied := range deniedDestinationPrefixes {
+		if denied.Contains(address) {
+			return false
+		}
+	}
+	return true
 }
 
 func (route EgressRoute) dialUpstream(ctx context.Context) (net.Conn, error) {

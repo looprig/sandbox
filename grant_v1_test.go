@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,7 +63,7 @@ func TestGrantVersionAndCommandStart(t *testing.T) {
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
-	executor, err := newExecutor(profile,
+	executor, err := newTestExecutor(profile,
 		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 		withClock(func() time.Time { return now }),
 	)
@@ -97,6 +98,83 @@ func TestGrantVersionAndCommandStart(t *testing.T) {
 	}
 }
 
+func TestGrantReplayStateExpiresAndPrunes(t *testing.T) {
+	base := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	now := base
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry := base.Add(time.Minute)
+	token, err := executor.IssueGrant(context.Background(), "boundary", "true", workspace,
+		"command.execute", "", "command.start.v1", "true", expiry.UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "boundary", workspace, "true", []string{token}); err != nil {
+		t.Fatal(err)
+	}
+	now = expiry
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "boundary", workspace, "true", []string{token}); !errors.Is(err, ErrGrantReplay) {
+		t.Fatalf("replay at exact expiry error = %v, want ErrGrantReplay", err)
+	}
+	now = expiry.Add(time.Millisecond)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "boundary", workspace, "true", []string{token}); !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("token after expiry error = %v, want ErrGrantExpired after replay-state pruning", err)
+	}
+	if got := len(executor.usedGrants); got != 0 {
+		t.Fatalf("expired replay entries = %d, want 0", got)
+	}
+}
+
+func TestGrantReplayStateRemainsBoundedAfterHighVolumeExpiry(t *testing.T) {
+	base := time.Date(2026, 7, 20, 13, 0, 0, 0, time.UTC)
+	now := base
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const volume = 256
+	for index := range volume {
+		executionID := fmt.Sprintf("volume-%03d", index)
+		token, err := executor.IssueGrant(context.Background(), executionID, "true", workspace,
+			"command.execute", "", "command.start.v1", "true", base.Add(time.Minute).UnixMilli())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := executor.RunCommandWithGrants(context.Background(), executionID, workspace, "true", []string{token}); err != nil {
+			t.Fatalf("consume grant %d: %v", index, err)
+		}
+	}
+	if got := len(executor.usedGrants); got != volume {
+		t.Fatalf("live replay entries = %d, want %d", got, volume)
+	}
+
+	now = base.Add(time.Minute + time.Millisecond)
+	fresh := issueTestGrant(t, executor, now, "fresh", "true", workspace,
+		"command.execute", "", "command.start.v1", "true")
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "fresh", workspace, "true", []string{fresh}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(executor.usedGrants); got != 1 {
+		t.Fatalf("replay entries after expiry and one fresh grant = %d, want 1", got)
+	}
+}
+
 func TestIssueGrantClassesAndBindings(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())
@@ -105,7 +183,7 @@ func TestIssueGrantClassesAndBindings(t *testing.T) {
 		HostRead: Gated, HostWrite: Gated, Network: Gated, Command: Gated,
 	})
 	backend := &captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +230,7 @@ func TestIssueGrantRejectsMismatchedScopeAndCommandTarget(t *testing.T) {
 		WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Gated,
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
-	executor, err := newExecutor(profile,
+	executor, err := newTestExecutor(profile,
 		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 		withClock(func() time.Time { return now }),
 	)
@@ -187,7 +265,7 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +306,7 @@ func TestFilesystemGrantRejectsTargetAndAncestorIdentitySwaps(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	newExecutor := func() *Executor {
-		executor, err := newExecutor(profile,
+		executor, err := newTestExecutor(profile,
 			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 			withClock(func() time.Time { return now }))
 		if err != nil {
@@ -289,7 +367,7 @@ func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.
 		HostRead: Gated, HostWrite: Gated, Network: Deny, Command: Allow,
 	})
 	backend := &boundaryBackend{baseBits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +381,7 @@ func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.
 	}
 
 	writeBackend := &boundaryBackend{baseBits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	writeExecutor, err := newExecutor(profile, withBackend(writeBackend), withClock(func() time.Time { return now }))
+	writeExecutor, err := newTestExecutor(profile, withBackend(writeBackend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +403,7 @@ func TestBroadNetworkGrantIncludesDNSForHostnameResolution(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
 	})
 	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +426,7 @@ func TestGrantCrossExecutorExpiryAndClose(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(2),
-		withExecutorSetExecOptions(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}), withClock(func() time.Time { return now })))
+		withExecutorSetConfig(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}), withClock(func() time.Time { return now })))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +459,7 @@ func TestGrantRejectsCWDProfileAndRouteDrift(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
 	newExecutor := func() *Executor {
-		executor, err := newExecutor(profile,
+		executor, err := newTestExecutor(profile,
 			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 			withClock(func() time.Time { return now }))
 		if err != nil {

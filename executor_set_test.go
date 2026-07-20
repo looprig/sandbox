@@ -48,7 +48,7 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 
 	set, err := NewExecutorSet(profile,
 		WithScratchRoot(scratch), WithMaxExecutors(2),
-		withExecutorSetExecOptions(withBackend(backend)),
+		withExecutorSetConfig(withBackend(backend)),
 	)
 	if err != nil {
 		t.Fatalf("NewExecutorSet: %v", err)
@@ -114,7 +114,7 @@ func TestExecutorSetConcurrentMemoization(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub})))
+		withExecutorSetConfig(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestExecutorSetPartialConstructionCleanup(t *testing.T) {
 	profile := mustProfile(t, ProfileConfig{WorkspaceRoot: t.TempDir()})
 	backend := &captureBackend{compileErr: errors.New("compile failed")}
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(backend)))
+		withExecutorSetConfig(withBackend(backend)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestExecutorSetCloseBlocksCommandsBeforeStart(t *testing.T) {
 				HostRead: Allow, HostWrite: Deny, Network: Deny, Command: commandAccess,
 			})
 			set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-				withExecutorSetExecOptions(withBackend(backend)))
+				withExecutorSetConfig(withBackend(backend)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,7 +242,7 @@ func TestExecutorSetCloseCancelsAndWaitsForActiveCommand(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(&captureBackend{
+		withExecutorSetConfig(withBackend(&captureBackend{
 			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
 		})))
 	if err != nil {

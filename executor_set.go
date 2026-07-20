@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -18,7 +19,8 @@ var (
 type executorSetConfig struct {
 	scratchRoot string
 	max         int
-	execOptions []ExecOption
+	executor    executorConfig
+	grantTTLSet bool
 	route       *EgressRoute
 }
 
@@ -35,15 +37,18 @@ func WithMaxExecutors(max int) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.max = max }
 }
 
+// WithGrantTTL sets the maximum lifetime of grants minted by every executor in
+// the set. The duration must be positive when explicitly configured.
+func WithGrantTTL(duration time.Duration) ExecutorSetOption {
+	return func(config *executorSetConfig) {
+		config.executor.grantTTL = duration
+		config.grantTTLSet = true
+	}
+}
+
 // WithEgressRoute configures the explicit route used by target-scoped grants.
 func WithEgressRoute(route EgressRoute) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.route = &route }
-}
-
-func withExecutorSetExecOptions(options ...ExecOption) ExecutorSetOption {
-	return func(config *executorSetConfig) {
-		config.execOptions = append(config.execOptions, options...)
-	}
 }
 
 // ExecutorSet owns per-key executors, their grant keys, and isolated HOME dirs.
@@ -52,7 +57,7 @@ type ExecutorSet struct {
 	profile   *Profile
 	ownedRoot string
 	max       int
-	options   []ExecOption
+	executor  executorConfig
 	route     *EgressRoute
 	executors map[string]*Executor
 	lifecycle *executorLifecycle
@@ -78,6 +83,9 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 	if config.max <= 0 {
 		return nil, errors.New("sandbox: executor set maximum must be positive")
 	}
+	if config.grantTTLSet && config.executor.grantTTL <= 0 {
+		return nil, errors.New("sandbox: executor set grant TTL must be positive")
+	}
 	if config.route != nil {
 		if err := config.route.validate(); err != nil {
 			return nil, err
@@ -97,7 +105,7 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 	}
 	return &ExecutorSet{
 		profile: profile, ownedRoot: owned, max: config.max,
-		options:   append([]ExecOption(nil), config.execOptions...),
+		executor:  config.executor,
 		route:     config.route,
 		executors: make(map[string]*Executor),
 		lifecycle: newExecutorLifecycle(),
@@ -190,9 +198,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		}
 		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
 	}
-	execOptions := append([]ExecOption(nil), set.options...)
-	execOptions = append(execOptions, withExecutorLifecycle(set.lifecycle))
-	executor, err := newExecutorFromEffective(set.profile, policy, execOptions...)
+	config := set.executor
+	config.lifecycle = set.lifecycle
+	executor, err := newExecutorFromEffective(set.profile, policy, config)
 	if err != nil {
 		if proxy != nil {
 			_ = proxy.Close()

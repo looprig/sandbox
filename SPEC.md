@@ -113,6 +113,7 @@ not escape the compiled boundary.
 func NewExecutorSet(*Profile, ...ExecutorSetOption) (*ExecutorSet, error)
 func WithScratchRoot(string) ExecutorSetOption
 func WithMaxExecutors(int) ExecutorSetOption
+func WithGrantTTL(time.Duration) ExecutorSetOption
 func WithEgressRoute(EgressRoute) ExecutorSetOption
 func (s *ExecutorSet) For(key string) (*Executor, error)
 func (s *ExecutorSet) Close() error
@@ -124,6 +125,8 @@ close. Each opaque key gets a separately keyed executor, HOME, and TMPDIR;
 concurrent requests for the same key return the same executor. Closing the set
 revokes all issued capabilities, cancels execution-scoped proxy activity, and
 releases owned resources. There is no public direct-executor constructor.
+`WithGrantTTL` configures the positive maximum lifetime of grants minted by
+every executor in the set; omission uses the fixed 15-minute default.
 
 ## 5. Grant lifecycle
 

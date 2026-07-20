@@ -23,7 +23,7 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 	route, _ := NewDirectEgressRoute()
 	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
-		withExecutorSetExecOptions(withBackend(backend), withClock(func() time.Time { return now })))
+		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,22 +64,31 @@ func TestExecutorComposesAddressGuaranteeWithSelectedRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	direct.lookup = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("100.100.100.200")}, nil
+	}
+	directDialed := false
+	direct.dial = func(context.Context, string, string) (net.Conn, error) {
+		directDialed = true
+		return nil, errors.New("special-use address reached dial")
+	}
 	untrusted, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		name  string
-		route EgressRoute
-		want  bool
+		name          string
+		route         EgressRoute
+		want          bool
+		verifyRefusal bool
 	}{
-		{name: "direct trusted resolution", route: direct, want: true},
+		{name: "direct trusted resolution", route: direct, want: true, verifyRefusal: true},
 		{name: "upstream without address contract", route: untrusted, want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeTargetNetwork | GuaranteeEnvScrub}
 			set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(test.route),
-				withExecutorSetExecOptions(withBackend(backend)))
+				withExecutorSetConfig(withBackend(backend)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -90,6 +99,15 @@ func TestExecutorComposesAddressGuaranteeWithSelectedRoute(t *testing.T) {
 			}
 			if got := executor.Guarantees().AddressNetwork; got != test.want {
 				t.Fatalf("AddressNetwork = %v, want %v", got, test.want)
+			}
+			if test.verifyRefusal {
+				_, err := executor.proxy.route.dialTarget(context.Background(), mustTarget(t, "tcp:metadata.example:80"))
+				if !errors.Is(err, errNetworkAddressDenied) {
+					t.Fatalf("composed direct route error = %v, want errNetworkAddressDenied", err)
+				}
+				if directDialed {
+					t.Fatal("composed AddressNetwork guarantee allowed a special-use address to reach dial")
+				}
 			}
 		})
 	}
@@ -104,7 +122,7 @@ func TestAuthenticatedProxyDenialPrecedesProcessResultAndCredentialIsRevoked(t *
 	})
 	route, _ := NewDirectEgressRoute()
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
-		withExecutorSetExecOptions(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}), withClock(func() time.Time { return now })))
+		withExecutorSetConfig(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}), withClock(func() time.Time { return now })))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +188,7 @@ func TestNetworkAllowUsesExplicitRoute(t *testing.T) {
 	route, _ := NewDirectEgressRoute()
 	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
-		withExecutorSetExecOptions(withBackend(backend)))
+		withExecutorSetConfig(withBackend(backend)))
 	if err != nil {
 		t.Fatal(err)
 	}

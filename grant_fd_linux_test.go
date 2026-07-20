@@ -183,7 +183,7 @@ func TestLinuxGrantHandleClosesWhenSpawnCompilationFails(t *testing.T) {
 	})
 	backend := &failingGrantPathBackend{}
 	now := time.Now()
-	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T
 					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
 				})
 				backend := &trackingGrantPathBackend{rung: rung}
-				executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+				executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -314,7 +314,7 @@ func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
 					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
 				})
 				backend := &trackingGrantPathBackend{rung: rung}
-				executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+				executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 				if err != nil {
 					t.Fatal(err)
 				}

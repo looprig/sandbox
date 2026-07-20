@@ -50,55 +50,14 @@ const spawnWaitGrace = time.Second
 // re-exec sentinels and dispatches a stage-2 helper or namespace-probe child
 // (moby/reexec pattern, §7.2); in a normal process it returns immediately.
 
-// execConfig accumulates ExecOption settings before they are stored on the
-// Executor. It exists so the option functions have a single mutable target
-// during internal executor construction.
-type execConfig struct {
-	grantTTL     time.Duration
-	cgroupParent string
-	clock        func() time.Time // nil means default time.Now
-	backend      backend          // nil means select via platformBackend (test seam)
-	lifecycle    *executorLifecycle
-}
-
-// ExecOption configures executors created by an ExecutorSet (SPEC §6).
-type ExecOption func(*execConfig)
-
-// WithGrantTTL sets the lifetime of grant tokens minted by this executor (SPEC
-// §9.2). Stored for the grant-wiring task; unused until then.
-func WithGrantTTL(d time.Duration) ExecOption {
-	return func(c *execConfig) { c.grantTTL = d }
-}
-
-// WithCgroupParent sets the parent cgroup under which resource-limited children
-// are placed on Linux (SPEC §7.4). Stored for the resource-limit task; unused
-// until then.
-func WithCgroupParent(path string) ExecOption {
-	return func(c *execConfig) { c.cgroupParent = path }
-}
-
-// withClock overrides the executor's clock, used only by tests for deterministic
-// grant expiry. It is deliberately UNEXPORTED: the public ExecOption surface is
-// WithGrantTTL/WithCgroupParent only.
-func withClock(f func() time.Time) ExecOption {
-	return func(c *execConfig) { c.clock = f }
-}
-
-// withBackend forces the executor's backend, bypassing platformBackend()
-// selection. It is deliberately UNEXPORTED — a test-only seam. Once platformBackend
-// returns a real OS backend on the host (e.g. Seatbelt on darwin), the executor
-// UNIT tests that assert null-backend semantics (LevelNone, EnvScrub-only
-// guarantees, the argv-not-found spawn-error convention) would otherwise observe
-// the platform backend instead. Pinning them to newNullBackend() via this option
-// keeps those tests deterministic and platform-independent, so they still test
-// executor logic — not the enforcement backend — and pass on every OS. Production
-// construction never sets it and always goes through platformBackend().
-func withBackend(b backend) ExecOption {
-	return func(c *execConfig) { c.backend = b }
-}
-
-func withExecutorLifecycle(lifecycle *executorLifecycle) ExecOption {
-	return func(c *execConfig) { c.lifecycle = lifecycle }
+// executorConfig is the private, concrete input to internal construction.
+// Public ownership configuration belongs to ExecutorSetOption; there is no
+// direct-executor option surface.
+type executorConfig struct {
+	grantTTL  time.Duration
+	clock     func() time.Time // nil means default time.Now
+	backend   backend          // nil means select via platformBackend (test seam)
+	lifecycle *executorLifecycle
 }
 
 // Executor compiles a effectivePolicy once via the platform backend and then runs
@@ -127,11 +86,9 @@ type Executor struct {
 	home             string
 	tmp              string
 	grantMu          sync.Mutex
-	usedGrants       map[[32]byte]struct{}
+	usedGrants       map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
 	closed           bool
 	lifecycle        *executorLifecycle
-
-	cgroupParent string // stored for the cgroup task (SPEC §7.4); unused here
 }
 
 // snapshot is the compiled state a single spawn needs.
@@ -143,26 +100,21 @@ type snapshot struct {
 
 // newExecutor is the internal direct-construction seam for focused unit tests.
 // Production ownership always enters through ExecutorSet.
-func newExecutor(profile *Profile, opts ...ExecOption) (*Executor, error) {
+func newExecutor(profile *Profile, config executorConfig) (*Executor, error) {
 	p, err := compileEffectivePolicy(profile)
 	if err != nil {
 		return nil, err
 	}
-	return newExecutorFromEffective(profile, p, opts...)
+	return newExecutorFromEffective(profile, p, config)
 }
 
-func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecOption) (*Executor, error) {
-	var cfg execConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
+func newExecutorFromEffective(profile *Profile, p effectivePolicy, config executorConfig) (*Executor, error) {
 	// Backend selection: platformBackend() for production; a test may pin one via
 	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
 	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
 	// backend selected without Init() having been called), which fails construction
 	// closed rather than building an executor that would spawn incorrectly.
-	b := cfg.backend
+	b := config.backend
 	if b == nil {
 		if profile != nil && profile.isolation == Unconfined {
 			b = newNullBackend()
@@ -190,7 +142,7 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 		return nil, fmt.Errorf("sandbox: grant key: %w", err)
 	}
 
-	lifecycle := cfg.lifecycle
+	lifecycle := config.lifecycle
 	if lifecycle == nil {
 		lifecycle = newExecutorLifecycle()
 	}
@@ -204,12 +156,11 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 		guaranteeBits:    bits,
 		env:              assembleEnv(p),
 		grantKey:         key,
-		clock:            clockOrDefault(cfg.clock),
-		grantTTL:         ttlOrDefault(cfg.grantTTL),
+		clock:            clockOrDefault(config.clock),
+		grantTTL:         ttlOrDefault(config.grantTTL),
 		routeFingerprint: defaultRouteIdentity,
-		usedGrants:       make(map[[32]byte]struct{}),
+		usedGrants:       make(map[[32]byte]int64),
 		lifecycle:        lifecycle,
-		cgroupParent:     cfg.cgroupParent,
 	}, nil
 }
 
@@ -589,7 +540,8 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	policy := cloneEffectivePolicy(e.policy)
 	now := e.clock()
-	seen := make(map[[32]byte]struct{}, len(grants))
+	e.pruneUsedGrantsLocked(now.UnixMilli())
+	seen := make(map[[32]byte]int64, len(grants))
 	commandGrant := e.profile.command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
@@ -603,7 +555,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		if _, ok := seen[id]; ok {
 			return nil, -1, ErrGrantReplay
 		}
-		seen[id] = struct{}{}
+		seen[id] = 0
 		payload, err := authenticateGrant(e.grantKey, token)
 		if err != nil {
 			return nil, -1, err
@@ -611,6 +563,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		if err := verifyGrantBinding(payload, now, executionID, command, canonicalCWD, e.profile.fingerprint, e.routeFingerprint, e.guaranteeBits); err != nil {
 			return nil, -1, err
 		}
+		seen[id] = payload.ExpiryUnixMilli
 		delta, requiredBits, err := validateGrantClass(classKind(payload.Class), classScope(payload.Class, payload.Target), payload.Class, payload.Target)
 		if err != nil {
 			return nil, -1, err
@@ -695,8 +648,8 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		policy.Env.Set["NO_PROXY"] = ""
 		policy.Env.Set["no_proxy"] = ""
 	}
-	for id := range seen {
-		e.usedGrants[id] = struct{}{}
+	for id, expiryUnixMilli := range seen {
+		e.usedGrants[id] = expiryUnixMilli
 	}
 	s := snapshot{spec: spec, env: assembleEnv(policy), policy: policy}
 	e.grantMu.Unlock()
@@ -711,6 +664,17 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		return out, code, &NetworkTargetDeniedError{ExitCode: code, ProcessError: runErr, denial: denial}
 	}
 	return out, code, runErr
+}
+
+// pruneUsedGrantsLocked removes entries only after their signed validity
+// window. verifyGrantBinding accepts a token at exact expiry equality, so replay
+// protection must do the same and prune only when expiry < now.
+func (e *Executor) pruneUsedGrantsLocked(nowUnixMilli int64) {
+	for id, expiryUnixMilli := range e.usedGrants {
+		if expiryUnixMilli < nowUnixMilli {
+			delete(e.usedGrants, id)
+		}
+	}
 }
 
 type grantPathBackend interface {

@@ -80,7 +80,7 @@ func TestLinuxTargetGrantFailsClosed(t *testing.T) {
 	}
 	set, err := NewExecutorSet(profile,
 		WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
-		withExecutorSetExecOptions(withBackend(&linuxBackend{rung: rungTwo}), withClock(func() time.Time { return now })),
+		withExecutorSetConfig(withBackend(&linuxBackend{rung: rungTwo}), withClock(func() time.Time { return now })),
 	)
 	if err != nil {
 		t.Fatal(err)

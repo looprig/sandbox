@@ -80,7 +80,8 @@ Consumers create an `ExecutorSet` with an explicit scratch root and maximum
 executor count. Each opaque key receives an independent executor, grant
 identity, HOME, and TMPDIR. `Close` revokes grants and proxy activity, then
 removes only the child directory it owns. Direct executor construction is not a
-public lifecycle path.
+public lifecycle path. `WithGrantTTL` optionally sets a positive maximum grant
+lifetime for every executor in the set; omission uses the 15-minute default.
 
 ## Post-decision grants
 

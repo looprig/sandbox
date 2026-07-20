@@ -25,7 +25,7 @@ func TestExecutorSetCloseRevokesBackgroundDescendant(t *testing.T) {
 				HostRead: Allow, HostWrite: Deny, Network: Deny, Command: commandAccess,
 			})
 			set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-				withExecutorSetExecOptions(withBackend(&captureBackend{
+				withExecutorSetConfig(withBackend(&captureBackend{
 					bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
 				})))
 			if err != nil {
@@ -97,7 +97,7 @@ func TestExecutorContextCancelRevokesBackgroundDescendant(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(&captureBackend{
+		withExecutorSetConfig(withBackend(&captureBackend{
 			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
 		})))
 	if err != nil {
@@ -148,7 +148,7 @@ func TestProcessTreeStartFailureDoesNotBlockClose(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(&captureBackend{
+		withExecutorSetConfig(withBackend(&captureBackend{
 			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
 		})))
 	if err != nil {

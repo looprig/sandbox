@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 const fixtureSharedTmpRoot = "/tmp"
@@ -131,8 +132,41 @@ func fixtureWithLimits(limits effectiveLimits) backendFixtureOption {
 
 func fixtureWithAckUnconfined() backendFixtureOption { return func(*effectivePolicy) {} }
 
-func newExecutorForEffectivePolicy(p effectivePolicy, opts ...ExecOption) (*Executor, error) {
-	return newExecutorFromEffective(nil, p, opts...)
+func newExecutorForEffectivePolicy(p effectivePolicy, configs ...executorConfig) (*Executor, error) {
+	return newExecutorFromEffective(nil, p, mergeExecutorConfigs(configs...))
+}
+
+func newTestExecutor(profile *Profile, configs ...executorConfig) (*Executor, error) {
+	return newExecutor(profile, mergeExecutorConfigs(configs...))
+}
+
+func withBackend(value backend) executorConfig { return executorConfig{backend: value} }
+
+func withClock(value func() time.Time) executorConfig { return executorConfig{clock: value} }
+
+func mergeExecutorConfigs(configs ...executorConfig) executorConfig {
+	var merged executorConfig
+	for _, config := range configs {
+		if config.grantTTL != 0 {
+			merged.grantTTL = config.grantTTL
+		}
+		if config.clock != nil {
+			merged.clock = config.clock
+		}
+		if config.backend != nil {
+			merged.backend = config.backend
+		}
+		if config.lifecycle != nil {
+			merged.lifecycle = config.lifecycle
+		}
+	}
+	return merged
+}
+
+func withExecutorSetConfig(configs ...executorConfig) ExecutorSetOption {
+	return func(config *executorSetConfig) {
+		config.executor = mergeExecutorConfigs(config.executor, mergeExecutorConfigs(configs...))
+	}
 }
 
 type testPassthroughBackend struct{}

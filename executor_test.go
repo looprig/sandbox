@@ -235,23 +235,6 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestExecOptions asserts the ExecOption surface exists and NewExecutor accepts
-// it. The values are stored for later tasks (grants, cgroups); here we only
-// verify construction succeeds with them applied.
-func TestExecOptions(t *testing.T) {
-	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws),
-		WithGrantTTL(30*time.Second),
-		WithCgroupParent("/sys/fs/cgroup/looprig"),
-	)
-	if err != nil {
-		t.Fatalf("NewExecutor with options: %v", err)
-	}
-	if e == nil {
-		t.Fatal("NewExecutor returned nil executor")
-	}
-}
-
 // TestInit asserts the initialization stub is callable and returns (no-op today,
 // load-bearing on Linux later).
 func TestInit(t *testing.T) {
@@ -386,7 +369,7 @@ func TestNewExecutorRejectsMissingRequiredGuarantees(t *testing.T) {
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	backend := &captureBackend{bits: GuaranteeEnvScrub}
-	if _, err := newExecutor(profile, withBackend(backend)); !errors.Is(err, ErrSandboxUnavailable) {
+	if _, err := newTestExecutor(profile, withBackend(backend)); !errors.Is(err, ErrSandboxUnavailable) {
 		t.Fatalf("NewExecutor error = %v, want ErrSandboxUnavailable", err)
 	}
 }
