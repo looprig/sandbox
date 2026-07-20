@@ -172,10 +172,8 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 			order = append(order, clean)
 		}
 		merged[clean] |= e.Access
-		if e.Canonical {
-			if index := matchingGrantPathTarget(handles, clean, e.Exact); index >= 0 {
-				plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].isDir}
-			}
+		if index := matchingGrantPathAncestor(handles, clean, e.Exact); index >= 0 {
+			plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].isDir}
 		}
 	}
 	for _, path := range order {
@@ -246,7 +244,14 @@ func enumerateMountView(plan mountViewPlan) MountViewSpec {
 }
 
 func enumerateMountViewWithGrantRules(plan mountViewPlan, grantRules []fsRule) MountViewSpec {
+	spec, _ := enumerateMountViewWithGrantPaths(plan, grantRules, nil)
+	return spec
+}
+
+func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []fsRule, handles []*grantPathHandle) (MountViewSpec, error) {
 	var spec MountViewSpec
+	resolver := newPinnedPathResolver(handles, firstGrantPathChildFD+len(handles))
+	defer closeGrantRuleFiles(resolver.files)
 	add := func(path string, ro bool) {
 		if _, ok := plan.grantBinds[path]; ok {
 			return
@@ -300,15 +305,25 @@ func enumerateMountViewWithGrantRules(plan mountViewPlan, grantRules []fsRule) M
 	slices.SortFunc(spec.Binds, func(a, b BindSpec) int { return strings.Compare(a.Target, b.Target) })
 
 	for _, d := range plan.denyMasks {
+		if matchingGrantPathIdentityAncestor(handles, d) >= 0 {
+			resolved, ok, err := resolver.resolveAny(d)
+			if err != nil {
+				return MountViewSpec{}, err
+			}
+			if ok {
+				spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: resolved.isDir})
+			}
+			continue
+		}
 		st, err := os.Lstat(d)
 		if err != nil {
 			continue // deny target absent: nothing to mask (already invisible)
 		}
 		spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: st.IsDir()})
 	}
-	spec.Masks = append(spec.Masks, scanGlobDenies(plan.scanRoots, plan.globDenies, globScanMaxDepth)...)
+	spec.Masks = append(spec.Masks, scanGlobDeniesWithGrantPaths(plan.scanRoots, plan.globDenies, globScanMaxDepth, handles, resolver)...)
 	slices.SortFunc(spec.Masks, func(a, b MaskSpec) int { return strings.Compare(a.Target, b.Target) })
-	return spec
+	return spec, nil
 }
 
 func procFDNumber(path string) int {
@@ -326,6 +341,10 @@ func procFDNumber(path string) int {
 // of the scanned tree). Matches are de-duplicated across roots. This is a
 // filesystem walk only (no namespaces), so it runs on every host.
 func scanGlobDenies(roots, globs []string, maxDepth int) []MaskSpec {
+	return scanGlobDeniesWithGrantPaths(roots, globs, maxDepth, nil, nil)
+}
+
+func scanGlobDeniesWithGrantPaths(roots, globs []string, maxDepth int, handles []*grantPathHandle, resolver *pinnedPathResolver) []MaskSpec {
 	if len(globs) == 0 {
 		return nil
 	}
@@ -336,9 +355,74 @@ func scanGlobDenies(roots, globs []string, maxDepth int) []MaskSpec {
 	seen := make(map[string]bool)
 	var out []MaskSpec
 	for _, root := range roots {
+		if matchingGrantPathIdentityAncestor(handles, root) >= 0 {
+			resolved, ok, err := resolver.resolveAny(root)
+			if err == nil && ok && resolved.isDir {
+				scanGlobRootAt(int(resolved.file.Fd()), root, pats, maxDepth, seen, &out)
+			}
+			continue
+		}
 		scanGlobRoot(root, pats, maxDepth, seen, &out)
 	}
 	return out
+}
+
+func scanGlobRootAt(dirFD int, dir string, pats []string, depthLeft int, seen map[string]bool, out *[]MaskSpec) {
+	if depthLeft < 0 {
+		return
+	}
+	readFD, err := unix.Openat2(dirFD, ".", &unix.OpenHow{
+		Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC),
+		Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS |
+			unix.RESOLVE_NO_MAGICLINKS),
+	})
+	if err != nil {
+		return
+	}
+	readDir := os.NewFile(uintptr(readFD), "sandbox-grant-glob-scan")
+	if readDir == nil {
+		_ = unix.Close(readFD)
+		return
+	}
+	entries, err := readDir.ReadDir(-1)
+	_ = readDir.Close()
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		childFD, err := unix.Openat2(dirFD, entry.Name(), &unix.OpenHow{
+			Flags: uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC),
+			Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS |
+				unix.RESOLVE_NO_MAGICLINKS),
+		})
+		if err != nil {
+			continue
+		}
+		child := os.NewFile(uintptr(childFD), "sandbox-grant-glob-child")
+		if child == nil {
+			_ = unix.Close(childFD)
+			continue
+		}
+		info, err := child.Stat()
+		if err != nil || info.Mode()&fs.ModeSymlink != 0 {
+			_ = child.Close()
+			continue
+		}
+		full := filepath.Join(dir, entry.Name())
+		for _, pat := range pats {
+			if ok, _ := filepath.Match(pat, entry.Name()); ok {
+				if !seen[full] {
+					seen[full] = true
+					*out = append(*out, MaskSpec{Target: full, IsDir: info.IsDir()})
+				}
+				break
+			}
+		}
+		if info.IsDir() && depthLeft > 0 {
+			scanGlobRootAt(int(child.Fd()), full, pats, depthLeft-1, seen, out)
+		}
+		_ = child.Close()
+	}
 }
 
 // globBasename returns the final path segment of a glob pattern (the part after

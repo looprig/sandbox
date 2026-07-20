@@ -437,7 +437,13 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		// net) — the netns filter is the network boundary.
 		if r1 != nil {
 			spec.Rung = stage2RungOne
-			spec.MountView = enumerateMountViewWithGrantRules(r1.mount, fsRules)
+			mountView, err := enumerateMountViewWithGrantPaths(r1.mount, fsRules, handles)
+			if err != nil {
+				closeGrantRuleFiles(grantRuleFiles)
+				grantRuleFiles = nil
+				return err
+			}
+			spec.MountView = mountView
 			spec.NftRules = r1.nft.toNftSpec()
 			spec.NetConfined = false
 			spec.NetTCPPorts = nil

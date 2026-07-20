@@ -20,7 +20,7 @@ func validateLandlockExactPaths(entries []fsEntry, handles []*grantPathHandle) e
 		if !entry.Exact || !entry.Canonical || entry.Access == 0 {
 			continue
 		}
-		if matchingGrantPathHandle(handles, filepath.Clean(entry.Path), true, entry.Access) >= 0 {
+		if matchingGrantPathAncestor(handles, filepath.Clean(entry.Path), true) >= 0 {
 			continue
 		}
 		info, err := os.Lstat(entry.Path)
@@ -41,10 +41,6 @@ type fsAllow struct {
 	path   string
 	access fsAccess
 	exact  bool
-	// grantFD is the inherited child O_PATH descriptor, or zero for an ordinary
-	// profile/runtime pathname. Zero keeps the struct's natural default safe for
-	// tests and other compiler inputs that construct fsAllow directly.
-	grantFD int
 }
 
 func (a fsAllow) writable() bool { return a.access&writeFSAccess != 0 }
@@ -72,12 +68,8 @@ func compileFSPolicyWithGrantPaths(entries []fsEntry, handles []*grantPathHandle
 		}
 		path := filepath.Clean(entry.Path)
 		if entry.Access != 0 {
-			grantFD := 0
-			if index := matchingGrantPathTarget(handles, path, entry.Exact); index >= 0 {
-				grantFD = firstGrantPathChildFD + index
-			}
 			compiled.allows = append(compiled.allows, fsAllow{
-				path: path, access: entry.Access, exact: entry.Exact, grantFD: grantFD,
+				path: path, access: entry.Access, exact: entry.Exact,
 			})
 		}
 		if denied := normalizedDenied(entry); denied != 0 {
@@ -87,22 +79,51 @@ func compileFSPolicyWithGrantPaths(entries []fsEntry, handles []*grantPathHandle
 	return compiled
 }
 
-func matchingGrantPathHandle(handles []*grantPathHandle, path string, exact bool, access fsAccess) int {
+// matchingGrantPathAncestor returns the longest identity-pinned handle that can
+// resolve path. Exact-file handles match only their exact target; directory
+// handles match their target and descendants. Equal targets retain scope-shape
+// compatibility so an exact directory rule cannot silently become a tree.
+func matchingGrantPathAncestor(handles []*grantPathHandle, path string, exact bool) int {
+	path = filepath.Clean(path)
+	best := -1
+	bestLen := -1
 	for index, handle := range handles {
-		if handle != nil && handle.target == path && handle.exact == exact && handle.access == access {
-			return index
+		if handle == nil || handle.file == nil {
+			continue
+		}
+		switch {
+		case handle.target == path:
+			if handle.exact != exact {
+				continue
+			}
+		case handle.exact || !pathUnder(handle.target, path):
+			continue
+		}
+		if len(handle.target) > bestLen {
+			best = index
+			bestLen = len(handle.target)
 		}
 	}
-	return -1
+	return best
 }
 
-func matchingGrantPathTarget(handles []*grantPathHandle, path string, exact bool) int {
+func matchingGrantPathIdentityAncestor(handles []*grantPathHandle, path string) int {
+	path = filepath.Clean(path)
+	best := -1
+	bestLen := -1
 	for index, handle := range handles {
-		if handle != nil && handle.target == path && handle.exact == exact {
-			return index
+		if handle == nil || handle.file == nil {
+			continue
+		}
+		if handle.target != path && (handle.exact || !pathUnder(handle.target, path)) {
+			continue
+		}
+		if len(handle.target) > bestLen {
+			best = index
+			bestLen = len(handle.target)
 		}
 	}
-	return -1
+	return best
 }
 
 func (compiled compiledFS) resolve(path string) fsAccess {
@@ -163,38 +184,37 @@ func enumerateFSRules(compiled compiledFS) []fsRule {
 
 func enumerateFSRulesWithGrantPaths(compiled compiledFS, handles []*grantPathHandle) ([]fsRule, []*os.File, error) {
 	accumulator := ruleAcc{seen: make(map[string]fsRule)}
-	var files []*os.File
+	resolver := newPinnedPathResolver(handles, firstGrantPathChildFD+len(handles))
 	for _, allow := range compiled.allows {
 		for _, bit := range []fsAccess{readFSAccess, execFSAccess, writeFSAccess} {
 			if allow.access&bit == 0 || deniedAtSamePath(allow, bit, compiled.denies) {
 				continue
 			}
 			excludes := excludesForAllowAxis(allow.path, bit, compiled.denies)
-			if allow.grantFD != 0 {
-				index := allow.grantFD - firstGrantPathChildFD
-				if index < 0 || index >= len(handles) || handles[index] == nil {
-					closeGrantRuleFiles(files)
-					return nil, nil, ErrGrantUnsupported
+			pinnedAncestor := matchingGrantPathAncestor(handles, allow.path, allow.exact) >= 0
+			resolved, pinned, err := resolver.resolve(allow.path, allow.exact)
+			if err != nil {
+				closeGrantRuleFiles(resolver.files)
+				return nil, nil, err
+			}
+			if pinnedAncestor {
+				if !pinned {
+					continue
 				}
 				if len(excludes) == 0 {
 					accumulator.add(fsRule{
 						Target:   allow.path,
-						ParentFD: allow.grantFD,
+						ParentFD: resolved.childFD,
 						Access:   bit,
-						IsDir:    !allow.exact,
+						IsDir:    resolved.isDir,
 					})
 					continue
 				}
-				rules, children, err := enumerateGrantPathHandle(
-					handles[index], allow.path, bit, excludes,
-					firstGrantPathChildFD+len(handles)+len(files),
-				)
+				rules, err := enumeratePinnedTree(resolved.file, allow.path, bit, excludes, resolver.addFile, resolver)
 				if err != nil {
-					closeGrantRuleFiles(children)
-					closeGrantRuleFiles(files)
+					closeGrantRuleFiles(resolver.files)
 					return nil, nil, err
 				}
-				files = append(files, children...)
 				for _, rule := range rules {
 					accumulator.add(rule)
 				}
@@ -210,7 +230,7 @@ func enumerateFSRulesWithGrantPaths(compiled compiledFS, handles []*grantPathHan
 			carveGrant(allow.path, bit, excludes, accumulator.add)
 		}
 	}
-	return accumulator.sorted(), files, nil
+	return accumulator.sorted(), resolver.files, nil
 }
 
 func closeGrantRuleFiles(files []*os.File) {
