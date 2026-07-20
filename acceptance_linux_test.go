@@ -56,7 +56,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 	if err := os.WriteFile(secret, []byte("token"), 0o600); err != nil {
 		t.Fatalf("seed secret: %v", err)
 	}
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithDenyRead(secret)))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithDenyRead(secret)))
 
 	// Write outside ws (+ not /tmp) is denied.
 	outside := filepath.Join(home, ".lrsandbox-accept-rung2-DONOTEXIST")
@@ -86,7 +86,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 	}
 
 	// --- TCP limited to Ports: allowlisted port permitted, others denied ---
-	got := runNetProbe(t, WithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
+	got := runNetProbe(t, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
 	if got[netKeyPortA] != netValAllowed {
 		t.Errorf("allowlisted port %d = %q, want %q", netProbeAllowP, got[netKeyPortA], netValAllowed)
 	}
@@ -108,7 +108,7 @@ func acceptLinuxRung1Write(t *testing.T) {
 	requireSeccomp(t)
 
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws)) // platformBackend selects rung 1 here
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws)) // platformBackend selects rung 1 here
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -131,7 +131,7 @@ func acceptLinuxDNSUnderTrusted(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e := newFSExecutor(t, testPolicy(testBroadNetwork, ws)) // fixture grants DNS
+	e := newFSExecutor(t, backendFixturePolicy(fixtureBroadNetwork, ws)) // fixture grants DNS
 
 	if !reportHas(e.Report(), "dns", "narrowed") {
 		t.Errorf("CompileReport missing dns/narrowed entry; report=%+v", e.Report())
@@ -165,7 +165,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(&linuxBackend{cgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}
@@ -177,7 +177,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 		t.Errorf("CompileReport missing resource-limits/unenforced entry; report=%+v", e.Report())
 	}
 	// Level unchanged vs the delegation-available backend.
-	avail := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	avail := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if e.Level() != avail.Level() {
 		t.Errorf("Level differs by delegation availability: unavailable=%d available=%d; want equal (§7.4)", e.Level(), avail.Level())
 	}

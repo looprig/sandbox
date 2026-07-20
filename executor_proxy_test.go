@@ -54,6 +54,47 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 	}
 }
 
+func TestExecutorComposesAddressGuaranteeWithSelectedRoute(t *testing.T) {
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	direct, err := NewDirectEgressRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	untrusted, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		route EgressRoute
+		want  bool
+	}{
+		{name: "direct trusted resolution", route: direct, want: true},
+		{name: "upstream without address contract", route: untrusted, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeTargetNetwork | GuaranteeEnvScrub}
+			set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(test.route),
+				withExecutorSetExecOptions(withBackend(backend)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = set.Close() })
+			executor, err := set.For("route")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := executor.Guarantees().AddressNetwork; got != test.want {
+				t.Fatalf("AddressNetwork = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestAuthenticatedProxyDenialPrecedesProcessResultAndCredentialIsRevoked(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())

@@ -3,7 +3,9 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,26 @@ type captureBackend struct {
 	policies   []effectivePolicy
 	bits       uint64
 	compileErr error
+}
+
+type boundaryBackend struct {
+	captureBackend
+	baseBits uint64
+}
+
+func (b *boundaryBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	b.captureBackend.mu.Lock()
+	b.captureBackend.policies = append(b.captureBackend.policies, cloneEffectivePolicy(policy))
+	b.captureBackend.mu.Unlock()
+	bits := b.baseBits
+	if resolveFS(policy.FS, string(os.PathSeparator))&readFSAccess != 0 {
+		bits &^= GuaranteeReadBoundary
+	}
+	if resolveFS(policy.FS, string(os.PathSeparator))&writeFSAccess != 0 {
+		bits &^= GuaranteeWriteBoundary
+	}
+	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd), func()) { return argv, nil, nil }}
+	return spec, CompileReport{}, LevelFull, bits, nil
 }
 
 func (b *captureBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
@@ -40,7 +62,7 @@ func TestGrantVersionAndCommandStart(t *testing.T) {
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
-	executor, err := NewExecutor(profile,
+	executor, err := newExecutor(profile,
 		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 		withClock(func() time.Time { return now }),
 	)
@@ -83,7 +105,7 @@ func TestIssueGrantClassesAndBindings(t *testing.T) {
 		HostRead: Gated, HostWrite: Gated, Network: Gated, Command: Gated,
 	})
 	backend := &captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := NewExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +152,8 @@ func TestIssueGrantRejectsMismatchedScopeAndCommandTarget(t *testing.T) {
 		WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Gated,
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
-	executor, err := NewExecutor(profile,
-		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeEnvScrub}),
+	executor, err := newExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 		withClock(func() time.Time { return now }),
 	)
 	if err != nil {
@@ -162,7 +184,7 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
-	executor, err := NewExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,12 +196,144 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 	if got := resolveFS(backend.lastPolicy().FS, target); got&writeFSAccess == 0 {
 		t.Fatalf("verified filesystem grant did not alter compiled policy: access %d", got)
 	}
+	if got := resolveFS(backend.lastPolicy().FS, target+"/child"); got&writeFSAccess != 0 {
+		t.Fatalf("path grant widened recursively to a child: access %d", got)
+	}
+
+	tree := issueTestGrant(t, executor, now, "exec-tree", "true", workspace,
+		"filesystem.write", "tree:"+workspace, "filesystem.tree.write.v1", workspace)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-tree", workspace, "true", []string{tree}); err != nil {
+		t.Fatalf("RunCommandWithGrants tree: %v", err)
+	}
+	if got := resolveFS(backend.lastPolicy().FS, target+"/child"); got&writeFSAccess == 0 {
+		t.Fatalf("tree grant did not apply recursively: access %d", got)
+	}
 
 	drift := issueTestGrant(t, executor, now, "exec-drift", "true", workspace,
 		"filesystem.write", target, "filesystem.path.write.v1", target)
 	executor.guaranteeBits ^= GuaranteeWriteBoundary
 	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-drift", workspace, "true", []string{drift}); !errors.Is(err, ErrGrantGuaranteeMismatch) {
 		t.Fatalf("guarantee drift error = %v, want ErrGrantGuaranteeMismatch", err)
+	}
+}
+
+func TestFilesystemGrantRejectsTargetAndAncestorIdentitySwaps(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	newExecutor := func() *Executor {
+		executor, err := newExecutor(profile,
+			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+			withClock(func() time.Time { return now }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return executor
+	}
+
+	t.Run("target replaced by symlink", func(t *testing.T) {
+		target := filepath.Join(workspace, "target")
+		outside := filepath.Join(t.TempDir(), "outside")
+		for _, path := range []string{target, outside} {
+			if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		executor := newExecutor()
+		token := issueTestGrant(t, executor, now, "exec-target-swap", "true", workspace,
+			"filesystem.write", target, "filesystem.path.write.v1", target)
+		if err := os.Remove(target); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, target); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-target-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
+			t.Fatalf("target swap error = %v, want ErrGrantTargetChanged", err)
+		}
+	})
+
+	t.Run("existing ancestor replaced by symlink", func(t *testing.T) {
+		ancestor := filepath.Join(workspace, "generated")
+		outside := t.TempDir()
+		if err := os.Mkdir(ancestor, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(ancestor, "future.txt")
+		executor := newExecutor()
+		token := issueTestGrant(t, executor, now, "exec-ancestor-swap", "true", workspace,
+			"filesystem.write", target, "filesystem.path.write.v1", target)
+		if err := os.Rename(ancestor, ancestor+".old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, ancestor); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-ancestor-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
+			t.Fatalf("ancestor swap error = %v, want ErrGrantTargetChanged", err)
+		}
+	})
+}
+
+func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Gated, HostWrite: Gated, Network: Deny, Command: Allow,
+	})
+	backend := &boundaryBackend{baseBits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
+	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestGrant(t, executor, now, "exec-host-read", "true", workspace,
+		"filesystem.read", "host:*", "filesystem.host.read.v1", "host:*")
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-host-read", workspace, "true", []string{token}); err != nil {
+		t.Fatalf("RunCommandWithGrants host read: %v", err)
+	}
+	if got := resolveFS(backend.lastPolicy().FS, string(os.PathSeparator)); got&readFSAccess == 0 {
+		t.Fatalf("host read grant did not apply at filesystem root: access %#x", got)
+	}
+
+	writeBackend := &boundaryBackend{baseBits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
+	writeExecutor, err := newExecutor(profile, withBackend(writeBackend), withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeToken := issueTestGrant(t, writeExecutor, now, "exec-host-write", "true", workspace,
+		"filesystem.write", "host:*", "filesystem.host.write.v1", "host:*")
+	if _, _, err := writeExecutor.RunCommandWithGrants(context.Background(), "exec-host-write", workspace, "true", []string{writeToken}); err != nil {
+		t.Fatalf("RunCommandWithGrants host write: %v", err)
+	}
+	if got := resolveFS(writeBackend.lastPolicy().FS, string(os.PathSeparator)); got&writeFSAccess == 0 {
+		t.Fatalf("host write grant did not apply at filesystem root: access %#x", got)
+	}
+}
+
+func TestBroadNetworkGrantIncludesDNSForHostnameResolution(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
+	executor, err := newExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestGrant(t, executor, now, "exec-network-broad", "true", workspace,
+		"network", "", "network.broad.v1", "tcp:*:443")
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-network-broad", workspace, "true", []string{token}); err != nil {
+		t.Fatalf("RunCommandWithGrants network broad: %v", err)
+	}
+	policy := backend.lastPolicy()
+	if !containsPort(policy.Net.Ports, 443) || !policy.Net.DNS {
+		t.Fatalf("broad network policy = %+v, want port 443 plus DNS", policy.Net)
 	}
 }
 
@@ -224,8 +378,8 @@ func TestGrantRejectsCWDProfileAndRouteDrift(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Gated,
 	})
 	newExecutor := func() *Executor {
-		executor, err := NewExecutor(profile,
-			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeEnvScrub}),
+		executor, err := newExecutor(profile,
+			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 			withClock(func() time.Time { return now }))
 		if err != nil {
 			t.Fatal(err)

@@ -121,7 +121,7 @@ func TestPlatformBackendLiveOnThisHost(t *testing.T) {
 func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

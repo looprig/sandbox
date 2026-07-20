@@ -1,8 +1,6 @@
 # sandbox module specification
 
-Status: canonical greenfield target contract, 2026-07-19. Implementation is in
-progress on `feat/sandbox-access-profiles`; exported code may temporarily lag
-this document until Phase 1 completes.
+Status: canonical implemented contract, 2026-07-19.
 
 ## 1. Scope and dependency boundary
 
@@ -102,7 +100,9 @@ grant permits. Fixed runtime support paths are a small, tested backend allowlist
 and never imply general host access. Environment scrubbing and resource limits
 are fixed executor safety behavior and cannot widen authority.
 
-`IsolatedHome` points `HOME` at executor-owned owner-only storage. `RealHome`
+`IsolatedHome` points `HOME` at executor-owned owner-only storage. Every
+executor has a separate owner-only TMPDIR beneath the set-owned root; the base
+profile neither selects nor grants shared `/tmp`. `RealHome`
 sets the real HOME path; access to that path is still governed by filesystem
 rules. Absolute paths, traversal, symlinks, and working-directory changes may
 not escape the compiled boundary.
@@ -120,9 +120,10 @@ func (s *ExecutorSet) Close() error
 
 Scratch root and a positive executor limit are mandatory. The set creates one
 owner-only child beneath the caller-owned root and removes only that child on
-close. Each opaque key gets a separately keyed executor and isolated HOME;
+close. Each opaque key gets a separately keyed executor, HOME, and TMPDIR;
 concurrent requests for the same key return the same executor. Closing the set
-revokes all issued capabilities and releases owned resources.
+revokes all issued capabilities, cancels execution-scoped proxy activity, and
+releases owned resources. There is no public direct-executor constructor.
 
 ## 5. Grant lifecycle
 
@@ -149,7 +150,7 @@ Grant ABI version 1 accepts only these typed enforcement classes:
 | `filesystem.tree.write.v1` | one canonical tree |
 | `filesystem.host.write.v1` | broad host write |
 | `network.proxy-target.v1` | normalized transport, hostname, and port |
-| `network.broad.v1` | honestly described backend-enforceable broad egress |
+| `network.broad.v1` | backend-enforceable broad TCP port plus platform resolver |
 | `command.start.v1` | exact normalized command start |
 
 Issuance occurs only after an external approval decision or compatible saved
@@ -158,7 +159,17 @@ one spawn. It binds the executor, execution ID, exact normalized command,
 canonical working directory, profile fingerprint, non-secret route fingerprint,
 achieved guarantee set, typed class, normalized target, and expiry. It cannot
 open `Deny`, cross executors, commands, directories, routes, or profiles, and is
-never stored as a permission record.
+never stored as a permission record. A filesystem token also binds the
+canonical target and the device/inode/type identity of the deepest existing
+ancestor. Verification walks that canonical ancestor without following
+symlinks, rejects identity drift, and requires a suffix that was missing at
+approval time to remain missing until spawn-policy compilation.
+
+`filesystem.path.*` applies only to the exact canonical object;
+`filesystem.tree.*` applies recursively. Seatbelt compiles those as `literal`
+and `subpath`, respectively. Landlock accepts an exact existing non-directory
+grant; an exact directory or nonexistent target is not representable and fails
+with `ErrGrantUnsupported` rather than widening to a tree.
 
 Verification alone is insufficient: the executor must use `command.start.v1`
 to authorize the exact start and apply filesystem/network classes while
@@ -181,7 +192,10 @@ the child to contact only a randomly bound loopback proxy owned by the
 executor. An execution-bound credential authenticates the child request. The
 proxy supports HTTP forwarding and HTTPS `CONNECT`, normalizes and enforces the
 transport/hostname/port target, strips local proxy credentials and hop-by-hop
-headers, and leaves application TLS end-to-end.
+headers, and leaves application TLS end-to-end. Releasing an execution
+authorization cancels its in-flight forward requests and closes both sides of
+its CONNECT tunnels, including tunnels racing registration; other execution
+identities remain active.
 
 An explicit organization HTTP/HTTPS proxy may be configured upstream. Its
 credentials remain in the supervisor and are excluded from environments,
@@ -192,12 +206,18 @@ fails closed and never retries directly.
 Hostname/port and resolved address-class enforcement are distinct guarantees.
 An upstream-resolved route reports address enforcement only when the upstream
 provides a trusted guarantee contract. HTTPS method/path enforcement is not
-claimed without TLS termination.
+claimed without TLS termination. `AddressNetwork` is composed only when the
+backend reports `TargetNetwork` and the selected route reports its address
+guarantee.
 
 Proxy-unaware clients cannot use a target grant. Direct egress remains denied,
 so ordinary Git-over-SSH fails closed. An external evaluator may instead request
 a clearly displayed `network.broad.v1` grant bound to the exact command, but
 only when the backend can enforce the described broad boundary.
+The broad grant includes platform DNS resolution in the same approved delta.
+On macOS this is the mDNSResponder socket. Linux rung 1 permits UDP/TCP port 53;
+rung 2 narrows DNS to TCP/53 and injects `RES_OPTIONS=use-vc`, whose resolver
+compatibility limitation remains visible in the compile report.
 
 ### 6.2 Linux v1
 
@@ -246,6 +266,9 @@ and symlink-equivalent public spellings for the same configured object, for
 both allows and later carveout denies. Network target enforcement permits only
 the executor's exact loopback proxy listener port, denies direct remote egress,
 and reports `TargetNetwork`; a host-read-denied profile reports `ReadBoundary`.
+The fixed runtime closure does not grant broad `/usr`, `/etc`, `/System`, or
+`/Library`: executable trees, library/certificate trees, and exact resolver or
+loader configuration files have separate minimum access bits.
 
 Linux preserves its explicit-root mount/Landlock, seccomp, nftables, and cgroup
 mechanisms. A parent proxy listener is not reachable as a target-scoped route in
@@ -260,10 +283,11 @@ the null backend accepts only an acknowledged `Unconfined` profile.
 - `Deny` is not grantable; `Gated` is blocked without a valid spawn token.
 - Grant issuance happens only after the external decision and never persists.
 - Filesystem targets are canonical and checked against traversal and symlink
-  escape.
+  escape, then identity-revalidated without following components before spawn.
 - Direct egress cannot bypass a target proxy.
 - Secret route credentials never cross into the child or durable metadata.
 - Executor and set closure revoke outstanding authority.
+- An execution release cancels only that execution's active proxy work.
 - Missing enforcement fails closed; sandboxed execution never falls through to
   direct host execution.
 

@@ -257,7 +257,7 @@ func TestRung1NftEnforcement(t *testing.T) {
 	ws := t.TempDir()
 	// This fixture grants loopback+private+443+dns, so the rung-1 nftables ruleset is
 	// installed with the metadata hard-deny ahead of the Private accept.
-	e, err := newExecutorForEffectivePolicy(testPolicy(testBroadNetwork, ws), withBackend(newLinuxBackendRung1()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureBroadNetwork, ws), withBackend(newLinuxBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

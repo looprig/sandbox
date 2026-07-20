@@ -34,7 +34,7 @@ func realpath(t *testing.T, p string) string {
 func TestStage2RoundTrip(t *testing.T) {
 	ws := t.TempDir()
 	e, err := newExecutorForEffectivePolicy(
-		testPolicy(testWorkspaceWrite, ws, WithEnv(effectiveEnvPolicy{Set: map[string]string{"LRSANDBOX_MARKER": "present"}})),
+		backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithEnv(effectiveEnvPolicy{Set: map[string]string{"LRSANDBOX_MARKER": "present"}})),
 		withBackend(newLinuxBackend()),
 	)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestStage2RoundTrip(t *testing.T) {
 // re-exec and asserts it ran and produced the expected output.
 func TestRunArgvViaLinuxBackend(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestEnvScrubHoldsViaLinuxBackend(t *testing.T) {
 	ws := t.TempDir()
 	t.Setenv("GITHUB_TOKEN", "super-secret") // must NOT reach the target
 
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestStage2FailsClosedWithoutSpec(t *testing.T) {
 // ENOENT on a bare name.
 func TestRunArgvBareNameResolvesPATH(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

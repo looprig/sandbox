@@ -3,7 +3,7 @@
 package sandbox
 
 // platformBackend selects the OS enforcement backend on darwin: Seatbelt via
-// /usr/bin/sandbox-exec (SPEC §7.1). Every non-external NewExecutor on macOS
+// /usr/bin/sandbox-exec (SPEC §7.1). Every non-external executor on macOS
 // compiles its policy to an SBPL profile and wraps each spawn with sandbox-exec.
 //
 // There is no runtime probe: sandbox-exec is present on every supported macOS, and

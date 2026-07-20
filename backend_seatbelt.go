@@ -5,6 +5,7 @@ package sandbox
 import (
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -41,18 +42,11 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 
 // compileSBPL generates the SBPL profile for a policy and returns it alongside
 // the compilation report, the achieved isolation level, and the guarantee
-// bitmask. It performs symlink resolution on emitted filesystem paths (canonPath,
-// an OS read) so rules match the kernel's resolved view (§7.1); output is
-// deterministic given a fixed workspace and HOME on a host where the named
-// non-/private roots (/ws, /lrsbx-home/tester) do not exist while /tmp,/etc resolve
-// macOS-invariantly.
-//
-// The filesystem section relies on SBPL's last-match-wins precedence to realize
-// the resolver's deny>write>read + carveout semantics (§5.1, fsresolve.go). It
-// emits, in order: (1) literal metadata lookup for allowed-root ancestors and
-// the per-entry read/exec/write ALLOWS; (2) carveout write DENIES for read-only
-// entries nested in a writable root, placed after the write allow so the deny
-// wins; (3) fixed/glob DENIES last so they override everything above.
+// bitmask. It resolves ordinary configured paths so rules match the kernel's
+// canonical view, but never re-follows identity-bound grant paths. The
+// filesystem section uses SBPL's last-match-wins behavior: rules are emitted
+// broad-to-narrow, allows before denies at a true tie, exact paths after trees
+// at the same spelling, and fail-closed glob denies last.
 //
 // Verification scope: the M1 spike (docs/spikes/seatbelt-net.md) verified the
 // NETWORK section and the base preamble against a real sandbox-exec; the file-rule
@@ -81,105 +75,114 @@ func compileSBPL(p effectivePolicy) (profile string, report CompileReport, level
 }
 
 // compileFS writes the filesystem section (SPEC §5.1, §7.5) into b, appending any
-// narrowing to report. See compileSBPL for the three-phase last-match-wins order.
+// narrowing to report. See compileSBPL for the broad-to-narrow last-match-wins order.
 func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 	b.WriteString("; --- filesystem ---\n")
 	compileAncestorMetadata(b, fs)
 
-	// Writable roots: the entries that grant write, used to detect which
-	// read-only entries are carveouts nested inside them.
-	var writableRoots []fsEntry
-	for _, e := range fs {
-		if e.Access != denyFSAccess && e.Access&writeFSAccess != 0 {
-			writableRoots = append(writableRoots, e)
-		}
-	}
-
-	// Phase 1: per-entry allows (read, exec, write) for every allow entry. Both the
-	// canonical path and any known symlink-equivalent public spelling are emitted;
-	// macOS reports different operations through different spellings.
-	for _, e := range fs {
-		if e.Access == denyFSAccess {
+	// Seatbelt is last-match-wins. Emit broad rules before narrow rules and, at
+	// one specificity, allows before denies. This realizes the same independent
+	// per-axis longest-match model as resolveFS.
+	rules := mergeSeatbeltRules(fs)
+	for _, rule := range rules {
+		if strings.ContainsAny(rule.Path, globMeta) {
+			compileSeatbeltGlobRule(b, report, rule)
 			continue
 		}
-		for _, candidate := range seatbeltPathAliases(e.Path) {
-			path := sbplString(candidate)
-			if e.Access&readFSAccess != 0 {
-				b.WriteString(`(allow file-read* (subpath "` + path + `"))` + "\n")
-			}
-			if e.Access&execFSAccess != 0 {
-				b.WriteString(`(allow process-exec (subpath "` + path + `"))` + "\n")
-			}
-			if e.Access&writeFSAccess != 0 {
-				b.WriteString(`(allow file-write* (subpath "` + path + `"))` + "\n")
-			}
+		for _, candidate := range seatbeltPathAliases(rule.Path, rule.Canonical) {
+			writeSeatbeltPathRule(b, "allow", rule.Access, candidate, rule.Exact)
+			writeSeatbeltPathRule(b, "deny", rule.Denied, candidate, rule.Exact)
 		}
 	}
+}
 
-	// Phase 2: carveout write-denies. A read-only entry nested inside a writable
-	// root would otherwise inherit that root's write allow; emitting the deny
-	// AFTER the allow removes write under last-match-wins (§5.1 carveout).
-	for _, e := range fs {
-		if e.Access == denyFSAccess || e.Access&writeFSAccess != 0 {
-			continue
-		}
-		if underWritableRoot(e.Path, writableRoots) {
-			for _, candidate := range seatbeltPathAliases(e.Path) {
-				b.WriteString(`(deny file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
-			}
-		}
+func mergeSeatbeltRules(entries []fsEntry) []fsEntry {
+	type ruleKey struct {
+		path      string
+		exact     bool
+		canonical bool
 	}
+	byPath := make(map[ruleKey]fsEntry, len(entries))
+	for _, entry := range entries {
+		key := ruleKey{path: entry.Path, exact: entry.Exact, canonical: entry.Canonical}
+		merged := byPath[key]
+		merged.Path = entry.Path
+		merged.Exact = entry.Exact
+		merged.Canonical = entry.Canonical
+		merged.Access |= entry.Access
+		merged.Denied |= normalizedDenied(entry)
+		byPath[key] = merged
+	}
+	rules := make([]fsEntry, 0, len(byPath))
+	for _, rule := range byPath {
+		rules = append(rules, rule)
+	}
+	sort.Slice(rules, func(i, j int) bool {
+		leftGlob := strings.ContainsAny(rules[i].Path, globMeta) && rules[i].Denied != 0
+		rightGlob := strings.ContainsAny(rules[j].Path, globMeta) && rules[j].Denied != 0
+		if leftGlob != rightGlob {
+			return !leftGlob
+		}
+		left, right := entryPrecedence(rules[i]), entryPrecedence(rules[j])
+		if left != right {
+			return left < right
+		}
+		return rules[i].Path < rules[j].Path
+	})
+	return rules
+}
 
-	// Phase 3: secret / deny-entry denies LAST so they win over every allow
-	// above. Fixed paths use (subpath ...); globs are translated to a regex. Two
-	// fail-closed fallbacks widen to a conservative subpath deny rather than emit
-	// a bad rule: (a) an untranslatable glob (does not compile), and (b) a glob
-	// whose translated regex would contain a double-quote — which an SBPL #"..."
-	// literal cannot represent (it would unbalance the delimiters), reachable via
-	// a consumer WithDenyRead of a quote-bearing path. Both over-deny, never skip.
-	//
-	// NOTE: unlike the network rules, the (regex #"...") and (subpath "...") FILE
-	// forms and file-rule deny-override are NOT part of the M1 spike — only
-	// byte-equality to Go's RE2 translation is proven here. SBPL's (older,
-	// different) regex engine matching identically is pending real-exec
-	// verification (Task 8b).
-	for _, e := range fs {
-		if e.Access != denyFSAccess {
-			continue
-		}
-		if strings.ContainsAny(e.Path, globMeta) {
-			// The regex form legitimately needs its backslashes (e.g. \.env), so
-			// it must NOT go through sbplString; only the un-representable quote
-			// case falls back. NOTE (canonPath limitation): a glob's literal prefix
-			// is NOT symlink-resolved here, so a WithDenyRead glob whose fixed prefix
-			// sits under a symlinked root would under-match. defaultSecretDenials'
-			// only glob (**/.env*) is suffix-anchored (no literal prefix), so this
-			// does not affect the secure defaults.
-			reSrc := globToRegexp(e.Path)
-			reCompiles := globRegexp(e.Path) != nil
-			if reCompiles && !strings.Contains(reSrc, `"`) {
-				b.WriteString(`(deny file-read* file-write* (regex #"` + reSrc + `"))` + "\n")
-				continue
-			}
-			broad := conservativeDenyRoot(e.Path)
-			for _, candidate := range seatbeltPathAliases(broad) {
-				b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
-			}
-			detail := "untranslatable deny glob " + e.Path + " compiled to a broad conservative deny of " + broad + " (fail closed, over-deny)"
-			if reCompiles { // translated fine, but the regex would contain a quote
-				detail = `deny glob contains a quote unrepresentable in an SBPL #"..." regex; widened to a conservative subpath deny`
-			}
-			report.Entries = append(report.Entries, ReportEntry{
-				Feature: "glob-deny",
-				Status:  "narrowed",
-				Detail:  detail,
-			})
-		} else {
-			for _, candidate := range seatbeltPathAliases(e.Path) {
-				b.WriteString(`(deny file-read* file-write* (subpath "` + sbplString(candidate) + `"))` + "\n")
-			}
-		}
+func writeSeatbeltPathRule(b *strings.Builder, action string, access fsAccess, path string, exact bool) {
+	path = sbplString(path)
+	selector := "subpath"
+	if exact {
+		selector = "literal"
 	}
+	if access&readFSAccess != 0 {
+		b.WriteString(`(` + action + ` file-read* (` + selector + ` "` + path + `"))` + "\n")
+	}
+	if access&execFSAccess != 0 {
+		b.WriteString(`(` + action + ` process-exec (` + selector + ` "` + path + `"))` + "\n")
+	}
+	if access&writeFSAccess != 0 {
+		b.WriteString(`(` + action + ` file-write* (` + selector + ` "` + path + `"))` + "\n")
+	}
+}
+
+func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule fsEntry) {
+	// Glob allows are not part of the effective profile vocabulary; dropping one
+	// under-grants. Denies fail closed to a conservative fixed subtree if SBPL
+	// cannot represent the translated expression.
+	denied := rule.Denied
+	if denied == 0 {
+		return
+	}
+	reSrc := globToRegexp(rule.Path)
+	representable := globRegexp(rule.Path) != nil
+	if representable && !strings.Contains(reSrc, `"`) {
+		if denied&readFSAccess != 0 {
+			b.WriteString(`(deny file-read* (regex #"` + reSrc + `"))` + "\n")
+		}
+		if denied&execFSAccess != 0 {
+			b.WriteString(`(deny process-exec (regex #"` + reSrc + `"))` + "\n")
+		}
+		if denied&writeFSAccess != 0 {
+			b.WriteString(`(deny file-write* (regex #"` + reSrc + `"))` + "\n")
+		}
+		return
+	}
+	broad := conservativeDenyRoot(rule.Path)
+	for _, candidate := range seatbeltPathAliases(broad, false) {
+		writeSeatbeltPathRule(b, "deny", denied, candidate, false)
+	}
+	detail := "unrepresentable deny glob widened to a conservative subtree deny"
+	if representable && strings.Contains(reSrc, `"`) {
+		detail = "deny glob contains a quote and was widened to a conservative subtree deny"
+	}
+	report.Entries = append(report.Entries, ReportEntry{
+		Feature: "glob-deny", Status: "narrowed",
+		Detail: detail,
+	})
 }
 
 // compileAncestorMetadata permits only metadata lookup on each configured
@@ -193,7 +196,7 @@ func compileAncestorMetadata(b *strings.Builder, fs []fsEntry) {
 		if entry.Access == denyFSAccess {
 			continue
 		}
-		for _, candidate := range seatbeltPathAliases(entry.Path) {
+		for _, candidate := range seatbeltPathAliases(entry.Path, entry.Canonical) {
 			for parent := filepath.Dir(candidate); parent != string(filepath.Separator); parent = filepath.Dir(parent) {
 				if _, ok := seen[parent]; ok {
 					continue
@@ -276,13 +279,13 @@ func compileGuarantees(p effectivePolicy) uint64 {
 	// the claim would be dishonest. Probed with the SAME resolver the level
 	// demotion uses (one consistent probe), which also catches a "/"-matching
 	// write glob that a literal-"/" scan would miss.
-	if resolveFS(p.FS, "/")&writeFSAccess == 0 {
+	if isFSAccessRestricted(p.FS, writeFSAccess) {
 		bits |= GuaranteeWriteBoundary
 	}
 
 	// Reads are confined whenever the effective policy does not grant broad root
 	// read. All process-exec and file-read allows are emitted per configured root.
-	if resolveFS(p.FS, "/")&readFSAccess == 0 {
+	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 
@@ -311,7 +314,7 @@ func compileGuarantees(p effectivePolicy) uint64 {
 // writable-root entries, i.e. it is a carveout that must have write removed.
 func underWritableRoot(path string, writableRoots []fsEntry) bool {
 	for _, w := range writableRoots {
-		if w.Path != path && literalMatches(w.Path, path) {
+		if w.Path != path && literalMatches(w.Path, path, false) {
 			return true
 		}
 	}
@@ -392,8 +395,11 @@ func canonPath(p string) string {
 // raw /var alias even though other operations use /private/var. Emitting both
 // spellings confines access to the same configured filesystem object. Deny
 // callers use this helper too, so a writable alias cannot bypass a carveout.
-func seatbeltPathAliases(p string) []string {
-	canonical := filepath.Clean(canonPath(p))
+func seatbeltPathAliases(p string, alreadyCanonical bool) []string {
+	canonical := filepath.Clean(p)
+	if !alreadyCanonical {
+		canonical = filepath.Clean(canonPath(p))
+	}
 	raw := filepath.Clean(p)
 	aliases := []string{canonical}
 	for _, pair := range [][2]string{

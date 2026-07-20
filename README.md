@@ -4,10 +4,6 @@
 access profiles and enforcing them around spawned commands. It does not import
 Harness, open approval prompts, parse tool arguments, or persist permissions.
 
-> Implementation status: this document specifies the greenfield target contract
-> being implemented on `feat/sandbox-access-profiles`. Until that branch is
-> complete, exported code may temporarily lag this contract.
-
 ## Profile contract
 
 Consumers choose every access value directly:
@@ -66,7 +62,9 @@ direct process cannot enforce narrower values. Command execution may still be
 denied or gated before the process starts; a gated start requires the executor
 to verify a `command.start.v1` grant.
 
-`IsolatedHome` gives each executor an owner-only scratch HOME. `RealHome`
+`IsolatedHome` gives each executor an owner-only scratch HOME. Every executor
+also receives a distinct owner-only TMPDIR under the `ExecutorSet` scratch
+root; shared `/tmp` is not implicitly writable. `RealHome`
 exposes the caller's HOME value, but filesystem access remains controlled by the
 profile. Fixed runtime paths such as dynamic loaders and `/dev/null` are backend
 implementation necessities, not implicit host-data access.
@@ -80,8 +78,9 @@ host-read profile therefore reports `ReadBoundary` honestly.
 
 Consumers create an `ExecutorSet` with an explicit scratch root and maximum
 executor count. Each opaque key receives an independent executor, grant
-identity, and isolated HOME. `Close` revokes the set and removes only the child
-directory it owns.
+identity, HOME, and TMPDIR. `Close` revokes grants and proxy activity, then
+removes only the child directory it owns. Direct executor construction is not a
+public lifecycle path.
 
 ## Post-decision grants
 
@@ -101,7 +100,11 @@ short-lived, single-spawn token for one typed enforcement class:
 
 Every token binds its executor, execution ID, exact normalized command,
 canonical working directory, profile fingerprint, non-secret route fingerprint,
-achieved guarantees, enforcement class, normalized target, and expiry. The
+achieved guarantees, enforcement class, normalized target, and expiry.
+Filesystem grants additionally bind the canonical target and the identity of
+its deepest existing ancestor; target replacement or a symlink swap before
+spawn fails closed. `filesystem.path.*` is exact while `filesystem.tree.*` is
+recursive. The
 executor verifies the token before spawning: `command.start.v1` authorizes that
 exact start, while filesystem and network classes modify the compiled policy.
 Tokens are never durable permission records.
@@ -121,12 +124,15 @@ to reach only that listener and denies direct remote egress. The proxy enforces
 the normalized hostname and port, leaves TLS end-to-end, and may chain through
 an explicitly configured organization HTTP/HTTPS proxy. Organization proxy
 credentials stay in the supervisor. Upstream failure never falls back to a
-direct connection.
+direct connection. Releasing an execution credential cancels its active forward
+requests and CONNECT tunnels without disturbing other executions.
 
 Hostname and address-class enforcement are separate guarantees. HTTPS method
 and path are not visible through opaque TLS and are not claimed. Proxy-unaware
 clients fail closed. Git over SSH therefore needs either a future raw-TCP
 adapter or an honestly broad, exact-command grant supported by the backend.
+`network.broad.v1` includes the platform resolver authority needed for hostname
+clients; it does not require a second DNS approval.
 
 Neither Linux enforcement rung reports target-network enforcement in v1. A
 target grant fails closed there. A consumer may instead request a visibly broad,
@@ -151,6 +157,8 @@ A required filesystem or network guarantee that is unavailable causes a
 fail-closed error; production never silently runs a sandboxed profile directly.
 The profile and route fingerprints cover all durable authority inputs while
 excluding permission rules, secret proxy credentials, and ephemeral grants.
+`AddressNetwork` is reported for a target route only when both the backend
+enforces `TargetNetwork` and the selected route supplies an address guarantee.
 
 ## Linux initialization
 

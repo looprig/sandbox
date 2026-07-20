@@ -20,10 +20,10 @@ import (
 // but the consumer never called Init() — otherwise a stage-2 child would run the
 // consumer's main() unconfined. It is atomic because, although Init() is meant to
 // run as the first line of main() (before any goroutine), a misuse that races it
-// against NewExecutor must not be a data race.
+// against executor-set construction must not be a data race.
 var initWasCalled atomic.Bool
 
-// ErrInitNotCalled is returned by NewExecutor on Linux when a
+// ErrInitNotCalled is returned while constructing an executor on Linux when a
 // re-exec enforcement backend (rung 1/2) would be selected but sandbox.Init() was
 // not called first (SPEC §6). It is a leaf sentinel so consumers can errors.Is it.
 var ErrInitNotCalled = errors.New("sandbox: Init() was not called — call sandbox.Init() as the very first line of main() before constructing a sandboxed executor on Linux")

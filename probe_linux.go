@@ -18,7 +18,7 @@ import (
 )
 
 // linuxCaps is the runtime capability snapshot the Linux backend selector reads
-// at NewExecutor time to pick the strongest achievable enforcement rung
+// while constructing an executor to pick the strongest achievable enforcement rung
 // (SPEC §7.2). Every field is a MEASURED fact about THIS host, taken by an
 // active probe (not assumed): a mechanism that cannot be confirmed is reported
 // absent (false / 0 / ""), which is the fail-secure default — an over-reported

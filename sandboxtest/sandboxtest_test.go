@@ -40,9 +40,15 @@ func TestSuiteAgainstLivePlatformBackend(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewProfile: %v", err)
 		}
-		e, err := sandbox.NewExecutor(profile)
+		set, err := sandbox.NewExecutorSet(profile,
+			sandbox.WithScratchRoot(t.TempDir()), sandbox.WithMaxExecutors(1))
 		if err != nil {
-			t.Fatalf("NewExecutor(live): %v", err)
+			t.Fatalf("NewExecutorSet(live): %v", err)
+		}
+		t.Cleanup(func() { _ = set.Close() })
+		e, err := set.For("conformance")
+		if err != nil {
+			t.Fatalf("ExecutorSet.For(live): %v", err)
 		}
 		return e
 	})

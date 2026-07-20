@@ -122,8 +122,12 @@ const plantedSecretVal = "lrsandboxtest-must-not-leak"
 //	        WorkspaceWrite: sandbox.Allow, HostWrite: sandbox.Deny,
 //	    })
 //	    if err != nil { t.Fatalf("NewProfile: %v", err) }
-//	    e, err := sandbox.NewExecutor(profile)
-//	    if err != nil { t.Fatalf("NewExecutor: %v", err) }
+//	    set, err := sandbox.NewExecutorSet(profile,
+//	        sandbox.WithScratchRoot(t.TempDir()), sandbox.WithMaxExecutors(1))
+//	    if err != nil { t.Fatalf("NewExecutorSet: %v", err) }
+//	    t.Cleanup(func() { _ = set.Close() })
+//	    e, err := set.For("conformance")
+//	    if err != nil { t.Fatalf("ExecutorSet.For: %v", err) }
 //	    return e
 //	})
 //
@@ -171,10 +175,9 @@ func checkWriteBoundary(t *testing.T, newSUT Factory) {
 		t.Skipf("SKIP write-boundary outside probe: home unresolvable (%v); no out-of-policy write target", err)
 	}
 	// The outside target must be OS-writable-if-unconfined (so a null backend
-	// actually creates it) yet outside every writable root. $HOME fits — unless
-	// the host rooted $HOME under a writable root (workspace or /tmp), in which
-	// case a denied write is unprovable; skip with a recorded reason.
-	if isUnder(home, ws) || isUnder(home, writableTmpRoot) {
+	// actually creates it) yet outside the workspace. ExecutorSet-owned HOME and
+	// TMPDIR are private paths unknown to this external conformance seam.
+	if isUnder(home, ws) {
 		t.Skipf("SKIP write-boundary outside probe: home %q sits under a writable root; cannot probe a denied write there", home)
 	}
 
@@ -302,11 +305,6 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 		}
 	}
 }
-
-// writableTmpRoot is the single writable tmp root the standard write policy
-// grants (SPEC §5.1, mirrored from the sandbox package). The write-boundary probe
-// uses it only to reject a $HOME that happens to sit under it.
-const writableTmpRoot = "/tmp"
 
 // runWrite opens path for write via a shell redirect (`: > path`) under the
 // executor and returns the exit code: 0 == the write was permitted, non-zero ==

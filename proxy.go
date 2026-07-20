@@ -51,6 +51,8 @@ type proxyAuthorization struct {
 	targets        map[string]struct{}
 	allowAll       bool
 	denial         error
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
 type egressProxy struct {
@@ -63,6 +65,10 @@ type egressProxy struct {
 	closing    bool
 	closeOnce  sync.Once
 	closeErr   error
+
+	// beforeTunnelRegister is an unexported deterministic race seam used only by
+	// tests; production proxies leave it nil.
+	beforeTunnelRegister func()
 }
 
 type proxyTunnel struct {
@@ -121,9 +127,11 @@ func (proxy *egressProxy) authorize(executionID string, targets []NetworkTarget,
 		}
 		authorization.targets[target.String()] = struct{}{}
 	}
+	authorization.ctx, authorization.cancel = context.WithCancel(context.Background())
 	proxy.mu.Lock()
 	defer proxy.mu.Unlock()
 	if proxy.closing || proxy.executions == nil {
+		authorization.cancel()
 		return "", ErrExecutorClosed
 	}
 	if _, exists := proxy.executions[executionID]; exists {
@@ -145,8 +153,12 @@ func (proxy *egressProxy) Release(executionID string) {
 		return
 	}
 	proxy.mu.Lock()
+	authorization := proxy.executions[executionID]
 	delete(proxy.executions, executionID)
 	proxy.mu.Unlock()
+	if authorization != nil {
+		authorization.cancel()
+	}
 }
 
 func (proxy *egressProxy) Denial(executionID string) error {
@@ -200,6 +212,13 @@ func (proxy *egressProxy) ServeHTTP(writer http.ResponseWriter, request *http.Re
 		http.Error(writer, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
+	requestContext, cancel := context.WithCancel(request.Context())
+	stop := context.AfterFunc(authorization.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	request = request.WithContext(requestContext)
 	target, err := targetForRequest(request)
 	if err != nil {
 		proxy.recordDenial(executionID, NetworkTarget{transport: "tcp", host: "invalid", port: 1})
@@ -299,6 +318,14 @@ func (proxy *egressProxy) serveConnect(writer http.ResponseWriter, request *http
 		return
 	}
 	pair := &proxyTunnel{child: &idleTimeoutConn{Conn: child, timeout: proxyIdleTimeout}, upstream: &idleTimeoutConn{Conn: upstream, timeout: proxyIdleTimeout}}
+	stopRelease := context.AfterFunc(request.Context(), func() {
+		_ = pair.child.Close()
+		_ = pair.upstream.Close()
+	})
+	defer stopRelease()
+	if proxy.beforeTunnelRegister != nil {
+		proxy.beforeTunnelRegister()
+	}
 	proxy.mu.Lock()
 	if proxy.closing {
 		proxy.mu.Unlock()
@@ -437,6 +464,9 @@ func (proxy *egressProxy) Close() error {
 	proxy.closeOnce.Do(func() {
 		proxy.mu.Lock()
 		proxy.closing = true
+		for _, authorization := range proxy.executions {
+			authorization.cancel()
+		}
 		for pair := range proxy.tunnels {
 			_ = pair.child.Close()
 			_ = pair.upstream.Close()

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -50,7 +51,7 @@ const spawnWaitGrace = time.Second
 
 // execConfig accumulates ExecOption settings before they are stored on the
 // Executor. It exists so the option functions have a single mutable target
-// during NewExecutor.
+// during internal executor construction.
 type execConfig struct {
 	grantTTL     time.Duration
 	cgroupParent string
@@ -58,7 +59,7 @@ type execConfig struct {
 	backend      backend          // nil means select via platformBackend (test seam)
 }
 
-// ExecOption configures a NewExecutor call (SPEC §6).
+// ExecOption configures executors created by an ExecutorSet (SPEC §6).
 type ExecOption func(*execConfig)
 
 // WithGrantTTL sets the lifetime of grant tokens minted by this executor (SPEC
@@ -118,6 +119,7 @@ type Executor struct {
 	routeFingerprint string
 	proxy            *egressProxy
 	home             string
+	tmp              string
 	grantMu          sync.Mutex
 	usedGrants       map[[32]byte]struct{}
 	closed           bool
@@ -132,9 +134,9 @@ type snapshot struct {
 	policy effectivePolicy
 }
 
-// NewExecutor selects a backend and compiles one immutable profile. Profile
-// validation is platform-independent; backend availability is checked here.
-func NewExecutor(profile *Profile, opts ...ExecOption) (*Executor, error) {
+// newExecutor is the internal direct-construction seam for focused unit tests.
+// Production ownership always enters through ExecutorSet.
+func newExecutor(profile *Profile, opts ...ExecOption) (*Executor, error) {
 	p, err := compileEffectivePolicy(profile)
 	if err != nil {
 		return nil, err
@@ -168,6 +170,12 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, opts ...ExecO
 	spec, report, level, bits, err := b.compile(p)
 	if err != nil {
 		return nil, err
+	}
+	if profile != nil {
+		missing := profile.requiredGuarantees &^ bits
+		if missing != 0 {
+			return nil, fmt.Errorf("%w: backend missing required guarantees %#x", ErrSandboxUnavailable, missing)
+		}
 	}
 
 	key, err := newGrantKey()
@@ -461,7 +469,14 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if class == "network.proxy-target.v1" && e.proxy == nil {
 		return "", ErrGrantUnsupported
 	}
-	_ = delta
+	var pathBinding *grantPathBinding
+	if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
+		binding, err := captureGrantPathBinding(delta.entry.Path)
+		if err != nil {
+			return "", fmt.Errorf("%w: bind target: %v", ErrGrantMalformed, err)
+		}
+		pathBinding = &binding
+	}
 	access, err := e.profile.AccessFor(kind, scope)
 	if err != nil {
 		return "", err
@@ -493,7 +508,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 		ExecutionID: executionID, Command: command, WorkingDirectory: canonicalCWD,
 		ProfileFingerprint: e.profile.fingerprint, RouteFingerprint: e.routeFingerprint,
 		GuaranteeBits: e.guaranteeBits, Class: class, Target: target,
-		ExpiryUnixMilli: expiryUnixMilli, Nonce: nonce,
+		PathBinding: pathBinding, ExpiryUnixMilli: expiryUnixMilli, Nonce: nonce,
 	})
 }
 
@@ -522,6 +537,7 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	now := e.clock()
 	seen := make(map[[32]byte]struct{}, len(grants))
 	commandGrant := e.profile.command == Allow
+	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
 	for _, token := range grants {
 		id := grantID(token)
@@ -546,6 +562,11 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
 			return nil, -1, ErrGrantGuaranteeMismatch
 		}
+		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
+			if err := revalidateGrantPathBinding(payload.PathBinding, delta.entry.Path); err != nil {
+				return nil, -1, err
+			}
+		}
 		if delta.class == "command.start.v1" {
 			if payload.Target != command {
 				return nil, -1, ErrGrantWrongCommand
@@ -553,11 +574,20 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 			commandGrant = true
 		}
 		if delta.entry != nil {
-			policy.FS = append(policy.FS, *delta.entry)
+			policy.FS = applyFilesystemGrant(policy.FS, *delta.entry)
 		}
+		dropped := delta.droppedGuarantees
+		if dropped&GuaranteeReadBoundary != 0 && isFSAccessRestricted(policy.FS, readFSAccess|execFSAccess) {
+			dropped &^= GuaranteeReadBoundary
+		}
+		if dropped&GuaranteeWriteBoundary != 0 && isFSAccessRestricted(policy.FS, writeFSAccess) {
+			dropped &^= GuaranteeWriteBoundary
+		}
+		expectedGuarantees &^= dropped
 		if delta.port != 0 && !containsPort(policy.Net.Ports, delta.port) {
 			policy.Net.Ports = append(policy.Net.Ports, delta.port)
 		}
+		policy.Net.DNS = policy.Net.DNS || delta.dns
 		if delta.target != nil {
 			proxyTargets = append(proxyTargets, *delta.target)
 		}
@@ -586,7 +616,8 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 	if err != nil {
 		return nil, -1, err
 	}
-	if bits != e.guaranteeBits {
+	bits = e.composeRouteGuarantees(bits)
+	if bits != expectedGuarantees {
 		return nil, -1, ErrGrantGuaranteeMismatch
 	}
 	if len(proxyTargets) != 0 {
@@ -617,6 +648,26 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 		return out, code, &NetworkTargetDeniedError{ExitCode: code, ProcessError: runErr, denial: denial}
 	}
 	return out, code, runErr
+}
+
+func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {
+	if e == nil || e.proxy == nil {
+		return bits
+	}
+	bits &^= GuaranteeAddressNetwork
+	if bits&GuaranteeTargetNetwork != 0 && e.proxy.route.AddressGuarantee() {
+		bits |= GuaranteeAddressNetwork
+	}
+	return bits
+}
+
+func applyFilesystemGrant(entries []fsEntry, grant fsEntry) []fsEntry {
+	for i := range entries {
+		if entries[i].Path == grant.Path && entries[i].Exact == grant.Exact {
+			entries[i].Denied &^= grant.Access
+		}
+	}
+	return append(entries, grant)
 }
 
 func classKind(class string) string {

@@ -142,13 +142,28 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		}
 		return nil, fmt.Errorf("sandbox: create executor HOME: %w", err)
 	}
+	tmp, err := os.MkdirTemp(set.ownedRoot, "tmp-")
+	if err == nil {
+		err = os.Chmod(tmp, 0o700)
+	}
+	if err != nil {
+		if ownedHome {
+			_ = os.RemoveAll(home)
+		}
+		if tmp != "" {
+			_ = os.RemoveAll(tmp)
+		}
+		return nil, fmt.Errorf("sandbox: create executor TMPDIR: %w", err)
+	}
 	if policy.Env.Set == nil {
 		policy.Env.Set = make(map[string]string)
 	}
 	policy.Env.Set["HOME"] = home
+	policy.Env.Set["TMPDIR"] = tmp
 	if ownedHome {
 		policy.FS = append(policy.FS, fsEntry{Path: home, Access: readFSAccess | writeFSAccess | execFSAccess})
 	}
+	policy.FS = append(policy.FS, fsEntry{Path: tmp, Access: readFSAccess | writeFSAccess | execFSAccess})
 	var proxy *egressProxy
 	if set.route != nil {
 		proxy, err = newEgressProxy(*set.route)
@@ -156,6 +171,7 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 			if ownedHome {
 				_ = os.RemoveAll(home)
 			}
+			_ = os.RemoveAll(tmp)
 			return nil, err
 		}
 		_, portText, splitErr := net.SplitHostPort(proxy.Addr())
@@ -165,6 +181,7 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 			if ownedHome {
 				_ = os.RemoveAll(home)
 			}
+			_ = os.RemoveAll(tmp)
 			return nil, errors.New("sandbox: invalid egress proxy listener")
 		}
 		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
@@ -177,12 +194,15 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		if ownedHome {
 			_ = os.RemoveAll(home)
 		}
+		_ = os.RemoveAll(tmp)
 		return nil, err
 	}
 	executor.home = home
+	executor.tmp = tmp
 	if proxy != nil {
 		executor.proxy = proxy
 		executor.routeFingerprint = set.route.Fingerprint()
+		executor.guaranteeBits = executor.composeRouteGuarantees(executor.guaranteeBits)
 	}
 	set.executors[key] = executor
 	return executor, nil

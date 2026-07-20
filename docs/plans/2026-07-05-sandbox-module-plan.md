@@ -1,5 +1,10 @@
 # Sandbox Module Implementation Plan (v2)
 
+> Historical implementation record. `SPEC.md` is the canonical current
+> contract; its ExecutorSet-owned HOME/TMPDIR and grant APIs supersede the older
+> `/tmp` and direct-constructor decisions below. Linux mechanism tests still
+> require Linux CI as noted in Phase 0.5.
+
 > **For Claude:** Execute with **superpowers:subagent-driven-development**
 > (fresh implementer subagent per task → spec-compliance review → code-quality
 > review). TDD each task. All paths below are **module-root relative** — the

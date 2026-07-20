@@ -137,12 +137,12 @@ func parseNetMarkers(out []byte) map[string]string {
 // runNetProbe builds a rung-2 executor for the given net policy, re-execs the
 // test binary as the confined target, and returns the parsed probe markers. It
 // injects the probe sentinel and the two probe ports into the TARGET env.
-func runNetProbe(t *testing.T, netOpt PolicyOption) map[string]string {
+func runNetProbe(t *testing.T, netOpt backendFixtureOption) map[string]string {
 	t.Helper()
 	ws := t.TempDir()
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws,
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws,
 		netOpt,
-		WithEnv(effectiveEnvPolicy{Set: map[string]string{
+		fixtureWithEnv(effectiveEnvPolicy{Set: map[string]string{
 			netTargetEnv:     "1",
 			netProbePortAEnv: strconv.Itoa(netProbeAllowP),
 			netProbePortBEnv: strconv.Itoa(netProbeBlockP),
@@ -169,7 +169,7 @@ func TestLinuxNetPortAllowlist(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
 
-	got := runNetProbe(t, WithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
+	got := runNetProbe(t, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
 
 	if got[netKeyPortA] != netValAllowed {
 		t.Errorf("allowlisted port %d = %q, want %q (Landlock must permit the connect) — full output:\n%v",
@@ -209,7 +209,7 @@ func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithNet(effectiveNetPolicy{DNS: true})))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{DNS: true})))
 
 	// The report must record DNS narrowed to TCP.
 	if !reportHas(e.Report(), "dns", "narrowed") {
@@ -239,7 +239,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 	ws := t.TempDir()
 
 	t.Run("confined port policy earns NetworkBoundary, not AddressNetwork", func(t *testing.T) {
-		e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithNet(effectiveNetPolicy{Ports: []uint16{443}})))
+		e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{443}})))
 		g := e.Guarantees()
 		if !g.NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = false, want true (confined TCP allowlist)")
@@ -256,7 +256,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 	})
 
 	t.Run("Loopback/Private records address-network unenforced", func(t *testing.T) {
-		e := newFSExecutor(t, testPolicy(testBroadNetwork, ws))
+		e := newFSExecutor(t, backendFixturePolicy(fixtureBroadNetwork, ws))
 		g := e.Guarantees()
 		if !g.NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = false, want true (fixture is net-confined at port level)")
@@ -271,7 +271,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 
 	t.Run("open egress does not earn NetworkBoundary", func(t *testing.T) {
 		// Net.Open makes the policy unconfined; AckUnconfined is required to build.
-		p := testPolicy(testWorkspaceWrite, ws, WithNet(effectiveNetPolicy{Open: true}), WithAckUnconfined())
+		p := backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{Open: true}), fixtureWithAckUnconfined())
 		e := newFSExecutor(t, p)
 		if e.Guarantees().NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = true for open egress, want false")

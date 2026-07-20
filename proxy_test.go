@@ -181,6 +181,76 @@ func TestProxyCloseTerminatesActiveTunnel(t *testing.T) {
 	_ = conn.Close()
 }
 
+func TestProxyReleaseTerminatesOnlyMatchingCONNECTTunnel(t *testing.T) {
+	echo := newEchoServer(t)
+	_, port, _ := net.SplitHostPort(echo.Addr().String())
+	route, _ := NewDirectEgressRoute()
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.10")}, nil }
+	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
+	}
+	proxy := newTestProxy(t, route)
+	target := mustTarget(t, "tcp:release-connect.test:"+port)
+	credentialA, _ := proxy.Authorize("exec-a", []NetworkTarget{target})
+	credentialB, _ := proxy.Authorize("exec-b", []NetworkTarget{target})
+	connA, readerA := openProxyTunnel(t, proxy, "exec-a", credentialA, "release-connect.test", port)
+	defer connA.Close()
+	connB, readerB := openProxyTunnel(t, proxy, "exec-b", credentialB, "release-connect.test", port)
+	defer connB.Close()
+
+	proxy.Release("exec-a")
+	_ = connA.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := connA.Write([]byte("revoked")); err == nil {
+		one := make([]byte, 1)
+		if _, err := readerA.Read(one); err == nil {
+			t.Fatal("released execution's CONNECT tunnel remained active")
+		}
+	}
+
+	_ = connB.SetDeadline(time.Now().Add(time.Second))
+	payload := []byte("still-authorized")
+	if _, err := connB.Write(payload); err != nil {
+		t.Fatalf("unrelated execution tunnel write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(readerB, got); err != nil {
+		t.Fatalf("unrelated execution tunnel read: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unrelated tunnel payload = %q, want %q", got, payload)
+	}
+}
+
+func TestProxyReleaseWinsCONNECTAuthorizationRegisterRace(t *testing.T) {
+	echo := newEchoServer(t)
+	_, port, _ := net.SplitHostPort(echo.Addr().String())
+	route, _ := NewDirectEgressRoute()
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("198.51.100.11")}, nil }
+	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, echo.Addr().String())
+	}
+	proxy := newTestProxy(t, route)
+	reached := make(chan struct{})
+	resume := make(chan struct{})
+	proxy.beforeTunnelRegister = func() {
+		close(reached)
+		<-resume
+	}
+	credential, _ := proxy.Authorize("exec-register-race", []NetworkTarget{mustTarget(t, "tcp:register-race.test:"+port)})
+	connection, reader := openProxyTunnel(t, proxy, "exec-register-race", credential, "register-race.test", port)
+	defer connection.Close()
+	<-reached
+	proxy.Release("exec-register-race")
+	close(resume)
+	_ = connection.SetDeadline(time.Now().Add(time.Second))
+	if _, err := connection.Write([]byte("revoked")); err == nil {
+		one := make([]byte, 1)
+		if _, err := reader.Read(one); err == nil {
+			t.Fatal("CONNECT registered after Release and survived revocation")
+		}
+	}
+}
+
 func TestProxyIgnoresNOProxyAndCleansUp(t *testing.T) {
 	t.Setenv("NO_PROXY", "*")
 	origin := newHTTPOrigin(t)
@@ -243,6 +313,34 @@ func TestProxyRequestCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("canceled proxy request did not terminate")
+	}
+}
+
+func TestProxyReleaseCancelsActiveForwardRequest(t *testing.T) {
+	route, _ := NewDirectEgressRoute()
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.13")}, nil }
+	started := make(chan struct{})
+	route.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	proxy := newTestProxy(t, route)
+	credential, _ := proxy.Authorize("exec-release-http", []NetworkTarget{mustTarget(t, "tcp:release.test:80")})
+	done := make(chan struct{}, 1)
+	go func() {
+		response, _ := proxyClient(t, proxy.URL("exec-release-http", credential)).Get("http://release.test/")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		done <- struct{}{}
+	}()
+	<-started
+	proxy.Release("exec-release-http")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Release did not cancel active forward request")
 	}
 }
 
@@ -317,6 +415,23 @@ func newTestProxy(t *testing.T, route EgressRoute) *egressProxy {
 	}
 	t.Cleanup(func() { _ = proxy.Close() })
 	return proxy
+}
+
+func openProxyTunnel(t *testing.T, proxy *egressProxy, executionID, credential, host, port string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	connection, err := net.Dial("tcp", proxy.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(executionID + ":" + credential))
+	_, _ = fmt.Fprintf(connection, "CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\nProxy-Authorization: Basic %s\r\n\r\n", host, port, host, port, auth)
+	reader := bufio.NewReader(connection)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil || response.StatusCode != http.StatusOK {
+		_ = connection.Close()
+		t.Fatalf("CONNECT = %#v, %v", response, err)
+	}
+	return connection, reader
 }
 
 func proxyClient(t *testing.T, rawProxy string) *http.Client {

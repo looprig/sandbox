@@ -79,6 +79,9 @@ func (b linuxBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
 // unenforced.
 func (b linuxBackend) compileRung2(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if err := validateLandlockExactPaths(p.FS); err != nil {
+		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+	}
 	cfs := compileFSPolicy(p.FS)
 	cnet := compileNetPolicy(p.Net)
 	// Task 14: resolve the cgroup v2 resource-limit plan against the ancestor
@@ -88,8 +91,11 @@ func (b linuxBackend) compileRung2(p effectivePolicy) (spawnSpec, CompileReport,
 	// containment-of-cost, not authority (§7.4), so LevelDegraded is unchanged.
 	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
 
-	bits := GuaranteeWriteBoundary
-	if cfs.hasLiteralDeny() {
+	var bits uint64
+	if isFSAccessRestricted(p.FS, writeFSAccess) {
+		bits |= GuaranteeWriteBoundary
+	}
+	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {
@@ -155,18 +161,21 @@ func (b linuxBackend) compileRung2(p effectivePolicy) (spawnSpec, CompileReport,
 // them, so rung 1 is LevelFull. Resource limits are containment-of-cost and never
 // change Level (§7.4).
 func (b linuxBackend) compileRung1(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if err := validateLandlockExactPaths(p.FS); err != nil {
+		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+	}
 	cfs := compileFSPolicy(p.FS)
 	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
 	mvp := compileMountView(p)
 	nft := compileNftPlan(p.Net)
 
-	// ProcessBoundary + WriteBoundary are unconditional at rung 1: the child runs
-	// inside user+mount+pid(+net) namespaces (process boundary) and writes are
-	// confined to the rw binds + Landlock (write boundary).
-	bits := GuaranteeProcessBoundary | GuaranteeWriteBoundary
-	if mvp.hasDenies() {
-		// The mount masks enforce BOTH fixed-path and glob denies for subprocesses
-		// (unlike rung 2, which cannot express globs) — the ReadBoundary guarantee.
+	// The process boundary is unconditional; filesystem guarantees are reported
+	// only for axes the effective policy actually restricts.
+	bits := uint64(GuaranteeProcessBoundary)
+	if isFSAccessRestricted(p.FS, writeFSAccess) {
+		bits |= GuaranteeWriteBoundary
+	}
+	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {

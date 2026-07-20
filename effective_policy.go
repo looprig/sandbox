@@ -18,7 +18,14 @@ const (
 type fsEntry struct {
 	Path   string
 	Access fsAccess
+	Denied fsAccess
+	Exact  bool
+	// Canonical marks a grant path already resolved and identity-bound by the
+	// executor. Backends must not follow it through symlinks again.
+	Canonical bool
 }
+
+const allFSAccess = readFSAccess | execFSAccess | writeFSAccess
 
 type effectiveNetPolicy struct {
 	Loopback  bool
@@ -67,8 +74,7 @@ func cloneEffectivePolicy(p effectivePolicy) effectivePolicy {
 }
 
 const (
-	writableTmpRoot = "/tmp"
-	nullDevicePath  = "/dev/null"
+	nullDevicePath = "/dev/null"
 )
 
 func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
@@ -79,9 +85,6 @@ func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
 		Workspace: profile.workspaceRoot,
 		Isolation: profile.isolation,
 		Home:      profile.home,
-		Env: effectiveEnvPolicy{
-			Set: map[string]string{"TMPDIR": writableTmpRoot},
-		},
 	}
 	if profile.isolation == Unconfined {
 		p.FS = []fsEntry{{Path: string(filepath.Separator), Access: readFSAccess | writeFSAccess | execFSAccess}}
@@ -89,10 +92,8 @@ func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
 		return p, nil
 	}
 
-	for _, path := range minimalRuntimeReadPaths() {
-		p.FS = append(p.FS, fsEntry{Path: path, Access: readFSAccess | execFSAccess})
-	}
-	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess})
+	p.FS = append(p.FS, minimalRuntimeEntries()...)
+	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess, Exact: true})
 	appendRootAccess(&p.FS, profile.workspaceRoot, profile.workspaceRead, profile.workspaceWrite)
 	for _, root := range profile.additionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
@@ -105,20 +106,40 @@ func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
 }
 
 func appendRootAccess(entries *[]fsEntry, path string, read, write Access) {
-	var access fsAccess
+	var access, denied fsAccess
 	if read == Allow {
 		access |= readFSAccess | execFSAccess
+	} else {
+		denied |= readFSAccess | execFSAccess
 	}
 	if write == Allow {
 		access |= writeFSAccess
+	} else {
+		denied |= writeFSAccess
 	}
-	if access != denyFSAccess {
-		*entries = append(*entries, fsEntry{Path: path, Access: access})
-	}
+	*entries = append(*entries, fsEntry{Path: path, Access: access, Denied: denied})
 }
 
-func minimalRuntimeReadPaths() []string {
-	return []string{"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/System", "/Library"}
+func minimalRuntimeEntries() []fsEntry {
+	var entries []fsEntry
+	for _, path := range []string{
+		"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec",
+		"/usr/lib/git-core", "/lib", "/lib64",
+	} {
+		entries = append(entries, fsEntry{Path: path, Access: readFSAccess | execFSAccess})
+	}
+	for _, path := range []string{
+		"/usr/lib", "/usr/lib64", "/System/Library", "/etc/ssl/certs", "/etc/pki",
+	} {
+		entries = append(entries, fsEntry{Path: path, Access: readFSAccess})
+	}
+	for _, path := range []string{
+		"/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/services",
+		"/etc/protocols", "/etc/localtime", "/etc/ld.so.cache", "/etc/ssl/cert.pem",
+	} {
+		entries = append(entries, fsEntry{Path: path, Access: readFSAccess, Exact: true})
+	}
+	return entries
 }
 
 func baselineEnvAllowlist() []string {
@@ -141,6 +162,19 @@ func containsPort(ports []uint16, port uint16) bool {
 func netBlocked(p effectivePolicy) bool {
 	net := p.Net
 	return !net.Loopback && !net.Private && !net.DNS && !net.Open && len(net.Ports) == 0
+}
+
+func hasDeniedFSAccess(entries []fsEntry, access fsAccess) bool {
+	for _, entry := range entries {
+		if normalizedDenied(entry)&access != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func isFSAccessRestricted(entries []fsEntry, access fsAccess) bool {
+	return hasDeniedFSAccess(entries, access) || resolveFS(entries, string(filepath.Separator))&access != access
 }
 
 func realHome() (string, error) {

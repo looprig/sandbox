@@ -77,7 +77,7 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 	outside := filepath.Join(home, ".lrsandbox-writeboundary-should-not-exist")
 	t.Cleanup(func() { _ = os.Remove(outside) })
 
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
 	inside := filepath.Join(ws, "inside.txt")
 	if code := tryWrite(t, e, ws, inside); code != 0 {
@@ -100,7 +100,7 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 func TestLinuxFSTmpWritable(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
 	tmpFile := filepath.Join("/tmp", ".lrsandbox-tmp-writable-test")
 	t.Cleanup(func() { _ = os.Remove(tmpFile) })
@@ -133,7 +133,7 @@ func TestLinuxFSGitCarveout(t *testing.T) {
 		t.Fatalf("mkdir src: %v", err)
 	}
 
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
 	// Positive: .git/config is readable, and the pre-existing src sibling is
 	// writable.
@@ -168,7 +168,7 @@ func TestLinuxFSSecretDeny(t *testing.T) {
 		t.Fatalf("seed allowed: %v", err)
 	}
 
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws, WithDenyRead(secret)))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithDenyRead(secret)))
 
 	// Negative: the secret is unreadable (denied out of BOTH the workspace RW and
 	// the broad "/" read via enumerated sibling allows).
@@ -205,7 +205,7 @@ func TestLinuxFSSnapshotSemantics(t *testing.T) {
 		t.Fatalf("mkdir work: %v", err)
 	}
 
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
 	// Pre-existing subdir: writable.
 	if code := tryWrite(t, e, ws, filepath.Join(work, "x")); code != 0 {
@@ -231,7 +231,7 @@ func TestLinuxFSSnapshotSemantics(t *testing.T) {
 func TestLinuxFSGuarantees(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
-	e := newFSExecutor(t, testPolicy(testWorkspaceWrite, ws))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
 	g := e.Guarantees()
 	trueBits := []struct {
@@ -394,7 +394,7 @@ func TestEnumerateFSRules(t *testing.T) {
 		secret := filepath.Join(root, "secret")
 		cfs := compiledFS{
 			allows: []fsAllow{{path: root, access: readFSAccess | writeFSAccess | execFSAccess}},
-			denies: []string{secret},
+			denies: []fsDeny{{path: secret, access: allFSAccess}},
 		}
 		rules := enumerateFSRules(cfs)
 		if _, ok := access(rules, secret); ok {
@@ -416,7 +416,7 @@ func TestEnumerateFSRules(t *testing.T) {
 		cfs := compiledFS{allows: []fsAllow{
 			{path: root, access: readFSAccess | writeFSAccess | execFSAccess},
 			{path: gitDir, access: readFSAccess},
-		}}
+		}, denies: []fsDeny{{path: gitDir, access: writeFSAccess}}}
 		rules := enumerateFSRules(cfs)
 		// .git present as a read-only rule (from its own allow), never writable.
 		if acc, ok := access(rules, gitDir); !ok {
@@ -439,7 +439,7 @@ func TestEnumerateFSRules(t *testing.T) {
 	t.Run("nonexistent deny does not carve (existence-gated)", func(t *testing.T) {
 		cfs := compiledFS{
 			allows: []fsAllow{{path: root, access: readFSAccess | writeFSAccess | execFSAccess}},
-			denies: []string{filepath.Join(root, "does-not-exist")},
+			denies: []fsDeny{{path: filepath.Join(root, "does-not-exist"), access: allFSAccess}},
 		}
 		rules := enumerateFSRules(cfs)
 		if acc, ok := access(rules, root); !ok || acc&writeFSAccess == 0 {
@@ -452,7 +452,7 @@ func TestEnumerateFSRules(t *testing.T) {
 // whose path is at-or-under a literal DENY is dropped (deny is a hard override,
 // SPEC §5.1) — no emitted rule covers the denied subtree. Covers both deny==allow
 // and deny-is-ancestor-of-allow.
-func TestEnumerateDenyOverridesAllow(t *testing.T) {
+func TestEnumerateUsesLongestSpecificAxisRule(t *testing.T) {
 	root := t.TempDir()
 	mk := func(p string) string {
 		full := filepath.Join(root, p)
@@ -466,37 +466,38 @@ func TestEnumerateDenyOverridesAllow(t *testing.T) {
 	a := filepath.Dir(abchild)
 
 	tests := []struct {
-		name   string
-		cfs    compiledFS
-		denied string // no emitted rule may be at-or-under this path
+		name        string
+		cfs         compiledFS
+		target      string
+		wantAllowed bool
 	}{
 		{
 			name:   "deny equals allow",
-			cfs:    compiledFS{allows: []fsAllow{{path: foo, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []string{foo}},
-			denied: foo,
+			cfs:    compiledFS{allows: []fsAllow{{path: foo, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []fsDeny{{path: foo, access: allFSAccess}}},
+			target: foo,
 		},
 		{
-			name:   "deny is ancestor of allow",
-			cfs:    compiledFS{allows: []fsAllow{{path: abchild, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []string{a}},
-			denied: abchild,
+			name:   "narrow allow overrides broad deny",
+			cfs:    compiledFS{allows: []fsAllow{{path: abchild, access: readFSAccess | writeFSAccess | execFSAccess}}, denies: []fsDeny{{path: a, access: allFSAccess}}},
+			target: abchild, wantAllowed: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rules := enumerateFSRules(tt.cfs)
+			allowed := false
 			for _, r := range rules {
-				// No emitted rule may be the denied path itself or an ancestor of it
-				// (an ancestor rule would grant the denied subtree recursively).
-				if r.Path == tt.denied || pathUnder(r.Path, tt.denied) {
-					t.Errorf("emitted rule %q covers denied path %q (fail-open)", r.Path, tt.denied)
-				}
+				allowed = allowed || r.Path == tt.target || r.IsDir && pathUnder(r.Path, tt.target)
+			}
+			if allowed != tt.wantAllowed {
+				t.Errorf("enumerated target %q allowed=%v, want %v; rules=%+v", tt.target, allowed, tt.wantAllowed, rules)
 			}
 		})
 	}
 }
 
 // TestLinuxFSDenyEqualsAllowIsDenied is the end-to-end proof of Finding 1 through
-// the public API: a path that is BOTH WithWritable and WithDenyRead must resolve
+// the public API: a path that is BOTH fixtureWithWritable and fixtureWithDenyRead must resolve
 // to denied (deny wins), so a spawned command cannot read it.
 func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 	requireLandlockV4(t)
@@ -507,7 +508,7 @@ func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws, WithWritable(secretDir), WithDenyRead(secretDir)), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithWritable(secretDir), fixtureWithDenyRead(secretDir)), withBackend(newLinuxBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

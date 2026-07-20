@@ -45,9 +45,14 @@ func TestAcceptanceMatrixDarwin(t *testing.T) {
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
 		AdditionalRoots: []RootAccess{{Path: gitDir, Read: Allow, Write: Deny}},
 	})
-	e, err := NewExecutor(profile)
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("NewExecutorSet: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	e, err := set.For("acceptance")
+	if err != nil {
+		t.Fatalf("ExecutorSet.For: %v", err)
 	}
 
 	// Per-row Guarantees() + Level (compile posture; no sandbox-exec needed).

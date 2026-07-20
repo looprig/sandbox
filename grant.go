@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ var (
 	ErrGrantProfileMismatch       = errors.New("sandbox: grant token profile mismatch")
 	ErrGrantGuaranteeMismatch     = errors.New("sandbox: grant token guarantee mismatch")
 	ErrGrantRouteMismatch         = errors.New("sandbox: grant token route mismatch")
+	ErrGrantTargetChanged         = errors.New("sandbox: granted filesystem target changed")
 	ErrGrantReplay                = errors.New("sandbox: grant token replay")
 	ErrGrantRequired              = errors.New("sandbox: approval grant required")
 	ErrGrantDenied                = errors.New("sandbox: capability denied")
@@ -48,8 +50,15 @@ type grantPayload struct {
 	GuaranteeBits      uint64
 	Class              string
 	Target             string
+	PathBinding        *grantPathBinding
 	ExpiryUnixMilli    int64
 	Nonce              [16]byte
+}
+
+type grantPathBinding struct {
+	CanonicalPath string
+	ExistingPath  string
+	Identity      string
 }
 
 func newGrantKey() ([]byte, error) {
@@ -128,6 +137,77 @@ func canonicalGrantPath(path string) (string, error) {
 	}
 }
 
+func captureGrantPathBinding(path string) (grantPathBinding, error) {
+	canonical := filepath.Clean(path)
+	existing := canonical
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return grantPathBinding{}, err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return grantPathBinding{}, os.ErrNotExist
+		}
+		existing = parent
+	}
+	if err := validateCanonicalPathNoFollow(existing); err != nil {
+		return grantPathBinding{}, err
+	}
+	identity, err := platformFileIdentity(existing)
+	if err != nil {
+		return grantPathBinding{}, err
+	}
+	return grantPathBinding{CanonicalPath: canonical, ExistingPath: existing, Identity: identity}, nil
+}
+
+func revalidateGrantPathBinding(binding *grantPathBinding, target string) error {
+	if binding == nil || binding.CanonicalPath != target || !filepath.IsAbs(binding.ExistingPath) {
+		return ErrGrantMalformed
+	}
+	if err := validateCanonicalPathNoFollow(binding.ExistingPath); err != nil {
+		return fmt.Errorf("%w: %v", ErrGrantTargetChanged, err)
+	}
+	identity, err := platformFileIdentity(binding.ExistingPath)
+	if err != nil || identity != binding.Identity {
+		return ErrGrantTargetChanged
+	}
+	if binding.ExistingPath != binding.CanonicalPath {
+		remainder, err := filepath.Rel(binding.ExistingPath, binding.CanonicalPath)
+		if err != nil || remainder == "." || strings.HasPrefix(remainder, ".."+string(filepath.Separator)) {
+			return ErrGrantMalformed
+		}
+		candidate := binding.ExistingPath
+		for _, component := range strings.Split(remainder, string(filepath.Separator)) {
+			candidate = filepath.Join(candidate, component)
+			if _, err := os.Lstat(candidate); err == nil || !errors.Is(err, os.ErrNotExist) {
+				return ErrGrantTargetChanged
+			}
+		}
+	}
+	return nil
+}
+
+func validateCanonicalPathNoFollow(path string) error {
+	clean := filepath.Clean(path)
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink component %q", current)
+		}
+	}
+	return nil
+}
+
 func normalizeGrantScopeTarget(scope, class, target string) (string, string, error) {
 	if !strings.HasPrefix(class, "filesystem.") || strings.Contains(class, ".host.") {
 		return scope, target, nil
@@ -158,18 +238,20 @@ func validGrantText(value string) bool {
 }
 
 type grantDelta struct {
-	entry  *fsEntry
-	port   uint16
-	class  string
-	target *NetworkTarget
+	entry             *fsEntry
+	port              uint16
+	class             string
+	target            *NetworkTarget
+	droppedGuarantees uint64
+	dns               bool
 }
 
 func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, error) {
-	filesystem := func(wantKind, wantScope string, access fsAccess, guarantee uint64) (grantDelta, uint64, error) {
+	filesystem := func(wantKind, wantScope, policyPath string, access fsAccess, guarantee uint64, exact bool) (grantDelta, uint64, error) {
 		if kind != wantKind || scope != wantScope {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return grantDelta{entry: &fsEntry{Path: target, Access: access}, class: class}, guarantee, nil
+		return grantDelta{entry: &fsEntry{Path: policyPath, Access: access, Exact: exact, Canonical: filepath.IsAbs(policyPath)}, class: class}, guarantee, nil
 	}
 	switch class {
 	case "command.start.v1":
@@ -182,27 +264,31 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		if class == "filesystem.path.read.v1" {
-			return filesystem("filesystem.read", target, readFSAccess|execFSAccess, GuaranteeReadBoundary)
+			return filesystem("filesystem.read", target, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, true)
 		}
-		return filesystem("filesystem.write", target, writeFSAccess, GuaranteeWriteBoundary)
+		return filesystem("filesystem.write", target, target, writeFSAccess, GuaranteeWriteBoundary, true)
 	case "filesystem.tree.read.v1", "filesystem.tree.write.v1":
 		if !filepath.IsAbs(target) || filepath.Clean(target) != target || scope != "tree:"+target {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		if class == "filesystem.tree.read.v1" {
-			return filesystem("filesystem.read", scope, readFSAccess|execFSAccess, GuaranteeReadBoundary)
+			return filesystem("filesystem.read", scope, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
 		}
-		return filesystem("filesystem.write", scope, writeFSAccess, GuaranteeWriteBoundary)
+		return filesystem("filesystem.write", scope, target, writeFSAccess, GuaranteeWriteBoundary, false)
 	case "filesystem.host.read.v1":
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return filesystem("filesystem.read", "host:*", readFSAccess|execFSAccess, GuaranteeReadBoundary)
+		delta, guarantee, err := filesystem("filesystem.read", "host:*", string(filepath.Separator), readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
+		delta.droppedGuarantees = GuaranteeReadBoundary
+		return delta, guarantee, err
 	case "filesystem.host.write.v1":
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return filesystem("filesystem.write", "host:*", writeFSAccess, GuaranteeWriteBoundary)
+		delta, guarantee, err := filesystem("filesystem.write", "host:*", string(filepath.Separator), writeFSAccess, GuaranteeWriteBoundary, false)
+		delta.droppedGuarantees = GuaranteeWriteBoundary
+		return delta, guarantee, err
 	case "network.broad.v1":
 		parts := strings.Split(target, ":")
 		if kind != "network" || scope != "" || len(parts) != 3 || parts[0] != "tcp" || parts[1] != "*" {
@@ -212,7 +298,7 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 		if err != nil || port == 0 {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return grantDelta{port: uint16(port), class: class}, GuaranteeNetworkBoundary, nil
+		return grantDelta{port: uint16(port), class: class, dns: true}, GuaranteeNetworkBoundary, nil
 	case "network.proxy-target.v1":
 		if kind != "network" || scope != "" || !validGrantText(target) {
 			return grantDelta{}, 0, ErrGrantMalformed

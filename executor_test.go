@@ -18,9 +18,9 @@ func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 	ws := t.TempDir()
 	// pin null: this asserts null-backend semantics (LevelNone, EnvScrub-only bits,
 	// empty report), not the platform backend that platformBackend() selects here.
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 
 	if e.Level() != LevelNone {
@@ -51,9 +51,9 @@ func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 // code even when non-zero; only a spawn/setup failure returns a non-nil error.
 func TestRunCommand(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 	ctx := context.Background()
 
@@ -82,9 +82,9 @@ func TestRunCommand(t *testing.T) {
 // metacharacters are literal arguments rather than syntax.
 func TestRunArgv(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 	ctx := context.Background()
 
@@ -113,9 +113,9 @@ func TestRunArgv(t *testing.T) {
 // spawn/setup failure (working directory does not exist) returns a non-nil error.
 func TestRunCommandSpawnFailure(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 
 	_, _, err = e.RunCommand(context.Background(), ws+"/does-not-exist", "echo hi")
@@ -139,9 +139,9 @@ func TestEnvScrub(t *testing.T) {
 
 	ws := t.TempDir()
 	// Construct AFTER Setenv: assembleEnv snapshots os.Environ() at build time.
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 
 	out, _, err := e.RunCommand(context.Background(), ws, "env")
@@ -240,7 +240,7 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 // verify construction succeeds with them applied.
 func TestExecOptions(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws),
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws),
 		WithGrantTTL(30*time.Second),
 		WithCgroupParent("/sys/fs/cgroup/looprig"),
 	)
@@ -263,9 +263,9 @@ func TestInit(t *testing.T) {
 // not a silent nil-error signal kill.
 func TestRunCommandContextTimeout(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -295,9 +295,9 @@ func TestRunArgvNonexistentBinary(t *testing.T) {
 	// binary, so exec fails with a Go spawn error. A real OS backend wraps argv[0]
 	// with sandbox-exec, which RUNS and exits nonzero (a ran-but-nonzero, not a
 	// spawn error), so the convention this test pins holds only for the null backend.
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 
 	_, _, err = e.RunArgv(context.Background(), ws, []string{"/no/such/bin"})
@@ -343,7 +343,7 @@ func TestAssembleEnvScrubNeverNil(t *testing.T) {
 	ws := t.TempDir()
 	e, err := newExecutorForEffectivePolicy(effectivePolicy{Workspace: ws, Env: effectiveEnvPolicy{}})
 	if err != nil {
-		t.Fatalf("NewExecutor: %v", err)
+		t.Fatalf("newExecutor: %v", err)
 	}
 	out, _, err := e.RunCommand(context.Background(), ws, "env")
 	if err != nil {
@@ -377,4 +377,16 @@ func countEnvName(env []string, name string) int {
 		}
 	}
 	return n
+}
+
+func TestNewExecutorRejectsMissingRequiredGuarantees(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Deny, WorkspaceWrite: Deny,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	backend := &captureBackend{bits: GuaranteeEnvScrub}
+	if _, err := newExecutor(profile, withBackend(backend)); !errors.Is(err, ErrSandboxUnavailable) {
+		t.Fatalf("NewExecutor error = %v, want ErrSandboxUnavailable", err)
+	}
 }

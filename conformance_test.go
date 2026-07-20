@@ -29,7 +29,7 @@ import (
 // no-op posture. Pinned via the unexported withBackend seam.
 func TestSandboxtestAgainstNullBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "null", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
+		e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newTestPassthroughBackend()))
 		if err != nil {
 			t.Fatalf("NewExecutor(null): %v", err)
 		}
@@ -44,9 +44,18 @@ func TestSandboxtestAgainstNullBackend(t *testing.T) {
 // backend's gate.
 func TestSandboxtestAgainstLiveBackend(t *testing.T) {
 	sandboxtest.RunSuite(t, "live", func(t *testing.T, ws string) sandboxtest.SUT {
-		e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+		profile := mustProfile(t, ProfileConfig{
+			WorkspaceRoot: ws, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+			HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+		})
+		set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1))
 		if err != nil {
-			t.Fatalf("NewExecutor(live): %v", err)
+			t.Fatalf("NewExecutorSet(live): %v", err)
+		}
+		t.Cleanup(func() { _ = set.Close() })
+		e, err := set.For("conformance")
+		if err != nil {
+			t.Fatalf("ExecutorSet.For(live): %v", err)
 		}
 		return e
 	})

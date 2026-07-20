@@ -1,5 +1,8 @@
 # sandbox — module spec (DRAFT)
 
+> Historical draft. `SPEC.md` is the canonical implemented contract and
+> supersedes the vocabulary and lifecycle sketches below.
+
 Status: draft v2 for review, 2026-07-05. Module not built. Design agreed in
 discussion; revised after review (env policy, grant unforgeability, honest v1
 denial detection, Landlock feasibility limits, backend compilation rules,

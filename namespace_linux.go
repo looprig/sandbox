@@ -37,9 +37,9 @@ import (
 //
 // Two-phase design across the re-exec, mirroring rung 2:
 //   - compile time (once, in linuxBackend.compileRung1): distil the effectivePolicy's FS
-//     axis into a mountViewPlan (rw/ro bind roots, literal deny masks, glob deny
-//     patterns, glob scan roots). Deny is a hard override: an allow at-or-under a
-//     literal deny is dropped (granting it would be WIDER than the policy).
+//     axis into a mountViewPlan (rw/ro bind roots, safe literal deny masks, glob
+//     deny patterns, glob scan roots). The mount view masks only full-path denies
+//     with no narrower restoration; Landlock composes the remaining per-axis rules.
 //   - spawn time (per spawn, in the wrap/configure closure): enumerateMountView
 //     stats each root (dir vs file, dropping nonexistent — fail secure) and
 //     re-runs the glob scan, producing a MountViewSpec that is gob-encoded into
@@ -112,24 +112,37 @@ type rung1Plan struct {
 
 // compileMountView distils a effectivePolicy's FS entries into a mountViewPlan (SPEC §7.2
 // rung 1). Literal allow roots become rw or ro binds; literal denies become
-// masks; glob denies are carried for the spawn-time scan. Allow globs (none in
-// the presets) are dropped — a mount cannot express a glob allow, and dropping
-// under-grants (fail secure). Deny is a HARD OVERRIDE: an allow at-or-under a
-// literal deny is dropped (deniedAtOrUnder), because binding it would be WIDER
-// than the policy; the denied path is still masked out of any broader allow.
+// masks when they deny every axis and have no narrower restoration; glob denies
+// are carried for the spawn-time scan. Allow globs are dropped — a mount cannot
+// express a glob allow, and dropping under-grants (fail secure). Landlock is
+// layered over the mount view to enforce partial-axis and restored descendants.
 func compileMountView(p effectivePolicy) mountViewPlan {
 	var plan mountViewPlan
 
-	// First pass: collect the deny intent (literal masks vs glob patterns).
+	// First pass: collect full-path deny intent that the mount view can hide
+	// without swallowing a more-specific allow. Partial-axis denies are enforced
+	// by Landlock, which composes on top of this view.
 	for _, e := range p.FS {
-		if e.Access != denyFSAccess {
+		if normalizedDenied(e) != allFSAccess || e.Access != 0 {
 			continue
 		}
 		if strings.ContainsAny(e.Path, globMeta) {
 			plan.globDenies = append(plan.globDenies, e.Path)
 			continue
 		}
-		plan.denyMasks = append(plan.denyMasks, filepath.Clean(e.Path))
+		denyPath := filepath.Clean(e.Path)
+		var covered, restored bool
+		for _, candidate := range p.FS {
+			if candidate.Access == 0 {
+				continue
+			}
+			allowPath := filepath.Clean(candidate.Path)
+			covered = covered || pathUnder(allowPath, denyPath)
+			restored = restored || pathUnder(denyPath, allowPath)
+		}
+		if covered && !restored {
+			plan.denyMasks = append(plan.denyMasks, denyPath)
+		}
 	}
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
@@ -147,9 +160,6 @@ func compileMountView(p effectivePolicy) mountViewPlan {
 		merged[clean] |= e.Access
 	}
 	for _, path := range order {
-		if deniedAtOrUnder(path, plan.denyMasks) {
-			continue // deny wins: never bind an allow at-or-under a deny
-		}
 		if merged[path]&writeFSAccess != 0 {
 			plan.rwBinds = append(plan.rwBinds, path)
 		} else {

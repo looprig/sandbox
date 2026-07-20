@@ -12,63 +12,67 @@ import (
 // string, so it is a faithful statement of policy intent shared by the OS
 // backends and the ReadGuard adapter.
 //
-// The reconciled model — deny overrides; otherwise the longest literal-prefix
-// match across all allow entries wins, and exact-specificity ties union their
-// bits — is:
-//
-//  1. If any deny entry (Access == denyFSAccess) matches the path — a literal
-//     ancestor or a matching glob — the result is denyFSAccess. Deny is a hard
-//     override; a more specific allow does not rescue it.
-//  2. Otherwise, among the matching allow entries the most specific wins, where
-//     specificity is the length of the matched literal prefix: the cleaned path
-//     for a literal entry, or the cleaned substring before the first glob
-//     metacharacter for a glob entry. On an exact specificity tie the results
-//     union (OR). Read/write/exec are not ranked against each other — the single
-//     longest allow decides, which is what makes the carveout below work (there
-//     is no case where a shorter writable root beats a longer read-only one).
-//  3. If nothing matches, the result is denyFSAccess (fail-closed).
-//
-// This yields the §5.1 carveout: a read-only ".git" entry nested inside a
-// writable root is a longer allow than the root, so it wins and the workspace's
-// history stays read-only — while a "**/.env*" deny still overrides that same
-// writable root because deny is checked first.
+// The model resolves read, execute, and write independently. For each bit, the
+// most-specific matching entry wins; explicit deny wins a true tie. Exact paths
+// outrank trees at the same spelling, so an approved exact object can open
+// without opening children. Glob denies remain hard fail-closed overrides
+// because backend glob masking cannot safely restore narrower descendants. If
+// no entry controls a bit, that bit is denied.
 //
 // Contract: target must be an absolute, canonical, symlink-resolved path.
 // resolveFS is purely lexical — it does no symlink, case-fold, or "." /".."
 // resolution beyond filepath.Clean — so resolving symlinks and case variants is
-// the caller's (ReadGuard/backend) responsibility. Passing an unresolved path
+// the caller's/backend's responsibility. Passing an unresolved path
 // could let a deny be bypassed via a symlink or a case variant on macOS.
 func resolveFS(entries []fsEntry, path string) fsAccess {
 	target := filepath.Clean(path)
-
-	// Rule 1: any matching deny entry is a hard override. Deny matching fails
-	// closed — an uncompilable deny glob over-denies rather than leaking.
-	for _, e := range entries {
-		if e.Access == denyFSAccess && denyMatches(e.Path, target) {
-			return denyFSAccess
+	var globDenied fsAccess
+	for _, entry := range entries {
+		if strings.ContainsAny(entry.Path, globMeta) && denyMatches(entry, target) {
+			globDenied |= normalizedDenied(entry)
 		}
 	}
 
-	// Rule 2: among matching allow entries, the most specific wins; exact
-	// specificity ties union their bits.
-	var best fsAccess
-	bestSpec := -1
-	for _, e := range entries {
-		if e.Access == denyFSAccess || !entryMatches(e.Path, target) {
-			continue
+	var result fsAccess
+	for _, bit := range []fsAccess{readFSAccess, execFSAccess, writeFSAccess} {
+		bestSpec := -1
+		allowed := false
+		denied := false
+		for _, entry := range entries {
+			entryDenied := normalizedDenied(entry)
+			if entry.Access&bit == 0 && entryDenied&bit == 0 {
+				continue
+			}
+			matches := entryMatches(entry, target)
+			if entryDenied&bit != 0 {
+				matches = denyMatches(entry, target)
+			}
+			if !matches {
+				continue
+			}
+			spec := entryPrecedence(entry)
+			switch {
+			case spec > bestSpec:
+				bestSpec = spec
+				allowed = entry.Access&bit != 0
+				denied = entryDenied&bit != 0
+			case spec == bestSpec:
+				allowed = allowed || entry.Access&bit != 0
+				denied = denied || entryDenied&bit != 0
+			}
 		}
-		switch spec := entrySpecificity(e.Path); {
-		case spec > bestSpec:
-			bestSpec, best = spec, e.Access
-		case spec == bestSpec:
-			best |= e.Access
+		if bestSpec >= 0 && allowed && !denied {
+			result |= bit
 		}
 	}
-	if bestSpec < 0 {
-		// Rule 3: nothing matched — fail closed.
-		return denyFSAccess
+	return result &^ globDenied
+}
+
+func normalizedDenied(entry fsEntry) fsAccess {
+	if entry.Access == 0 && entry.Denied == 0 {
+		return allFSAccess
 	}
-	return best
+	return entry.Denied
 }
 
 // globMeta are the glob metacharacters whose presence makes an entry a glob
@@ -79,12 +83,12 @@ const globMeta = "*?["
 // target path, dispatching on whether the entry is a glob or a literal. It fails
 // closed by under-granting: an uncompilable allow glob (globRegexp == nil)
 // simply grants nothing, so a malformed allow never widens access.
-func entryMatches(entryPath, target string) bool {
-	if strings.ContainsAny(entryPath, globMeta) {
-		re := globRegexp(entryPath)
+func entryMatches(entry fsEntry, target string) bool {
+	if strings.ContainsAny(entry.Path, globMeta) {
+		re := globRegexp(entry.Path)
 		return re != nil && re.MatchString(target)
 	}
-	return literalMatches(entryPath, target)
+	return literalMatches(entry.Path, target, entry.Exact)
 }
 
 // denyMatches reports whether a DENY entry matches an already-cleaned target
@@ -92,19 +96,22 @@ func entryMatches(entryPath, target string) bool {
 // deny glob (globRegexp == nil) is treated as a MATCH so a malformed pattern
 // over-denies rather than silently letting the path through. A deny that
 // silently does not deny is the one failure mode this resolver must never have.
-func denyMatches(entryPath, target string) bool {
-	if strings.ContainsAny(entryPath, globMeta) {
-		re := globRegexp(entryPath)
+func denyMatches(entry fsEntry, target string) bool {
+	if strings.ContainsAny(entry.Path, globMeta) {
+		re := globRegexp(entry.Path)
 		return re == nil || re.MatchString(target)
 	}
-	return literalMatches(entryPath, target)
+	return literalMatches(entry.Path, target, entry.Exact)
 }
 
 // literalMatches reports whether target is entryPath or is nested under it at a
 // path boundary, so "/work/repo" matches "/work/repo" and "/work/repo/src" but
 // not "/work/repository". The root "/" matches everything.
-func literalMatches(entryPath, target string) bool {
+func literalMatches(entryPath, target string, exact bool) bool {
 	ep := filepath.Clean(entryPath)
+	if exact {
+		return target == ep
+	}
 	if ep == "/" {
 		return true
 	}
@@ -129,6 +136,17 @@ func entrySpecificity(entryPath string) int {
 		return 0
 	}
 	return len(filepath.Clean(prefix))
+}
+
+// entryPrecedence refines lexical specificity with scope shape. An exact path
+// controls only one object and therefore outranks a recursive tree rooted at
+// the same spelling, without opening any child of that tree.
+func entryPrecedence(entry fsEntry) int {
+	precedence := entrySpecificity(entry.Path) * 2
+	if entry.Exact {
+		precedence++
+	}
+	return precedence
 }
 
 // globRegexp compiles a glob pattern into an anchored regexp implementing the

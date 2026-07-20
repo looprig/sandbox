@@ -46,16 +46,24 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if beta == alpha || beta.home == alpha.home {
-		t.Fatal("distinct keys shared executor or HOME")
+	if beta == alpha || beta.home == alpha.home || beta.tmp == alpha.tmp {
+		t.Fatal("distinct keys shared executor, HOME, or TMPDIR")
 	}
 	assertOwnerOnlyDir(t, alpha.home)
 	assertOwnerOnlyDir(t, beta.home)
+	assertOwnerOnlyDir(t, alpha.tmp)
+	assertOwnerOnlyDir(t, beta.tmp)
 	if access := resolveFS(alpha.policy.FS, alpha.home); access&(readFSAccess|writeFSAccess) != readFSAccess|writeFSAccess {
 		t.Fatalf("isolated HOME access = %d, want read and write", access)
 	}
-	if !pathWithin(alpha.home, owned) || !pathWithin(beta.home, owned) {
-		t.Fatalf("executor HOMEs %q and %q are not beneath %q", alpha.home, beta.home, owned)
+	if access := resolveFS(alpha.policy.FS, alpha.tmp); access&(readFSAccess|writeFSAccess) != readFSAccess|writeFSAccess {
+		t.Fatalf("isolated TMPDIR access = %d, want read and write", access)
+	}
+	if !containsEnv(alpha.env, "TMPDIR="+alpha.tmp) {
+		t.Fatalf("executor environment does not use owned TMPDIR %q", alpha.tmp)
+	}
+	if !pathWithin(alpha.home, owned) || !pathWithin(beta.home, owned) || !pathWithin(alpha.tmp, owned) || !pathWithin(beta.tmp, owned) {
+		t.Fatalf("executor HOME/TMPDIR paths are not all beneath %q", owned)
 	}
 	if _, err := set.For("gamma"); !errors.Is(err, ErrExecutorLimit) {
 		t.Fatalf("third executor error = %v, want ErrExecutorLimit", err)
@@ -84,7 +92,7 @@ func TestExecutorSetConcurrentMemoization(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
-		withExecutorSetExecOptions(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeEnvScrub})))
+		withExecutorSetExecOptions(withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub})))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,55 +6,56 @@ import (
 	"path/filepath"
 )
 
-// These fixtures preserve backend unit-test shapes while production profiles
-// are consumer-defined. They are not part of the package API.
-type testPolicyShape uint8
+const fixtureSharedTmpRoot = "/tmp"
+
+// These fixtures preserve isolated backend mechanism shapes. They deliberately
+// do not model a production profile or ExecutorSet-owned HOME/TMPDIR and must
+// not be used for lifecycle, profile, or guarantee-contract tests.
+type backendFixtureShape uint8
 
 const (
-	testScopedRuntime testPolicyShape = iota
-	testHostRead
-	testWorkspaceWrite
-	testBroadNetwork
-	testDirect
+	fixtureScopedRuntime backendFixtureShape = iota
+	fixtureHostRead
+	fixtureWorkspaceWrite
+	fixtureBroadNetwork
+	fixtureDirect
 )
 
-type PolicyOption func(*effectivePolicy)
+type backendFixtureOption func(*effectivePolicy)
 
-func testPolicy(shape testPolicyShape, workspace string, opts ...PolicyOption) effectivePolicy {
+func backendFixturePolicy(shape backendFixtureShape, workspace string, opts ...backendFixtureOption) effectivePolicy {
 	workspace = filepath.Clean(workspace)
 	p := effectivePolicy{
 		Workspace: workspace,
 		Env: effectiveEnvPolicy{Set: map[string]string{
-			"TMPDIR": writableTmpRoot,
+			"TMPDIR": fixtureSharedTmpRoot,
 		}},
 	}
 	switch shape {
-	case testScopedRuntime:
-		for _, path := range minimalRuntimeReadPaths() {
-			p.FS = append(p.FS, fsEntry{Path: path, Access: readFSAccess | execFSAccess})
-		}
+	case fixtureScopedRuntime:
+		p.FS = append(p.FS, minimalRuntimeEntries()...)
 		p.FS = append(p.FS, fsEntry{Path: workspace, Access: readFSAccess})
-	case testHostRead:
+	case fixtureHostRead:
 		p.FS = append(p.FS, fsEntry{Path: "/", Access: readFSAccess | execFSAccess})
-	case testWorkspaceWrite, testBroadNetwork:
+	case fixtureWorkspaceWrite, fixtureBroadNetwork:
 		p.FS = append(p.FS,
 			fsEntry{Path: "/", Access: readFSAccess | execFSAccess},
 			fsEntry{Path: workspace, Access: readFSAccess | writeFSAccess | execFSAccess},
 			fsEntry{Path: "/tmp", Access: readFSAccess | writeFSAccess | execFSAccess},
-			fsEntry{Path: filepath.Join(workspace, ".git"), Access: readFSAccess},
-			fsEntry{Path: filepath.Join(workspace, ".looprig"), Access: readFSAccess},
+			fsEntry{Path: filepath.Join(workspace, ".git"), Access: readFSAccess, Denied: execFSAccess | writeFSAccess},
+			fsEntry{Path: filepath.Join(workspace, ".looprig"), Access: readFSAccess, Denied: execFSAccess | writeFSAccess},
 		)
-	case testDirect:
+	case fixtureDirect:
 		p.FS = append(p.FS, fsEntry{Path: "/", Access: readFSAccess | writeFSAccess | execFSAccess})
 		p.Net.Open = true
 		p.Env.Inherit = true
 		p.Isolation = Unconfined
 	}
 	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess})
-	if shape != testDirect {
-		p.FS = append(p.FS, testSecretDenials()...)
+	if shape != fixtureDirect {
+		p.FS = append(p.FS, fixtureSecretDenials()...)
 	}
-	if shape == testBroadNetwork {
+	if shape == fixtureBroadNetwork {
 		p.Net = effectiveNetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}
 	}
 	for _, opt := range opts {
@@ -63,7 +64,7 @@ func testPolicy(shape testPolicyShape, workspace string, opts ...PolicyOption) e
 	return p
 }
 
-func testSecretDenials() []fsEntry {
+func fixtureSecretDenials() []fsEntry {
 	paths := []string{"**/.env*", "/Library/Keychains"}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		paths = append(paths,
@@ -73,31 +74,33 @@ func testSecretDenials() []fsEntry {
 	}
 	entries := make([]fsEntry, 0, len(paths))
 	for _, path := range paths {
-		entries = append(entries, fsEntry{Path: path, Access: denyFSAccess})
+		entries = append(entries, fsEntry{Path: path, Denied: allFSAccess})
 	}
 	return entries
 }
 
-func WithWritable(path string) PolicyOption {
+func fixtureWithWritable(path string) backendFixtureOption {
 	return func(p *effectivePolicy) {
 		path = filepath.Clean(path)
 		p.FS = append(p.FS,
 			fsEntry{Path: path, Access: readFSAccess | writeFSAccess | execFSAccess},
-			fsEntry{Path: filepath.Join(path, ".git"), Access: readFSAccess},
-			fsEntry{Path: filepath.Join(path, ".looprig"), Access: readFSAccess},
+			fsEntry{Path: filepath.Join(path, ".git"), Access: readFSAccess, Denied: execFSAccess | writeFSAccess},
+			fsEntry{Path: filepath.Join(path, ".looprig"), Access: readFSAccess, Denied: execFSAccess | writeFSAccess},
 		)
 	}
 }
 
-func WithDenyRead(path string) PolicyOption {
-	return func(p *effectivePolicy) { p.FS = append(p.FS, fsEntry{Path: path, Access: denyFSAccess}) }
+func fixtureWithDenyRead(path string) backendFixtureOption {
+	return func(p *effectivePolicy) {
+		p.FS = append(p.FS, fsEntry{Path: path, Denied: readFSAccess | execFSAccess})
+	}
 }
 
-func WithoutSecretDenials() PolicyOption {
+func fixtureWithoutSecretDenials() backendFixtureOption {
 	return func(p *effectivePolicy) {
 		kept := p.FS[:0]
 		for _, entry := range p.FS {
-			if entry.Access != denyFSAccess {
+			if normalizedDenied(entry) == 0 {
 				kept = append(kept, entry)
 			}
 		}
@@ -105,11 +108,11 @@ func WithoutSecretDenials() PolicyOption {
 	}
 }
 
-func WithNet(net effectiveNetPolicy) PolicyOption {
+func fixtureWithNet(net effectiveNetPolicy) backendFixtureOption {
 	return func(p *effectivePolicy) { p.Net = net }
 }
 
-func WithEnv(env effectiveEnvPolicy) PolicyOption {
+func fixtureWithEnv(env effectiveEnvPolicy) backendFixtureOption {
 	return func(p *effectivePolicy) {
 		p.Env.Inherit = p.Env.Inherit || env.Inherit
 		p.Env.Allow = append(p.Env.Allow, env.Allow...)
@@ -122,11 +125,11 @@ func WithEnv(env effectiveEnvPolicy) PolicyOption {
 	}
 }
 
-func WithLimits(limits effectiveLimits) PolicyOption {
+func fixtureWithLimits(limits effectiveLimits) backendFixtureOption {
 	return func(p *effectivePolicy) { p.limits = limits }
 }
 
-func WithAckUnconfined() PolicyOption { return func(*effectivePolicy) {} }
+func fixtureWithAckUnconfined() backendFixtureOption { return func(*effectivePolicy) {} }
 
 func newExecutorForEffectivePolicy(p effectivePolicy, opts ...ExecOption) (*Executor, error) {
 	return newExecutorFromEffective(nil, p, opts...)

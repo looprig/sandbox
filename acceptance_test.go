@@ -64,7 +64,7 @@ func acceptRowEnvScrub(t *testing.T) {
 	ws := t.TempDir()
 
 	// Construct AFTER Setenv: the executor snapshots os.Environ at build.
-	e, err := newExecutorForEffectivePolicy(testPolicy(testWorkspaceWrite, ws))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
