@@ -204,6 +204,33 @@ type WindowsSetupConfig struct {
     ProxyPorts     []uint16
 }
 
+type WindowsSetupProblemCode uint16
+
+const (
+    WindowsSetupProblemUnknown WindowsSetupProblemCode = iota
+    WindowsSetupProblemManifestMissing
+    WindowsSetupProblemOwnerMismatch
+    WindowsSetupProblemHostBinaryStale
+    WindowsSetupProblemServiceUnavailable
+    WindowsSetupProblemAccountMissing
+    WindowsSetupProblemCredentialUnavailable
+    WindowsSetupProblemFirewallOverridden
+    WindowsSetupProblemFirewallRuleChanged
+    WindowsSetupProblemPortInUse
+    WindowsSetupProblemRuntimeBaselineGap
+    WindowsSetupProblemLeaseRecoveryPending
+    WindowsSetupProblemProtocolMismatch
+)
+
+type WindowsSetupProblem struct {
+    Code     WindowsSetupProblemCode
+    Resource string
+    Path     string
+    Port     uint16
+    PID      uint32
+    Detail   string
+}
+
 type WindowsSetupStatus struct {
     Ready           bool
     Version         uint32
@@ -212,7 +239,7 @@ type WindowsSetupStatus struct {
     OfflineAccount  string
     OnlineAccount   string
     ProxyPorts      []uint16
-    Problems        []string
+    Problems        []WindowsSetupProblem
 }
 
 func InspectWindowsSandbox(context.Context, WindowsSetupConfig) (WindowsSetupStatus, error)
@@ -223,6 +250,14 @@ func RemoveWindowsSandbox(context.Context, WindowsSetupConfig) error
 `InstallationID` is a stable application installation identifier, not a display
 name. Account, service, mutex, pipe, and firewall names use a truncated SHA-256
 digest of it so Windows account-name limits do not create collisions.
+
+Consumers branch on `WindowsSetupProblem.Code`; `Detail` is diagnostic text,
+not a stable API. Fields irrelevant to a code remain zero. In particular,
+`WindowsSetupProblemPortInUse` may report a zero PID when Windows cannot safely
+identify the owner. Producers normalize paths and resource names and never put
+passwords, tokens, proxy credentials, pipe nonces, or other secrets in a
+problem. Adding a new problem code is backward compatible; changing the meaning
+of an existing code is not.
 
 `StateRoot` must be an absolute local path. Elevated setup requires it to be
 beneath `%ProgramData%` unless a future explicit unsafe override is added.
@@ -403,6 +438,25 @@ fail-closed compatibility error, never a reason to omit the UI limits.
 This ordering is stricter than Codex's current runner, which assigns after
 creation and tolerates some Job errors.
 
+Every Windows process creation uses `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; ambient
+handle inheritance is forbidden on both tiers. The allowlist contains only the
+child's standard-input, standard-output, and standard-error handles plus, for
+the elevated runner, the read end of its sealed request pipe. Token, Job,
+process, thread, desktop/window-station, broker connection, canonicalization,
+ACL lease, journal, state-root, manifest, and proxy handles are never inherited.
+All handles are created non-inheritable by default, and each allowlisted handle
+is duplicated with the minimum required access and marked inheritable as
+required by `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The runner clears inheritance
+from its request handle before it launches the untrusted target, then
+constructs a fresh target handle list containing only standard I/O.
+
+The implementation must not rely on Go's ambient `InheritHandles` behavior.
+When the standard library launch path is usable, it must populate the explicit
+list from standard handles and intentional additional handles; the custom
+suspended/token/desktop launch path must reproduce the same invariant directly
+with `STARTUPINFOEX`. A launch fails closed if the attribute list cannot be
+created or updated.
+
 Restricted-token mode launches the target directly using `SysProcAttr.Token`.
 Elevated mode launches the installed host binary in runner mode using the token
 handle returned by the broker. Because the runner is assigned before resume,
@@ -509,6 +563,34 @@ AppContainer/LPAC backend requires a separate threat-model and SPEC revision.
 Both the sandbox account's normal access check and the restricting-SID access
 check must pass. This supplies the elevated read boundary without placing broad
 persistent deny-read ACEs across the user's profile.
+
+### 9.3 Elevated runtime feasibility gate
+
+Before broker or elevated-boundary implementation begins, a Windows spike must
+prove the exact fully restricted token on every supported Windows image. The
+inventory covers the installed runner, `cmd.exe`, PowerShell, the Go test
+helper, every runtime promised by the product, ordinary DLL/CRT loading, locale
+and console startup objects, and fixtures with DLL initializers and TLS
+callbacks. It records every restricting-list denial, the owning component, and
+the relevant DACL in `docs/spikes/windows-restricted-runtime.md`. The spike must
+not modify a WRP-owned object. Its result is a reviewed milestone gate, not a
+test deferred until the elevated implementation is otherwise complete.
+
+If the gaps affect only the protected, cooperative runner, the sanctioned
+fallback is Chromium's startup pattern: create the runner with the restricted
+primary token, install a minimally more capable impersonation token on its
+initial thread for trusted initialization, and irreversibly drop and close that
+token before the runner parses or launches an untrusted command. The runner
+must assert the final thread token state before launch, and the handle allowlist
+in §8 must prevent either token handle reaching the target.
+
+That pattern is not a fallback for arbitrary target executables. Their loader
+callbacks and startup code are already attacker-controlled, so giving their
+initial thread extra authority would invalidate the read boundary. If an
+arbitrary supported target needs bootstrap authority, the gate fails: the
+implementation must narrow its supported target set or return for a reviewed
+LPAC/AppContainer design change. It must not silently add a broader ambient SID,
+weaken the token, or expose the startup impersonation token to the target.
 
 ## 10. Windows path and filesystem policy
 
@@ -720,6 +802,9 @@ Compile reports use stable feature names such as `windows.token`,
 - Windows path-key pure tests, including case, separators, drive roots, extended
   syntax, ADS, device paths, UNC, and malformed UTF-16.
 - Broker protocol framing, versioning, size limits, invalid enums, and fuzzing.
+- Handle-list construction tests prove that only the declared standard/request
+  handles reach each launch path and that every other opened handle is
+  non-inheritable.
 - `GOOS=windows go test -c` for every package from Linux CI, catching build-tag
   gaps. Fix the existing `platform_other_test.go` typo as the first task.
 
@@ -766,6 +851,9 @@ Run on a standard-user Windows account with elevated installation absent:
 - timeout and parent crash leave no descendant marker;
 - the Job read-back shows all basic UI restrictions enabled and both breakaway
   limits disabled;
+- the child enumerates its handle table while the parent plants inheritable
+  canaries for the journal, state root, Job, canonical directory, and a writable
+  file; none is present, while standard I/O remains functional;
 - Explorer `IShellDispatch.ShellExecute`, `Start-Process`, WMI
   `Win32_Process.Create`, `schtasks`, COM elevation/broker paths, and GUI launch
   attempts run as adversarial subprocess cases. Any successful broker escape
@@ -792,6 +880,12 @@ Run on an ephemeral elevated Windows CI worker. Setup and removal wrap the suite
 - the `S-1-5-12` runtime baseline is inventoried, appears in the compile report,
   launches required Windows runtime code without changing WRP-owned DACLs, and
   cannot read any configured denied root or protected carveout;
+- the §9.3 spike corpus executes under the exact production token; if the
+  trusted-runner bootstrap fallback is selected, tests prove the impersonation
+  token is absent before request parsing and target launch;
+- the runner and target enumerate their handle tables while the parent and
+  broker plant inheritable token, Job, journal, state, canonicalization, pipe,
+  and writable-file canaries; each sees only its explicit §8 allowlist;
 - deny-read globs and protected carveouts survive case, extended-path, ADS,
   junction, symlink, root-swap, and post-grant races;
 - tree projection skips multi-link files and records narrowing; exact grants to
@@ -852,14 +946,23 @@ Implementation is split into independently reviewable milestones:
    selection, conservative one-way guarantee conformance, and the explicit
    Windows `S-1-5-12` runtime baseline; then add portability seams, path model,
    and cross-compilation;
-2. Job limits and expanded conformance suite;
-3. restricted-token direct write confinement, UI restrictions, local cleanup
+2. complete and review the §9.3 runtime-baseline feasibility spike, including
+   the exact-token startup corpus and a go/no-go decision on trusted-runner
+   impersonation; add the shared explicit-handle-list launch primitive and its
+   canary tests;
+3. Job limits and expanded conformance suite;
+4. restricted-token direct write confinement, UI restrictions, local cleanup
    journal, and broker-escape suite with all end-to-end OS bits withheld;
-4. broker protocol and protected setup lifecycle;
-5. elevated filesystem/read boundary and private runner;
-6. offline firewall and target proxy;
-7. grant recompilation and ACL lease lifecycle;
-8. adversarial Windows CI and documentation.
+5. broker protocol and protected setup lifecycle;
+6. elevated filesystem/read boundary and private runner;
+7. offline firewall and target proxy;
+8. grant recompilation and ACL lease lifecycle;
+9. adversarial Windows CI and documentation.
+
+Milestone 5 may not begin until milestone 2 has recorded a supported runtime
+baseline or a reviewed trusted-runner-only bootstrap. A result that needs extra
+authority in arbitrary target startup is a design failure, not an implementation
+task hidden inside milestone 6.
 
 Restricted-token support may ship before elevated support, but `WindowsAuto`
 must continue failing closed for write/read/network-required profiles. A later
@@ -868,11 +971,55 @@ change backed by the full broker suite. Elevated mode may ship only after setup
 removal and crash reconciliation are implemented; a persistent security
 mechanism without a safe uninstall/recovery path is not complete.
 
+### 16.1 Deferred strong unelevated tier: LPAC/AppContainer
+
+The expected path to promote unelevated process, read, and network guarantees is
+an LPAC/AppContainer tier, not an attempt to prove that a `WRITE_RESTRICTED`
+interactive-user token can never reach Explorer, COM, WMI, or another full-user
+broker. AppContainer package and capability SIDs provide an identity that those
+brokers deny unless explicitly enabled; LPAC removes the normal broad
+AppContainer resource grants, including COM unless the `lpacCom` capability is
+present. Network access is denied without a network capability, and filesystem
+access can use package/capability SID ACL projection without administrative
+account provisioning.
+
+This direction is not free compatibility. The current target proxy uses
+loopback, which AppContainer blocks by default; a v2 design must choose and
+threat-model either a narrowly scoped loopback exemption or a different broker
+transport. It must also inventory packaged/unpackaged process creation,
+toolchain child processes, registry and named-object dependencies, runtime
+capabilities, ACL cleanup, and supported Windows editions. Restricted-tier
+guarantee bits are promoted only after those mechanisms and the full broker
+escape suite pass live CI.
+
+### 16.2 Optional no-child exact commands
+
+A future exact-command grant may declare that the target is not expected to
+spawn children and request `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` with
+`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`. This is opt-in because normal build
+tools create processes. It is defense in depth on the v1 restricted tier and
+does not earn `ProcessBoundary`: Microsoft documents the policy as effective
+for sandboxed applications such as AppContainer and as bypassable by a process
+with sufficient rights to another process handle, while out-of-process brokers
+remain outside the restricted token's Job.
+
+The strong form therefore belongs with the LPAC/AppContainer design. There it
+may support a hard no-child claim for a narrow exact command only after live
+tests cover direct creation, shell/COM/WMI/scheduled-task brokers, handle-based
+remote creation, and cleanup. This uses the child-process-policy process
+attribute, not the mitigation-policy attribute.
+
 ## 17. Acceptance criteria
 
 The feature is complete when:
 
 - both explicit modes and auto selection are public and documented;
+- setup inspection returns stable typed problem codes with safe structured
+  details rather than prose-only diagnostics;
+- the §9.3 feasibility gate records a supported runtime baseline or an approved
+  trusted-runner-only bootstrap before elevated implementation proceeds;
+- both tiers enforce an explicit inherited-handle allowlist, and live canary
+  enumeration finds no ambient handle in the runner or target;
 - restricted mode live-tests direct Job/ACL/UI defenses and broker escapes
   without claiming process/write/resource guarantees;
 - elevated mode live-tests read/write/process/network/target guarantees after
@@ -901,6 +1048,13 @@ The feature is complete when:
   `Win32_Process.Create` exception.
 - [JOBOBJECT_BASIC_UI_RESTRICTIONS](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_ui_restrictions)
   defines the USER, desktop, atom, clipboard, and system UI limits.
+- [UpdateProcThreadAttribute](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+  defines explicit handle inheritance and the child-process policy, including
+  its sandbox and privileged-handle qualifications.
+- [SetThreadToken](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadtoken)
+  is the API used to install or remove a startup impersonation token.
+- [Chromium sandbox design](https://chromium.googlesource.com/chromium/src/%2B/master/docs/design/sandbox.md)
+  documents the cooperative target bootstrap whose scope is narrowed in §9.3.
 - [Security Identifiers](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers)
   defines `S-1-5-12` as Restricted Code.
 - [Hard Links and Junctions](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)
