@@ -1,6 +1,6 @@
 //go:build linux
 
-package sandbox
+package linux
 
 import (
 	"context"
@@ -17,104 +17,104 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// linuxCaps is the runtime capability snapshot the Linux backend selector reads
-// while constructing an executor to pick the strongest achievable enforcement rung
+// Caps is the runtime capability snapshot the Linux backend selector reads
+// while constructing an executor to pick the strongest achievable enforcement Rung
 // (SPEC §7.2). Every field is a MEASURED fact about THIS host, taken by an
 // active probe (not assumed): a mechanism that cannot be confirmed is reported
 // absent (false / 0 / ""), which is the fail-secure default — an over-reported
-// capability would let the selector claim a rung the kernel will not enforce.
-type linuxCaps struct {
-	// landlockABI is the kernel's Landlock ABI version, or 0 when Landlock is
-	// unavailable. Rung 1 needs >=1 (any FS rules); rung 2 needs >=4 (that is
-	// where Landlock TCP port rules land, which rung 2's port allowlist uses).
-	landlockABI int
-	// seccomp reports whether SECCOMP_MODE_FILTER (classic-BPF filters) can be
+// capability would let the selector claim a Rung the kernel will not enforce.
+type Caps struct {
+	// LandlockABI is the kernel's Landlock ABI version, or 0 when Landlock is
+	// unavailable. Rung 1 needs >=1 (any FS rules); Rung 2 needs >=4 (that is
+	// where Landlock TCP port rules land, which Rung 2's port allowlist uses).
+	LandlockABI int
+	// Seccomp reports whether SECCOMP_MODE_FILTER (classic-BPF filters) can be
 	// installed — probed side-effect-free via SECCOMP_GET_ACTION_AVAIL, which
-	// installs nothing. Both rungs apply a seccomp filter in the stage-2 child.
-	seccomp bool
-	// userns reports a USABLE unprivileged user namespace: one that can be
+	// installs nothing. Both rungs apply a Seccomp filter in the stage-2 child.
+	Seccomp bool
+	// Userns reports a USABLE unprivileged user namespace: one that can be
 	// created AND grants effective privilege inside it (at least one of the
-	// rung-1 capabilities — CAP_SYS_ADMIN for the mount view or CAP_NET_ADMIN
-	// for the netns). A userns that CREATES but is stripped of effective
+	// Rung-1 capabilities — CAP_SYS_ADMIN for the mount view or CAP_NET_ADMIN
+	// for the Netns). A Userns that CREATES but is stripped of effective
 	// capabilities (Ubuntu's apparmor_restrict_unprivileged_userns=1) is
-	// reported false, because it cannot support rung 1. It is exactly
-	// (mountns || netns), so the invariants "netns implies userns" and
-	// "mountns implies userns" hold by construction.
-	userns bool
-	// netns reports a net namespace created together with a userns in which
-	// CAP_NET_ADMIN is EFFECTIVE (proven by bringing loopback up). This is what
-	// rung 1 needs to run in-namespace nftables (SPEC §5.2). Implies userns.
-	netns bool
-	// mountns reports a mount namespace created together with a userns in which
-	// CAP_SYS_ADMIN is EFFECTIVE (proven by a private recursive remount of /,
-	// confined to the throwaway child's own mount namespace). This is what
-	// rung 1 needs for its bind-mount view. Implies userns.
-	mountns bool
-	// cgroupV2 reports the cgroup v2 unified hierarchy is mounted (used by the
-	// resource-limit backend, SPEC §7.4). Not part of the rung ladder.
-	cgroupV2 bool
-	// cgroupPids is the nearest writable cgroup ancestor that distributes the
+	// reported false, because it cannot support Rung 1. It is exactly
+	// (Mountns || Netns), so the invariants "Netns implies Userns" and
+	// "Mountns implies Userns" hold by construction.
+	Userns bool
+	// Netns reports a net namespace created together with a Userns in which
+	// CAP_NET_ADMIN is EFFECTIVE (proven by bringing Loopback up). This is what
+	// Rung 1 needs to run in-namespace nftables (SPEC §5.2). Implies Userns.
+	Netns bool
+	// Mountns reports a mount namespace created together with a Userns in which
+	// CAP_SYS_ADMIN is EFFECTIVE (proven by a Private recursive remount of /,
+	// Confined to the throwaway child's own mount namespace). This is what
+	// Rung 1 needs for its bind-mount view. Implies Userns.
+	Mountns bool
+	// CgroupV2 reports the cgroup v2 unified hierarchy is mounted (used by the
+	// resource-limit backend, SPEC §7.4). Not part of the Rung ladder.
+	CgroupV2 bool
+	// CgroupPids is the nearest writable cgroup Ancestor that distributes the
 	// pids controller to its children, or "" when none exists. A non-empty
-	// value implies cgroupV2. Not part of the rung ladder.
-	cgroupPids string
+	// value implies CgroupV2. Not part of the Rung ladder.
+	CgroupPids string
 }
 
-// rung is the OS-enforcement tier a Linux host can achieve (SPEC §7.2),
+// Rung is the OS-enforcement tier a Linux host can achieve (SPEC §7.2),
 // strongest last so the numeric order matches strength.
-type rung uint8
+type Rung uint8
 
 const (
-	// rungNone means no usable OS enforcement mechanism -> LevelNone.
-	rungNone rung = iota
-	// rungTwo means Landlock (v4+) + seccomp with NO namespaces: FS by
+	// RungNone means no usable OS enforcement mechanism -> profile.LevelNone.
+	RungNone Rung = iota
+	// RungTwo means Landlock (v4+) + Seccomp with NO namespaces: FS by
 	// enumerated allowlist and a TCP port allowlist, no address scoping.
-	rungTwo
-	// rungOne means namespaces (user+mount+net) + Landlock + seccomp: the full
-	// ladder, including in-netns nftables address scoping and the mount view.
-	rungOne
+	RungTwo
+	// RungOne means namespaces (user+mount+net) + Landlock + Seccomp: the full
+	// ladder, including in-Netns nftables address scoping and the mount view.
+	RungOne
 )
 
-// selectRung picks the strongest achievable rung from a capability snapshot,
+// SelectRung picks the strongest achievable Rung from a capability snapshot,
 // per the SPEC §7.2 ladder. Rung 1 requires the three namespaces plus Landlock
 // (any ABI >= 1, since it scopes network with nftables rather than Landlock TCP
-// rules) plus seccomp. Rung 2 requires Landlock ABI >= 4 (TCP port rules) plus
-// seccomp. Anything less is rungNone. It is fail-secure: a missing capability
-// can only ever LOWER the rung.
-func (c linuxCaps) selectRung() rung {
+// rules) plus Seccomp. Rung 2 requires Landlock ABI >= 4 (TCP port rules) plus
+// Seccomp. Anything less is RungNone. It is fail-secure: a missing capability
+// can only ever LOWER the Rung.
+func (c Caps) SelectRung() Rung {
 	switch {
-	case c.userns && c.mountns && c.netns && c.landlockABI >= 1 && c.seccomp:
-		return rungOne
-	case c.landlockABI >= 4 && c.seccomp:
-		return rungTwo
+	case c.Userns && c.Mountns && c.Netns && c.LandlockABI >= 1 && c.Seccomp:
+		return RungOne
+	case c.LandlockABI >= 4 && c.Seccomp:
+		return RungTwo
 	default:
-		return rungNone
+		return RungNone
 	}
 }
 
-// probeLinuxCaps actively measures every capability the rung ladder depends on.
+// ProbeCaps actively measures every capability the Rung ladder depends on.
 // It has NO lasting side effects on the calling process: the namespace probes
-// run in throwaway forked children (see probeNamespaceCap), the seccomp probe
+// run in throwaway forked children (see probeNamespaceCap), the Seccomp probe
 // only queries availability, and the Landlock/cgroup probes are read-only.
-func probeLinuxCaps() linuxCaps {
-	c := linuxCaps{
-		landlockABI: probeLandlockABI(),
-		seccomp:     probeSeccompFilter(),
-		mountns:     probeNamespaceCap(nsProbeMount),
-		netns:       probeNamespaceCap(nsProbeNet),
-		cgroupV2:    probeCgroupV2Unified(),
-		cgroupPids:  probeDelegatedPidsAncestor(),
+func ProbeCaps() Caps {
+	c := Caps{
+		LandlockABI: ProbeLandlockABI(),
+		Seccomp:     ProbeSeccompFilter(),
+		Mountns:     probeNamespaceCap(nsProbeMount),
+		Netns:       probeNamespaceCap(nsProbeNet),
+		CgroupV2:    probeCgroupV2Unified(),
+		CgroupPids:  ProbeDelegatedPidsAncestor(),
 	}
-	// userns is the usable-userns rollup: a user namespace is only useful to
-	// rung 1 if it grants at least one effective privilege. Deriving it from
-	// the two capability probes guarantees the "netns/mountns implies userns"
+	// Userns is the usable-Userns rollup: a user namespace is only useful to
+	// Rung 1 if it grants at least one effective privilege. Deriving it from
+	// the two capability probes guarantees the "Netns/Mountns implies Userns"
 	// invariants hold.
-	c.userns = c.mountns || c.netns
+	c.Userns = c.Mountns || c.Netns
 	return c
 }
 
-// probeLandlockABI returns the kernel Landlock ABI version, or 0 when Landlock
+// ProbeLandlockABI returns the kernel Landlock ABI version, or 0 when Landlock
 // is unavailable. LandlockGetABIVersion is a pure query (no ruleset created).
-func probeLandlockABI() int {
+func ProbeLandlockABI() int {
 	abi, err := lsyscall.LandlockGetABIVersion()
 	if err != nil || abi < 0 {
 		return 0
@@ -122,14 +122,14 @@ func probeLandlockABI() int {
 	return abi
 }
 
-// probeSeccompFilter reports whether SECCOMP_MODE_FILTER is usable, WITHOUT
-// installing a filter. seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &action) asks the
+// ProbeSeccompFilter reports whether SECCOMP_MODE_FILTER is usable, WITHOUT
+// installing a filter. Seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &action) asks the
 // kernel whether it recognizes a given filter return action; a zero errno means
-// the seccomp filter machinery is present and usable. It is unprivileged and
+// the Seccomp filter machinery is present and usable. It is unprivileged and
 // side-effect-free. (A pre-4.14 kernel lacks GET_ACTION_AVAIL and would report
 // false even though filter mode exists — that under-reports, which is
 // fail-secure, and is irrelevant on the modern kernels this ships against.)
-func probeSeccompFilter() bool {
+func ProbeSeccompFilter() bool {
 	action := uint32(unix.SECCOMP_RET_KILL_PROCESS)
 	_, _, errno := unix.Syscall(
 		unix.SYS_SECCOMP,
@@ -148,8 +148,8 @@ const probeSentinelEnv = "LRSANDBOX_PROBE_NS"
 
 // The two capability probes carried in probeSentinelEnv.
 const (
-	nsProbeMount = "mount" // CAP_SYS_ADMIN via a private remount inside a new mount ns
-	nsProbeNet   = "net"   // CAP_NET_ADMIN via bringing loopback up inside a new net ns
+	nsProbeMount = "mount" // CAP_SYS_ADMIN via a Private remount inside a new mount ns
+	nsProbeNet   = "net"   // CAP_NET_ADMIN via bringing Loopback up inside a new net ns
 )
 
 // probeCapEffectiveCode is the DISTINCTIVE exit code a namespace-probe child uses
@@ -157,7 +157,7 @@ const (
 // probeNamespaceCap must distinguish a genuinely-dispatched probe child from a
 // process that never dispatched (Init not called -> the re-exec'd child fell
 // through to run its normal main() and happened to exit 0). Reading exit 0 as
-// "effective" would be a fail-OPEN — an over-claimed rung the kernel will not
+// "effective" would be a fail-OPEN — an over-claimed Rung the kernel will not
 // enforce. Only this exact code counts as success; everything else (including 0)
 // reads as "absent" (fail-secure). 66 is arbitrary, outside the common
 // 0/1/2/126/127 range.
@@ -175,12 +175,12 @@ const probeChildTimeout = 5 * time.Second
 // EFFECTIVE; any other code means it was denied (EPERM/EACCES under
 // apparmor_restrict_unprivileged_userns) or the operation otherwise failed. The
 // success code is distinctive (not 0) so a non-dispatching child cannot be misread
-// as success (see probeCapEffectiveCode). Every mutation is confined to this
+// as success (see probeCapEffectiveCode). Every mutation is Confined to this
 // child's own namespaces, which vanish when it exits — the parent is never touched.
 func runNamespaceProbeChild(mode string) int {
 	switch mode {
 	case nsProbeMount:
-		// A recursive private remount of / needs CAP_SYS_ADMIN and is confined
+		// A recursive Private remount of / needs CAP_SYS_ADMIN and is Confined
 		// to this child's own (unshared) mount namespace: nothing the parent or
 		// host can observe.
 		if err := unix.Mount("none", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
@@ -197,9 +197,9 @@ func runNamespaceProbeChild(mode string) int {
 	}
 }
 
-// bringLoopbackUp sets the loopback interface UP inside the child's own network
-// namespace — a CAP_NET_ADMIN operation. In a fresh netns lo starts DOWN, so
-// SIOCSIFFLAGS here exercises the capability rung 1 needs for in-netns nftables.
+// bringLoopbackUp sets the Loopback interface UP inside the child's own network
+// namespace — a CAP_NET_ADMIN operation. In a fresh Netns lo starts DOWN, so
+// SIOCSIFFLAGS here exercises the capability Rung 1 needs for in-Netns nftables.
 func bringLoopbackUp() error {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -268,7 +268,7 @@ func probeNamespaceCap(mode string) bool {
 	// probeCapEffectiveCode. A nil error (exit 0) is NOT treated as success: a
 	// child that never dispatched (Init not called, so it fell through to its
 	// normal main() and exited 0) must not be misread as "capability present" —
-	// that would be a fail-OPEN over-claim of the rung. Any error, any other exit
+	// that would be a fail-OPEN over-claim of the Rung. Any error, any other exit
 	// code, a signal, or the context timeout all read as "absent" (fail-secure).
 	err := cmd.Run()
 	var ee *exec.ExitError
@@ -289,16 +289,16 @@ func probeCgroupV2Unified() bool {
 	return err == nil
 }
 
-// probeDelegatedPidsAncestor returns the nearest ancestor of this process's own
+// ProbeDelegatedPidsAncestor returns the nearest Ancestor of this process's own
 // cgroup that is BOTH writable AND distributes the pids controller to its
 // children (so a fresh child cgroup created there immediately has a working
-// pids.max), or "" when no such ancestor exists. It walks up from the unified
+// pids.max), or "" when no such Ancestor exists. It walks up from the unified
 // ("0::") cgroup of /proc/self/cgroup, never escaping the mount root.
-func probeDelegatedPidsAncestor() string {
+func ProbeDelegatedPidsAncestor() string {
 	if !probeCgroupV2Unified() {
 		return ""
 	}
-	selfDir, ok := selfCgroupDir()
+	selfDir, ok := SelfCgroupDir()
 	if !ok {
 		return ""
 	}
@@ -318,11 +318,11 @@ func probeDelegatedPidsAncestor() string {
 	}
 }
 
-// selfCgroupDir resolves the absolute directory of this process's own cgroup v2
+// SelfCgroupDir resolves the absolute directory of this process's own cgroup v2
 // node from the unified ("0::") line of /proc/self/cgroup. The relative path is
 // cleaned and re-anchored under the mount root so a crafted cgroup path cannot
 // escape it.
-func selfCgroupDir() (string, bool) {
+func SelfCgroupDir() (string, bool) {
 	b, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return "", false

@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
@@ -17,15 +18,15 @@ import (
 // weaker kernels rather than silently passing an unenforced sandbox.
 func requireLandlockV4(t *testing.T) {
 	t.Helper()
-	if abi := probeLandlockABI(); abi < 4 {
-		t.Skipf("landlock ABI v4 unavailable: kernel reports ABI v%d; rung-2 FS confinement cannot run", abi)
+	if abi := linux.ProbeLandlockABI(); abi < 4 {
+		t.Skipf("landlock ABI v4 unavailable: kernel reports ABI v%d; linux.Rung-2 FS confinement cannot run", abi)
 	}
 }
 
 // newFSExecutor builds an executor pinned to the rung-2 linux backend.
 func newFSExecutor(t *testing.T, p policy.Effective) *Executor {
 	t.Helper()
-	e, err := newExecutorForEffectivePolicy(p, withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(p, withBackend(linux.NewBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -150,7 +151,7 @@ func TestLinuxFSGitCarveout(t *testing.T) {
 		t.Errorf("write into .git succeeded — FAIL-OPEN: the read-only carveout leaked write access")
 	}
 	if _, err := os.Stat(gitWrite); err == nil {
-		t.Errorf(".git/x was created — FAIL-OPEN: carveout not enforced")
+		t.Errorf(".git/x was created — FAIL-OPEN: carveout not linux.Enforced")
 	}
 }
 
@@ -242,7 +243,7 @@ func TestLinuxFSGuarantees(t *testing.T) {
 		{"WriteBoundary", g.WriteBoundary},
 		{"ReadBoundary", g.ReadBoundary},
 		{"EnvScrub", g.EnvScrub},
-		// NetworkBoundary is earned by 12c: the fixture is net-confined (Net{}
+		// NetworkBoundary is earned by 12c: the fixture is net-Confined (Net{}
 		// compiles to an empty TCP allowlist = all TCP denied), so the port-level
 		// network boundary holds. AddressNetwork stays false — rung 2 cannot
 		// address-scope.
@@ -262,12 +263,12 @@ func TestLinuxFSGuarantees(t *testing.T) {
 	}
 	for _, b := range falseBits {
 		if b.got {
-			t.Errorf("Guarantees().%s = true, want false (not enforced at rung 2)", b.name)
+			t.Errorf("Guarantees().%s = true, want false (not linux.Enforced at linux.Rung 2)", b.name)
 		}
 	}
 	// ResourceLimits (Task 14) is earned only when cgroup v2 pids delegation is
 	// available; it is orthogonal to the FS rung and must never move the Level.
-	wantResourceLimits := probeDelegatedPidsAncestor() != ""
+	wantResourceLimits := linux.ProbeDelegatedPidsAncestor() != ""
 	if g.ResourceLimits != wantResourceLimits {
 		t.Errorf("Guarantees().ResourceLimits = %v, want %v (matches cgroup v2 pids delegation availability)", g.ResourceLimits, wantResourceLimits)
 	}
@@ -297,11 +298,11 @@ func TestLinuxFSFailsClosedOnUnexecutableTarget(t *testing.T) {
 	}
 	e := newFSExecutor(t, p)
 
-	out, code, err := e.RunArgv(context.Background(), ws, []string{"/bin/echo", "confined"})
+	out, code, err := e.RunArgv(context.Background(), ws, []string{"/bin/echo", "Confined"})
 	if err != nil {
 		// A spawn/setup error is also an acceptable fail-closed outcome; either way
 		// the target did not run.
-		if string(out) == "confined\n" {
+		if string(out) == "Confined\n" {
 			t.Fatalf("target produced output despite error — FAIL-OPEN: %v", err)
 		}
 		return
@@ -309,7 +310,7 @@ func TestLinuxFSFailsClosedOnUnexecutableTarget(t *testing.T) {
 	if code == 0 {
 		t.Errorf("over-restrictive FS spawn exited 0 — FAIL-OPEN: target ran unconfined; out=%q", out)
 	}
-	if string(out) == "confined\n" {
+	if string(out) == "Confined\n" {
 		t.Errorf("target echoed its output — FAIL-OPEN: it executed despite no exec grant; out=%q", out)
 	}
 }
@@ -453,7 +454,7 @@ func TestEnumerateFSRules(t *testing.T) {
 // TestEnumerateDenyOverridesAllow proves the review's Finding 1 fix: an ALLOW
 // whose path is at-or-under a literal DENY is dropped (deny is a hard override,
 // SPEC §5.1) — no emitted rule covers the denied subtree. Covers both deny==allow
-// and deny-is-ancestor-of-allow.
+// and deny-is-Ancestor-of-allow.
 func TestEnumerateUsesLongestSpecificAxisRule(t *testing.T) {
 	root := t.TempDir()
 	mk := func(p string) string {
@@ -510,7 +511,7 @@ func TestLinuxFSDenyEqualsAllowIsDenied(t *testing.T) {
 		t.Fatalf("seed secret: %v", err)
 	}
 
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithWritable(secretDir), fixtureWithDenyRead(secretDir)), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithWritable(secretDir), fixtureWithDenyRead(secretDir)), withBackend(linux.NewBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -545,7 +546,7 @@ func TestLandlockAccessSetHonorsBits(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			set := landlockAccessSet(tt.access, tt.isDir)
+			set := linux.LandlockAccessSet(tt.access, tt.isDir)
 			if got := set&llsys.AccessFSExecute != 0; got != tt.wantExec {
 				t.Errorf("execute bit = %v, want %v (set=%#x)", got, tt.wantExec, set)
 			}

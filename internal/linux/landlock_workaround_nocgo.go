@@ -1,6 +1,6 @@
 //go:build linux && !cgo
 
-package sandbox
+package linux
 
 import (
 	"github.com/looprig/sandbox/internal/policy"

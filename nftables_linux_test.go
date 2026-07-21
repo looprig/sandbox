@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"net"
 	"strings"
@@ -16,7 +17,7 @@ import (
 
 // TestCompileNftPlan asserts the pure policy.NetPolicy -> nftables plan compilation
 // (SPEC §5.2, §5.4, §7.2 rung 1): open egress is unconfined (no ruleset, no
-// netns); every other policy is confined with the metadata deny always present
+// Netns); every other policy is Confined with the metadata deny always present
 // and each accept gated by its flag. Runs on THIS host — no netlink.
 func TestCompileNftPlan(t *testing.T) {
 	t.Parallel()
@@ -31,9 +32,9 @@ func TestCompileNftPlan(t *testing.T) {
 		wantMetadata bool
 	}{
 		{name: "open egress: unconfined, no ruleset", net: policy.NetPolicy{Open: true}, wantConfined: false},
-		{name: "zerotrust (all-false): confined, everything dropped, metadata denied", net: policy.NetPolicy{}, wantConfined: true, wantMetadata: true},
+		{name: "zerotrust (all-false): Confined, everything dropped, metadata denied", net: policy.NetPolicy{}, wantConfined: true, wantMetadata: true},
 		{
-			name:         "trusted: ports+loopback+private+dns, metadata denied",
+			name:         "trusted: ports+Loopback+Private+Dns, metadata denied",
 			net:          policy.NetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true},
 			wantConfined: true, wantPorts: []uint16{443}, wantLoopback: true, wantPrivate: true, wantDNS: true, wantMetadata: true,
 		},
@@ -46,25 +47,25 @@ func TestCompileNftPlan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			plan := compileNftPlan(tt.net)
-			if plan.confined != tt.wantConfined {
-				t.Fatalf("confined = %v, want %v", plan.confined, tt.wantConfined)
+			plan := linux.CompileNftPlan(tt.net)
+			if plan.Confined != tt.wantConfined {
+				t.Fatalf("Confined = %v, want %v", plan.Confined, tt.wantConfined)
 			}
 			if !tt.wantConfined {
-				if len(plan.metadataCIDRs) != 0 {
-					t.Errorf("open policy carries metadata CIDRs: %v", plan.metadataCIDRs)
+				if len(plan.MetadataCIDRs) != 0 {
+					t.Errorf("open policy carries metadata CIDRs: %v", plan.MetadataCIDRs)
 				}
 				return
 			}
-			if len(plan.tcpPorts) != len(tt.wantPorts) {
-				t.Errorf("tcpPorts = %v, want %v", plan.tcpPorts, tt.wantPorts)
+			if len(plan.TcpPorts) != len(tt.wantPorts) {
+				t.Errorf("TcpPorts = %v, want %v", plan.TcpPorts, tt.wantPorts)
 			}
-			if plan.loopback != tt.wantLoopback || plan.private != tt.wantPrivate || plan.dns != tt.wantDNS {
-				t.Errorf("flags loopback/private/dns = %v/%v/%v, want %v/%v/%v",
-					plan.loopback, plan.private, plan.dns, tt.wantLoopback, tt.wantPrivate, tt.wantDNS)
+			if plan.Loopback != tt.wantLoopback || plan.Private != tt.wantPrivate || plan.Dns != tt.wantDNS {
+				t.Errorf("flags Loopback/Private/Dns = %v/%v/%v, want %v/%v/%v",
+					plan.Loopback, plan.Private, plan.Dns, tt.wantLoopback, tt.wantPrivate, tt.wantDNS)
 			}
-			if tt.wantMetadata && len(plan.metadataCIDRs) == 0 {
-				t.Errorf("metadata deny CIDRs missing on a confined policy")
+			if tt.wantMetadata && len(plan.MetadataCIDRs) == 0 {
+				t.Errorf("metadata deny CIDRs missing on a Confined policy")
 			}
 		})
 	}
@@ -91,9 +92,9 @@ func TestParseCIDR(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			ipnet, err := parseCIDR(tt.in)
+			ipnet, err := linux.ParseCIDR(tt.in)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseCIDR(%q) err = %v, wantErr %v", tt.in, err, tt.wantErr)
+				t.Fatalf("linux.ParseCIDR(%q) err = %v, wantErr %v", tt.in, err, tt.wantErr)
 			}
 			if tt.wantErr {
 				return
@@ -125,16 +126,16 @@ func TestCidrVerdictRule(t *testing.T) {
 	}{
 		{name: "ipv4 metadata drop", cidr: "169.254.0.0/16", kind: expr.VerdictDrop},
 		{name: "ipv6 metadata drop (bare)", cidr: "fd00:ec2::254", kind: expr.VerdictDrop},
-		{name: "ipv4 private accept", cidr: "10.0.0.0/8", kind: expr.VerdictAccept},
+		{name: "ipv4 Private accept", cidr: "10.0.0.0/8", kind: expr.VerdictAccept},
 		{name: "ipv6 ula accept", cidr: "fc00::/7", kind: expr.VerdictAccept},
 		{name: "bad cidr fails closed", cidr: "xyz", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			rule, err := cidrVerdictRule(table, chain, tt.cidr, tt.kind)
+			rule, err := linux.CIDRVerdictRule(table, chain, tt.cidr, tt.kind)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("cidrVerdictRule err = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("linux.CIDRVerdictRule err = %v, wantErr %v", err, tt.wantErr)
 			}
 			if tt.wantErr {
 				return
@@ -153,7 +154,7 @@ func TestDportAcceptRule(t *testing.T) {
 	t.Parallel()
 	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "filter"}
 	chain := &nftables.Chain{Name: "output", Table: table}
-	rule := dportAcceptRule(table, chain, unix.IPPROTO_TCP, 443)
+	rule := linux.DportAcceptRule(table, chain, unix.IPPROTO_TCP, 443)
 
 	// 443 == 0x01BB, big-endian.
 	foundPort := false
@@ -173,22 +174,22 @@ func TestDportAcceptRule(t *testing.T) {
 // TestIfname asserts the interface name is padded to the 16-byte IFNAMSIZ field.
 func TestIfname(t *testing.T) {
 	t.Parallel()
-	b := ifname("lo")
+	b := linux.Ifname("lo")
 	if len(b) != 16 {
-		t.Fatalf("ifname len = %d, want 16", len(b))
+		t.Fatalf("linux.Ifname len = %d, want 16", len(b))
 	}
 	if b[0] != 'l' || b[1] != 'o' {
-		t.Errorf("ifname prefix = %q, want lo", b[:2])
+		t.Errorf("linux.Ifname prefix = %q, want lo", b[:2])
 	}
 	for i := 2; i < 16; i++ {
 		if b[i] != 0 {
-			t.Errorf("ifname byte %d = %d, want 0 padding", i, b[i])
+			t.Errorf("linux.Ifname byte %d = %d, want 0 padding", i, b[i])
 		}
 	}
 }
 
 // TestBuildRung1Ruleset builds the full rung-1 ruleset (metadata deny + ct +
-// loopback + ports + dns + private) into a netlink conn WITHOUT flushing, proving
+// Loopback + ports + Dns + Private) into a netlink conn WITHOUT flushing, proving
 // every CIDR/port rule assembles without error. Constructing the conn opens an
 // unprivileged netlink socket; if that is unavailable the test skips (the flush —
 // which needs CAP_NET_ADMIN — is never reached here). Runs on THIS host when
@@ -198,7 +199,7 @@ func TestBuildRung1Ruleset(t *testing.T) {
 	if err != nil {
 		t.Skipf("nftables netlink socket unavailable on this host (no flush attempted): %v", err)
 	}
-	spec := NftSpec{
+	spec := linux.NftSpec{
 		Confined:      true,
 		TCPPorts:      []uint16{443},
 		Loopback:      true,
@@ -206,10 +207,10 @@ func TestBuildRung1Ruleset(t *testing.T) {
 		DNS:           true,
 		MetadataCIDRs: policy.MetadataDenyCIDRs(),
 	}
-	if err := buildRung1Ruleset(conn, spec); err != nil {
-		t.Fatalf("buildRung1Ruleset: %v", err)
+	if err := linux.BuildRung1Ruleset(conn, spec); err != nil {
+		t.Fatalf("linux.BuildRung1Ruleset: %v", err)
 	}
-	// Deliberately NOT flushed: Flush would require CAP_NET_ADMIN in a netns.
+	// Deliberately NOT flushed: Flush would require CAP_NET_ADMIN in a Netns.
 }
 
 // TestDaddrMatchExprsFamilyGuard asserts the address match guards on nfproto
@@ -217,11 +218,11 @@ func TestBuildRung1Ruleset(t *testing.T) {
 // v4/v6-mixed inet table needs. Runs on THIS host.
 func TestDaddrMatchExprsFamilyGuard(t *testing.T) {
 	t.Parallel()
-	v4, err := parseCIDR("10.0.0.0/8")
+	v4, err := linux.ParseCIDR("10.0.0.0/8")
 	if err != nil {
-		t.Fatalf("parseCIDR v4: %v", err)
+		t.Fatalf("linux.ParseCIDR v4: %v", err)
 	}
-	exprs := daddrMatchExprs(v4)
+	exprs := linux.DaddrMatchExprs(v4)
 	// First expr must be the nfproto meta load; a payload load must appear.
 	if _, ok := exprs[0].(*expr.Meta); !ok {
 		t.Errorf("first expr = %T, want *expr.Meta (nfproto guard)", exprs[0])
@@ -245,24 +246,24 @@ func TestDaddrMatchExprsFamilyGuard(t *testing.T) {
 	}
 }
 
-// TestRung1NftEnforcement is the CI-verified enforcement proof for the in-netns
+// TestRung1NftEnforcement is the CI-verified enforcement proof for the in-Netns
 // nftables filter (SPEC §5.4). Anti-fail-open: it asserts the §5.4 cloud-metadata
-// endpoint is DROPPED (not merely unrouted) while a confined command still runs —
+// endpoint is DROPPED (not merely unrouted) while a Confined command still runs —
 // the negative direction that a blanket blackhole could NOT prove on its own (the
 // positive scoping is proven by the M4 spike). It SKIPS on the authoring host
-// (netns/CAP_NET_ADMIN blocked) with a recorded reason and runs only in CI (which
+// (Netns/CAP_NET_ADMIN blocked) with a recorded reason and runs only in CI (which
 // also needs nf_conntrack + a shell with /dev/tcp).
 func TestRung1NftEnforcement(t *testing.T) {
 	requireRung1Caps(t)
 
 	ws := t.TempDir()
-	// This fixture grants loopback+private+443+dns, so the rung-1 nftables ruleset is
+	// This fixture grants Loopback+Private+443+Dns, so the rung-1 nftables ruleset is
 	// installed with the metadata hard-deny ahead of the Private accept.
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureBroadNetwork, ws), withBackend(newLinuxBackendRung1()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureBroadNetwork, ws), withBackend(linux.NewBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
-	// A confined command must still run (the nft install did not fail closed) AND
+	// A Confined command must still run (the nft install did not fail closed) AND
 	// the metadata IP must be unreachable. bash /dev/tcp with a short timeout dials
 	// 169.254.169.254:80; the connect must NOT succeed (SYN dropped at OUTPUT).
 	script := `echo RAN; ` +
@@ -273,9 +274,9 @@ func TestRung1NftEnforcement(t *testing.T) {
 	}
 	s := string(out)
 	if !strings.Contains(s, "RAN") {
-		t.Errorf("confined command did not run (nft may have failed closed); out=%q", s)
+		t.Errorf("Confined command did not run (nft may have failed closed); out=%q", s)
 	}
 	if strings.Contains(s, "META_REACHED") || !strings.Contains(s, "META_BLOCKED") {
-		t.Errorf("cloud-metadata endpoint was reachable under the rung-1 nft filter (§5.4 violated); out=%q", s)
+		t.Errorf("cloud-metadata endpoint was reachable under the linux.Rung-1 nft filter (§5.4 violated); out=%q", s)
 	}
 }

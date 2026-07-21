@@ -339,24 +339,24 @@ func TestFilesystemGrantRejectsTargetAndAncestorIdentitySwaps(t *testing.T) {
 		}
 	})
 
-	t.Run("existing ancestor replaced by symlink", func(t *testing.T) {
-		ancestor := filepath.Join(workspace, "generated")
+	t.Run("existing Ancestor replaced by symlink", func(t *testing.T) {
+		Ancestor := filepath.Join(workspace, "generated")
 		outside := t.TempDir()
-		if err := os.Mkdir(ancestor, 0o700); err != nil {
+		if err := os.Mkdir(Ancestor, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		target := filepath.Join(ancestor, "future.txt")
+		target := filepath.Join(Ancestor, "future.txt")
 		executor := newExecutor()
-		token := issueTestGrant(t, executor, now, "exec-ancestor-swap", "true", workspace,
+		token := issueTestGrant(t, executor, now, "exec-Ancestor-swap", "true", workspace,
 			"filesystem.write", target, "filesystem.path.write.v1", target)
-		if err := os.Rename(ancestor, ancestor+".old"); err != nil {
+		if err := os.Rename(Ancestor, Ancestor+".old"); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(outside, ancestor); err != nil {
+		if err := os.Symlink(outside, Ancestor); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-ancestor-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
-			t.Fatalf("ancestor swap error = %v, want ErrGrantTargetChanged", err)
+		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-Ancestor-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
+			t.Fatalf("Ancestor swap error = %v, want ErrGrantTargetChanged", err)
 		}
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"strconv"
@@ -18,20 +19,20 @@ import (
 
 // --- Runtime proof through the REAL stage-2 backend ---------------------------
 //
-// Like the seccomp e2e, these tests re-run THIS test binary as the stage-2
-// TARGET: the linuxBackend re-execs /proc/self/exe, the stage-2 helper installs
-// Landlock FS + seccomp + the Landlock TCP-port allowlist and execve's
+// Like the Seccomp e2e, these tests re-run THIS test binary as the stage-2
+// TARGET: the linux.Backend re-execs /proc/self/exe, the stage-2 helper installs
+// Landlock FS + Seccomp + the Landlock TCP-port allowlist and execve's
 // /proc/self/exe. In the target the net-probe sentinel is set (via Env.Set) and
 // the dispatch sentinel is NOT (scrubbed out), so netTargetDispatch runs a
 // CLASSIC-TCP connect probe under the inherited Landlock net ruleset and prints
 // markers the parent asserts on. The probe uses a raw AF_INET/SOCK_STREAM socket
 // (proto 0) and unix.Connect — NOT net.Dial — so it exercises the classic-TCP
-// Landlock ConnectTCP path, never MPTCP (which 12b's seccomp separately blocks).
+// Landlock ConnectTCP path, never MPTCP (which 12b's Seccomp separately blocks).
 
 // netTargetEnv marks a process that should run the connect probes and exit. It is
 // injected into the TARGET env via Env.Set, so it is present only after the
 // stage-2 execve — not in the stage-2 helper (which additionally carries
-// stage2SentinelEnv, the distinguisher checked below).
+// linux.Stage2SentinelEnv, the distinguisher checked below).
 const netTargetEnv = "LRSANDBOX_NET_PROBE"
 
 // netProbePortAEnv / netProbePortBEnv carry the two TCP ports the target probes.
@@ -62,8 +63,8 @@ func netTargetDispatch() {
 	if os.Getenv(netTargetEnv) != "1" {
 		return // not a probe target
 	}
-	if os.Getenv(stage2SentinelEnv) == stage2SentinelValue {
-		return // this is the stage-2 helper (pre-execve); let Init()/runStage2 run
+	if os.Getenv(linux.Stage2SentinelEnv) == linux.Stage2SentinelValue {
+		return // this is the stage-2 helper (pre-execve); let Init()/linux.RunStage2 run
 	}
 	portA := netProbePortFromEnv(netProbePortAEnv)
 	portB := netProbePortFromEnv(netProbePortBEnv)
@@ -97,7 +98,7 @@ func init() { netTargetDispatch() }
 //     port nobody listens on is the NETWORK saying no, not Landlock)
 //
 // The ECONNREFUSED=ALLOWED mapping is what lets the positive control work without
-// a listener: an allowlisted port with nothing behind it refuses fast on loopback,
+// a listener: an allowlisted port with nothing behind it refuses fast on Loopback,
 // proving Landlock let the connect through. Any other errno is surfaced verbatim.
 func classifyNetConnect(port uint16) string {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
@@ -136,7 +137,7 @@ func parseNetMarkers(out []byte) map[string]string {
 }
 
 // runNetProbe builds a rung-2 executor for the given net policy, re-execs the
-// test binary as the confined target, and returns the parsed probe markers. It
+// test binary as the Confined target, and returns the parsed probe markers. It
 // injects the probe sentinel and the two probe ports into the TARGET env.
 func runNetProbe(t *testing.T, netOpt backendFixtureOption) map[string]string {
 	t.Helper()
@@ -202,9 +203,9 @@ func TestLinuxNetAllDeniedWhenZero(t *testing.T) {
 
 // TestLinuxNetDNSForcedOverTCP proves the DNS-over-TCP compilation end to end: a
 // DNS-enabled policy injects RES_OPTIONS=use-vc into the TARGET env (asserted by
-// running the real `env` binary under the sandbox) and records the dns/narrowed
+// running the real `env` binary under the sandbox) and records the Dns/narrowed
 // report entry. Port 53's presence in the allowlist is covered by the
-// compileNetPolicy unit test below.
+// linux.CompileNetPolicy unit test below.
 func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
@@ -213,12 +214,12 @@ func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{DNS: true})))
 
 	// The report must record DNS narrowed to TCP.
-	if !reportHas(e.Report(), "dns", "narrowed") {
-		t.Errorf("CompileReport missing dns/narrowed entry; report=%+v", e.Report())
+	if !reportHas(e.Report(), "Dns", "narrowed") {
+		t.Errorf("CompileReport missing Dns/narrowed entry; report=%+v", e.Report())
 	}
 
 	// Run the real `env` under the sandbox and assert RES_OPTIONS=use-vc is present
-	// in the confined target's environment.
+	// in the Confined target's environment.
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"/usr/bin/env"})
 	if err != nil {
 		t.Fatalf("RunArgv(env): %v (out=%q)", err, out)
@@ -226,33 +227,33 @@ func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("env exit = %d, want 0 (out=%q)", code, out)
 	}
-	if !strings.Contains(string(out), resOptionsEnvKey+"="+resOptionUseVC) {
-		t.Errorf("target env missing %s=%s; env output:\n%s", resOptionsEnvKey, resOptionUseVC, out)
+	if !strings.Contains(string(out), linux.ResOptionsEnvKey+"="+linux.ResOptionUseVC) {
+		t.Errorf("target env missing %s=%s; env output:\n%s", linux.ResOptionsEnvKey, linux.ResOptionUseVC, out)
 	}
 }
 
 // TestLinuxNetGuarantees asserts the rung-2 network level/guarantee/report posture
-// (§6, §5.2, §7.5): a confined-net policy earns NetworkBoundary but NOT
+// (§6, §5.2, §7.5): a Confined-net policy earns NetworkBoundary but NOT
 // AddressNetwork, stays LevelDegraded, records network-boundary/enforced, and — when
 // it requests Loopback/Private — records address-network/unenforced.
 func TestLinuxNetGuarantees(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
 
-	t.Run("confined port policy earns NetworkBoundary, not AddressNetwork", func(t *testing.T) {
+	t.Run("Confined port policy earns NetworkBoundary, not AddressNetwork", func(t *testing.T) {
 		e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{Ports: []uint16{443}})))
 		g := e.Guarantees()
 		if !g.NetworkBoundary {
-			t.Errorf("Guarantees().NetworkBoundary = false, want true (confined TCP allowlist)")
+			t.Errorf("Guarantees().NetworkBoundary = false, want true (Confined TCP allowlist)")
 		}
 		if g.AddressNetwork {
-			t.Errorf("Guarantees().AddressNetwork = true, want false (rung 2 cannot address-scope)")
+			t.Errorf("Guarantees().AddressNetwork = true, want false (linux.Rung 2 cannot address-scope)")
 		}
 		if lvl := e.Level(); lvl != LevelDegraded {
 			t.Errorf("Level() = %d, want LevelDegraded (%d)", lvl, LevelDegraded)
 		}
-		if !reportHas(e.Report(), "network-boundary", "enforced") {
-			t.Errorf("CompileReport missing network-boundary/enforced entry; report=%+v", e.Report())
+		if !reportHas(e.Report(), "network-boundary", "linux.Enforced") {
+			t.Errorf("CompileReport missing network-boundary/linux.Enforced entry; report=%+v", e.Report())
 		}
 	})
 
@@ -260,7 +261,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 		e := newFSExecutor(t, backendFixturePolicy(fixtureBroadNetwork, ws))
 		g := e.Guarantees()
 		if !g.NetworkBoundary {
-			t.Errorf("Guarantees().NetworkBoundary = false, want true (fixture is net-confined at port level)")
+			t.Errorf("Guarantees().NetworkBoundary = false, want true (fixture is net-Confined at port level)")
 		}
 		if g.AddressNetwork {
 			t.Errorf("Guarantees().AddressNetwork = true, want false")
@@ -285,8 +286,8 @@ func TestLinuxNetGuarantees(t *testing.T) {
 
 // --- Pure compile unit tests (no Landlock) -----------------------------------
 
-// TestCompileNetPolicy asserts the policy.NetPolicy -> compiledNet mapping: Open is a
-// passthrough (unconfined), everything else is confined, DNS folds port 53 in,
+// TestCompileNetPolicy asserts the policy.NetPolicy -> linux.CompiledNet mapping: Open is a
+// passthrough (unconfined), everything else is Confined, DNS folds port 53 in,
 // duplicates are collapsed, and Loopback/Private never widen the port set.
 func TestCompileNetPolicy(t *testing.T) {
 	t.Parallel()
@@ -297,28 +298,28 @@ func TestCompileNetPolicy(t *testing.T) {
 		wantPorts    []uint16
 		wantDNS      bool
 	}{
-		{"zero denies all (confined, empty)", policy.NetPolicy{}, true, nil, false},
+		{"zero denies all (Confined, empty)", policy.NetPolicy{}, true, nil, false},
 		{"open is unconfined passthrough", policy.NetPolicy{Open: true}, false, nil, false},
 		{"ports only", policy.NetPolicy{Ports: []uint16{443}}, true, []uint16{443}, false},
-		{"dns folds in port 53", policy.NetPolicy{DNS: true}, true, []uint16{dnsTCPPort}, true},
-		{"ports plus dns", policy.NetPolicy{Ports: []uint16{443}, DNS: true}, true, []uint16{443, dnsTCPPort}, true},
-		{"dns does not duplicate an explicit 53", policy.NetPolicy{Ports: []uint16{53}, DNS: true}, true, []uint16{53}, true},
+		{"Dns folds in port 53", policy.NetPolicy{DNS: true}, true, []uint16{linux.DNSTCPPort}, true},
+		{"ports plus Dns", policy.NetPolicy{Ports: []uint16{443}, DNS: true}, true, []uint16{443, linux.DNSTCPPort}, true},
+		{"Dns does not duplicate an explicit 53", policy.NetPolicy{Ports: []uint16{53}, DNS: true}, true, []uint16{53}, true},
 		{"duplicate ports collapsed", policy.NetPolicy{Ports: []uint16{443, 443}}, true, []uint16{443}, false},
-		{"loopback/private do not widen ports", policy.NetPolicy{Loopback: true, Private: true}, true, nil, false},
+		{"Loopback/Private do not widen ports", policy.NetPolicy{Loopback: true, Private: true}, true, nil, false},
 		{"open wins even with ports", policy.NetPolicy{Ports: []uint16{443}, Open: true}, false, nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := compileNetPolicy(tt.in)
-			if got.confined != tt.wantConfined {
-				t.Errorf("confined = %v, want %v", got.confined, tt.wantConfined)
+			got := linux.CompileNetPolicy(tt.in)
+			if got.Confined != tt.wantConfined {
+				t.Errorf("Confined = %v, want %v", got.Confined, tt.wantConfined)
 			}
-			if got.dns != tt.wantDNS {
-				t.Errorf("dns = %v, want %v", got.dns, tt.wantDNS)
+			if got.Dns != tt.wantDNS {
+				t.Errorf("Dns = %v, want %v", got.Dns, tt.wantDNS)
 			}
-			if !equalPorts(got.tcpPorts, tt.wantPorts) {
-				t.Errorf("tcpPorts = %v, want %v", got.tcpPorts, tt.wantPorts)
+			if !equalPorts(got.TcpPorts, tt.wantPorts) {
+				t.Errorf("TcpPorts = %v, want %v", got.TcpPorts, tt.wantPorts)
 			}
 		})
 	}
@@ -353,7 +354,7 @@ func TestEnsureResOptionsUseVC(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := ensureResOptionsUseVC(append([]string(nil), tt.in...))
+			got := linux.EnsureResOptionsUseVC(append([]string(nil), tt.in...))
 			found := false
 			for _, kv := range got {
 				if kv == tt.want {
@@ -361,14 +362,14 @@ func TestEnsureResOptionsUseVC(t *testing.T) {
 				}
 			}
 			if !found {
-				t.Errorf("ensureResOptionsUseVC(%v) = %v, want to contain %q", tt.in, got, tt.want)
+				t.Errorf("linux.EnsureResOptionsUseVC(%v) = %v, want to contain %q", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
 // TestNetCompileReport asserts the per-feature network report entries for the
-// confined, open, and DNS shapes.
+// Confined, open, and DNS shapes.
 func TestNetCompileReport(t *testing.T) {
 	t.Parallel()
 	has := func(entries []ReportEntry, feature, status string) bool {
@@ -382,22 +383,22 @@ func TestNetCompileReport(t *testing.T) {
 	tests := []struct {
 		name          string
 		in            policy.NetPolicy
-		wantEnforced  bool // network-boundary/enforced
+		wantEnforced  bool // network-boundary/linux.Enforced
 		wantOpen      bool // network/unenforced
 		wantAddrUnenf bool // address-network/unenforced
-		wantDNS       bool // dns/narrowed
+		wantDNS       bool // Dns/narrowed
 	}{
-		{"write zero: boundary enforced, no address entry", policy.NetPolicy{}, true, false, false, false},
+		{"write zero: boundary linux.Enforced, no address entry", policy.NetPolicy{}, true, false, false, false},
 		{"ports only: boundary + address unenforced", policy.NetPolicy{Ports: []uint16{443}}, true, false, true, false},
-		{"trusted-shape: boundary + address + dns", policy.NetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}, true, false, true, true},
+		{"trusted-shape: boundary + address + Dns", policy.NetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}, true, false, true, true},
 		{"open: unenforced only", policy.NetPolicy{Open: true}, false, true, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			entries := netCompileReport(tt.in, compileNetPolicy(tt.in))
-			if has(entries, "network-boundary", "enforced") != tt.wantEnforced {
-				t.Errorf("network-boundary/enforced presence = %v, want %v; entries=%+v", !tt.wantEnforced, tt.wantEnforced, entries)
+			entries := linux.NetCompileReport(tt.in, linux.CompileNetPolicy(tt.in))
+			if has(entries, "network-boundary", "linux.Enforced") != tt.wantEnforced {
+				t.Errorf("network-boundary/linux.Enforced presence = %v, want %v; entries=%+v", !tt.wantEnforced, tt.wantEnforced, entries)
 			}
 			if has(entries, "network", "unenforced") != tt.wantOpen {
 				t.Errorf("network/unenforced presence = %v, want %v; entries=%+v", !tt.wantOpen, tt.wantOpen, entries)
@@ -405,8 +406,8 @@ func TestNetCompileReport(t *testing.T) {
 			if has(entries, "address-network", "unenforced") != tt.wantAddrUnenf {
 				t.Errorf("address-network/unenforced presence = %v, want %v; entries=%+v", !tt.wantAddrUnenf, tt.wantAddrUnenf, entries)
 			}
-			if has(entries, "dns", "narrowed") != tt.wantDNS {
-				t.Errorf("dns/narrowed presence = %v, want %v; entries=%+v", !tt.wantDNS, tt.wantDNS, entries)
+			if has(entries, "Dns", "narrowed") != tt.wantDNS {
+				t.Errorf("Dns/narrowed presence = %v, want %v; entries=%+v", !tt.wantDNS, tt.wantDNS, entries)
 			}
 		})
 	}

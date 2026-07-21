@@ -18,7 +18,7 @@ import (
 
 // TestAcceptanceMatrixDarwin runs the macOS Seatbelt writable-profile row: the
 // write boundary + .git carveout hold, a ~/.ssh read is denied, Level = Full
-// (loopback+ports+DNS enforced; Private/metadata compile-to-blocked, so a policy
+// (Loopback+ports+DNS enforced; Private/metadata compile-to-blocked, so a policy
 // needing address-scoping would be Degraded), and AddressNetwork is always false
 // (SBPL cannot address-scope, Task M1).
 func TestAcceptanceMatrixDarwin(t *testing.T) {

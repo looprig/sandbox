@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -26,8 +27,8 @@ func realpath(t *testing.T, p string) string {
 }
 
 // TestStage2RoundTrip is the headline end-to-end proof: NewExecutor(withBackend
-// linuxBackend).RunCommand re-execs /proc/self/exe -> the test binary's TestMain
-// calls Init() -> Init dispatches the stage-2 sentinel -> runStage2 reads the
+// linux.Backend).RunCommand re-execs /proc/self/exe -> the test binary's TestMain
+// calls Init() -> Init dispatches the stage-2 sentinel -> linux.RunStage2 reads the
 // sealed spec from the pipe (fd 3) -> chdir(ws) -> execve(/bin/sh) with the
 // SCRUBBED env. It asserts the target ran in ws, exited 0, saw the forced
 // marker, and did NOT see the dispatch sentinel (proving the target env is the
@@ -36,7 +37,7 @@ func TestStage2RoundTrip(t *testing.T) {
 	ws := t.TempDir()
 	e, err := newExecutorForEffectivePolicy(
 		backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithEnv(policy.EnvPolicy{Set: map[string]string{"LRSANDBOX_MARKER": "present"}})),
-		withBackend(newLinuxBackend()),
+		withBackend(linux.NewBackend()),
 	)
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
@@ -77,7 +78,7 @@ func TestStage2RoundTrip(t *testing.T) {
 // re-exec and asserts it ran and produced the expected output.
 func TestRunArgvViaLinuxBackend(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(linux.NewBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestEnvScrubHoldsViaLinuxBackend(t *testing.T) {
 	ws := t.TempDir()
 	t.Setenv("GITHUB_TOKEN", "super-secret") // must NOT reach the target
 
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(linux.NewBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -119,33 +120,33 @@ func TestEnvScrubHoldsViaLinuxBackend(t *testing.T) {
 	if !strings.Contains(string(out), "TMPDIR=") {
 		t.Errorf("baseline TMPDIR missing from scrubbed target env; out=%q", out)
 	}
-	if strings.Contains(string(out), stage2SentinelEnv) {
-		t.Errorf("dispatch sentinel %s leaked into target env; out=%q", stage2SentinelEnv, out)
+	if strings.Contains(string(out), linux.Stage2SentinelEnv) {
+		t.Errorf("dispatch sentinel %s leaked into target env; out=%q", linux.Stage2SentinelEnv, out)
 	}
 }
 
 // TestStage2SpecCodecRoundTrip is the codec unit test: encoding then decoding a
-// stage2Spec through the same gob helpers the re-exec uses yields an equal spec.
+// linux.Stage2Spec through the same gob helpers the re-exec uses yields an equal spec.
 func TestStage2SpecCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		spec stage2Spec
+		spec linux.Stage2Spec
 	}{
-		{name: "typical", spec: stage2Spec{Dir: "/work", Argv: []string{"/bin/sh", "-c", "echo hi"}, Env: []string{"TMPDIR=/tmp", "A=b"}}},
-		{name: "empty dir + single argv", spec: stage2Spec{Dir: "", Argv: []string{"/bin/true"}, Env: []string{}}},
-		{name: "nil slices", spec: stage2Spec{Dir: "/x"}},
+		{name: "typical", spec: linux.Stage2Spec{Dir: "/work", Argv: []string{"/bin/sh", "-c", "echo hi"}, Env: []string{"TMPDIR=/tmp", "A=b"}}},
+		{name: "empty dir + single argv", spec: linux.Stage2Spec{Dir: "", Argv: []string{"/bin/true"}, Env: []string{}}},
+		{name: "nil slices", spec: linux.Stage2Spec{Dir: "/x"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var buf bytes.Buffer
-			if err := encodeStage2Spec(&buf, tt.spec); err != nil {
-				t.Fatalf("encodeStage2Spec: %v", err)
+			if err := linux.EncodeStage2Spec(&buf, tt.spec); err != nil {
+				t.Fatalf("linux.EncodeStage2Spec: %v", err)
 			}
-			got, err := decodeStage2Spec(fileFromBuf(t, &buf))
+			got, err := linux.DecodeStage2Spec(fileFromBuf(t, &buf))
 			if err != nil {
-				t.Fatalf("decodeStage2Spec: %v", err)
+				t.Fatalf("linux.DecodeStage2Spec: %v", err)
 			}
 			if got.Dir != tt.spec.Dir {
 				t.Errorf("Dir = %q, want %q", got.Dir, tt.spec.Dir)
@@ -193,29 +194,29 @@ func slicesEqual(a, b []string) bool {
 }
 
 // TestDecodeStage2SpecFailsClosed asserts a garbage/truncated payload yields a
-// typed stage2Error rather than a zero-value spec that would let the child
+// typed linux.Stage2Error rather than a zero-value spec that would let the child
 // proceed — the decode seam fails closed.
 func TestDecodeStage2SpecFailsClosed(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
 	buf.WriteString("this is not a gob stream")
-	_, err := decodeStage2Spec(fileFromBuf(t, &buf))
+	_, err := linux.DecodeStage2Spec(fileFromBuf(t, &buf))
 	if err == nil {
-		t.Fatal("decodeStage2Spec on garbage: err = nil, want a decode error")
+		t.Fatal("linux.DecodeStage2Spec on garbage: err = nil, want a decode error")
 	}
-	var se *stage2Error
+	var se *linux.Stage2Error
 	if !errors.As(err, &se) {
-		t.Fatalf("decode error = %T (%v), want *stage2Error", err, err)
+		t.Fatalf("decode error = %T (%v), want *linux.Stage2Error", err, err)
 	}
 }
 
 // TestStage2FailsClosedWithoutSpec re-execs the test binary with only the
 // dispatch sentinel set and NO spec pipe (no fd 3). The child's TestMain -> Init
-// -> runStage2 must fail closed: read the missing spec, fail to decode, and exit
+// -> linux.RunStage2 must fail closed: read the missing spec, fail to decode, and exit
 // non-zero — it must NEVER fall through to run the test suite (exit 0).
 func TestStage2FailsClosedWithoutSpec(t *testing.T) {
 	cmd := exec.Command("/proc/self/exe")
-	cmd.Env = append(os.Environ(), stage2SentinelEnv+"="+stage2SentinelValue)
+	cmd.Env = append(os.Environ(), linux.Stage2SentinelEnv+"="+linux.Stage2SentinelValue)
 	// Deliberately no ExtraFiles: fd 3 is absent in the child.
 	err := cmd.Run()
 	if err == nil {
@@ -237,7 +238,7 @@ func TestStage2FailsClosedWithoutSpec(t *testing.T) {
 // ENOENT on a bare name.
 func TestRunArgvBareNameResolvesPATH(t *testing.T) {
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackend()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(linux.NewBackend()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -283,12 +284,12 @@ func TestLookPathIn(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := lookPathIn(tt.bin, tt.env)
+			got, err := linux.LookPathIn(tt.bin, tt.env)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("lookPathIn(%q) err = %v, wantErr %v", tt.bin, err, tt.wantErr)
+				t.Fatalf("linux.LookPathIn(%q) err = %v, wantErr %v", tt.bin, err, tt.wantErr)
 			}
 			if !tt.wantErr && got != tt.want {
-				t.Errorf("lookPathIn(%q) = %q, want %q", tt.bin, got, tt.want)
+				t.Errorf("linux.LookPathIn(%q) = %q, want %q", tt.bin, got, tt.want)
 			}
 		})
 	}

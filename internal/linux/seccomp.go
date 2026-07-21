@@ -1,6 +1,6 @@
 //go:build linux
 
-package sandbox
+package linux
 
 import (
 	"runtime"
@@ -9,14 +9,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file builds and installs the rung-2 seccomp-BPF filter in the stage-2
+// This file builds and installs the Rung-2 Seccomp-BPF filter in the stage-2
 // child, AFTER Landlock (applyLandlockRules) and BEFORE chdir/execve (SPEC
 // §7.2, Task 12b). The filter is a hand-built classic-BPF program — pure Go, NO
 // cgo, NO libseccomp — installed via PR_SET_SECCOMP (SECCOMP_MODE_FILTER). It
 // and PR_SET_NO_NEW_PRIVS are INHERITED across the execve into the target, so a
-// rung-2 spawn's target additionally runs with the dangerous syscalls below
+// Rung-2 spawn's target additionally runs with the dangerous syscalls below
 // soft-denied. The construction mirrors the proven Task M3 spike
-// (docs/spikes/seccomp-reexec.md): arch guard FIRST, then a MANDATORY x32 guard,
+// (docs/spikes/Seccomp-reexec.md): arch guard FIRST, then a MANDATORY x32 guard,
 // then the nr/arg policy checks, then allow-default.
 //
 // What the filter denies (all EACCES, all arch- and x32-guarded):
@@ -28,26 +28,26 @@ import (
 //   - IPPROTO_MPTCP (protocol 262): socket(AF_INET|AF_INET6, SOCK_STREAM, 262).
 //     LOAD-BEARING: Landlock's TCP ConnectTCP/BindTCP port rules (12c) do NOT
 //     cover Multipath TCP, and Go 1.24+ defaults net.Dial/net.Listen to MPTCP —
-//     so without this block a confined child bypasses the port allowlist.
+//     so without this block a Confined child bypasses the port allowlist.
 //   - ptrace: prevents debugging-based escapes / inspection of other processes.
 //   - io_uring (setup/enter/register): io_uring can dispatch operations that
-//     bypass syscall-based filtering — a well-known seccomp-evasion surface.
+//     bypass syscall-based filtering — a well-known Seccomp-evasion surface.
 //
 // Everything else is ALLOWED: the target and the Go runtime must run.
 //
-// Ordering vs Landlock. Landlock is applied first, seccomp second. Both survive
+// Ordering vs Landlock. Landlock is applied first, Seccomp second. Both survive
 // execve, so the order does not change the confinement the target inherits;
-// seccomp is placed last (immediately before chdir/execve) so the filter thread
+// Seccomp is placed last (immediately before chdir/execve) so the filter thread
 // is the execve thread with no intervening work that could migrate the goroutine
 // (see installSeccompFilter's runtime.LockOSThread).
 
-// seccomp_data field byte offsets (see <linux/seccomp.h>). On little-endian
+// seccomp_data field byte offsets (see <linux/Seccomp.h>). On little-endian
 // x86_64 the low 32 bits of a u64 arg live at the arg's base offset, so a single
 // BPF_W|BPF_ABS load at the base offset yields the low word we compare. The args
 // array starts at offset 16, each entry 8 bytes wide.
 const (
-	seccompOffNR   = 0  // int    nr
-	seccompOffArch = 4  // __u32  arch
+	SeccompOffNR   = 0  // int    nr
+	SeccompOffArch = 4  // __u32  arch
 	seccompOffArg0 = 16 // __u64  args[0] — socket domain   (low word @16)
 	seccompOffArg1 = 24 // __u64  args[1] — socket type     (low word @24)
 	seccompOffArg2 = 32 // __u64  args[2] — socket protocol (low word @32)
@@ -59,20 +59,20 @@ const (
 // `type` raw against SOCK_DGRAM would never match and fail open.
 const seccompSockTypeMask = 0xff
 
-// seccompX32SyscallBit is __X32_SYSCALL_BIT. The x32 ABI shares
+// SeccompX32SyscallBit is __X32_SYSCALL_BIT. The x32 ABI shares
 // AUDIT_ARCH_X86_64 with native x86_64 (so it passes the arch guard), but its
 // syscall numbers are OR'd with this bit — an x32 socket() has nr = 41|0x40000000,
 // which would NOT match SYS_socket and would fall through to ALLOW: a silent
 // bypass of every nr-based rule. Any syscall carrying this bit is killed
 // (fail-closed) right after the arch guard. (The arch guard alone stops i386,
 // which uses a DIFFERENT arch value; it does NOT stop x32.)
-const seccompX32SyscallBit = 0x40000000
+const SeccompX32SyscallBit = 0x40000000
 
-// ipprotoMPTCP is IPPROTO_MPTCP (protocol 262). Named locally so the filter reads
+// IPProtoMPTCP is IPPROTO_MPTCP (protocol 262). Named locally so the filter reads
 // clearly; it equals unix.IPPROTO_MPTCP.
-const ipprotoMPTCP = unix.IPPROTO_MPTCP
+const IPProtoMPTCP = unix.IPPROTO_MPTCP
 
-// buildSeccompFilter builds the rung-2 classic-BPF program as a []unix.SockFilter.
+// BuildSeccompFilter builds the Rung-2 classic-BPF program as a []unix.SockFilter.
 // See the annotated instruction listing inline. Structure:
 //
 //	arch guard  -> KILL_PROCESS on mismatch (stops i386 — a different arch value)
@@ -84,7 +84,7 @@ const ipprotoMPTCP = unix.IPPROTO_MPTCP
 //	(type & 0xff) == SOCK_DGRAM -> ERRNO(EACCES)          (UDP)
 //	protocol == IPPROTO_MPTCP    -> ERRNO(EACCES)          (Multipath TCP)
 //	else -> ALLOW                                          (e.g. plain TCP)
-func buildSeccompFilter() []unix.SockFilter {
+func BuildSeccompFilter() []unix.SockFilter {
 	const (
 		retKill  = unix.SECCOMP_RET_KILL_PROCESS
 		retAllow = unix.SECCOMP_RET_ALLOW
@@ -93,7 +93,7 @@ func buildSeccompFilter() []unix.SockFilter {
 	return []unix.SockFilter{
 		// --- arch guard ---------------------------------------------------------
 		// [0] A = seccomp_data.arch
-		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArch),
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, SeccompOffArch),
 		// [1] if A == AUDIT_ARCH_X86_64 -> skip the kill, else fall to [2]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AUDIT_ARCH_X86_64, 1, 0),
 		// [2] arch mismatch (e.g. i386): kill the whole process (fail-closed)
@@ -101,9 +101,9 @@ func buildSeccompFilter() []unix.SockFilter {
 
 		// --- x32 guard ----------------------------------------------------------
 		// [3] A = seccomp_data.nr
-		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffNR),
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, SeccompOffNR),
 		// [4] if (A & __X32_SYSCALL_BIT) != 0 -> fall to [5] kill, else skip it
-		seccompJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, seccompX32SyscallBit, 0, 1),
+		seccompJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, SeccompX32SyscallBit, 0, 1),
 		// [5] x32 syscall: kill (shares the x86_64 arch value but its nr would dodge
 		//     the nr compares below and fall through to ALLOW)
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retKill),
@@ -157,7 +157,7 @@ func buildSeccompFilter() []unix.SockFilter {
 		// [24] A = args[2] low word (socket protocol)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
 		// [25] if A == IPPROTO_MPTCP -> fall to [26] deny, else skip it
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(ipprotoMPTCP), 0, 1),
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(IPProtoMPTCP), 0, 1),
 		// [26] AF_INET* MPTCP: deny with EACCES (closes the port-allowlist bypass)
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
 		// [27] AF_INET* stream/other, not MPTCP (e.g. plain TCP): allow — the
@@ -178,20 +178,20 @@ func seccompJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
 	return unix.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
 }
 
-// seccompError is the typed, fail-closed failure of the stage-2 seccomp install
+// seccompError is the typed, fail-closed failure of the stage-2 Seccomp install
 // (SPEC §7.2). It names the failing step (PR_SET_NO_NEW_PRIVS or PR_SET_SECCOMP)
-// and wraps the underlying errno for errors.As/Unwrap. runStage2 surfaces it as a
-// stage2Error{Op:"seccomp"} so the child fails closed rather than running the
+// and wraps the underlying errno for errors.As/Unwrap. RunStage2 surfaces it as a
+// Stage2Error{Op:"Seccomp"} so the child fails closed rather than running the
 // target unconfined.
 type seccompError struct {
 	Op  string // the failing step, e.g. "PR_SET_NO_NEW_PRIVS", "PR_SET_SECCOMP"
 	Err error  // the wrapped underlying error (typically a syscall.Errno)
 }
 
-func (e *seccompError) Error() string { return "sandbox: seccomp: " + e.Op + ": " + e.Err.Error() }
+func (e *seccompError) Error() string { return "sandbox: Seccomp: " + e.Op + ": " + e.Err.Error() }
 func (e *seccompError) Unwrap() error { return e.Err }
 
-// installSeccompFilter installs the rung-2 filter on the CURRENT OS thread and
+// installSeccompFilter installs the Rung-2 filter on the CURRENT OS thread and
 // leaves that thread pinned so the caller's subsequent syscall.Exec runs on it.
 //
 // PR_SET_SECCOMP and PR_SET_NO_NEW_PRIVS are PER-THREAD, so the thread that
@@ -201,8 +201,8 @@ func (e *seccompError) Unwrap() error { return e.Err }
 // stage-2 child does install -> chdir -> execve on this one goroutine, so the
 // pinned thread is the execve thread, and execve collapses the process to that
 // single filtered thread. Every thread the target later spawns inherits the
-// filter (seccomp filters propagate across clone), so the whole target is
-// confined. (Landlock (12a) already restricts all threads via psx and sets
+// filter (Seccomp filters propagate across clone), so the whole target is
+// Confined. (Landlock (12a) already restricts all threads via psx and sets
 // no_new_privs; PR_SET_NO_NEW_PRIVS is set again here, idempotently, so the
 // SET_MODE_FILTER install can never EACCES on the precondition.)
 //
@@ -218,7 +218,7 @@ func installSeccompFilter() error {
 		return &seccompError{Op: "PR_SET_NO_NEW_PRIVS", Err: err}
 	}
 
-	filter := buildSeccompFilter()
+	filter := BuildSeccompFilter()
 	prog := unix.SockFprog{
 		Len:    uint16(len(filter)),
 		Filter: &filter[0],

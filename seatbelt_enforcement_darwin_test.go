@@ -38,8 +38,8 @@ import (
 //
 // KEY macOS behaviour (SPEC §7.1): Seatbelt matches subpath/regex rules against the
 // CANONICAL (symlink-resolved) path. macOS symlinks the very roots a policy names —
-// /tmp→/private/tmp, /etc→/private/etc, /var→/private/var (so t.TempDir workspaces
-// under /var/folders resolve into /private). The generator therefore canonicalizes
+// /tmp→/Private/tmp, /etc→/Private/etc, /var→/Private/var (so t.TempDir workspaces
+// under /var/folders resolve into /Private). The generator therefore canonicalizes
 // every emitted FS path (compileSBPL → canonPath); these tests deliberately pass a
 // RAW t.TempDir() (symlinked under /var/folders) and rely on the backend to resolve
 // it — which is itself part of what they verify, alongside the $TMPDIR write row.
@@ -64,9 +64,9 @@ func requireSandboxExec(t *testing.T) {
 // real Seatbelt — under null the write would succeed.
 func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 	requireSandboxExec(t)
-	// RAW t.TempDir() (symlinked under /var/folders → /private/var). Passing it
+	// RAW t.TempDir() (symlinked under /var/folders → /Private/var). Passing it
 	// straight to the effective-policy fixture proves the generator canonicalizes
-	// the workspace: without canonPath the emitted (subpath "/var/…") never matches the kernel's /private/…
+	// the workspace: without canonPath the emitted (subpath "/var/…") never matches the kernel's /Private/…
 	// resolution and even this in-workspace write would be denied.
 	ws := t.TempDir()
 	outside := t.TempDir() // a sibling temp dir: NOT ws, NOT /tmp
@@ -106,10 +106,10 @@ func TestSeatbeltEnforceWriteBoundary(t *testing.T) {
 
 // TestSeatbeltEnforceTmpWrite is the $TMPDIR-write payoff of the path-canonicalize
 // fix. §5.5/decision 1 forces TMPDIR=/tmp, and write mode grants write to /tmp. On
-// macOS /tmp is a symlink to /private/tmp, so the raw (subpath "/tmp") grant matched
+// macOS /tmp is a symlink to /Private/tmp, so the raw (subpath "/tmp") grant matched
 // NOTHING — every $TMPDIR write was DENIED, making the Seatbelt backend unusable for
 // tools that write to their temp dir. With canonPath the grant is (subpath
-// "/private/tmp") and the write succeeds. This test FAILS without the fix.
+// "/Private/tmp") and the write succeeds. This test FAILS without the fix.
 func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 	requireSandboxExec(t)
 	ws := t.TempDir()
@@ -122,7 +122,7 @@ func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 	target := filepath.Join("/tmp", name)
 	t.Cleanup(func() {
 		os.Remove(target)
-		os.Remove(filepath.Join("/private/tmp", name))
+		os.Remove(filepath.Join("/Private/tmp", name))
 	})
 
 	// The child's TMPDIR is the forced /tmp; write through $TMPDIR as a real tool would.
@@ -131,14 +131,14 @@ func TestSeatbeltEnforceTmpWrite(t *testing.T) {
 		t.Fatalf("$TMPDIR write: spawn err %v (out=%s)", err, out)
 	}
 	if code != 0 {
-		t.Errorf("$TMPDIR (/tmp) write: exit %d, want 0 (grant must canonicalize to /private/tmp); out=%s", code, out)
+		t.Errorf("$TMPDIR (/tmp) write: exit %d, want 0 (grant must canonicalize to /Private/tmp); out=%s", code, out)
 	}
 	if _, serr := os.Stat(target); serr != nil {
-		t.Errorf("$TMPDIR write: %s not created (%v); the /tmp grant did not enforce as /private/tmp", target, serr)
+		t.Errorf("$TMPDIR write: %s not created (%v); the /tmp grant did not enforce as /Private/tmp", target, serr)
 	}
 }
 
-// TestSeatbeltEnforceNullDevice proves confined commands can open /dev/null
+// TestSeatbeltEnforceNullDevice proves Confined commands can open /dev/null
 // read-write. Git does this during startup even for read-only commands such as
 // `git status`; denying the null device therefore makes an otherwise available
 // tool fail before it can inspect the repository.
@@ -243,10 +243,10 @@ func TestSeatbeltEnforceSSHDeny(t *testing.T) {
 
 // TestSeatbeltEnforceCarveoutNotPreCreated guards the C1 fail-open: a .git/.looprig
 // carveout whose target does NOT exist at NewExecutor (compile) time. On an ephemeral
-// /var/folders workspace (symlinked into /private), a raw-Clean canonPath left the
+// /var/folders workspace (symlinked into /Private), a raw-Clean canonPath left the
 // carveout write-deny UNRESOLVED so it never matched the kernel's resolved path — the
 // write fell through to the workspace ALLOW (fail OPEN, .git/.looprig writable). The
-// deepest-existing-ancestor resolution fixes it. The carveout dir is created AFTER
+// deepest-existing-Ancestor resolution fixes it. The carveout dir is created AFTER
 // compile (so the write itself would succeed if not for the deny), which is exactly
 // the compile-time-nonexistent / runtime-existent case the old code got wrong.
 func TestSeatbeltEnforceCarveoutNotPreCreated(t *testing.T) {
@@ -352,7 +352,7 @@ func TestSeatbeltEnforceEnvGlobDeny(t *testing.T) {
 }
 
 // TestSeatbeltEnforceNetworkBlocked proves that under a network-denied policy
-// (Net zero → default-deny egress) a sandboxed connect to a LIVE loopback listener
+// (Net zero → default-deny egress) a sandboxed connect to a LIVE Loopback listener
 // is blocked. A control dial from the test process (unsandboxed) succeeds first, so
 // a sandboxed failure is attributable to enforcement, not a dead port.
 func TestSeatbeltEnforceNetworkBlocked(t *testing.T) {

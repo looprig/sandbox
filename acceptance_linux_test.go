@@ -3,13 +3,14 @@
 package sandbox
 
 // Linux-rung acceptance coverage. On THIS host Landlock ABI
-// v4 is live (rung 2 RUNS) and userns is BLOCKED (rung-1 rows SKIP with a recorded
+// v4 is live (rung 2 RUNS) and Userns is BLOCKED (rung-1 rows SKIP with a recorded
 // reason). Each row asserts its mechanism AND its Guarantees() posture — the
 // matrix's load-bearing auto-approval signal. Rows reuse the enforcement helpers
 // from the rung-2 e2e tests (tryRead/tryWrite/newFSExecutor/runNetProbe/…).
 
 import (
 	"context"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestAcceptanceMatrixLinux(t *testing.T) {
 	}{
 		{"linux-rung2/write-mode", acceptLinuxRung2Write},
 		{"linux-rung1/write-mode", acceptLinuxRung1Write},
-		{"dns-under-trusted/rung2", acceptLinuxDNSUnderTrusted},
+		{"Dns-under-trusted/rung2", acceptLinuxDNSUnderTrusted},
 		{"cgroup-v2-unavailable", acceptLinuxCgroupUnavailable},
 		{"metadata-fetch-under-trusted/rung1", acceptLinuxMetadataUnderTrusted},
 	}
@@ -80,7 +81,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 		t.Errorf("Guarantees() = %+v; want WriteBoundary && ReadBoundary && EnvScrub && NetworkBoundary", g)
 	}
 	if g.ProcessBoundary || g.AddressNetwork {
-		t.Errorf("Guarantees() = %+v; want ProcessBoundary=false && AddressNetwork=false (not enforced at rung 2)", g)
+		t.Errorf("Guarantees() = %+v; want ProcessBoundary=false && AddressNetwork=false (not linux.Enforced at linux.Rung 2)", g)
 	}
 	if lvl := e.Level(); lvl != LevelDegraded {
 		t.Errorf("Level() = %d, want LevelDegraded (%d)", lvl, LevelDegraded)
@@ -97,35 +98,35 @@ func acceptLinuxRung2Write(t *testing.T) {
 }
 
 // acceptLinuxRung1Write proves the rung-1 write boundary. Rung 1 needs a usable
-// user namespace (userns+mountns/netns). This host has userns BLOCKED, so the row
-// SKIPS with a recorded reason; on a userns-enabled host (CI) it asserts the
+// user namespace (Userns+Mountns/Netns). This host has Userns BLOCKED, so the row
+// SKIPS with a recorded reason; on a Userns-enabled host (CI) it asserts the
 // rung-1 distinguishers: Level = Full plus the ProcessBoundary and AddressNetwork
 // guarantees rung 2 cannot provide.
 func acceptLinuxRung1Write(t *testing.T) {
-	if !probeLinuxCaps().userns {
-		t.Skip("RECORDED SKIP: rung 1 needs a usable user namespace (userns+mountns/netns for the bind-mount view + in-netns nftables); this host reports probeLinuxCaps().userns=false (userns BLOCKED), so the rung-1 write-mode row — restricted-read in zerotrust, metadata IP unreachable under trusted, Level=Full, all guarantee bits — cannot run here. Exercised in CI on a userns-enabled host.")
+	if !linux.ProbeCaps().Userns {
+		t.Skip("RECORDED SKIP: linux.Rung 1 needs a usable user namespace (Userns+Mountns/Netns for the bind-mount view + in-Netns nftables); this host reports linux.ProbeCaps().Userns=false (Userns BLOCKED), so the linux.Rung-1 write-mode row — restricted-read in zerotrust, metadata IP unreachable under trusted, Level=Full, all guarantee bits — cannot run here. Exercised in CI on a Userns-enabled host.")
 	}
 	requireLandlockV4(t)
 	requireSeccomp(t)
 
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws)) // platformBackend selects rung 1 here
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws)) // platformBackend selects linux.Rung 1 here
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
 	if lvl := e.Level(); lvl != LevelFull {
-		t.Errorf("Level() = %d, want LevelFull (%d) for rung 1", lvl, LevelFull)
+		t.Errorf("Level() = %d, want LevelFull (%d) for linux.Rung 1", lvl, LevelFull)
 	}
 	g := e.Guarantees()
 	if !(g.ProcessBoundary && g.AddressNetwork && g.WriteBoundary && g.ReadBoundary && g.EnvScrub && g.NetworkBoundary) {
-		t.Errorf("Guarantees() = %+v; want the full rung-1 posture incl. ProcessBoundary && AddressNetwork", g)
+		t.Errorf("Guarantees() = %+v; want the full linux.Rung-1 posture incl. ProcessBoundary && AddressNetwork", g)
 	}
 }
 
 // acceptLinuxDNSUnderTrusted proves DNS behavior under broad network access: a
 // DNS-enabled policy forces resolution over TCP by injecting RES_OPTIONS=use-vc
 // into the target env (asserted by running the real `env` under the sandbox) and
-// records the dns/narrowed report entry. Guarantee posture: NetworkBoundary true,
+// records the Dns/narrowed report entry. Guarantee posture: NetworkBoundary true,
 // AddressNetwork false.
 func acceptLinuxDNSUnderTrusted(t *testing.T) {
 	requireLandlockV4(t)
@@ -134,15 +135,15 @@ func acceptLinuxDNSUnderTrusted(t *testing.T) {
 
 	e := newFSExecutor(t, backendFixturePolicy(fixtureBroadNetwork, ws)) // fixture grants DNS
 
-	if !reportHas(e.Report(), "dns", "narrowed") {
-		t.Errorf("CompileReport missing dns/narrowed entry; report=%+v", e.Report())
+	if !reportHas(e.Report(), "Dns", "narrowed") {
+		t.Errorf("CompileReport missing Dns/narrowed entry; report=%+v", e.Report())
 	}
 	g := e.Guarantees()
 	if !g.NetworkBoundary {
-		t.Errorf("Guarantees().NetworkBoundary = false, want true (fixture is port-confined at rung 2)")
+		t.Errorf("Guarantees().NetworkBoundary = false, want true (fixture is port-Confined at linux.Rung 2)")
 	}
 	if g.AddressNetwork {
-		t.Errorf("Guarantees().AddressNetwork = true, want false (rung 2 cannot address-scope)")
+		t.Errorf("Guarantees().AddressNetwork = true, want false (linux.Rung 2 cannot address-scope)")
 	}
 
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"/usr/bin/env"})
@@ -152,8 +153,8 @@ func acceptLinuxDNSUnderTrusted(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("env exit=%d, want 0 (out=%q)", code, out)
 	}
-	if !containsLine(out, resOptionsEnvKey+"="+resOptionUseVC) {
-		t.Errorf("target env missing %s=%s; env output:\n%s", resOptionsEnvKey, resOptionUseVC, out)
+	if !containsLine(out, linux.ResOptionsEnvKey+"="+linux.ResOptionUseVC) {
+		t.Errorf("target env missing %s=%s; env output:\n%s", linux.ResOptionsEnvKey, linux.ResOptionUseVC, out)
 	}
 }
 
@@ -166,7 +167,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(&linux.Backend{CgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}
@@ -194,14 +195,14 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 
 // acceptLinuxMetadataUnderTrusted proves metadata denial under broad network access.
 // The cloud-metadata hard-deny (curl 169.254.169.254 fails; curl example.com
-// succeeds) is a rung-1 netns+nftables address rule. userns is BLOCKED here so
-// there is no netns to install it into; and it needs live external egress anyway.
+// succeeds) is a rung-1 Netns+nftables address rule. Userns is BLOCKED here so
+// there is no Netns to install it into; and it needs live external egress anyway.
 // SKIP with a recorded reason on both counts.
 func acceptLinuxMetadataUnderTrusted(t *testing.T) {
-	if !probeLinuxCaps().userns {
-		t.Skip("RECORDED SKIP: the metadata hard-deny is enforced by rung-1 in-netns nftables (§5.2, §5.4); userns is BLOCKED on this host (probeLinuxCaps().userns=false), so there is no netns to install the 169.254.0.0/16 deny into. Rung 2 cannot address-scope, so metadata is only vacuously denied (:80 not in the default trusted port set). Live metadata/external reachability is exercised in the CI integration environment on a userns-enabled host.")
+	if !linux.ProbeCaps().Userns {
+		t.Skip("RECORDED SKIP: the metadata hard-deny is linux.Enforced by linux.Rung-1 in-Netns nftables (§5.2, §5.4); Userns is BLOCKED on this host (linux.ProbeCaps().Userns=false), so there is no Netns to install the 169.254.0.0/16 deny into. Rung 2 cannot address-scope, so metadata is only vacuously denied (:80 not in the default trusted port set). Live metadata/external reachability is exercised in the CI integration environment on a Userns-enabled host.")
 	}
-	t.Skip("RECORDED SKIP: even on a userns host this row requires live external egress (reach 169.254.169.254 and example.com), which is not available/deterministic in the unit-test environment; asserted by the CI integration suite.")
+	t.Skip("RECORDED SKIP: even on a Userns host this row requires live external egress (reach 169.254.169.254 and example.com), which is not available/deterministic in the unit-test environment; asserted by the CI integration suite.")
 }
 
 // containsLine reports whether out contains want as a full, trimmed line — a

@@ -5,6 +5,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
@@ -21,16 +22,16 @@ import (
 // this — they walk the filesystem and build plans without any namespace.
 func requireRung1Caps(t *testing.T) {
 	t.Helper()
-	c := probeLinuxCaps()
-	if !c.userns || !c.mountns || !c.netns {
-		t.Skip("rung-1 backend requires unprivileged userns+mountns+netns; blocked on this host by apparmor_restrict_unprivileged_userns=1 — CI-verified")
+	c := linux.ProbeCaps()
+	if !c.Userns || !c.Mountns || !c.Netns {
+		t.Skip("linux.Rung-1 backend requires unprivileged Userns+Mountns+Netns; blocked on this host by apparmor_restrict_unprivileged_userns=1 — CI-verified")
 	}
 }
 
 // TestCompileMountView asserts the pure policy -> mount-view plan compilation:
 // writable roots become rw binds, read roots + carveouts become ro binds, literal
 // secret denies become masks, glob denies are carried for the spawn scan, and a
-// deny that is an ancestor-or-equal of an allow drops that allow (deny is a hard
+// deny that is an Ancestor-or-equal of an allow drops that allow (deny is a hard
 // override). This runs on THIS host — no namespaces.
 func TestCompileMountView(t *testing.T) {
 	t.Parallel()
@@ -39,11 +40,11 @@ func TestCompileMountView(t *testing.T) {
 	tests := []struct {
 		name         string
 		policy       policy.Effective
-		wantRW       []string // must be present in rwBinds
-		wantRO       []string // must be present in roBinds
+		wantRW       []string // must be present in RWBinds
+		wantRO       []string // must be present in ROBinds
 		wantNotBound []string // must NOT appear in rw or ro binds
-		wantGlob     []string // must be present in globDenies
-		wantMaskAny  bool     // denyMasks must be non-empty
+		wantGlob     []string // must be present in GlobDenies
+		wantMaskAny  bool     // DenyMasks must be non-empty
 	}{
 		{
 			name:        "write mode: workspace+tmp rw, / ro, carveouts ro, secrets masked",
@@ -85,29 +86,29 @@ func TestCompileMountView(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			plan := compileMountView(tt.policy)
+			plan := linux.CompileMountView(tt.policy)
 			for _, w := range tt.wantRW {
-				if !containsStr(plan.rwBinds, w) {
-					t.Errorf("rwBinds %v missing %q", plan.rwBinds, w)
+				if !containsStr(plan.RWBinds, w) {
+					t.Errorf("RWBinds %v missing %q", plan.RWBinds, w)
 				}
 			}
 			for _, w := range tt.wantRO {
-				if !containsStr(plan.roBinds, w) {
-					t.Errorf("roBinds %v missing %q", plan.roBinds, w)
+				if !containsStr(plan.ROBinds, w) {
+					t.Errorf("ROBinds %v missing %q", plan.ROBinds, w)
 				}
 			}
 			for _, w := range tt.wantNotBound {
-				if containsStr(plan.rwBinds, w) || containsStr(plan.roBinds, w) {
-					t.Errorf("path %q should not be bound; rw=%v ro=%v", w, plan.rwBinds, plan.roBinds)
+				if containsStr(plan.RWBinds, w) || containsStr(plan.ROBinds, w) {
+					t.Errorf("path %q should not be bound; rw=%v ro=%v", w, plan.RWBinds, plan.ROBinds)
 				}
 			}
 			for _, g := range tt.wantGlob {
-				if !containsStr(plan.globDenies, g) {
-					t.Errorf("globDenies %v missing %q", plan.globDenies, g)
+				if !containsStr(plan.GlobDenies, g) {
+					t.Errorf("GlobDenies %v missing %q", plan.GlobDenies, g)
 				}
 			}
-			if tt.wantMaskAny && len(plan.denyMasks) == 0 {
-				t.Errorf("denyMasks empty, want at least one literal secret deny")
+			if tt.wantMaskAny && len(plan.DenyMasks) == 0 {
+				t.Errorf("DenyMasks empty, want at least one literal secret deny")
 			}
 		})
 	}
@@ -130,12 +131,12 @@ func TestEnumerateMountView(t *testing.T) {
 	}
 	missing := filepath.Join(root, "does-not-exist")
 
-	plan := mountViewPlan{
-		rwBinds:   []string{root, missing}, // missing must be dropped
-		roBinds:   []string{sub},
-		denyMasks: []string{file, missing}, // missing deny must be skipped
+	plan := linux.MountViewPlan{
+		RWBinds:   []string{root, missing}, // missing must be dropped
+		ROBinds:   []string{sub},
+		DenyMasks: []string{file, missing}, // missing deny must be skipped
 	}
-	spec := enumerateMountView(plan)
+	spec := linux.EnumerateMountView(plan)
 
 	// Binds: root (rw, dir) and sub (ro, dir); missing dropped; sorted parents-first.
 	if len(spec.Binds) != 2 {
@@ -186,7 +187,7 @@ func TestScanGlobDenies(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	masks := scanGlobDenies([]string{root}, []string{"**/.env*"}, globScanMaxDepth)
+	masks := linux.ScanGlobDenies([]string{root}, []string{"**/.env*"}, linux.GlobScanMaxDepth)
 	got := make(map[string]bool)
 	for _, m := range masks {
 		got[m.Target] = true
@@ -205,7 +206,7 @@ func TestScanGlobDenies(t *testing.T) {
 	}
 
 	// Depth bound: with maxDepth 0 only the top level is scanned.
-	shallow := scanGlobDenies([]string{root}, []string{"**/.env*"}, 0)
+	shallow := linux.ScanGlobDenies([]string{root}, []string{"**/.env*"}, 0)
 	for _, m := range shallow {
 		if m.Target == deepEnv {
 			t.Errorf("depth-0 scan reached %q; depth bound not honored", deepEnv)
@@ -214,8 +215,8 @@ func TestScanGlobDenies(t *testing.T) {
 }
 
 // TestConfigureRung1SysProcAttr asserts the namespace cloneflags + uid/gid maps
-// (SPEC §7.2 rung 1): user+mount+pid always, net only when egress is confined,
-// and the caller mapped to root-in-userns. Pure logic — runs on THIS host.
+// (SPEC §7.2 rung 1): user+mount+pid always, net only when egress is Confined,
+// and the caller mapped to root-in-Userns. Pure logic — runs on THIS host.
 func TestConfigureRung1SysProcAttr(t *testing.T) {
 	t.Parallel()
 	base := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID)
@@ -224,14 +225,14 @@ func TestConfigureRung1SysProcAttr(t *testing.T) {
 		netConfined bool
 		wantFlags   uintptr
 	}{
-		{"confined egress adds a net namespace", true, base | syscall.CLONE_NEWNET},
+		{"Confined egress adds a net namespace", true, base | syscall.CLONE_NEWNET},
 		{"open egress keeps host networking (no net ns)", false, base},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			attr := &syscall.SysProcAttr{}
-			configureRung1SysProcAttr(attr, tt.netConfined)
+			linux.ConfigureRung1SysProcAttr(attr, tt.netConfined)
 			if attr.Cloneflags != tt.wantFlags {
 				t.Errorf("Cloneflags = %#x, want %#x", attr.Cloneflags, tt.wantFlags)
 			}
@@ -246,31 +247,31 @@ func TestConfigureRung1SysProcAttr(t *testing.T) {
 }
 
 // TestSelectLinuxBackendRung1 asserts the selector returns a backend compiled for
-// rung 1 when the probe yields rungOne, and rung 2 for rungTwo — the wiring proof
+// rung 1 when the probe yields linux.RungOne, and rung 2 for linux.RungTwo — the wiring proof
 // that platformBackend now selects the full tier. Pure logic — runs on THIS host.
 func TestSelectLinuxBackendRung1(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
-		rung     rung
-		wantRung rung
+		Rung     linux.Rung
+		wantRung linux.Rung
 	}{
-		{"rungOne selects the rung-1 backend", rungOne, rungOne},
-		{"rungTwo selects the rung-2 backend", rungTwo, rungTwo},
+		{"linux.RungOne selects the linux.Rung-1 backend", linux.RungOne, linux.RungOne},
+		{"linux.RungTwo selects the linux.Rung-2 backend", linux.RungTwo, linux.RungTwo},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b, err := selectLinuxBackend(tt.rung, true)
+			b, err := linux.SelectBackend(tt.Rung, true)
 			if err != nil {
-				t.Fatalf("selectLinuxBackend: %v", err)
+				t.Fatalf("linux.SelectBackend: %v", err)
 			}
-			lb, ok := b.(*linuxBackend)
+			lb, ok := b.(*linux.Backend)
 			if !ok {
-				t.Fatalf("backend = %T, want *linuxBackend", b)
+				t.Fatalf("backend = %T, want *linux.Backend", b)
 			}
-			if lb.rung != tt.wantRung {
-				t.Errorf("backend rung = %d, want %d", lb.rung, tt.wantRung)
+			if lb.Rung != tt.wantRung {
+				t.Errorf("backend linux.Rung = %d, want %d", lb.Rung, tt.wantRung)
 			}
 		})
 	}
@@ -290,12 +291,12 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 		wantBits uint64 // bits that MUST be set
 	}{
 		{
-			name:     "write mode: full posture incl. address network (egress confined-empty)",
+			name:     "write mode: full posture incl. address network (egress Confined-empty)",
 			policy:   backendFixturePolicy(fixtureWorkspaceWrite, ws),
 			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
 		{
-			name:     "trusted mode: full posture with ports/loopback/private/dns",
+			name:     "trusted mode: full posture with ports/Loopback/Private/Dns",
 			policy:   backendFixturePolicy(fixtureBroadNetwork, ws),
 			wantBits: GuaranteeProcessBoundary | GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeEnvScrub | GuaranteeNetworkBoundary | GuaranteeAddressNetwork,
 		},
@@ -303,7 +304,7 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b := newLinuxBackendRung1()
+			b := linux.NewBackendRung1()
 			_, report, level, bits, err := b.Compile(tt.policy)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
@@ -316,14 +317,14 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 			}
 			// The report must record restricted-read and metadata-deny as enforced —
 			// the two rung-2 cannot claim.
-			if !reportHas(report, "restricted-read", "enforced") {
-				t.Errorf("report missing enforced restricted-read: %+v", report.Entries)
+			if !reportHas(report, "restricted-read", "linux.Enforced") {
+				t.Errorf("report missing linux.Enforced restricted-read: %+v", report.Entries)
 			}
-			if !reportHas(report, "metadata-deny", "enforced") {
-				t.Errorf("report missing enforced metadata-deny: %+v", report.Entries)
+			if !reportHas(report, "metadata-deny", "linux.Enforced") {
+				t.Errorf("report missing linux.Enforced metadata-deny: %+v", report.Entries)
 			}
-			if !reportHas(report, "glob-deny", "enforced") {
-				t.Errorf("report missing enforced glob-deny: %+v", report.Entries)
+			if !reportHas(report, "glob-deny", "linux.Enforced") {
+				t.Errorf("report missing linux.Enforced glob-deny: %+v", report.Entries)
 			}
 		})
 	}
@@ -334,19 +335,19 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 // child). Runs on THIS host.
 func TestMountViewSpecGobRoundTrip(t *testing.T) {
 	t.Parallel()
-	spec := stage2Spec{
+	spec := linux.Stage2Spec{
 		Dir:  "/work",
 		Argv: []string{"/bin/true"},
 		Env:  []string{"PATH=/usr/bin"},
-		Rung: stage2RungOne,
-		MountView: MountViewSpec{
-			Binds: []BindSpec{
+		Rung: linux.Stage2RungOne,
+		MountView: linux.MountViewSpec{
+			Binds: []linux.BindSpec{
 				{Source: "/work", Target: "/work", ReadOnly: false, IsDir: true},
 				{Source: "/work/.git", Target: "/work/.git", ReadOnly: true, IsDir: true},
 			},
-			Masks: []MaskSpec{{Target: "/work/.env", IsDir: false}},
+			Masks: []linux.MaskSpec{{Target: "/work/.env", IsDir: false}},
 		},
-		NftRules: NftSpec{
+		NftRules: linux.NftSpec{
 			Confined:      true,
 			TCPPorts:      []uint16{443},
 			Loopback:      true,
@@ -356,15 +357,15 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	if err := encodeStage2Spec(&buf, spec); err != nil {
+	if err := linux.EncodeStage2Spec(&buf, spec); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	got, err := decodeStage2Spec(fileFromBuf(t, &buf))
+	got, err := linux.DecodeStage2Spec(fileFromBuf(t, &buf))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Rung != stage2RungOne {
-		t.Errorf("Rung = %d, want %d", got.Rung, stage2RungOne)
+	if got.Rung != linux.Stage2RungOne {
+		t.Errorf("Rung = %d, want %d", got.Rung, linux.Stage2RungOne)
 	}
 	if len(got.MountView.Binds) != 2 || got.MountView.Binds[1].Target != "/work/.git" || !got.MountView.Binds[1].ReadOnly {
 		t.Errorf("MountView.Binds round-trip mismatch: %+v", got.MountView.Binds)
@@ -384,7 +385,7 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 // bind-mount view (SPEC §7.2 rung 1, §7.5). Anti-fail-open: it asserts BOTH the
 // positive (the workspace is visible and writable) AND the negative (a host path
 // NOT in the policy is INVISIBLE — restricted-read, not merely unreadable — and a
-// glob-masked .env reads empty). It SKIPS on the authoring host (userns blocked)
+// glob-masked .env reads empty). It SKIPS on the authoring host (Userns blocked)
 // with a recorded reason and runs for real only in CI.
 func TestRung1MountViewEnforcement(t *testing.T) {
 	requireRung1Caps(t)
@@ -406,7 +407,7 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 
 	// Write mode (workspace rw, glob deny on .env). The workspace is visible/writable
 	// and the .env is masked empty; use Write so the write assertion is meaningful.
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(newLinuxBackendRung1()))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(linux.NewBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -18,20 +19,20 @@ import (
 
 // --- Fork-bomb target dispatch (runs in the re-exec'd, cgroup-joined target) ---
 //
-// The e2e proof re-runs THIS test binary as the stage-2 TARGET: the linuxBackend
+// The e2e proof re-runs THIS test binary as the stage-2 TARGET: the linux.Backend
 // creates a transient cgroup v2 scope with pids.max=N, joins the stage-2 child at
 // clone via CLONE_INTO_CGROUP, and execve's /proc/self/exe (the target). In the
 // target the fork-bomb sentinel is set (via the policy's Env.Set) and the dispatch
 // sentinel is NOT (it is scrubbed out of the target env), so cgroupForkbombDispatch
 // runs a bounded fork loop UNDER the pids cap inherited from the join and prints
 // markers the parent asserts on. This proves a fork bomb is capped at pids.max in a
-// real post-execve target, composed with the rung-2 Landlock+seccomp confinement.
+// real post-execve target, composed with the rung-2 Landlock+Seccomp confinement.
 
 const (
 	// cgroupForkbombEnv marks a process that should run the fork loop and exit. It
 	// is injected into the TARGET env via Env.Set, so it is present only after the
 	// stage-2 execve — not in the stage-2 helper (which additionally carries
-	// stage2SentinelEnv, the distinguisher checked below).
+	// linux.Stage2SentinelEnv, the distinguisher checked below).
 	cgroupForkbombEnv = "LRSANDBOX_CGROUP_FORKBOMB"
 	// cgroupForkbombSleep passes the resolved sleep binary path to the target, so
 	// the fork loop needs no PATH lookup under confinement.
@@ -61,7 +62,7 @@ const (
 	cgMaxSpawnAttempts = 60
 	cgCappedPidsMax    = 20
 	cgControlPidsMax   = 200
-	cgSleepSeconds     = "30" // spawned children sleep; teardown kills them
+	cgSleepSeconds     = "30" // spawned children sleep; linux.Teardown kills them
 	cgHelperExitConfig = 4    // distinct from a fork-loop outcome (reported via stdout)
 )
 
@@ -74,8 +75,8 @@ func cgroupForkbombDispatch() {
 	if os.Getenv(cgroupForkbombEnv) != "1" {
 		return // not a fork-bomb target
 	}
-	if os.Getenv(stage2SentinelEnv) == stage2SentinelValue {
-		return // this is the stage-2 helper (pre-execve); let Init()/runStage2 run
+	if os.Getenv(linux.Stage2SentinelEnv) == linux.Stage2SentinelValue {
+		return // this is the stage-2 helper (pre-execve); let Init()/linux.RunStage2 run
 	}
 	os.Exit(runCgroupForkbomb())
 }
@@ -90,14 +91,14 @@ func init() { cgroupForkbombDispatch() }
 // children, counting how many start before a fork fails with EAGAIN (pids.max
 // reached), then reports the count, the outcome, and pids.current / pids.max read
 // from its OWN cgroup at that instant. It does not wait for the children — the
-// parent's spawn teardown (cgroup.kill) reaps them.
+// parent's spawn Teardown (cgroup.kill) reaps them.
 func runCgroupForkbomb() int {
 	sleepPath := os.Getenv(cgroupForkbombSleep)
 	if sleepPath == "" {
 		fmt.Printf("%s=ERR:missing-sleep-path\n", cgKeyOutcome)
 		return cgHelperExitConfig
 	}
-	selfDir, ok := selfCgroupDir()
+	selfDir, ok := linux.SelfCgroupDir()
 	if !ok {
 		fmt.Printf("%s=ERR:self-cgroup\n", cgKeyOutcome)
 		return cgHelperExitConfig
@@ -106,7 +107,7 @@ func runCgroupForkbomb() int {
 	outcome := cgOutcomeNoLimit
 	spawned := 0
 	// Keep references so the children stay alive (not GC'd) for the loop; they run
-	// until teardown kills them. Their stdout is os.DevNull (exec default), so they
+	// until Teardown kills them. Their stdout is os.DevNull (exec default), so they
 	// never touch the marker stream on the target's stdout pipe.
 	started := make([]*exec.Cmd, 0, cgMaxSpawnAttempts)
 	for i := 0; i < cgMaxSpawnAttempts; i++ {
@@ -168,7 +169,7 @@ func parseCgroupMarkers(out []byte) map[string]string {
 // on hosts where a fork-bomb cap cannot be enforced rather than passing silently.
 func requireCgroupPids(t *testing.T) {
 	t.Helper()
-	if probeDelegatedPidsAncestor() == "" {
+	if linux.ProbeDelegatedPidsAncestor() == "" {
 		t.Skip("cgroup v2 pids delegation unavailable on this host; resource-limit spawn tests cannot run")
 	}
 }
@@ -177,11 +178,11 @@ func requireCgroupPids(t *testing.T) {
 // runs the fork-bomb target (/proc/self/exe) under it, returning the parsed
 // markers. GOMAXPROCS=1 keeps the target's own Go-runtime thread footprint small
 // so the cap budget is spent on the fork loop, not runtime threads.
-func runForkbombUnderSandbox(t *testing.T, pidsMax int, sleepPath string) map[string]string {
+func runForkbombUnderSandbox(t *testing.T, PidsMax int, sleepPath string) map[string]string {
 	t.Helper()
 	ws := t.TempDir()
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws,
-		fixtureWithLimits(policy.Limits{MaxPIDs: pidsMax}),
+		fixtureWithLimits(policy.Limits{MaxPIDs: PidsMax}),
 		fixtureWithEnv(policy.EnvPolicy{Set: map[string]string{
 			cgroupForkbombEnv:   "1",
 			cgroupForkbombSleep: sleepPath,
@@ -206,7 +207,7 @@ func runForkbombUnderSandbox(t *testing.T, pidsMax int, sleepPath string) map[st
 // the capped case asserts it hit EAGAIN AND real forks succeeded (>=1, <60) AND
 // pids.max reads back as configured AND pids.current == pids.max.
 func TestLinuxCgroupForkBombCapped(t *testing.T) {
-	requireLandlockV4(t) // the rung-2 backend needs Landlock v4 to spawn
+	requireLandlockV4(t) // the linux.Rung-2 backend needs Landlock v4 to spawn
 	requireSeccomp(t)
 	requireCgroupPids(t)
 	sleepPath, err := exec.LookPath("sleep")
@@ -216,7 +217,7 @@ func TestLinuxCgroupForkBombCapped(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		pidsMax    int
+		PidsMax    int
 		wantCapped bool
 	}{
 		{"fork bomb capped at pids.max=20", cgCappedPidsMax, true},
@@ -224,7 +225,7 @@ func TestLinuxCgroupForkBombCapped(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := runForkbombUnderSandbox(t, tt.pidsMax, sleepPath)
+			m := runForkbombUnderSandbox(t, tt.PidsMax, sleepPath)
 			t.Logf("markers: %s=%s %s=%s %s=%s %s=%s",
 				cgKeyOutcome, m[cgKeyOutcome], cgKeySpawned, m[cgKeySpawned],
 				cgKeyPidsCurrent, m[cgKeyPidsCurrent], cgKeyPidsMax, m[cgKeyPidsMax])
@@ -269,7 +270,7 @@ func TestLinuxCgroupForkBombCapped(t *testing.T) {
 
 // TestLinuxCgroupGuaranteeAndLevel asserts that, on a host with pids delegation,
 // the ResourceLimits guarantee holds and a resource-limits/enforced report entry
-// exists — and that the isolation Level is UNCHANGED versus a limits-disabled
+// exists — and that the isolation Level is UNCHANGED versus a limits-Disabled
 // executor (resource limits are containment-of-cost, not authority, §7.4).
 func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 	requireLandlockV4(t)
@@ -280,27 +281,27 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 	if !limited.Guarantees().ResourceLimits {
 		t.Errorf("ResourceLimits guarantee = false; want true on a host with cgroup v2 pids delegation")
 	}
-	if !reportHas(limited.Report(), "resource-limits", "enforced") {
-		t.Errorf("missing resource-limits/enforced report entry; report=%+v", limited.Report())
+	if !reportHas(limited.Report(), "resource-limits", "linux.Enforced") {
+		t.Errorf("missing resource-limits/linux.Enforced report entry; report=%+v", limited.Report())
 	}
 
-	// A limits-disabled executor: no scope, no guarantee, an unenforced entry — but
+	// A limits-Disabled executor: no scope, no guarantee, an unenforced entry — but
 	// the SAME Level (limits never move the ladder).
-	disabled := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithLimits(policy.Limits{Disabled: true})))
-	if disabled.Guarantees().ResourceLimits {
-		t.Errorf("disabled policy reports ResourceLimits guarantee; want false")
+	Disabled := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithLimits(policy.Limits{Disabled: true})))
+	if Disabled.Guarantees().ResourceLimits {
+		t.Errorf("Disabled policy reports ResourceLimits guarantee; want false")
 	}
-	if !reportHas(disabled.Report(), "resource-limits", "unenforced") {
-		t.Errorf("disabled policy missing resource-limits/unenforced report entry; report=%+v", disabled.Report())
+	if !reportHas(Disabled.Report(), "resource-limits", "unenforced") {
+		t.Errorf("Disabled policy missing resource-limits/unenforced report entry; report=%+v", Disabled.Report())
 	}
-	if limited.Level() != disabled.Level() {
-		t.Errorf("Level changed by resource limits: limited=%d disabled=%d; want equal (§7.4)", limited.Level(), disabled.Level())
+	if limited.Level() != Disabled.Level() {
+		t.Errorf("Level changed by resource limits: limited=%d Disabled=%d; want equal (§7.4)", limited.Level(), Disabled.Level())
 	}
 }
 
 // TestLinuxCgroupUnavailablePathFailSecure exercises the no-delegation branch on
-// THIS host by pinning the backend's probed ancestor to "" (the exact state
-// probeDelegatedPidsAncestor returns on a host without pids delegation). The
+// THIS host by pinning the backend's probed Ancestor to "" (the exact state
+// linux.ProbeDelegatedPidsAncestor returns on a host without pids delegation). The
 // guarantee is cleared, the report records it unenforced, the Level is unchanged,
 // and a spawn STILL RUNS — limits are best-effort, their absence is never fatal.
 func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
@@ -308,7 +309,7 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(&linuxBackend{cgroupPids: ""}))
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(&linux.Backend{CgroupPids: ""}))
 	if err != nil {
 		t.Fatalf("NewExecutor (no delegation): %v", err)
 	}
@@ -336,11 +337,11 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 	}
 }
 
-// TestLinuxCgroupNoDanglingScopes proves teardown works: after a capped fork bomb,
-// no lrsb-* transient cgroup remains under the delegated ancestor. It is
+// TestLinuxCgroupNoDanglingScopes proves Teardown works: after a capped fork bomb,
+// no lrsb-* transient cgroup remains under the delegated Ancestor. It is
 // non-parallel, so no concurrent spawn's live scope can race the scan (parallel
 // tests are deferred until the sequential phase completes), and the spawn's own
-// teardown is synchronous within RunArgv's cleanup.
+// Teardown is synchronous within RunArgv's cleanup.
 func TestLinuxCgroupNoDanglingScopes(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
@@ -349,13 +350,13 @@ func TestLinuxCgroupNoDanglingScopes(t *testing.T) {
 	if err != nil {
 		t.Skipf("no-dangling test needs a sleep binary: %v", err)
 	}
-	ancestor := probeDelegatedPidsAncestor()
+	Ancestor := linux.ProbeDelegatedPidsAncestor()
 
 	_ = runForkbombUnderSandbox(t, cgCappedPidsMax, sleepPath)
 
-	leaked := listLrsbScopes(t, ancestor)
+	leaked := listLrsbScopes(t, Ancestor)
 	if len(leaked) != 0 {
-		t.Errorf("dangling transient cgroups after teardown under %s: %v", ancestor, leaked)
+		t.Errorf("dangling transient cgroups after linux.Teardown under %s: %v", Ancestor, leaked)
 	}
 }
 
@@ -364,11 +365,11 @@ func listLrsbScopes(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("read delegated ancestor %s: %v", dir, err)
+		t.Fatalf("read delegated Ancestor %s: %v", dir, err)
 	}
 	var scopes []string
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), cgroupScopePrefix) {
+		if e.IsDir() && strings.HasPrefix(e.Name(), linux.CgroupScopePrefix) {
 			scopes = append(scopes, e.Name())
 		}
 	}
@@ -378,48 +379,48 @@ func listLrsbScopes(t *testing.T, dir string) []string {
 // --- Pure unit tests (no kernel; fast) ---------------------------------------
 
 // TestCompileCgroupPolicy exercises limit resolution: defaults, explicit values,
-// the fail-secure branches (no ancestor / disabled), and boundary/negative inputs.
+// the fail-secure branches (no Ancestor / Disabled), and boundary/negative inputs.
 func TestCompileCgroupPolicy(t *testing.T) {
 	t.Parallel()
 	const anc = "/sys/fs/cgroup/session.slice"
 	tests := []struct {
 		name         string
 		limits       policy.Limits
-		ancestor     string
+		Ancestor     string
 		wantEnforced bool
 		wantPids     int64
 		wantMem      int64
 		wantCPU      int
 		wantDisabled bool
 	}{
-		{"defaults apply on available ancestor", policy.Limits{}, anc, true, defaultMaxPIDs, 0, 0, false},
+		{"defaults apply on available Ancestor", policy.Limits{}, anc, true, linux.DefaultMaxPIDs, 0, 0, false},
 		{"explicit MaxPIDs overrides the default", policy.Limits{MaxPIDs: 20}, anc, true, 20, 0, 0, false},
 		{"memory and cpu carried when set", policy.Limits{MaxPIDs: 100, MaxMemBytes: 1 << 30, MaxCPUPct: 150}, anc, true, 100, 1 << 30, 150, false},
-		{"zero MaxPIDs falls back to default", policy.Limits{MaxMemBytes: 4096}, anc, true, defaultMaxPIDs, 4096, 0, false},
-		{"disabled applies no limits (fail-secure)", policy.Limits{MaxPIDs: 99, Disabled: true}, anc, false, 0, 0, 0, true},
-		{"disabled wins even with no ancestor", policy.Limits{Disabled: true}, "", false, 0, 0, 0, true},
-		{"no ancestor -> unenforced (fail-secure)", policy.Limits{MaxPIDs: 20}, "", false, 0, 0, 0, false},
-		{"negative mem/cpu ignored", policy.Limits{MaxMemBytes: -5, MaxCPUPct: -1}, anc, true, defaultMaxPIDs, 0, 0, false},
+		{"zero MaxPIDs falls back to default", policy.Limits{MaxMemBytes: 4096}, anc, true, linux.DefaultMaxPIDs, 4096, 0, false},
+		{"Disabled applies no limits (fail-secure)", policy.Limits{MaxPIDs: 99, Disabled: true}, anc, false, 0, 0, 0, true},
+		{"Disabled wins even with no Ancestor", policy.Limits{Disabled: true}, "", false, 0, 0, 0, true},
+		{"no Ancestor -> unenforced (fail-secure)", policy.Limits{MaxPIDs: 20}, "", false, 0, 0, 0, false},
+		{"negative mem/cpu ignored", policy.Limits{MaxMemBytes: -5, MaxCPUPct: -1}, anc, true, linux.DefaultMaxPIDs, 0, 0, false},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cg := compileCgroupPolicy(tt.limits, tt.ancestor)
-			if cg.enforced() != tt.wantEnforced {
-				t.Errorf("enforced() = %v, want %v", cg.enforced(), tt.wantEnforced)
+			cg := linux.CompileCgroupPolicy(tt.limits, tt.Ancestor)
+			if cg.Enforced() != tt.wantEnforced {
+				t.Errorf("linux.Enforced() = %v, want %v", cg.Enforced(), tt.wantEnforced)
 			}
-			if cg.pidsMax != tt.wantPids {
-				t.Errorf("pidsMax = %d, want %d", cg.pidsMax, tt.wantPids)
+			if cg.PidsMax != tt.wantPids {
+				t.Errorf("PidsMax = %d, want %d", cg.PidsMax, tt.wantPids)
 			}
-			if cg.memMax != tt.wantMem {
-				t.Errorf("memMax = %d, want %d", cg.memMax, tt.wantMem)
+			if cg.MemMax != tt.wantMem {
+				t.Errorf("MemMax = %d, want %d", cg.MemMax, tt.wantMem)
 			}
-			if cg.cpuPct != tt.wantCPU {
-				t.Errorf("cpuPct = %d, want %d", cg.cpuPct, tt.wantCPU)
+			if cg.CPUPct != tt.wantCPU {
+				t.Errorf("CPUPct = %d, want %d", cg.CPUPct, tt.wantCPU)
 			}
-			if cg.disabled != tt.wantDisabled {
-				t.Errorf("disabled = %v, want %v", cg.disabled, tt.wantDisabled)
+			if cg.Disabled != tt.wantDisabled {
+				t.Errorf("Disabled = %v, want %v", cg.Disabled, tt.wantDisabled)
 			}
 		})
 	}
@@ -443,33 +444,33 @@ func TestFormatCPUMax(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := formatCPUMax(tt.pct); got != tt.want {
-				t.Errorf("formatCPUMax(%d) = %q, want %q", tt.pct, got, tt.want)
+			if got := linux.FormatCPUMax(tt.pct); got != tt.want {
+				t.Errorf("linux.FormatCPUMax(%d) = %q, want %q", tt.pct, got, tt.want)
 			}
 		})
 	}
 }
 
 // TestCgroupCompileReport asserts the single resource-limits entry's status for
-// the enforced, disabled, and delegation-absent cases (the detail must
-// distinguish disabled from absent).
+// the enforced, Disabled, and delegation-absent cases (the detail must
+// distinguish Disabled from absent).
 func TestCgroupCompileReport(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name       string
-		cg         compiledCgroup
+		cg         linux.CompiledCgroup
 		wantStatus string
 		wantDetail string // substring the detail must contain
 	}{
-		{"enforced", compiledCgroup{ancestor: "/x", pidsMax: 512}, "enforced", "pids.max=512"},
-		{"disabled unenforced", compiledCgroup{disabled: true}, "unenforced", "disabled by policy"},
-		{"absent unenforced", compiledCgroup{}, "unenforced", "delegation absent"},
+		{"linux.Enforced", linux.CompiledCgroup{Ancestor: "/x", PidsMax: 512}, "linux.Enforced", "pids.max=512"},
+		{"Disabled unenforced", linux.CompiledCgroup{Disabled: true}, "unenforced", "Disabled by policy"},
+		{"absent unenforced", linux.CompiledCgroup{}, "unenforced", "delegation absent"},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			e := cgroupCompileReport(tt.cg)
+			e := linux.CgroupCompileReport(tt.cg)
 			if e.Feature != "resource-limits" {
 				t.Errorf("Feature = %q, want %q", e.Feature, "resource-limits")
 			}
@@ -483,29 +484,29 @@ func TestCgroupCompileReport(t *testing.T) {
 	}
 }
 
-// TestCreateTransientCgroupNoop verifies the disabled/absent plan creates nothing
+// TestCreateTransientCgroupNoop verifies the Disabled/absent plan creates nothing
 // (returns (nil, nil)) so the caller simply spawns without a cgroup — the
 // fail-secure spawn-time counterpart to the cleared compile-time guarantee.
 func TestCreateTransientCgroupNoop(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		cg   compiledCgroup
+		cg   linux.CompiledCgroup
 	}{
-		{"no ancestor", compiledCgroup{}},
-		{"disabled", compiledCgroup{disabled: true}},
+		{"no Ancestor", linux.CompiledCgroup{}},
+		{"Disabled", linux.CompiledCgroup{Disabled: true}},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			tc, err := createTransientCgroup(tt.cg)
+			tc, err := linux.CreateTransientCgroup(tt.cg)
 			if err != nil {
-				t.Fatalf("createTransientCgroup(no-op) err = %v, want nil", err)
+				t.Fatalf("linux.CreateTransientCgroup(no-op) err = %v, want nil", err)
 			}
 			if tc != nil {
-				tc.teardown()
-				t.Fatalf("createTransientCgroup(no-op) returned a scope %+v, want nil", tc)
+				tc.Teardown()
+				t.Fatalf("linux.CreateTransientCgroup(no-op) returned a scope %+v, want nil", tc)
 			}
 		})
 	}

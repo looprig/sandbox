@@ -1,6 +1,6 @@
 //go:build linux
 
-package sandbox
+package linux
 
 import (
 	"errors"
@@ -15,21 +15,21 @@ import (
 )
 
 // This file compiles a policy.Effective's filesystem axis into a go-landlock ruleset for
-// the rung-2 backend (SPEC §7.2, §7.5). Landlock is ADDITIVE (allowlist-only, no
+// the Rung-2 backend (SPEC §7.2, §7.5). Landlock is ADDITIVE (allowlist-only, no
 // deny rules), so a fixed-path deny compiles by ENUMERATED SIBLING ALLOWS: at
 // spawn, grant the siblings of a denied path instead of the parent, inode-pinned
 // with snapshot semantics (entries created after the spawn-time enumeration are
 // inaccessible for that command — which errs narrow, §7.5).
 //
 // Two-phase design across the re-exec:
-//   - compile time (once, in linuxBackend.compile): distil the policy.Effective's FS axis
+//   - compile time (once, in Backend.compile): distil the policy.Effective's FS axis
 //     into a policy.CompiledFS — the literal ALLOW entries with their access bits and
-//     the literal DENY paths. Globs are not expressible at rung 2 and are
-//     dropped here (recorded in the CompileReport).
+//     the literal DENY paths. Globs are not expressible at Rung 2 and are
+//     dropped here (recorded in the profile.CompileReport).
 //   - spawn time (per spawn, in the wrap/configure closure): policy.EnumerateFSRules
 //     walks the live filesystem, carving each deny/read-only-carveout out of its
 //     covering allow, and produces a flat []policy.FSRule. That slice is gob-encoded
-//     into the stage2Spec and rebuilt into a go-landlock ruleset by the stage-2
+//     into the Stage2Spec and rebuilt into a go-landlock ruleset by the stage-2
 //     child (applyLandlockRules), which restricts itself BEFORE execve.
 //
 // Enumeration is deliberately at SPAWN time (a fresh snapshot each spawn), not at
@@ -43,7 +43,7 @@ import (
 
 // applyLandlockRules rebuilds a go-landlock ruleset from the spawn-time
 // enumerated allowlist and restricts the CURRENT process (and everything it
-// subsequently execve's) to it, using the exact ABI v4 config (SPEC §7.2 rung 2).
+// subsequently execve's) to it, using the exact ABI v4 config (SPEC §7.2 Rung 2).
 // It is called by the stage-2 child BEFORE chdir/execve; a non-nil return makes
 // the child fail closed so the target never runs unconfined.
 //
@@ -92,7 +92,7 @@ func applyLandlockRules(rules []policy.FSRule) error {
 }
 
 func addLandlockFSRule(ruleset int, rule policy.FSRule) error {
-	access := uint64(landlockAccessSet(rule.Access, rule.IsDir))
+	access := uint64(LandlockAccessSet(rule.Access, rule.IsDir))
 	if rule.LandlockAccess != 0 {
 		access = rule.LandlockAccess
 	}
@@ -130,16 +130,16 @@ func addLandlockFSRule(ruleset int, rule policy.FSRule) error {
 // PathAccess with a precisely-assembled AccessFSSet avoids that; it also clamps
 // the set to the ABI's supported subset, so the mapping is kernel-version-safe.
 func landlockRule(r policy.FSRule) landlock.Rule {
-	return landlock.PathAccess(landlockAccessSet(r.Access, r.IsDir), r.Path).IgnoreIfMissing()
+	return landlock.PathAccess(LandlockAccessSet(r.Access, r.IsDir), r.Path).IgnoreIfMissing()
 }
 
-// landlockAccessSet assembles the Landlock AccessFSSet for the given policy
+// LandlockAccessSet assembles the Landlock AccessFSSet for the given policy
 // access bits and node kind. Read → read-file (+ read-dir for a directory);
 // Exec → execute; Write → the mutation rights (matching go-landlock's own
 // accessFSWrite set), with the directory-entry rights (make*/remove*) applied
 // only to a directory rule. Bits absent from the policy access are never set, so
 // a read-only entry grants no execute and no write.
-func landlockAccessSet(access policy.FSAccess, isDir bool) landlock.AccessFSSet {
+func LandlockAccessSet(access policy.FSAccess, isDir bool) landlock.AccessFSSet {
 	var set landlock.AccessFSSet
 	if access&policy.ReadAccess != 0 {
 		set |= llsys.AccessFSReadFile

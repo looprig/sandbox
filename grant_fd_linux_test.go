@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -23,21 +24,21 @@ type failingGrantPathBackend struct {
 }
 
 type trackingGrantPathBackend struct {
-	rung          rung
+	Rung          linux.Rung
 	grantCompiles int
 	configures    int
 	handles       []*policy.PathHandle
-	spec          stage2Spec
+	spec          linux.Stage2Spec
 }
 
 func (backend *trackingGrantPathBackend) Compile(pol policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
-	return (&linuxBackend{rung: backend.rung}).Compile(pol)
+	return (&linux.Backend{Rung: backend.Rung}).Compile(pol)
 }
 
 func (backend *trackingGrantPathBackend) CompileWithPathHandles(pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	backend.grantCompiles++
 	backend.handles = append([]*policy.PathHandle(nil), handles...)
-	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).CompileWithPathHandles(pol, handles)
+	spawn, report, level, bits, err := (&linux.Backend{Rung: backend.Rung}).CompileWithPathHandles(pol, handles)
 	if err != nil {
 		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
@@ -49,7 +50,7 @@ func (backend *trackingGrantPathBackend) CompileWithPathHandles(pol policy.Effec
 		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
 	backend.configures++
-	backend.spec, err = decodeStage2Spec(cmd.ExtraFiles[0])
+	backend.spec, err = linux.DecodeStage2Spec(cmd.ExtraFiles[0])
 	cleanup()
 	if err != nil {
 		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
@@ -78,8 +79,8 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 		{name: "exact-file", exact: true},
 		{name: "tree-directory", exact: false},
 	} {
-		for _, rung := range []rung{rungTwo, rungOne} {
-			t.Run(targetKind.name+"/rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
+		for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
+			t.Run(targetKind.name+"/linux.Rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 				root := t.TempDir()
 				target := filepath.Join(root, "target")
 				outside := filepath.Join(root, "outside")
@@ -118,7 +119,7 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 					{Path: target, Access: policy.ReadAccess, Exact: targetKind.exact},
 					{Path: target, Access: policy.WriteAccess, Exact: targetKind.exact, Canonical: true},
 				}}
-				backend := &linuxBackend{rung: rung}
+				backend := &linux.Backend{Rung: rung}
 				spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
 				if err != nil {
 					t.Fatal(err)
@@ -133,11 +134,11 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 				if len(cmd.ExtraFiles) != 2 {
 					t.Fatalf("ExtraFiles = %d, want sealed spec plus one pinned grant FD", len(cmd.ExtraFiles))
 				}
-				spec, err := decodeStage2Spec(cmd.ExtraFiles[0])
+				spec, err := linux.DecodeStage2Spec(cmd.ExtraFiles[0])
 				if err != nil {
 					t.Fatal(err)
 				}
-				const grantChildFD = stage2SpecFD + 1
+				const grantChildFD = linux.Stage2SpecFD + 1
 				if len(spec.GrantFDs) != 1 || spec.GrantFDs[0] != grantChildFD {
 					t.Fatalf("GrantFDs = %v, want [%d]", spec.GrantFDs, grantChildFD)
 				}
@@ -156,7 +157,7 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 				if !foundLandlockFD {
 					t.Fatalf("FSRules = %+v, want direct inherited FD %d", spec.FSRules, grantChildFD)
 				}
-				if rung == rungOne {
+				if rung == linux.RungOne {
 					wantSource := "/proc/self/fd/" + strconv.Itoa(grantChildFD)
 					foundBindFD := false
 					for _, bind := range spec.MountView.Binds {
@@ -204,7 +205,7 @@ func TestLinuxGrantHandleClosesWhenSpawnCompilationFails(t *testing.T) {
 }
 
 func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		for _, order := range []struct {
 			name    string
 			classes []string
@@ -229,7 +230,7 @@ func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T
 					HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
 				})
-				backend := &trackingGrantPathBackend{rung: rung}
+				backend := &trackingGrantPathBackend{Rung: rung}
 				executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 				if err != nil {
 					t.Fatal(err)
@@ -297,7 +298,7 @@ func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T
 }
 
 func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		for _, reverse := range []bool{false, true} {
 			name := "read-then-write"
 			if reverse {
@@ -315,7 +316,7 @@ func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
 					HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 					AdditionalRoots: []RootAccess{{Path: target, Read: Gated, Write: Gated}},
 				})
-				backend := &trackingGrantPathBackend{rung: rung}
+				backend := &trackingGrantPathBackend{Rung: rung}
 				executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 				if err != nil {
 					t.Fatal(err)
@@ -409,7 +410,7 @@ func TestLinuxGrantHandleSetSortsCanonicalTargetsAndPreservesLongestAncestor(t *
 	}
 	descendant := filepath.Join(targets[2], "leaf")
 	if got := policy.MatchingPathHandleIdentityAncestor(handles, descendant); got != 2 {
-		t.Fatalf("longest ancestor index = %d, want inner target at canonical index 2", got)
+		t.Fatalf("longest Ancestor index = %d, want inner target at canonical index 2", got)
 	}
 	set.Close()
 	for _, fd := range acquiredFDs {
@@ -552,7 +553,7 @@ func TestLinuxExactGrantNonexistentErrorTyping(t *testing.T) {
 }
 
 func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			target := filepath.Join(root, "target")
@@ -587,7 +588,7 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 				{Path: target, Access: policy.AllAccess, Canonical: true},
 				{Path: denied, Denied: policy.ReadAccess},
 			}}
-			backend := &linuxBackend{rung: rung}
+			backend := &linux.Backend{Rung: rung}
 			spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
 			if err != nil {
 				t.Fatal(err)
@@ -601,7 +602,7 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 			if len(cmd.ExtraFiles) < 3 {
 				t.Fatalf("ExtraFiles = %d, want spec + root grant + relative child", len(cmd.ExtraFiles))
 			}
-			spec, err := decodeStage2Spec(cmd.ExtraFiles[0])
+			spec, err := linux.DecodeStage2Spec(cmd.ExtraFiles[0])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -611,13 +612,13 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 					allowedRead = rule
 				}
 				if rule.Target == denied && rule.Access&policy.ReadAccess != 0 {
-					t.Fatalf("denied read rule reached rung %d spec: %+v", rung, rule)
+					t.Fatalf("denied read rule reached linux.Rung %d spec: %+v", rung, rule)
 				}
 			}
 			if allowedRead.ParentFD <= policy.FirstPathHandleChildFD || allowedRead.Path != "" {
 				t.Fatalf("rung %d allowed read rule = %+v, want direct relative child FD", rung, allowedRead)
 			}
-			if rung == rungOne {
+			if rung == linux.RungOne {
 				wantSource := "/proc/self/fd/" + strconv.Itoa(allowedRead.ParentFD)
 				var found bool
 				for _, bind := range spec.MountView.Binds {
@@ -626,7 +627,7 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 					}
 				}
 				if !found {
-					t.Fatalf("rung-1 binds = %+v, want allowed child sourced only from %q", spec.MountView.Binds, wantSource)
+					t.Fatalf("linux.Rung-1 binds = %+v, want allowed child sourced only from %q", spec.MountView.Binds, wantSource)
 				}
 			}
 
@@ -637,7 +638,7 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 			cleanup()
 			for _, fd := range childFDs {
 				if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-					t.Fatalf("rung %d relative child fd %d remains open after cleanup: %v", rung, fd, err)
+					t.Fatalf("linux.Rung %d relative child fd %d remains open after cleanup: %v", rung, fd, err)
 				}
 			}
 		})
@@ -645,7 +646,7 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 }
 
 func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			target := filepath.Join(root, "target")
@@ -701,7 +702,7 @@ func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
 }
 
 func TestLinuxPinnedNestedAdditionalRootFeedsBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			target := filepath.Join(root, "target")
@@ -745,7 +746,7 @@ func TestLinuxPinnedNestedAdditionalRootFeedsBothRungs(t *testing.T) {
 }
 
 func TestLinuxPinnedDescendantLongestAncestorFeedsBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			outer := filepath.Join(root, "outer")
@@ -801,7 +802,7 @@ func TestLinuxPinnedDescendantLongestAncestorFeedsBothRungs(t *testing.T) {
 }
 
 func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			outer := filepath.Join(root, "outer")
@@ -863,7 +864,7 @@ func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing
 					continue
 				}
 				found = true
-				extraIndex := rule.ParentFD - stage2SpecFD
+				extraIndex := rule.ParentFD - linux.Stage2SpecFD
 				if rule.Path != "" || extraIndex < 0 || extraIndex >= len(cmd.ExtraFiles) {
 					t.Fatalf("carved rule did not carry direct child handle: %+v", rule)
 				}
@@ -872,7 +873,7 @@ func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing
 					t.Fatal(err)
 				}
 				if string(contents) != "longest" {
-					t.Fatalf("carved rule resolved from shorter pinned ancestor: rule=%+v identity=%q", rule, contents)
+					t.Fatalf("carved rule resolved from shorter pinned Ancestor: rule=%+v identity=%q", rule, contents)
 				}
 			}
 			if !found {
@@ -883,7 +884,7 @@ func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing
 }
 
 func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T) {
-	for _, rung := range []rung{rungTwo, rungOne} {
+	for _, rung := range []linux.Rung{linux.RungTwo, linux.RungOne} {
 		t.Run("rung-"+strconv.Itoa(int(rung)), func(t *testing.T) {
 			root := t.TempDir()
 			target := filepath.Join(root, "target")
@@ -957,10 +958,10 @@ func TestLinuxPinnedExactFileIsNeverAnAncestor(t *testing.T) {
 	defer handle.Close()
 	descendant := filepath.Join(target, "child")
 	if got := policy.MatchingPathHandleAncestor([]*policy.PathHandle{handle}, descendant, false); got != -1 {
-		t.Fatalf("exact-file handle selected as typed ancestor: %d", got)
+		t.Fatalf("exact-file handle selected as typed Ancestor: %d", got)
 	}
 	if got := policy.MatchingPathHandleIdentityAncestor([]*policy.PathHandle{handle}, descendant); got != -1 {
-		t.Fatalf("exact-file handle selected as identity ancestor: %d", got)
+		t.Fatalf("exact-file handle selected as identity Ancestor: %d", got)
 	}
 }
 
@@ -985,7 +986,7 @@ func TestLinuxPinnedDescendantFDTransportAndCleanup(t *testing.T) {
 		{Path: target, Access: policy.WriteAccess, Canonical: true},
 		{Path: descendant, Access: policy.ReadAccess},
 	}}
-	spec, cmd, cleanup := compilePinnedGrantSpec(t, rungTwo, root, pol, []*policy.PathHandle{handle})
+	spec, cmd, cleanup := compilePinnedGrantSpec(t, linux.RungTwo, root, pol, []*policy.PathHandle{handle})
 	if len(cmd.ExtraFiles) != 3 {
 		t.Fatalf("ExtraFiles = %d, want sealed spec + root + descendant", len(cmd.ExtraFiles))
 	}
@@ -995,7 +996,7 @@ func TestLinuxPinnedDescendantFDTransportAndCleanup(t *testing.T) {
 	}
 	seen := make(map[int]bool)
 	for i, fd := range spec.GrantFDs {
-		if fd != wantFDs[i] || fd <= stage2SpecFD || seen[fd] {
+		if fd != wantFDs[i] || fd <= linux.Stage2SpecFD || seen[fd] {
 			t.Fatalf("GrantFDs = %v, want collision-free %v with no zero sentinel", spec.GrantFDs, wantFDs)
 		}
 		seen[fd] = true
@@ -1004,7 +1005,7 @@ func TestLinuxPinnedDescendantFDTransportAndCleanup(t *testing.T) {
 	if descendantParentFD == 0 {
 		t.Fatal("descendant ParentFD used zero pathname sentinel")
 	}
-	actualDescendantFD := int(cmd.ExtraFiles[descendantParentFD-stage2SpecFD].Fd())
+	actualDescendantFD := int(cmd.ExtraFiles[descendantParentFD-linux.Stage2SpecFD].Fd())
 	cleanup()
 	if _, err := unix.FcntlInt(uintptr(actualDescendantFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("descendant transport fd %d remains open after cleanup: %v", actualDescendantFD, err)
@@ -1051,7 +1052,7 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 		{Path: denied, Denied: policy.AllAccess},
 		{Path: "**/*.secret", Denied: policy.AllAccess},
 	}}
-	spec, _, cleanup := compilePinnedGrantSpec(t, rungOne, root, pol, []*policy.PathHandle{handle})
+	spec, _, cleanup := compilePinnedGrantSpec(t, linux.RungOne, root, pol, []*policy.PathHandle{handle})
 	defer cleanup()
 	var foundDeny, foundOriginalGlob bool
 	for _, mask := range spec.MountView.Masks {
@@ -1072,9 +1073,9 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 	}
 }
 
-func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, pol policy.Effective, handles []*policy.PathHandle) (stage2Spec, *exec.Cmd, func()) {
+func compilePinnedGrantSpec(t *testing.T, rung linux.Rung, dir string, pol policy.Effective, handles []*policy.PathHandle) (linux.Stage2Spec, *exec.Cmd, func()) {
 	t.Helper()
-	backend := &linuxBackend{rung: rung}
+	backend := &linux.Backend{Rung: rung}
 	spawn, _, _, _, err := backend.CompileWithPathHandles(pol, handles)
 	if err != nil {
 		t.Fatal(err)
@@ -1086,7 +1087,7 @@ func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, pol policy.Effe
 		cleanup()
 		t.Fatal(err)
 	}
-	spec, err := decodeStage2Spec(cmd.ExtraFiles[0])
+	spec, err := linux.DecodeStage2Spec(cmd.ExtraFiles[0])
 	if err != nil {
 		cleanup()
 		t.Fatal(err)
@@ -1094,7 +1095,7 @@ func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, pol policy.Effe
 	return spec, cmd, cleanup
 }
 
-func assertPinnedDescendantRule(t *testing.T, spec stage2Spec, cmd *exec.Cmd, target string, access policy.FSAccess, wantIdentity string, rung rung) {
+func assertPinnedDescendantRule(t *testing.T, spec linux.Stage2Spec, cmd *exec.Cmd, target string, access policy.FSAccess, wantIdentity string, rung linux.Rung) {
 	t.Helper()
 	var pinned *policy.FSRule
 	for i := range spec.FSRules {
@@ -1115,7 +1116,7 @@ func assertPinnedDescendantRule(t *testing.T, spec stage2Spec, cmd *exec.Cmd, ta
 	if pinned == nil {
 		t.Fatalf("FSRules = %+v, want pinned descendant %q access %#x", spec.FSRules, target, access)
 	}
-	extraIndex := pinned.ParentFD - stage2SpecFD
+	extraIndex := pinned.ParentFD - linux.Stage2SpecFD
 	if extraIndex < 0 || extraIndex >= len(cmd.ExtraFiles) {
 		t.Fatalf("child fd %d has no ExtraFiles entry in %d files", pinned.ParentFD, len(cmd.ExtraFiles))
 	}
@@ -1126,19 +1127,19 @@ func assertPinnedDescendantRule(t *testing.T, spec stage2Spec, cmd *exec.Cmd, ta
 	if string(contents) != wantIdentity {
 		t.Fatalf("pinned descendant resolved %q, want %q", contents, wantIdentity)
 	}
-	if rung != rungOne {
+	if rung != linux.RungOne {
 		return
 	}
 	wantSource := "/proc/self/fd/" + strconv.Itoa(pinned.ParentFD)
 	for _, bind := range spec.MountView.Binds {
 		if bind.Target == target {
 			if bind.Source != wantSource {
-				t.Fatalf("rung-1 descendant source = %q, want %q", bind.Source, wantSource)
+				t.Fatalf("linux.Rung-1 descendant source = %q, want %q", bind.Source, wantSource)
 			}
 			return
 		}
 	}
-	t.Fatalf("rung-1 binds = %+v, want descendant target %q", spec.MountView.Binds, target)
+	t.Fatalf("linux.Rung-1 binds = %+v, want descendant target %q", spec.MountView.Binds, target)
 }
 
 func closeFiles(files []*os.File) {

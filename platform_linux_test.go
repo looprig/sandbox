@@ -6,35 +6,36 @@ import (
 	"context"
 	"errors"
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"testing"
 	"time"
 )
 
 // TestSelectLinuxBackend covers the rung × Init-called matrix that platformBackend
-// uses: a re-exec rung (1/2) needs Init() and yields the linuxBackend, else
-// ErrInitNotCalled; rung none yields the null backend regardless of Init.
+// uses: a re-exec rung (1/2) needs Init() and yields the linux.Backend, else
+// linux.ErrInitNotCalled; rung none yields the null backend regardless of Init.
 func TestSelectLinuxBackend(t *testing.T) {
 	tests := []struct {
 		name       string
-		rung       rung
+		Rung       linux.Rung
 		initCalled bool
 		wantErr    error
 		wantType   string // "linux" | "null"
 	}{
-		{"rung2 with Init -> linux backend", rungTwo, true, nil, "linux"},
-		{"rung1 with Init -> linux backend", rungOne, true, nil, "linux"},
-		{"rung2 without Init -> ErrInitNotCalled", rungTwo, false, ErrInitNotCalled, ""},
-		{"rung1 without Init -> ErrInitNotCalled", rungOne, false, ErrInitNotCalled, ""},
-		{"rung none with Init -> unavailable", rungNone, true, enforce.ErrUnavailable, ""},
-		{"rung none without Init -> unavailable", rungNone, false, enforce.ErrUnavailable, ""},
+		{"rung2 with Init -> linux backend", linux.RungTwo, true, nil, "linux"},
+		{"rung1 with Init -> linux backend", linux.RungOne, true, nil, "linux"},
+		{"rung2 without Init -> linux.ErrInitNotCalled", linux.RungTwo, false, linux.ErrInitNotCalled, ""},
+		{"rung1 without Init -> linux.ErrInitNotCalled", linux.RungOne, false, linux.ErrInitNotCalled, ""},
+		{"linux.Rung none with Init -> unavailable", linux.RungNone, true, enforce.ErrUnavailable, ""},
+		{"linux.Rung none without Init -> unavailable", linux.RungNone, false, enforce.ErrUnavailable, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b, err := selectLinuxBackend(tt.rung, tt.initCalled)
+			b, err := linux.SelectBackend(tt.Rung, tt.initCalled)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("selectLinuxBackend err = %v, want %v", err, tt.wantErr)
+				t.Fatalf("linux.SelectBackend err = %v, want %v", err, tt.wantErr)
 			}
 			if tt.wantErr != nil {
 				if b != nil {
@@ -44,8 +45,8 @@ func TestSelectLinuxBackend(t *testing.T) {
 			}
 			switch tt.wantType {
 			case "linux":
-				if _, ok := b.(*linuxBackend); !ok {
-					t.Errorf("backend = %T, want *linuxBackend", b)
+				if _, ok := b.(*linux.Backend); !ok {
+					t.Errorf("backend = %T, want *linux.Backend", b)
 				}
 			}
 		})
@@ -58,13 +59,13 @@ func TestLinuxBackendsNeverClaimTargetNetwork(t *testing.T) {
 		Env:       policy.EnvPolicy{Set: map[string]string{}},
 		Isolation: Sandboxed,
 	}
-	for _, backend := range []*linuxBackend{{rung: rungOne}, {rung: rungTwo}} {
+	for _, backend := range []*linux.Backend{{Rung: linux.RungOne}, {Rung: linux.RungTwo}} {
 		_, _, _, bits, err := backend.Compile(pol)
 		if err != nil {
-			t.Fatalf("rung %d compile: %v", backend.rung, err)
+			t.Fatalf("linux.Rung %d compile: %v", backend.Rung, err)
 		}
 		if bits&GuaranteeTargetNetwork != 0 {
-			t.Errorf("rung %d claimed GuaranteeTargetNetwork for parent proxy port", backend.rung)
+			t.Errorf("linux.Rung %d claimed GuaranteeTargetNetwork for parent proxy port", backend.Rung)
 		}
 	}
 }
@@ -82,7 +83,7 @@ func TestLinuxTargetGrantFailsClosed(t *testing.T) {
 	}
 	set, err := NewExecutorSet(profile,
 		WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
-		withExecutorSetConfig(withBackend(&linuxBackend{rung: rungTwo}), withClock(func() time.Time { return now })),
+		withExecutorSetConfig(withBackend(&linux.Backend{Rung: linux.RungTwo}), withClock(func() time.Time { return now })),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -112,8 +113,8 @@ func TestPlatformBackendLiveOnThisHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("platformBackend: %v", err)
 	}
-	if _, ok := b.(*linuxBackend); !ok {
-		t.Fatalf("platformBackend = %T, want *linuxBackend (rung 2 live on this host)", b)
+	if _, ok := b.(*linux.Backend); !ok {
+		t.Fatalf("platformBackend = %T, want *linux.Backend (linux.Rung 2 live on this host)", b)
 	}
 }
 
@@ -128,10 +129,10 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 		t.Fatalf("NewExecutor: %v", err)
 	}
 	if e.Level() != LevelDegraded {
-		t.Errorf("Level() = %d, want LevelDegraded (rung-2 linux enforce.Backend)", e.Level())
+		t.Errorf("Level() = %d, want LevelDegraded (linux.Rung-2 linux enforce.Backend)", e.Level())
 	}
 	if !e.Guarantees().WriteBoundary {
-		t.Errorf("Guarantees().WriteBoundary = false, want true (rung-2 FS confinement live)")
+		t.Errorf("Guarantees().WriteBoundary = false, want true (linux.Rung-2 FS confinement live)")
 	}
 	// And it actually runs a command through the stage-2 re-exec + Landlock.
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"echo", "wired"})
