@@ -18,8 +18,11 @@ integration but no native Windows OS-confinement backend to reuse.
 Ship both Windows tiers:
 
 1. `WindowsRestrictedToken`: no administrative setup. It confines the process
-   tree and filesystem writes by running the current user through a restricted
-   token with one or more restricting capability SIDs.
+   tree and filesystem writes for direct Win32 descendants by running the
+   current user through a restricted token with one or more restricting
+   capability SIDs. In v1 these mechanisms are defense in depth: the backend
+   withholds end-to-end process and write guarantees because an interactive-user
+   COM/WMI/shell broker may create a process outside both the Job and token.
 2. `WindowsElevated`: one-time administrative setup. It uses dedicated offline
    and online local accounts, account-scoped firewall rules, full restricting
    SIDs for read and write confinement, a protected runner, and a minimal
@@ -27,8 +30,11 @@ Ship both Windows tiers:
 
 `WindowsAuto` is the default. It prefers a ready elevated installation. If the
 elevated tier is unavailable, it uses the restricted-token tier only when that
-tier can satisfy every guarantee required by the profile. It otherwise returns
-a typed setup-required error. Auto mode never weakens a profile to make it run.
+tier's honestly reported bits satisfy every guarantee required by the profile.
+For the initial v1 posture that normally means profiles requiring only
+`EnvScrub`; a write-, read-, or network-restricted profile requires elevated
+setup. Auto mode otherwise returns a typed setup-required error and never
+weakens a profile to make it run.
 
 The Windows mode is an operational backend choice, not authority. It therefore
 does not become part of `Profile`, `Restrict`, or the profile fingerprint.
@@ -55,18 +61,22 @@ Looprig keeps those sound mechanisms but deliberately differs in four places:
 - it never counts environment rewriting as `NetworkBoundary`;
 - it keeps elevated-account secrets in a LocalSystem broker so a current-user
   unelevated child cannot decrypt them; and
-- it binds every ACL mutation to a lease, identity handle, guarantee bit, and
-  tested cleanup path instead of leaving enforcement strength implicit.
+- it tracks ACL mutations by lease and identity handle, never reuses their SIDs,
+  and tests both normal cleanup and inert-orphan recovery instead of leaving
+  enforcement strength implicit.
 
 ## 2. Goals
 
 - Preserve exact Looprig `Deny` / `Gated` / `Allow` authority and grant classes.
-- Provide a useful no-admin tier for write-confined development commands.
+- Provide a no-admin compatibility tier with direct-child write confinement,
+  while withholding end-to-end guarantees that broker escapes can bypass.
 - Provide read, write, process, and network boundaries after one-time setup.
 - Keep command approval and sandbox enforcement separate.
 - Reuse the existing authenticated target proxy for target-scoped egress.
 - Bind filesystem decisions to Windows object identity, not path spelling.
-- Kill the entire descendant tree on cancellation, timeout, or host exit.
+- Kill the entire elevated execution tree and every ordinary direct-launch
+  descendant on cancellation, timeout, or host exit; withhold the restricted
+  process guarantee for broker-created exceptions.
 - Fail closed on stale setup, unsupported filesystems, ACL failures, firewall
   policy override, path races, runner tampering, and Job Object assignment.
 - Add a Windows CI matrix and an adversarial suite broad enough to prevent
@@ -84,8 +94,21 @@ Looprig keeps those sound mechanisms but deliberately differs in four places:
 - GUI application compatibility as a reason to relax confinement. Commands
   that cannot run on the private desktop fail rather than moving to the user's
   interactive desktop.
-- Multiple host processes sharing one elevated installation in v1. A second
-  process must use a different installation ID and reserved proxy-port set.
+
+### 3.1 Accepted v1 adoption limitation: one host process
+
+One elevated installation supports one host process at a time because that
+process must exclusively bind every firewall-exempt proxy port. A second
+Looprig process cannot silently share the accounts, service, rules, or ports. It
+must either wait, use a separately provisioned installation ID and port set, or
+run without profiles that require elevated Windows guarantees.
+
+This is a product-visible limitation, not an implementation footnote. Consumers
+must expose the lock owner and a useful diagnostic rather than asking users to
+create accounts manually. The intended v2 direction is a multi-client broker
+with per-execution WFP/AppContainer identity, which removes static shared port
+exceptions and permits concurrent host processes without duplicating local
+accounts and services.
 
 ## 4. Threat model
 
@@ -112,17 +135,26 @@ the interactive user.
 
 | Property | Restricted token | Elevated |
 |---|---:|---:|
-| `GuaranteeProcessBoundary` | yes | yes |
-| `GuaranteeWriteBoundary` | yes when ACL projection succeeds | yes when ACL projection succeeds |
+| `GuaranteeProcessBoundary` | no in v1; direct descendants still use a Job | yes |
+| `GuaranteeWriteBoundary` | no in v1; direct writes still use ACL restriction | yes when ACL projection succeeds |
 | `GuaranteeReadBoundary` | never | yes for local supported roots |
 | `GuaranteeEnvScrub` | yes, executor-owned | yes, executor-owned |
 | `GuaranteeNetworkBoundary` | never | yes for the offline account |
 | `GuaranteeAddressNetwork` | never | only when the configured route earns it |
-| `GuaranteeResourceLimits` | when every requested Job limit is installed | same |
+| `GuaranteeResourceLimits` | no in v1; direct Job limits remain active | when every requested Job limit is installed |
 | `GuaranteeTargetNetwork` | never | yes through the authenticated proxy |
 
-Restricted-token mode is always `LevelDegraded` when it enforces an OS boundary.
-It never reports `LevelFull`. Elevated mode reports `LevelFull` only when every
+Elevated `ReadBoundary` is relative to the declared Windows runtime baseline in
+§9.2. That baseline is included in policy intent and the compile report; it is
+not silently treated as an implementation exception.
+
+Restricted-token mode reports `LevelNone` in v1 because no end-to-end OS
+guarantee survives a possible full-user broker escape; `EnvScrub` remains an
+executor-owned bit. Its Job, token, UI limits, and ACLs remain active defense in
+depth and are reported as narrowed compile entries, not guarantee bits. A future
+release may promote process and write bits only after the full broker-escape
+suite passes on every supported Windows version and the change receives a
+separate spec review. Elevated mode reports `LevelFull` only when every
 restricted policy axis was compiled without narrowing and every requested Job
 limit is active; otherwise it reports `LevelDegraded` if all required guarantees
 still hold.
@@ -130,8 +162,12 @@ still hold.
 Examples:
 
 - Host reads and network are `Allow`, workspace writes are `Allow`, and host
-  writes are `Deny`: restricted-token mode can run and claims process, write,
-  and environment guarantees.
+  writes are `Deny`: the profile requires `WriteBoundary`, so v1 auto mode
+  requires elevated setup even though the restricted tier would directly block
+  ordinary writes outside the workspace.
+- All filesystem and network axes are `Allow`: restricted-token mode can run and
+  claims only the executor-owned environment guarantee while still applying its
+  direct-child defenses.
 - Host reads are `Deny` or `Gated`: restricted-token mode cannot run because the
   profile requires `ReadBoundary`.
 - Network is `Deny` or `Gated`: restricted-token mode cannot run because the
@@ -200,7 +236,9 @@ The host binds every configured port before constructing an offline executor:
 one carries the authenticated proxy and the others are deny-only guards. If any
 port cannot be bound, construction fails. This makes the firewall exception
 usable only by this host process and prevents an unrelated local forward proxy
-from occupying an allowed port.
+from occupying an allowed port. The binding also acts as the single-host-process
+installation lock described in §3.1; failure reports the owning installation
+and remediation rather than a generic listen error.
 
 `SetupWindowsSandbox` and `RemoveWindowsSandbox` require an already elevated
 process and return `ErrWindowsElevationRequired` otherwise. The library never
@@ -238,6 +276,10 @@ Auto selection occurs against the compiled effective policy:
 4. If its bits cover `Profile.Settings().RequiredGuarantees`, use it.
 5. Otherwise return `ErrWindowsSetupRequired` with the missing named guarantees.
 
+In v1 the restricted posture contributes only `EnvScrub` to this comparison.
+Its direct Job/ACL mechanisms appear in the compile report as narrowed defense
+in depth until the broker-escape acceptance gate permits stronger bits.
+
 Explicit `WindowsRestrictedToken` never contacts the service. Explicit
 `WindowsElevated` never falls back.
 
@@ -263,9 +305,9 @@ It depends on stdlib and `golang.org/x/sys/windows`; it introduces no cgo.
 
 - Windows service mode: a LocalSystem broker serving a versioned named-pipe
   protocol.
-- Runner mode: a restricted process that creates a private window
-  station/desktop, launches the requested target, forwards standard I/O, waits
-  for the target, and exits with the target's code.
+- Runner mode: a restricted process that launches the requested target on a
+  broker-precreated private window station/desktop, forwards standard I/O,
+  waits for the target, and exits with the target's code.
 
 The broker deliberately has no arbitrary-process-launch request. Its allowed
 operations are:
@@ -316,6 +358,15 @@ Job Object reports zero active processes. Compile failure rolls back any partial
 lease before returning. Existing Darwin, Linux, and null specs have a nil
 release callback.
 
+This intentionally changes the current `enforce.Spec` statement that a spec
+holds nothing long-lived and the `SPEC.md §7` stateless-per-spawn framing. The
+first implementation milestone must amend both contracts: compiled specs may
+own immutable, idempotently releasable enforcement resources, while every
+mutable execution resource remains per-spawn. That milestone also replaces the
+current "universal `/bin/sh -c`" `ShellArgv` contract with the platform shell
+selection in §8. These are named canonical-SPEC changes, not incidental code
+edits.
+
 This lifecycle permits one executor-scoped restricting SID and one recursive ACL
 projection instead of rewriting a whole workspace on every spawn. New objects
 inherit the executor SID. Grant-specific exact/tree leases use fresh one-shot
@@ -326,11 +377,28 @@ SIDs and live for one execution.
 Both tiers reuse the existing Windows Job Object path:
 
 1. create the process suspended;
-2. assign it to a Job configured with kill-on-close and requested limits;
-3. fail and terminate it if assignment fails;
-4. resume only after assignment succeeds; and
-5. after cancellation or exit, retain the Job handle until active process count
+2. configure kill-on-close, requested resource limits, and basic UI
+   restrictions before assignment;
+3. leave both `JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
+   `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` unset;
+4. assign it to the Job and fail/terminate it if assignment fails;
+5. resume only after assignment succeeds; and
+6. after cancellation or exit, retain the Job handle until active process count
    reaches zero.
+
+The Job installs `JOB_OBJECT_UILIMIT_HANDLES`, `DESKTOP`, `GLOBALATOMS`,
+`READCLIPBOARD`, `WRITECLIPBOARD`, `DISPLAYSETTINGS`, `SYSTEMPARAMETERS`, and
+`EXITWINDOWS` on both tiers. These limits block cross-Job USER handles, hooks,
+desktop switching, global atoms, clipboard, and related UI channels. They do
+not block COM/RPC/WMI process brokers and therefore do not by themselves earn
+`ProcessBoundary` for the restricted tier.
+
+With neither breakaway limit enabled, ordinary `CreateProcess` descendants join
+the Job and `CREATE_BREAKAWAY_FROM_JOB` cannot escape it. Windows explicitly
+documents `Win32_Process.Create` as an exception, which is why broker tests and
+the restricted-tier downgrade are required. UI-limited jobs can also be
+incompatible with some nested-job arrangements; assignment failure is a
+fail-closed compatibility error, never a reason to omit the UI limits.
 
 This ordering is stricter than Codex's current runner, which assigns after
 creation and tolerates some Job errors.
@@ -341,12 +409,14 @@ handle returned by the broker. Because the runner is assigned before resume,
 its target and all ordinary descendants join the same Job automatically.
 
 The runner request is delivered through an inherited read-only pipe handle, not
-through a shell command line. It contains the normalized inner argv, cwd, and a
-protocol nonce. The runner inherits the already scrubbed environment and
-standard handles. It creates a private desktop, launches the target there,
-waits, and mirrors its exit status. The installed runner is owner- and
-sandbox-read/execute only, SYSTEM/Administrators-write only, and hash-checked by
-status and before every elevated construction.
+through a shell command line. It contains the normalized inner argv, cwd, an
+opaque broker-created desktop name, and a protocol nonce. The broker creates and
+ACLs the private window station/desktop before the UI-limited Job starts; the
+runner never needs permission to create or switch desktops. The runner inherits
+the already scrubbed environment and standard handles, launches the target on
+the supplied desktop, waits, and mirrors its exit status. The installed runner
+is owner- and sandbox-read/execute only, SYSTEM/Administrators-write only, and
+hash-checked by status and before every elevated construction.
 
 Job limits map as follows:
 
@@ -355,8 +425,10 @@ Job limits map as follows:
 - `MaxCPUPct` -> Job CPU rate control in hard-cap mode.
 
 `GuaranteeResourceLimits` is reported only when all non-zero requested limits
-are supported, installed, and read back. Limits that cannot be expressed narrow
-the compile and withhold the bit; invalid limits fail profile compilation.
+are supported, installed, and read back and the backend otherwise has an
+end-to-end process boundary. The restricted tier therefore withholds it in v1
+even though its direct Job limits remain active. Limits that cannot be expressed
+narrow the compile; invalid limits fail profile compilation.
 
 `RunCommand` becomes platform-shell aware:
 
@@ -384,7 +456,10 @@ named-pipe access through stripped privileges and the restricting-SID write
 check, and verifies those cases in the adversarial suite.
 
 Because `WRITE_RESTRICTED` does not restrict reads, this tier never claims
-`ReadBoundary`. It also never claims a network guarantee; dead-proxy environment
+`ReadBoundary`. Because execute-class COM/RPC access is not subjected to the
+write-only restricting-SID check, the v1 tier also withholds `ProcessBoundary`,
+`WriteBoundary`, and `ResourceLimits`: a broker-created full-user process could
+bypass all three. It never claims a network guarantee. Dead-proxy environment
 variables may be added as defense in depth but are explicitly absent from the
 guarantee calculation.
 
@@ -405,10 +480,31 @@ groups disabled, and full restricting SIDs. Unlike `WRITE_RESTRICTED`, full
 restriction runs the second SID-list access check for reads as well as writes.
 The token contains:
 
-- a persistent installation-runtime SID for the protected runner and required
-  Windows runtime objects;
+- the well-known Restricted Code SID (`S-1-5-12`) as the Windows runtime
+  baseline;
+- a persistent installation-runtime SID only for the protected runner and
+  installation-owned runtime objects;
 - an executor-scoped SID for configured roots and carveouts; and
 - zero or more one-shot grant SIDs.
+
+The backend never attempts to project ACEs onto Windows, System32, WinSxS,
+KnownDlls, or other TrustedInstaller/WRP-owned runtime objects. `S-1-5-12` is
+selected because Windows defines it for processes running in a restricted
+security context. Setup and live CI must prove that every required runtime
+object already grants it sufficient access; a missing grant is an unsupported
+runtime, not permission to rewrite the object. `ALL APPLICATION PACKAGES` SIDs
+are not added to this token.
+
+This runtime SID is an explicit Windows platform baseline, not a magic private
+capability. Any securable object whose DACL grants `S-1-5-12` may pass the
+restricting-list half of the access check. Milestone 1 must add that baseline to
+the canonical policy/SPEC and compile report (`windows.runtime-baseline`) so it
+is not hidden widening. Setup and CI inventory the baseline on every supported
+Windows image; configured denied roots and protected carveouts are audited and
+construction fails if their DACL grants Restricted Code the denied access. If a
+future Windows version needs `ALL APPLICATION PACKAGES` or another broader
+ambient SID to launch, setup fails as stale/unsupported. Adopting that SID or an
+AppContainer/LPAC backend requires a separate threat-model and SPEC revision.
 
 Both the sandbox account's normal access check and the restricting-SID access
 check must pass. This supplies the elevated read boundary without placing broad
@@ -469,15 +565,35 @@ An ACL projection lease records:
 - the parent client process handle.
 
 Tree projection is deterministic and fail-closed: sort paths, apply narrow
-denies before broad allows, skip reparse traversal, read back each DACL, and
-rollback all inserted ACEs if any object fails. Cleanup removes only ACEs whose
-SID and lease marker match. It never restores a saved whole DACL over concurrent
-user changes.
+denies before broad allows, skip reparse traversal, deny multi-link files, read
+back each DACL, and rollback all inserted ACEs if any object fails. A regular
+file whose link count is greater than one receives an explicit deny ACE for the
+projected SID and axis so an inherited tree allow cannot reach it; it is
+recorded as a `windows.filesystem.hardlink` narrowing. An exact grant naming
+such a file returns `ErrGrantUnsupported`. Because all hard-link names share the
+same file security descriptor, this prevents one projected file object from
+granting access through an alias outside the approved tree. Directories cannot
+be hard-linked on supported Windows filesystems. Cleanup removes only ACEs
+whose SID and lease marker match. It never restores a saved whole DACL over
+concurrent user changes.
 
 The service journal is SYSTEM/Administrators-only. Explicit release cleans the
 lease after the Job empties. Client death triggers cleanup. Service startup
 reconciles any incomplete journal before accepting token requests. Random SIDs
 are never reused, so an ACE left by power loss is inert until reconciliation.
+
+Restricted-token mode has no broker. Before changing a DACL it writes and
+flushes a cleanup-only journal beneath the caller's stable scratch root,
+recording the random SID, canonical path, file ID, and exact inserted ACE. The
+journal is never trusted to grant access. Normal close removes the ACE and then
+the record; the next restricted construction sweeps valid records before
+creating a new SID. Because the child runs as the same interactive user, it can
+tamper with this journal. Invalid or missing records are therefore tolerated as
+cleanup loss: any orphan ACE remains inert because its restricting SID is never
+reused, and a later safe tree scan may prune recognized orphan SIDs
+opportunistically. The spec explicitly accepts possible inert ACE accumulation
+after hostile journal deletion or total power loss; it does not describe such
+orphans as fully recoverable.
 
 Existing exact-file grants are supported. Existing directory-tree grants are
 supported. A nonexistent exact target and an exact-directory target return
@@ -508,7 +624,7 @@ most a listener that always rejects it.
 
 ### 11.2 Target grants
 
-`network.proxy.target.v1` keeps the current flow:
+`network.proxy-target.v1` keeps the current flow:
 
 1. authenticate and consume the grant;
 2. authorize the normalized target under a random execution ID;
@@ -585,9 +701,13 @@ proxy-port set differs from the requested configuration.
 - Private desktop creation failure: fail the elevated spawn.
 - Cleanup failure: retain the lease in the broker journal, mark elevated status
   unhealthy for new work, and retry reconciliation. Never reuse its SID.
+- Restricted cleanup/journal failure: report the cleanup error, retire the SID
+  permanently, and leave at most inert ACEs; never trust journal content for an
+  access decision.
 
 Compile reports use stable feature names such as `windows.token`,
-`windows.filesystem.read`, `windows.filesystem.write`, `windows.firewall`,
+`windows.runtime-baseline`, `windows.filesystem.read`,
+`windows.filesystem.write`, `windows.filesystem.hardlink`, `windows.firewall`,
 `windows.private-desktop`, `windows.job`, and `windows.resource-limits`.
 
 ## 14. Test strategy
@@ -607,8 +727,10 @@ Compile reports use stable feature names such as `windows.token`,
 
 Make the suite shell-aware through platform-specific helpers and add checks for:
 
-- write inside succeeds / write outside is equivalent to `WriteBoundary`;
-- read inside succeeds / read outside is equivalent to `ReadBoundary`;
+- write inside succeeds / a claimed `WriteBoundary` implies every direct and
+  brokered outside-write probe is denied;
+- read inside succeeds / a claimed `ReadBoundary` implies outside reads are
+  denied except the declared platform runtime baseline;
 - planted parent environment secrets do not cross `EnvScrub`;
 - direct non-loopback and loopback-bypass probes agree with `NetworkBoundary`;
 - target proxy success and unapproved-target failure agree with
@@ -618,6 +740,13 @@ Make the suite shell-aware through platform-specific helpers and add checks for:
 - requested process/memory/CPU limits agree with `ResourceLimits`; and
 - all guarantee implication invariants remain coherent.
 
+The current suite treats direct write denial and `WriteBoundary` as a
+biconditional. Milestone 1 changes that to the security-relevant one-way
+contract: a claimed bit must be enforced, while a backend may conservatively
+withhold a bit despite defense-in-depth denial. Windows broker probes then
+decide whether an end-to-end bit is supportable; a single direct file-open probe
+cannot do so.
+
 Tests run in subprocesses where token, desktop, firewall, service, or ACL state
 could outlive an assertion. Every material test has a positive control proving
 the attempted operation would work without the relevant boundary.
@@ -626,17 +755,30 @@ the attempted operation would work without the relevant boundary.
 
 Run on a standard-user Windows account with elevated installation absent:
 
-- auto selects restricted mode for write-only-required profiles;
-- explicit and auto modes reject read/network-required profiles;
+- auto selects restricted mode only when `EnvScrub` covers all required bits;
+- explicit construction reports only `EnvScrub`, and auto mode rejects
+  write/read/network-required profiles with setup required;
 - writes inside workspace/tmp succeed;
 - writes to profile, sibling repo, `.git` carveout, setup state, and another
-  drive fail;
+  drive fail through ordinary direct opens, without claiming `WriteBoundary`;
 - current-user reads remain possible and `ReadBoundary` is never claimed;
 - nested `cmd`, PowerShell, Python, and native descendants stay in the Job;
 - timeout and parent crash leave no descendant marker;
+- the Job read-back shows all basic UI restrictions enabled and both breakaway
+  limits disabled;
+- Explorer `IShellDispatch.ShellExecute`, `Start-Process`, WMI
+  `Win32_Process.Create`, `schtasks`, COM elevation/broker paths, and GUI launch
+  attempts run as adversarial subprocess cases. Any successful broker escape
+  proves why `ProcessBoundary`, `WriteBoundary`, and `ResourceLimits` remain
+  unset and is cleaned up by an out-of-sandbox test watchdog;
 - junction/symlink creation cannot turn an allowed write into an outside write;
+- pre-existing multi-link files are inaccessible/narrowed, exact hard-link
+  grants are unsupported, and a sandbox cannot create a link in a denied
+  outside directory;
 - `\\?\`, case variants, 8.3 names, ADS, raw devices, and named pipes do not
   bypass write restrictions; and
+- normal close and next-construction sweep prune restricted lease records;
+  deleted/corrupt journals leave only inert, never-reused SID ACEs; and
 - stale random-SID ACEs cannot be used by a later token.
 
 ### 14.4 Elevated Windows suite
@@ -647,8 +789,13 @@ Run on an ephemeral elevated Windows CI worker. Setup and removal wrap the suite
 - sandbox children cannot read or change broker state, credentials, service,
   runner, manifest, or firewall configuration;
 - exact/tree read and write allow/deny matrices pass;
+- the `S-1-5-12` runtime baseline is inventoried, appears in the compile report,
+  launches required Windows runtime code without changing WRP-owned DACLs, and
+  cannot read any configured denied root or protected carveout;
 - deny-read globs and protected carveouts survive case, extended-path, ADS,
   junction, symlink, root-swap, and post-grant races;
+- tree projection skips multi-link files and records narrowing; exact grants to
+  hard-linked files fail;
 - UNC, device, unsupported filesystem, nonexistent exact, and broad network
   grants fail closed;
 - offline direct TCP/UDP, DNS, metadata, loopback non-proxy, PowerShell web
@@ -701,9 +848,13 @@ Each claimed bit needs at least one live positive/negative mechanism test.
 
 Implementation is split into independently reviewable milestones:
 
-1. portability seams, path model, shell selection, and cross-compilation;
+1. amend canonical `SPEC.md` for releasable compiled specs, platform shell
+   selection, conservative one-way guarantee conformance, and the explicit
+   Windows `S-1-5-12` runtime baseline; then add portability seams, path model,
+   and cross-compilation;
 2. Job limits and expanded conformance suite;
-3. restricted-token write confinement;
+3. restricted-token direct write confinement, UI restrictions, local cleanup
+   journal, and broker-escape suite with all end-to-end OS bits withheld;
 4. broker protocol and protected setup lifecycle;
 5. elevated filesystem/read boundary and private runner;
 6. offline firewall and target proxy;
@@ -711,17 +862,19 @@ Implementation is split into independently reviewable milestones:
 8. adversarial Windows CI and documentation.
 
 Restricted-token support may ship before elevated support, but `WindowsAuto`
-must continue failing closed for read/network-required profiles. Elevated mode
-may ship only after setup removal and crash reconciliation are implemented; a
-persistent security mechanism without a safe uninstall/recovery path is not
-complete.
+must continue failing closed for write/read/network-required profiles. A later
+promotion of restricted process/write bits requires a separate reviewed spec
+change backed by the full broker suite. Elevated mode may ship only after setup
+removal and crash reconciliation are implemented; a persistent security
+mechanism without a safe uninstall/recovery path is not complete.
 
 ## 17. Acceptance criteria
 
 The feature is complete when:
 
 - both explicit modes and auto selection are public and documented;
-- restricted mode live-tests its process/write guarantees without admin rights;
+- restricted mode live-tests direct Job/ACL/UI defenses and broker escapes
+  without claiming process/write/resource guarantees;
 - elevated mode live-tests read/write/process/network/target guarantees after
   one-time setup;
 - every unsupported profile or grant fails before spawning;
@@ -729,7 +882,28 @@ The feature is complete when:
 - setup, refresh, crash recovery, and removal are idempotent and tested;
 - Windows paths cannot bypass policy via case, reparse, extended, stream, device,
   UNC, or identity-swap variants covered above;
-- cancellation and host death leave no descendant process;
-- ACL leases and proxy credentials do not survive their owner execution;
+- elevated cancellation and host death leave no controlled or brokered process;
+- restricted ordinary descendants are killed, and its broker suite justifies
+  the deliberately absent process/write/resource bits;
+- elevated ACL leases and proxy credentials do not survive their owner
+  execution; restricted normal cleanup is tested and any crash orphan is inert
+  under a never-reused SID;
 - the reusable conformance suite covers every guarantee bit; and
 - macOS and Linux behavior and tests remain unchanged.
+
+## 18. Primary Windows references
+
+- [CreateRestrictedToken](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken)
+  defines the two-pass restricting-SID check and the write-only behavior of
+  `WRITE_RESTRICTED`.
+- [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+  defines default descendant association, breakaway flags, and the explicit
+  `Win32_Process.Create` exception.
+- [JOBOBJECT_BASIC_UI_RESTRICTIONS](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_ui_restrictions)
+  defines the USER, desktop, atom, clipboard, and system UI limits.
+- [Security Identifiers](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers)
+  defines `S-1-5-12` as Restricted Code.
+- [Hard Links and Junctions](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions)
+  defines the shared-file semantics that require multi-link projection denial.
+- [Implementing an AppContainer](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)
+  is the reference for the possible stronger unelevated/AppContainer v2 path.
