@@ -1,6 +1,9 @@
 package sandbox
 
-import "os/exec"
+import (
+	"github.com/looprig/sandbox/internal/policy"
+	"os/exec"
+)
 
 // nullBackend is the direct-execution backend for an explicitly acknowledged
 // Unconfined profile. It is never a fallback for Sandboxed execution.
@@ -13,7 +16,7 @@ func newNullBackend() *nullBackend { return &nullBackend{} }
 // compile rejects every Sandboxed policy. For Unconfined it returns a direct
 // passthrough spawnSpec and LevelNone; environment scrubbing is reported only if
 // a future valid direct profile actually requests it.
-func (nullBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (nullBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	if p.Isolation != Unconfined {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, ErrSandboxUnavailable
 	}

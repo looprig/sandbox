@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,7 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file compiles a effectivePolicy's filesystem axis into the RUNG-1 bind-mount VIEW
+// This file compiles a policy.Effective's filesystem axis into the RUNG-1 bind-mount VIEW
 // (SPEC §7.2 rung 1, §7.5) and carries the stage-2 mechanism that materializes
 // it inside the child's mount namespace. Where rung 2 (landlock_linux.go)
 // enforces the FS axis by an ENUMERATED Landlock allowlist against the live
@@ -37,7 +38,7 @@ import (
 // unit-tested and run on every host; the actual mounting is exercised only in CI.
 //
 // Two-phase design across the re-exec, mirroring rung 2:
-//   - compile time (once, in linuxBackend.compileRung1): distil the effectivePolicy's FS
+//   - compile time (once, in linuxBackend.compileRung1): distil the policy.Effective's FS
 //     axis into a mountViewPlan (rw/ro bind roots, safe literal deny masks, glob
 //     deny patterns, glob scan roots). The mount view masks only full-path denies
 //     with no narrower restoration; Landlock composes the remaining per-axis rules.
@@ -73,15 +74,15 @@ const emptyMaskFile = ".lrsandbox-empty"
 // which is what makes every host path NOT bound into the new root INVISIBLE.
 const oldRootDir = ".lrsandbox-oldroot"
 
-// mountViewPlan is the rung-1 filesystem intent distilled from a effectivePolicy at
+// mountViewPlan is the rung-1 filesystem intent distilled from a policy.Effective at
 // compile time (SPEC §7.2 rung 1, §7.5). It holds bind ROOTS and deny intent,
 // not stat'd entries: the dir/file classification and the glob scan are redone
 // per spawn (enumerateMountView) so the view is a fresh snapshot each time.
 type mountViewPlan struct {
-	// rwBinds are the writable allow roots (writeFSAccess) — bound rw into the view.
+	// rwBinds are the writable allow roots (policy.WriteAccess) — bound rw into the view.
 	rwBinds []string
-	// roBinds are the read-only allow roots (readFSAccess, no writeFSAccess) — bound
-	// ro. Carveouts (a readFSAccess allow nested under a writable root, e.g. .git)
+	// roBinds are the read-only allow roots (policy.ReadAccess, no policy.WriteAccess) — bound
+	// ro. Carveouts (a policy.ReadAccess allow nested under a writable root, e.g. .git)
 	// are ordinary roBinds; nesting is resolved by applying binds parents-first so
 	// the ro carveout re-masks the rw root it sits under.
 	roBinds []string
@@ -119,17 +120,17 @@ type rung1Plan struct {
 	nft   compiledNftPlan
 }
 
-// compileMountView distils a effectivePolicy's FS entries into a mountViewPlan (SPEC §7.2
+// compileMountView distils a policy.Effective's FS entries into a mountViewPlan (SPEC §7.2
 // rung 1). Literal allow roots become rw or ro binds; literal denies become
 // masks when they deny every axis and have no narrower restoration; glob denies
 // are carried for the spawn-time scan. Allow globs are dropped — a mount cannot
 // express a glob allow, and dropping under-grants (fail secure). Landlock is
 // layered over the mount view to enforce partial-axis and restored descendants.
-func compileMountView(p effectivePolicy) mountViewPlan {
+func compileMountView(p policy.Effective) mountViewPlan {
 	return compileMountViewWithGrantPaths(p, nil)
 }
 
-func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandle) mountViewPlan {
+func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHandle) mountViewPlan {
 	var plan mountViewPlan
 	plan.grantBinds = make(map[string]grantMountSource)
 
@@ -137,10 +138,10 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 	// without swallowing a more-specific allow. Partial-axis denies are enforced
 	// by Landlock, which composes on top of this view.
 	for _, e := range p.FS {
-		if normalizedDenied(e) != allFSAccess || e.Access != 0 {
+		if policy.NormalizedDenied(e) != policy.AllAccess || e.Access != 0 {
 			continue
 		}
-		if strings.ContainsAny(e.Path, globMeta) {
+		if strings.ContainsAny(e.Path, policy.GlobMeta) {
 			plan.globDenies = append(plan.globDenies, e.Path)
 			continue
 		}
@@ -151,8 +152,8 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 				continue
 			}
 			allowPath := filepath.Clean(candidate.Path)
-			covered = covered || pathUnder(allowPath, denyPath)
-			restored = restored || pathUnder(denyPath, allowPath)
+			covered = covered || policy.PathUnder(allowPath, denyPath)
+			restored = restored || policy.PathUnder(denyPath, allowPath)
 		}
 		if covered && !restored {
 			plan.denyMasks = append(plan.denyMasks, denyPath)
@@ -161,10 +162,10 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
 	// seen order, so a path granted read then write is bound rw exactly once.
-	merged := make(map[string]fsAccess)
+	merged := make(map[string]policy.FSAccess)
 	var order []string
 	for _, e := range p.FS {
-		if e.Access == denyFSAccess || strings.ContainsAny(e.Path, globMeta) {
+		if e.Access == policy.DenyAccess || strings.ContainsAny(e.Path, policy.GlobMeta) {
 			continue
 		}
 		clean := filepath.Clean(e.Path)
@@ -172,12 +173,12 @@ func compileMountViewWithGrantPaths(p effectivePolicy, handles []*grantPathHandl
 			order = append(order, clean)
 		}
 		merged[clean] |= e.Access
-		if index := matchingGrantPathAncestor(handles, clean, e.Exact); index >= 0 {
-			plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].isDir}
+		if index := policy.MatchingPathHandleAncestor(handles, clean, e.Exact); index >= 0 {
+			plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].IsDir()}
 		}
 	}
 	for _, path := range order {
-		if merged[path]&writeFSAccess != 0 {
+		if merged[path]&policy.WriteAccess != 0 {
 			plan.rwBinds = append(plan.rwBinds, path)
 		} else {
 			plan.roBinds = append(plan.roBinds, path)
@@ -243,15 +244,15 @@ func enumerateMountView(plan mountViewPlan) MountViewSpec {
 	return enumerateMountViewWithGrantRules(plan, nil)
 }
 
-func enumerateMountViewWithGrantRules(plan mountViewPlan, grantRules []fsRule) MountViewSpec {
+func enumerateMountViewWithGrantRules(plan mountViewPlan, grantRules []policy.FSRule) MountViewSpec {
 	spec, _ := enumerateMountViewWithGrantPaths(plan, grantRules, nil)
 	return spec
 }
 
-func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []fsRule, handles []*grantPathHandle) (MountViewSpec, error) {
+func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []policy.FSRule, handles []*policy.PathHandle) (MountViewSpec, error) {
 	var spec MountViewSpec
-	resolver := newPinnedPathResolver(handles, firstGrantPathChildFD+len(handles))
-	defer closeGrantRuleFiles(resolver.files)
+	resolver := policy.NewPinnedPathResolver(handles, policy.FirstPathHandleChildFD+len(handles))
+	defer policy.CloseRuleFiles(resolver.Files())
 	add := func(path string, ro bool) {
 		if _, ok := plan.grantBinds[path]; ok {
 			return
@@ -276,7 +277,7 @@ func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []fsRule, h
 	grantBindByTarget := make(map[string]BindSpec)
 	for root := range plan.grantBinds {
 		for _, rule := range grantRules {
-			if rule.ParentFD == 0 || rule.Target == "" || rule.Target != root && !pathUnder(root, rule.Target) {
+			if rule.ParentFD == 0 || rule.Target == "" || rule.Target != root && !policy.PathUnder(root, rule.Target) {
 				continue
 			}
 			current, ok := grantBindByTarget[rule.Target]
@@ -292,7 +293,7 @@ func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []fsRule, h
 	for target, bind := range grantBindByTarget {
 		bind.ReadOnly = true
 		for _, rule := range grantRules {
-			if rule.Access&writeFSAccess != 0 && (rule.Target == target || rule.IsDir && pathUnder(rule.Target, target)) {
+			if rule.Access&policy.WriteAccess != 0 && (rule.Target == target || rule.IsDir && policy.PathUnder(rule.Target, target)) {
 				bind.ReadOnly = false
 				break
 			}
@@ -305,13 +306,13 @@ func enumerateMountViewWithGrantPaths(plan mountViewPlan, grantRules []fsRule, h
 	slices.SortFunc(spec.Binds, func(a, b BindSpec) int { return strings.Compare(a.Target, b.Target) })
 
 	for _, d := range plan.denyMasks {
-		if matchingGrantPathIdentityAncestor(handles, d) >= 0 {
-			resolved, ok, err := resolver.resolveAny(d)
+		if policy.MatchingPathHandleIdentityAncestor(handles, d) >= 0 {
+			resolved, ok, err := resolver.ResolveAny(d)
 			if err != nil {
 				return MountViewSpec{}, err
 			}
 			if ok {
-				spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: resolved.isDir})
+				spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: resolved.IsDir})
 			}
 			continue
 		}
@@ -344,7 +345,7 @@ func scanGlobDenies(roots, globs []string, maxDepth int) []MaskSpec {
 	return scanGlobDeniesWithGrantPaths(roots, globs, maxDepth, nil, nil)
 }
 
-func scanGlobDeniesWithGrantPaths(roots, globs []string, maxDepth int, handles []*grantPathHandle, resolver *pinnedPathResolver) []MaskSpec {
+func scanGlobDeniesWithGrantPaths(roots, globs []string, maxDepth int, handles []*policy.PathHandle, resolver *policy.PinnedPathResolver) []MaskSpec {
 	if len(globs) == 0 {
 		return nil
 	}
@@ -355,10 +356,10 @@ func scanGlobDeniesWithGrantPaths(roots, globs []string, maxDepth int, handles [
 	seen := make(map[string]bool)
 	var out []MaskSpec
 	for _, root := range roots {
-		if matchingGrantPathIdentityAncestor(handles, root) >= 0 {
-			resolved, ok, err := resolver.resolveAny(root)
-			if err == nil && ok && resolved.isDir {
-				scanGlobRootAt(int(resolved.file.Fd()), root, pats, maxDepth, seen, &out)
+		if policy.MatchingPathHandleIdentityAncestor(handles, root) >= 0 {
+			resolved, ok, err := resolver.ResolveAny(root)
+			if err == nil && ok && resolved.IsDir {
+				scanGlobRootAt(int(resolved.File.Fd()), root, pats, maxDepth, seen, &out)
 			}
 			continue
 		}

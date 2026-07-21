@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,7 +35,7 @@ func realpath(t *testing.T, p string) string {
 func TestStage2RoundTrip(t *testing.T) {
 	ws := t.TempDir()
 	e, err := newExecutorForEffectivePolicy(
-		backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithEnv(effectiveEnvPolicy{Set: map[string]string{"LRSANDBOX_MARKER": "present"}})),
+		backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithEnv(policy.EnvPolicy{Set: map[string]string{"LRSANDBOX_MARKER": "present"}})),
 		withBackend(newLinuxBackend()),
 	)
 	if err != nil {

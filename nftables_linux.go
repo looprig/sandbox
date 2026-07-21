@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"net"
 
 	"github.com/google/nftables"
@@ -12,7 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file compiles a effectivePolicy's network axis into the RUNG-1 in-netns nftables
+// This file compiles a policy.Effective's network axis into the RUNG-1 in-netns nftables
 // ADDRESS filter (SPEC §7.2 rung 1, §5.2, §5.4) and carries the stage-2
 // mechanism that installs it. Unlike rung 2 (net_linux.go — Landlock TCP-port
 // rules, no address scoping), rung 1 runs inside a private network namespace and
@@ -47,10 +48,10 @@ const nftablesOp = "nftables"
 // match loads into and compares against it. Mirrors the M4 spike.
 const nftReg1 = uint32(1)
 
-// dnsPort is the DNS service port (udp+tcp) accepted when effectiveNetPolicy.DNS is set.
+// dnsPort is the DNS service port (udp+tcp) accepted when policy.NetPolicy.DNS is set.
 const dnsPort uint16 = 53
 
-// privateCIDRs are the RFC1918 + ULA ranges accepted when effectiveNetPolicy.Private is
+// privateCIDRs are the RFC1918 + ULA ranges accepted when policy.NetPolicy.Private is
 // set (SPEC §5.2). Metadata (§5.4) is dropped BEFORE these, so fd00:ec2::254
 // inside fc00::/7 is still denied.
 var privateCIDRs = []string{
@@ -61,26 +62,26 @@ var privateCIDRs = []string{
 }
 
 // loopbackCIDRs are the destination ranges accepted for loopback egress (oif lo)
-// when effectiveNetPolicy.Loopback is set. Address-scoped (not a blanket oif-lo accept) so
+// when policy.NetPolicy.Loopback is set. Address-scoped (not a blanket oif-lo accept) so
 // a locally-routed metadata alias cannot slip through the loopback rule.
 var loopbackCIDRs = []string{
 	"127.0.0.0/8",
 	"::1/128",
 }
 
-// compiledNftPlan is the rung-1 network intent distilled from a effectiveNetPolicy at
+// compiledNftPlan is the rung-1 network intent distilled from a policy.NetPolicy at
 // compile time. It flows (via toNftSpec) into the gob-encoded stage2Spec.NftRules
 // and is installed by the stage-2 child inside the netns.
 type compiledNftPlan struct {
 	// confined reports whether the stage-2 child installs a ruleset (and thus
 	// whether the netns is created). It is true whenever the policy does NOT grant
-	// open egress (!effectiveNetPolicy.Open); false leaves host networking untouched (the
+	// open egress (!policy.NetPolicy.Open); false leaves host networking untouched (the
 	// unconfined passthrough — the netns is not even created, so connectivity is
 	// preserved).
 	confined bool
 	// tcpPorts are the accepted egress TCP ports (deduped).
 	tcpPorts []uint16
-	// loopback / private / dns mirror the effectiveNetPolicy flags that gate the
+	// loopback / private / dns mirror the policy.NetPolicy flags that gate the
 	// corresponding accept rules.
 	loopback bool
 	private  bool
@@ -89,17 +90,17 @@ type compiledNftPlan struct {
 	metadataCIDRs []string
 }
 
-// compileNftPlan distils a effectiveNetPolicy into a compiledNftPlan (SPEC §5.2, §5.4,
+// compileNftPlan distils a policy.NetPolicy into a compiledNftPlan (SPEC §5.2, §5.4,
 // §7.2 rung 1). Fail-closed: an Open policy yields confined=false (no netns, no
 // ruleset — the unconfined passthrough); otherwise every accept is gated by its
-// effectiveNetPolicy flag and the metadata deny is always included.
-func compileNftPlan(n effectiveNetPolicy) compiledNftPlan {
+// policy.NetPolicy flag and the metadata deny is always included.
+func compileNftPlan(n policy.NetPolicy) compiledNftPlan {
 	if n.Open {
 		return compiledNftPlan{confined: false}
 	}
 	var ports []uint16
 	for _, p := range n.Ports {
-		if !containsPort(ports, p) {
+		if !policy.ContainsPort(ports, p) {
 			ports = append(ports, p)
 		}
 	}
@@ -109,7 +110,7 @@ func compileNftPlan(n effectiveNetPolicy) compiledNftPlan {
 		loopback:      n.Loopback,
 		private:       n.Private,
 		dns:           n.DNS,
-		metadataCIDRs: metadataDenyCIDRs(),
+		metadataCIDRs: policy.MetadataDenyCIDRs(),
 	}
 }
 
@@ -324,7 +325,7 @@ func daddrMatchExprs(ipnet *net.IPNet) []expr.Any {
 
 // parseCIDR parses a CIDR or a bare IP (treated as a host /32 or /128) into a
 // normalized *net.IPNet. A bare IP is how the §5.4 EC2 IPv6 endpoint
-// (fd00:ec2::254) is expressed in metadataDenyCIDRs.
+// (fd00:ec2::254) is expressed in policy.MetadataDenyCIDRs.
 func parseCIDR(s string) (*net.IPNet, error) {
 	if _, ipnet, err := net.ParseCIDR(s); err == nil {
 		return ipnet, nil

@@ -10,6 +10,7 @@ package sandbox
 
 import (
 	"context"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 	}
 
 	// --- TCP limited to Ports: allowlisted port permitted, others denied ---
-	got := runNetProbe(t, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
+	got := runNetProbe(t, fixtureWithNet(policy.NetPolicy{Ports: []uint16{netProbeAllowP}}))
 	if got[netKeyPortA] != netValAllowed {
 		t.Errorf("allowlisted port %d = %q, want %q", netProbeAllowP, got[netKeyPortA], netValAllowed)
 	}

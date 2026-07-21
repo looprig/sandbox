@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,7 +15,7 @@ import (
 // a stage-2 helper (Init -> runStage2) that becomes the confined target.
 //
 // Task 12a wires the RUNG-2 filesystem axis: compile distils the policy's FS
-// entries into a compiledFS, the per-spawn wrap enumerates that into a flat
+// entries into a policy.CompiledFS, the per-spawn wrap enumerates that into a flat
 // Landlock allowlist against the live filesystem (snapshot semantics), and the
 // stage-2 child applies the ruleset before execve. Rung 1 (namespaces/cgroup,
 // Task 13), seccomp (Task 14), and network scoping (Task 12c) still fill in
@@ -62,11 +63,11 @@ func newLinuxBackendRung1() *linuxBackend {
 // newLinuxBackend, which existing tests pin) compiles the Landlock+seccomp tier
 // (compileRung2). It never errors — a policy that compiles to a narrower ruleset
 // is reported via level/bits/report, not via err.
-func (b linuxBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	return b.compileWithGrantPaths(p, nil)
 }
 
-func (b linuxBackend) compileWithGrantPaths(p effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileWithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
 	if b.rung == rungOne {
 		return b.compileRung1WithGrantPaths(p, handles)
 	}
@@ -74,7 +75,7 @@ func (b linuxBackend) compileWithGrantPaths(p effectivePolicy, handles []*grantP
 }
 
 // compileRung2 builds the re-exec spawnSpec and applies rung-2 FS confinement. It
-// distils the policy's FS axis into a compiledFS (literal allows + literal
+// distils the policy's FS axis into a policy.CompiledFS (literal allows + literal
 // denies; globs dropped), which the per-spawn wrap enumerates into a Landlock
 // allowlist. It reports LevelDegraded (rung 2 enforces the write boundary and
 // fixed-path denies but cannot express glob denies or address-scoped network for
@@ -82,28 +83,28 @@ func (b linuxBackend) compileWithGrantPaths(p effectivePolicy, handles []*grantP
 // policy carries an enforceable fixed-path deny), and GuaranteeEnvScrub (when
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
 // unenforced.
-func (b linuxBackend) compileRung2(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung2(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	return b.compileRung2WithGrantPaths(p, nil)
 }
 
-func (b linuxBackend) compileRung2WithGrantPaths(p effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
-	if err := validateLandlockExactPaths(p.FS, handles); err != nil {
+func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
 	}
-	cfs := compileFSPolicyWithGrantPaths(p.FS, handles)
+	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
 	cnet := compileNetPolicy(p.Net)
 	// Task 14: resolve the cgroup v2 resource-limit plan against the ancestor
 	// probed at construction. enforced() decides the ResourceLimits guarantee at
 	// COMPILE time; each spawn creates the transient scope at SPAWN time (see
 	// linuxWrap). Resource limits never change the isolation Level — they are
 	// containment-of-cost, not authority (§7.4), so LevelDegraded is unchanged.
-	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
+	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
 
 	var bits uint64
-	if isFSAccessRestricted(p.FS, writeFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.WriteAccess) {
 		bits |= GuaranteeWriteBoundary
 	}
-	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.ReadAccess|policy.ExecAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {
@@ -155,7 +156,7 @@ func (b linuxBackend) compileRung2WithGrantPaths(p effectivePolicy, handles []*g
 //     bound are INVISIBLE (restricted-read, the rung-1 property rung 2 lacks);
 //   - the in-netns nftables address filter (compileNftPlan): address-scoped
 //     loopback/private, UDP+TCP DNS, and the §5.4 metadata hard-deny;
-//   - the Landlock FS allowlist (compileFSPolicy, shared with rung 2) — applied
+//   - the Landlock FS allowlist (policy.CompileFS, shared with rung 2) — applied
 //     on top of the mount view as defense-in-depth (SPEC §7.2 "then Landlock");
 //   - the cgroup v2 scope (compileCgroupPolicy, shared) for resource limits.
 //
@@ -168,26 +169,26 @@ func (b linuxBackend) compileRung2WithGrantPaths(p effectivePolicy, handles []*g
 // Degraded and be recorded; for the standard tested profile shapes the mechanisms reach all of
 // them, so rung 1 is LevelFull. Resource limits are containment-of-cost and never
 // change Level (§7.4).
-func (b linuxBackend) compileRung1(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung1(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	return b.compileRung1WithGrantPaths(p, nil)
 }
 
-func (b linuxBackend) compileRung1WithGrantPaths(p effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
-	if err := validateLandlockExactPaths(p.FS, handles); err != nil {
+func (b linuxBackend) compileRung1WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
 	}
-	cfs := compileFSPolicyWithGrantPaths(p.FS, handles)
-	cg := compileCgroupPolicy(p.limits, b.cgroupPids)
+	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
+	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
 	mvp := compileMountViewWithGrantPaths(p, handles)
 	nft := compileNftPlan(p.Net)
 
 	// The process boundary is unconditional; filesystem guarantees are reported
 	// only for axes the effective policy actually restricts.
 	bits := uint64(GuaranteeProcessBoundary)
-	if isFSAccessRestricted(p.FS, writeFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.WriteAccess) {
 		bits |= GuaranteeWriteBoundary
 	}
-	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.ReadAccess|policy.ExecAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 	if !p.Env.Inherit {
@@ -218,7 +219,7 @@ func (b linuxBackend) compileRung1WithGrantPaths(p effectivePolicy, handles []*g
 // address-scoped network with the metadata hard-deny — all "enforced". The one
 // recorded residual is the self-created-file glob-mask gap (§7.5), which does not
 // demote Level.
-func rung1CompileReport(p effectivePolicy, mvp mountViewPlan, nft compiledNftPlan) CompileReport {
+func rung1CompileReport(p policy.Effective, mvp mountViewPlan, nft compiledNftPlan) CompileReport {
 	entries := []ReportEntry{
 		{
 			Feature: "process-boundary",
@@ -261,7 +262,7 @@ func rung1CompileReport(p effectivePolicy, mvp mountViewPlan, nft compiledNftPla
 		entries = append(entries, ReportEntry{
 			Feature: "env-scrub",
 			Status:  "enforced",
-			Detail:  "target execve'd with the effectiveEnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
+			Detail:  "target execve'd with the policy.EnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
 		})
 	}
 	entries = append(entries, rung1NetReport(nft)...)
@@ -305,20 +306,20 @@ func rung1NetReport(nft compiledNftPlan) []ReportEntry {
 // glob denies are unenforced (inexpressible in Landlock's additive model, left
 // to the in-process ReadGuard for native tools). It also notes that nonexistent
 // allow paths are dropped at spawn (fail secure).
-func fsCompileReport(p effectivePolicy, cfs compiledFS) CompileReport {
+func fsCompileReport(p policy.Effective, cfs policy.CompiledFS) CompileReport {
 	entries := []ReportEntry{{
 		Feature: "write-boundary",
 		Status:  "enforced",
 		Detail:  "writes confined to policy writable roots via Landlock (rung 2, ABI v4)",
 	}}
-	if cfs.hasLiteralDeny() {
+	if cfs.HasLiteralDeny() {
 		entries = append(entries, ReportEntry{
 			Feature: "fixed-path-deny",
 			Status:  "enforced",
 			Detail:  "fixed-path secret deny-reads enforced by enumerated sibling allows, snapshot at spawn (§7.5)",
 		})
 	}
-	if cfs.hasCarveout() {
+	if cfs.HasCarveout() {
 		entries = append(entries, ReportEntry{
 			Feature: "carveout",
 			Status:  "narrowed",
@@ -342,9 +343,9 @@ func fsCompileReport(p effectivePolicy, cfs compiledFS) CompileReport {
 
 // policyHasGlobDeny reports whether the policy carries any glob DENY entry, which
 // rung 2 cannot enforce for subprocesses (recorded unenforced in the report).
-func policyHasGlobDeny(p effectivePolicy) bool {
+func policyHasGlobDeny(p policy.Effective) bool {
 	for _, e := range p.FS {
-		if e.Access == denyFSAccess && strings.ContainsAny(e.Path, globMeta) {
+		if e.Access == policy.DenyAccess && strings.ContainsAny(e.Path, policy.GlobMeta) {
 			return true
 		}
 	}
@@ -358,7 +359,7 @@ func policyHasGlobDeny(p effectivePolicy) bool {
 // load-bearing — each closes over its own (dir, innerArgv), its own enumerated
 // rules, and its own pipe, so concurrent spawns never share per-spawn state or a
 // file descriptor.
-func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle) func(string, []string) ([]string, func(*exec.Cmd) error, func()) {
+func linuxWrapTransform(cfs policy.CompiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*policy.PathHandle) func(string, []string) ([]string, func(*exec.Cmd) error, func()) {
 	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return linuxWrap(cfs, cnet, cg, r1, handles, dir, innerArgv)
 	}
@@ -375,7 +376,7 @@ func linuxWrapTransform(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 
 // applies the mount view + nftables before Landlock. The cloneflags, the spec
 // pipe, and the cgroup UseCgroupFD all coexist on the one SysProcAttr. r1 == nil
 // is the rung-2 path (no namespaces), unchanged.
-func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*grantPathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
+func linuxWrap(cfs policy.CompiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Plan, handles []*policy.PathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -406,7 +407,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		// the live filesystem: a secret that exists when the command starts is
 		// carved out; a file the command later creates is not (§7.5 snapshot
 		// semantics). The stage-2 child rebuilds the Landlock ruleset from this.
-		fsRules, relativeFiles, err := enumerateFSRulesWithGrantPaths(cfs, handles)
+		fsRules, relativeFiles, err := policy.EnumerateFSRulesWithPathHandles(cfs, handles)
 		if err != nil {
 			return err
 		}
@@ -426,10 +427,10 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 			Rung:        stage2RungTwo,
 		}
 		for index := range handles {
-			spec.GrantFDs = append(spec.GrantFDs, firstGrantPathChildFD+index)
+			spec.GrantFDs = append(spec.GrantFDs, policy.FirstPathHandleChildFD+index)
 		}
 		for index := range grantRuleFiles {
-			spec.GrantFDs = append(spec.GrantFDs, firstGrantPathChildFD+len(handles)+index)
+			spec.GrantFDs = append(spec.GrantFDs, policy.FirstPathHandleChildFD+len(handles)+index)
 		}
 		// Task 13: a rung-1 spawn additionally enumerates the bind-mount view (a
 		// fresh snapshot, like the FS allowlist above) and carries the nftables plan.
@@ -439,7 +440,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 			spec.Rung = stage2RungOne
 			mountView, err := enumerateMountViewWithGrantPaths(r1.mount, fsRules, handles)
 			if err != nil {
-				closeGrantRuleFiles(grantRuleFiles)
+				policy.CloseRuleFiles(grantRuleFiles)
 				grantRuleFiles = nil
 				return err
 			}
@@ -465,7 +466,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		// stdio) — stage2SpecFD.
 		cmd.ExtraFiles = append(cmd.ExtraFiles, r)
 		for _, handle := range handles {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, handle.file)
+			cmd.ExtraFiles = append(cmd.ExtraFiles, handle.File())
 		}
 		cmd.ExtraFiles = append(cmd.ExtraFiles, grantRuleFiles...)
 		// Add the dispatch sentinel to the CHILD's env only (after capturing the
@@ -529,7 +530,7 @@ func linuxWrap(cfs compiledFS, cnet compiledNet, cg compiledCgroup, r1 *rung1Pla
 		if pipeW != nil {
 			_ = pipeW.Close()
 		}
-		closeGrantRuleFiles(grantRuleFiles)
+		policy.CloseRuleFiles(grantRuleFiles)
 	}
 
 	return finalArgv, configure, cleanup

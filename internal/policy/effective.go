@@ -1,33 +1,34 @@
-package sandbox
+package policy
 
 import (
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
 )
 
-type fsAccess uint8
+type FSAccess uint8
 
-const denyFSAccess fsAccess = 0
+const DenyAccess FSAccess = 0
 
 const (
-	readFSAccess fsAccess = 1 << iota
-	execFSAccess
-	writeFSAccess
+	ReadAccess FSAccess = 1 << iota
+	ExecAccess
+	WriteAccess
 )
 
-type fsEntry struct {
+type FSEntry struct {
 	Path   string
-	Access fsAccess
-	Denied fsAccess
+	Access FSAccess
+	Denied FSAccess
 	Exact  bool
 	// Canonical marks a grant path already resolved and identity-bound by the
 	// executor. Backends must not follow it through symlinks again.
 	Canonical bool
 }
 
-const allFSAccess = readFSAccess | execFSAccess | writeFSAccess
+const AllAccess = ReadAccess | ExecAccess | WriteAccess
 
-type effectiveNetPolicy struct {
+type NetPolicy struct {
 	Loopback  bool
 	Private   bool
 	Ports     []uint16
@@ -36,32 +37,32 @@ type effectiveNetPolicy struct {
 	Open      bool
 }
 
-type effectiveEnvPolicy struct {
+type EnvPolicy struct {
 	Inherit bool
 	Allow   []string
 	Set     map[string]string
 }
 
-type effectiveLimits struct {
+type Limits struct {
 	MaxPIDs     int
 	MaxMemBytes int64
 	MaxCPUPct   int
 	Disabled    bool
 }
 
-type effectivePolicy struct {
+type Effective struct {
 	Workspace string
-	FS        []fsEntry
-	Net       effectiveNetPolicy
-	Env       effectiveEnvPolicy
-	limits    effectiveLimits
-	Isolation Isolation
-	Home      Home
+	FS        []FSEntry
+	Net       NetPolicy
+	Env       EnvPolicy
+	Limits    Limits
+	Isolation profile.Isolation
+	Home      profile.Home
 }
 
-func cloneEffectivePolicy(p effectivePolicy) effectivePolicy {
+func Clone(p Effective) Effective {
 	clone := p
-	clone.FS = append([]fsEntry(nil), p.FS...)
+	clone.FS = append([]FSEntry(nil), p.FS...)
 	clone.Net.Ports = append([]uint16(nil), p.Net.Ports...)
 	clone.Env.Allow = append([]string(nil), p.Env.Allow...)
 	if p.Env.Set != nil {
@@ -74,84 +75,84 @@ func cloneEffectivePolicy(p effectivePolicy) effectivePolicy {
 }
 
 const (
-	nullDevicePath = "/dev/null"
+	NullDevicePath = "/dev/null"
 )
 
-func compileEffectivePolicy(prof *Profile) (effectivePolicy, error) {
+func Compile(prof *profile.Profile) (Effective, error) {
 	if err := prof.Validate(); err != nil {
-		return effectivePolicy{}, err
+		return Effective{}, err
 	}
 	settings := prof.Settings()
-	p := effectivePolicy{
+	p := Effective{
 		Workspace: settings.WorkspaceRoot,
 		Isolation: settings.Isolation,
 		Home:      settings.Home,
 	}
-	if settings.Isolation == Unconfined {
-		p.FS = []fsEntry{{Path: string(filepath.Separator), Access: readFSAccess | writeFSAccess | execFSAccess}}
+	if settings.Isolation == profile.Unconfined {
+		p.FS = []FSEntry{{Path: string(filepath.Separator), Access: ReadAccess | WriteAccess | ExecAccess}}
 		p.Net.Open = true
 		return p, nil
 	}
 
-	p.FS = append(p.FS, minimalRuntimeEntries()...)
-	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess, Exact: true})
+	p.FS = append(p.FS, MinimalRuntimeEntries()...)
+	p.FS = append(p.FS, FSEntry{Path: NullDevicePath, Access: ReadAccess | WriteAccess, Exact: true})
 	appendRootAccess(&p.FS, settings.WorkspaceRoot, settings.WorkspaceRead, settings.WorkspaceWrite)
 	for _, root := range settings.AdditionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
 	}
 	appendRootAccess(&p.FS, string(filepath.Separator), settings.HostRead, settings.HostWrite)
-	if settings.Network == Allow {
+	if settings.Network == profile.Allow {
 		p.Net.Open = true
 	}
 	return p, nil
 }
 
-func appendRootAccess(entries *[]fsEntry, path string, read, write Access) {
-	var access, denied fsAccess
-	if read == Allow {
-		access |= readFSAccess | execFSAccess
+func appendRootAccess(entries *[]FSEntry, path string, read, write profile.Access) {
+	var access, denied FSAccess
+	if read == profile.Allow {
+		access |= ReadAccess | ExecAccess
 	} else {
-		denied |= readFSAccess | execFSAccess
+		denied |= ReadAccess | ExecAccess
 	}
-	if write == Allow {
-		access |= writeFSAccess
+	if write == profile.Allow {
+		access |= WriteAccess
 	} else {
-		denied |= writeFSAccess
+		denied |= WriteAccess
 	}
-	*entries = append(*entries, fsEntry{Path: path, Access: access, Denied: denied})
+	*entries = append(*entries, FSEntry{Path: path, Access: access, Denied: denied})
 }
 
-func minimalRuntimeEntries() []fsEntry {
-	var entries []fsEntry
+func MinimalRuntimeEntries() []FSEntry {
+	var entries []FSEntry
 	for _, path := range []string{
 		"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec",
 		"/usr/lib/git-core", "/lib", "/lib64",
 	} {
-		entries = append(entries, fsEntry{Path: path, Access: readFSAccess | execFSAccess})
+		entries = append(entries, FSEntry{Path: path, Access: ReadAccess | ExecAccess})
 	}
 	for _, path := range []string{
 		"/usr/lib", "/usr/lib64", "/System/Library", "/etc/ssl/certs", "/etc/pki",
 	} {
-		entries = append(entries, fsEntry{Path: path, Access: readFSAccess})
+		entries = append(entries, FSEntry{Path: path, Access: ReadAccess})
 	}
 	for _, path := range []string{
 		"/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/services",
 		"/etc/protocols", "/etc/localtime", "/etc/ld.so.cache", "/etc/ssl/cert.pem",
 	} {
-		entries = append(entries, fsEntry{Path: path, Access: readFSAccess, Exact: true})
+		entries = append(entries, FSEntry{Path: path, Access: ReadAccess, Exact: true})
 	}
 	return entries
 }
 
-func baselineEnvAllowlist() []string {
+func BaselineEnvAllowlist() []string {
 	return []string{"PATH", "HOME", "TERM", "LANG", "LC_*", "USER", "LOGNAME", "SHELL", "TZ"}
 }
 
-func metadataDenyCIDRs() []string {
+func MetadataDenyCIDRs() []string {
 	return []string{"169.254.0.0/16", "fd00:ec2::254"}
 }
 
-func containsPort(ports []uint16, port uint16) bool {
+func ContainsPort(ports []uint16, port uint16) bool {
 	for _, candidate := range ports {
 		if candidate == port {
 			return true
@@ -160,25 +161,25 @@ func containsPort(ports []uint16, port uint16) bool {
 	return false
 }
 
-func netBlocked(p effectivePolicy) bool {
+func netBlocked(p Effective) bool {
 	net := p.Net
 	return !net.Loopback && !net.Private && !net.DNS && !net.Open && len(net.Ports) == 0
 }
 
-func hasDeniedFSAccess(entries []fsEntry, access fsAccess) bool {
+func hasDeniedFSAccess(entries []FSEntry, access FSAccess) bool {
 	for _, entry := range entries {
-		if normalizedDenied(entry)&access != 0 {
+		if NormalizedDenied(entry)&access != 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func isFSAccessRestricted(entries []fsEntry, access fsAccess) bool {
-	return hasDeniedFSAccess(entries, access) || resolveFS(entries, string(filepath.Separator))&access != access
+func IsAccessRestricted(entries []FSEntry, access FSAccess) bool {
+	return hasDeniedFSAccess(entries, access) || ResolveFS(entries, string(filepath.Separator))&access != access
 }
 
-func realHome() (string, error) {
+func RealHome() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

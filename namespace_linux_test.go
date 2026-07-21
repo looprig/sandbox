@@ -5,6 +5,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,7 @@ func TestCompileMountView(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		policy       effectivePolicy
+		policy       policy.Effective
 		wantRW       []string // must be present in rwBinds
 		wantRO       []string // must be present in roBinds
 		wantNotBound []string // must NOT appear in rw or ro binds
@@ -63,12 +64,12 @@ func TestCompileMountView(t *testing.T) {
 		},
 		{
 			name: "deny hard-override: an allow at-or-under a deny is dropped",
-			policy: effectivePolicy{
+			policy: policy.Effective{
 				Workspace: ws,
-				FS: []fsEntry{
-					{Path: ws, Access: readFSAccess | writeFSAccess | execFSAccess},
-					{Path: filepath.Join(ws, "secret"), Access: readFSAccess}, // under the deny below
-					{Path: filepath.Join(ws, "secret"), Access: denyFSAccess},
+				FS: []policy.FSEntry{
+					{Path: ws, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess},
+					{Path: filepath.Join(ws, "secret"), Access: policy.ReadAccess}, // under the deny below
+					{Path: filepath.Join(ws, "secret"), Access: policy.DenyAccess},
 				},
 			},
 			wantRW:       []string{ws},
@@ -77,7 +78,7 @@ func TestCompileMountView(t *testing.T) {
 		},
 		{
 			name:   "open/full policy: single rw bind, no denies",
-			policy: effectivePolicy{Workspace: ws, FS: []fsEntry{{Path: "/", Access: readFSAccess | writeFSAccess | execFSAccess}}},
+			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{{Path: "/", Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}}},
 			wantRW: []string{"/"},
 		},
 	}
@@ -285,7 +286,7 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	ws := t.TempDir()
 	tests := []struct {
 		name     string
-		policy   effectivePolicy
+		policy   policy.Effective
 		wantBits uint64 // bits that MUST be set
 	}{
 		{
@@ -351,7 +352,7 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 			Loopback:      true,
 			Private:       true,
 			DNS:           true,
-			MetadataCIDRs: metadataDenyCIDRs(),
+			MetadataCIDRs: policy.MetadataDenyCIDRs(),
 		},
 	}
 	var buf bytes.Buffer
@@ -374,7 +375,7 @@ func TestMountViewSpecGobRoundTrip(t *testing.T) {
 	if !got.NftRules.Confined || len(got.NftRules.TCPPorts) != 1 || got.NftRules.TCPPorts[0] != 443 {
 		t.Errorf("NftRules round-trip mismatch: %+v", got.NftRules)
 	}
-	if len(got.NftRules.MetadataCIDRs) != len(metadataDenyCIDRs()) {
+	if len(got.NftRules.MetadataCIDRs) != len(policy.MetadataDenyCIDRs()) {
 		t.Errorf("NftRules.MetadataCIDRs round-trip mismatch: %+v", got.NftRules.MetadataCIDRs)
 	}
 }

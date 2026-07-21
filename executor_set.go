@@ -3,6 +3,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"net"
 	"os"
 	"strconv"
@@ -137,14 +138,14 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		return nil, ErrExecutorLimit
 	}
 
-	policy, err := compileEffectivePolicy(set.profile)
+	pol, err := policy.Compile(set.profile)
 	if err != nil {
 		return nil, err
 	}
 	var home string
 	var ownedHome bool
 	if set.settings.Home == RealHome {
-		home, err = realHome()
+		home, err = policy.RealHome()
 	} else {
 		home, err = os.MkdirTemp(set.ownedRoot, "home-")
 		ownedHome = err == nil
@@ -171,15 +172,15 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		}
 		return nil, fmt.Errorf("sandbox: create executor TMPDIR: %w", err)
 	}
-	if policy.Env.Set == nil {
-		policy.Env.Set = make(map[string]string)
+	if pol.Env.Set == nil {
+		pol.Env.Set = make(map[string]string)
 	}
-	policy.Env.Set["HOME"] = home
-	policy.Env.Set["TMPDIR"] = tmp
+	pol.Env.Set["HOME"] = home
+	pol.Env.Set["TMPDIR"] = tmp
 	if ownedHome {
-		policy.FS = append(policy.FS, fsEntry{Path: home, Access: readFSAccess | writeFSAccess | execFSAccess})
+		pol.FS = append(pol.FS, policy.FSEntry{Path: home, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
 	}
-	policy.FS = append(policy.FS, fsEntry{Path: tmp, Access: readFSAccess | writeFSAccess | execFSAccess})
+	pol.FS = append(pol.FS, policy.FSEntry{Path: tmp, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
 	var proxy *network.Proxy
 	if set.route != nil {
 		proxy, err = network.NewProxy(*set.route)
@@ -200,11 +201,11 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 			_ = os.RemoveAll(tmp)
 			return nil, errors.New("sandbox: invalid egress proxy listener")
 		}
-		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
+		pol.Net = policy.NetPolicy{ProxyPort: uint16(port)}
 	}
 	config := set.executor
 	config.lifecycle = set.lifecycle
-	executor, err := newExecutorFromEffective(set.profile, policy, config)
+	executor, err := newExecutorFromEffective(set.profile, pol, config)
 	if err != nil {
 		if proxy != nil {
 			_ = proxy.Close()

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"strconv"
 	"strings"
@@ -142,7 +143,7 @@ func runNetProbe(t *testing.T, netOpt backendFixtureOption) map[string]string {
 	ws := t.TempDir()
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws,
 		netOpt,
-		fixtureWithEnv(effectiveEnvPolicy{Set: map[string]string{
+		fixtureWithEnv(policy.EnvPolicy{Set: map[string]string{
 			netTargetEnv:     "1",
 			netProbePortAEnv: strconv.Itoa(netProbeAllowP),
 			netProbePortBEnv: strconv.Itoa(netProbeBlockP),
@@ -169,7 +170,7 @@ func TestLinuxNetPortAllowlist(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
 
-	got := runNetProbe(t, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{netProbeAllowP}}))
+	got := runNetProbe(t, fixtureWithNet(policy.NetPolicy{Ports: []uint16{netProbeAllowP}}))
 
 	if got[netKeyPortA] != netValAllowed {
 		t.Errorf("allowlisted port %d = %q, want %q (Landlock must permit the connect) — full output:\n%v",
@@ -188,8 +189,8 @@ func TestLinuxNetAllDeniedWhenZero(t *testing.T) {
 	requireLandlockV4(t)
 	requireSeccomp(t)
 
-	// A no-op net option keeps Write's zero effectiveNetPolicy (all TCP denied).
-	got := runNetProbe(t, func(*effectivePolicy) {})
+	// A no-op net option keeps Write's zero policy.NetPolicy (all TCP denied).
+	got := runNetProbe(t, func(*policy.Effective) {})
 
 	for _, k := range []string{netKeyPortA, netKeyPortB} {
 		if got[k] != netValDenied {
@@ -209,7 +210,7 @@ func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 
-	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{DNS: true})))
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{DNS: true})))
 
 	// The report must record DNS narrowed to TCP.
 	if !reportHas(e.Report(), "dns", "narrowed") {
@@ -239,7 +240,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 	ws := t.TempDir()
 
 	t.Run("confined port policy earns NetworkBoundary, not AddressNetwork", func(t *testing.T) {
-		e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{Ports: []uint16{443}})))
+		e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{Ports: []uint16{443}})))
 		g := e.Guarantees()
 		if !g.NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = false, want true (confined TCP allowlist)")
@@ -271,7 +272,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 
 	t.Run("open egress does not earn NetworkBoundary", func(t *testing.T) {
 		// Net.Open makes the policy unconfined; AckUnconfined is required to build.
-		p := backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(effectiveNetPolicy{Open: true}), fixtureWithAckUnconfined())
+		p := backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{Open: true}), fixtureWithAckUnconfined())
 		e := newFSExecutor(t, p)
 		if e.Guarantees().NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = true for open egress, want false")
@@ -284,27 +285,27 @@ func TestLinuxNetGuarantees(t *testing.T) {
 
 // --- Pure compile unit tests (no Landlock) -----------------------------------
 
-// TestCompileNetPolicy asserts the effectiveNetPolicy -> compiledNet mapping: Open is a
+// TestCompileNetPolicy asserts the policy.NetPolicy -> compiledNet mapping: Open is a
 // passthrough (unconfined), everything else is confined, DNS folds port 53 in,
 // duplicates are collapsed, and Loopback/Private never widen the port set.
 func TestCompileNetPolicy(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name         string
-		in           effectiveNetPolicy
+		in           policy.NetPolicy
 		wantConfined bool
 		wantPorts    []uint16
 		wantDNS      bool
 	}{
-		{"zero denies all (confined, empty)", effectiveNetPolicy{}, true, nil, false},
-		{"open is unconfined passthrough", effectiveNetPolicy{Open: true}, false, nil, false},
-		{"ports only", effectiveNetPolicy{Ports: []uint16{443}}, true, []uint16{443}, false},
-		{"dns folds in port 53", effectiveNetPolicy{DNS: true}, true, []uint16{dnsTCPPort}, true},
-		{"ports plus dns", effectiveNetPolicy{Ports: []uint16{443}, DNS: true}, true, []uint16{443, dnsTCPPort}, true},
-		{"dns does not duplicate an explicit 53", effectiveNetPolicy{Ports: []uint16{53}, DNS: true}, true, []uint16{53}, true},
-		{"duplicate ports collapsed", effectiveNetPolicy{Ports: []uint16{443, 443}}, true, []uint16{443}, false},
-		{"loopback/private do not widen ports", effectiveNetPolicy{Loopback: true, Private: true}, true, nil, false},
-		{"open wins even with ports", effectiveNetPolicy{Ports: []uint16{443}, Open: true}, false, nil, false},
+		{"zero denies all (confined, empty)", policy.NetPolicy{}, true, nil, false},
+		{"open is unconfined passthrough", policy.NetPolicy{Open: true}, false, nil, false},
+		{"ports only", policy.NetPolicy{Ports: []uint16{443}}, true, []uint16{443}, false},
+		{"dns folds in port 53", policy.NetPolicy{DNS: true}, true, []uint16{dnsTCPPort}, true},
+		{"ports plus dns", policy.NetPolicy{Ports: []uint16{443}, DNS: true}, true, []uint16{443, dnsTCPPort}, true},
+		{"dns does not duplicate an explicit 53", policy.NetPolicy{Ports: []uint16{53}, DNS: true}, true, []uint16{53}, true},
+		{"duplicate ports collapsed", policy.NetPolicy{Ports: []uint16{443, 443}}, true, []uint16{443}, false},
+		{"loopback/private do not widen ports", policy.NetPolicy{Loopback: true, Private: true}, true, nil, false},
+		{"open wins even with ports", policy.NetPolicy{Ports: []uint16{443}, Open: true}, false, nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -380,16 +381,16 @@ func TestNetCompileReport(t *testing.T) {
 	}
 	tests := []struct {
 		name          string
-		in            effectiveNetPolicy
+		in            policy.NetPolicy
 		wantEnforced  bool // network-boundary/enforced
 		wantOpen      bool // network/unenforced
 		wantAddrUnenf bool // address-network/unenforced
 		wantDNS       bool // dns/narrowed
 	}{
-		{"write zero: boundary enforced, no address entry", effectiveNetPolicy{}, true, false, false, false},
-		{"ports only: boundary + address unenforced", effectiveNetPolicy{Ports: []uint16{443}}, true, false, true, false},
-		{"trusted-shape: boundary + address + dns", effectiveNetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}, true, false, true, true},
-		{"open: unenforced only", effectiveNetPolicy{Open: true}, false, true, false, false},
+		{"write zero: boundary enforced, no address entry", policy.NetPolicy{}, true, false, false, false},
+		{"ports only: boundary + address unenforced", policy.NetPolicy{Ports: []uint16{443}}, true, false, true, false},
+		{"trusted-shape: boundary + address + dns", policy.NetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true}, true, false, true, true},
+		{"open: unenforced only", policy.NetPolicy{Open: true}, false, true, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

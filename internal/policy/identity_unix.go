@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package sandbox
+package policy
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-func platformFileIdentity(path string) (string, error) {
+func FileIdentity(path string) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", err

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"net"
 	"os"
 	"os/exec"
@@ -131,7 +132,7 @@ func TestCompileSBPLNetworkBroadTarget(t *testing.T) {
 // outbound-tcp form.
 func TestCompileSBPLNetworkPorts(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
-	p := backendFixturePolicy(fixtureWorkspaceWrite, "/ws", fixtureWithNet(effectiveNetPolicy{Ports: []uint16{443, 8080}}))
+	p := backendFixturePolicy(fixtureWorkspaceWrite, "/ws", fixtureWithNet(policy.NetPolicy{Ports: []uint16{443, 8080}}))
 	profile, _, _, _ := compileSBPL(p)
 	for _, w := range []string{
 		`(allow network-outbound (remote tcp "*:443"))`,
@@ -244,7 +245,7 @@ func TestCompileSBPLGuarantees(t *testing.T) {
 	}
 
 	// An Inherit policy (unconfined-style) does NOT scrub env.
-	_, _, _, inheritBits := compileSBPL(effectivePolicy{Workspace: "/ws", Env: effectiveEnvPolicy{Inherit: true}})
+	_, _, _, inheritBits := compileSBPL(policy.Effective{Workspace: "/ws", Env: policy.EnvPolicy{Inherit: true}})
 	if inheritBits&GuaranteeEnvScrub != 0 {
 		t.Error("Inherit policy EnvScrub bit set; an inherited env is not scrubbed")
 	}

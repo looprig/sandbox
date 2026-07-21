@@ -1,7 +1,8 @@
-package sandbox
+package policy
 
 import (
 	"errors"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,11 +17,11 @@ func TestCompiledFSPreservesRealProfileAxisPrecedence(t *testing.T) {
 		HostRead: Allow, HostWrite: Allow, Network: Deny, Command: Allow,
 		AdditionalRoots: []RootAccess{{Path: additional, Read: Allow, Write: Gated}},
 	})
-	policy, err := compileEffectivePolicy(profile)
+	policy, err := Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiled := compileFSPolicy(policy.FS)
+	compiled := CompileFS(policy.FS)
 	for _, test := range []struct {
 		name                string
 		path                string
@@ -31,8 +32,8 @@ func TestCompiledFSPreservesRealProfileAxisPrecedence(t *testing.T) {
 		{"host access outside carveouts", outside, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := compiled.resolve(test.path)
-			if got&readFSAccess != 0 != test.wantRead || got&writeFSAccess != 0 != test.wantWrite {
+			got := compiled.Resolve(test.path)
+			if got&ReadAccess != 0 != test.wantRead || got&WriteAccess != 0 != test.wantWrite {
 				t.Fatalf("compiled access at %q = %#x, want read=%v write=%v", test.path, got, test.wantRead, test.wantWrite)
 			}
 		})
@@ -48,15 +49,15 @@ func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	compiled := compileFSPolicy([]fsEntry{
-		{Path: root, Access: allFSAccess},
-		{Path: workspace, Access: writeFSAccess, Denied: readFSAccess | execFSAccess},
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: workspace, Access: WriteAccess, Denied: ReadAccess | ExecAccess},
 	})
-	rules := enumerateFSRules(compiled)
-	if got := resolveEnumeratedRules(rules, filepath.Join(workspace, "file")); got != writeFSAccess {
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, filepath.Join(workspace, "file")); got != WriteAccess {
 		t.Fatalf("workspace enumerated access = %#x, want write-only", got)
 	}
-	if got := resolveEnumeratedRules(rules, filepath.Join(outside, "file")); got != allFSAccess {
+	if got := resolveEnumeratedRules(rules, filepath.Join(outside, "file")); got != AllAccess {
 		t.Fatalf("outside enumerated access = %#x, want full root access", got)
 	}
 }
@@ -66,15 +67,15 @@ func TestCompiledFSPreservesExactScope(t *testing.T) {
 	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	compiled := compileFSPolicy([]fsEntry{{Path: target, Access: writeFSAccess, Exact: true}})
-	if got := compiled.resolve(target); got != writeFSAccess {
+	compiled := CompileFS([]FSEntry{{Path: target, Access: WriteAccess, Exact: true}})
+	if got := compiled.Resolve(target); got != WriteAccess {
 		t.Fatalf("exact target access = %#x, want write", got)
 	}
-	if got := compiled.resolve(filepath.Join(target, "child")); got != denyFSAccess {
+	if got := compiled.Resolve(filepath.Join(target, "child")); got != DenyAccess {
 		t.Fatalf("exact target widened recursively after compilation: %#x", got)
 	}
-	rules := enumerateFSRules(compiled)
-	if got := resolveEnumeratedRules(rules, target); got != writeFSAccess {
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, target); got != WriteAccess {
 		t.Fatalf("exact target enumerated access = %#x, want write", got)
 	}
 }
@@ -87,18 +88,18 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name    string
-		entries []fsEntry
+		entries []FSEntry
 		wantErr bool
 	}{
-		{name: "exact regular file", entries: []fsEntry{{Path: file, Access: writeFSAccess, Exact: true, Canonical: true}}},
-		{name: "recursive directory", entries: []fsEntry{{Path: root, Access: writeFSAccess}}},
-		{name: "exact directory unsupported", entries: []fsEntry{{Path: root, Access: writeFSAccess, Exact: true, Canonical: true}}, wantErr: true},
-		{name: "exact nonexistent unsupported", entries: []fsEntry{{Path: filepath.Join(root, "future"), Access: writeFSAccess, Exact: true, Canonical: true}}, wantErr: true},
+		{name: "exact regular file", entries: []FSEntry{{Path: file, Access: WriteAccess, Exact: true, Canonical: true}}},
+		{name: "recursive directory", entries: []FSEntry{{Path: root, Access: WriteAccess}}},
+		{name: "exact directory unsupported", entries: []FSEntry{{Path: root, Access: WriteAccess, Exact: true, Canonical: true}}, wantErr: true},
+		{name: "exact nonexistent unsupported", entries: []FSEntry{{Path: filepath.Join(root, "future"), Access: WriteAccess, Exact: true, Canonical: true}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateLandlockExactPaths(test.entries, nil)
-			if test.wantErr && !errors.Is(err, ErrGrantUnsupported) {
-				t.Fatalf("error = %v, want ErrGrantUnsupported", err)
+			err := ValidateLandlockExactPaths(test.entries, nil)
+			if test.wantErr && !errors.Is(err, ErrUnsupportedClass) {
+				t.Fatalf("error = %v, want ErrUnsupportedClass", err)
 			}
 			if !test.wantErr && err != nil {
 				t.Fatalf("error = %v, want nil", err)
@@ -107,10 +108,10 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 	}
 }
 
-func resolveEnumeratedRules(rules []fsRule, path string) fsAccess {
-	var access fsAccess
+func resolveEnumeratedRules(rules []FSRule, path string) FSAccess {
+	var access FSAccess
 	for _, rule := range rules {
-		if rule.Path == path || rule.IsDir && pathWithin(path, rule.Path) {
+		if rule.Path == path || rule.IsDir && profile.PathWithin(path, rule.Path) {
 			access |= rule.Access
 		}
 	}

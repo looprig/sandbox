@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"os/exec"
 )
 
@@ -45,7 +46,7 @@ type spawnSpec struct {
 	wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
 }
 
-// backend compiles a effectivePolicy into a reusable spawnSpec plus the achieved isolation
+// backend compiles a policy.Effective into a reusable spawnSpec plus the achieved isolation
 // rollup: the coarse level (SPEC §6), the per-property guarantee bitmask (SPEC
 // and a compilation report of what was enforced, narrowed, or left
 // unenforced (SPEC §7.5). Compilation is where the soundness invariant lives:
@@ -54,5 +55,5 @@ type spawnSpec struct {
 // that merely enforces less than requested reports that via level/bits/report,
 // not via err. The direct backend accepts only Unconfined.
 type backend interface {
-	compile(p effectivePolicy) (spec spawnSpec, report CompileReport, level uint8, guaranteeBits uint64, err error)
+	compile(p policy.Effective) (spec spawnSpec, report CompileReport, level uint8, guaranteeBits uint64, err error)
 }

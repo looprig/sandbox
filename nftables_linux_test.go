@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"github.com/looprig/sandbox/internal/policy"
 	"net"
 	"strings"
 	"testing"
@@ -13,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestCompileNftPlan asserts the pure effectiveNetPolicy -> nftables plan compilation
+// TestCompileNftPlan asserts the pure policy.NetPolicy -> nftables plan compilation
 // (SPEC §5.2, §5.4, §7.2 rung 1): open egress is unconfined (no ruleset, no
 // netns); every other policy is confined with the metadata deny always present
 // and each accept gated by its flag. Runs on THIS host — no netlink.
@@ -21,7 +22,7 @@ func TestCompileNftPlan(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name         string
-		net          effectiveNetPolicy
+		net          policy.NetPolicy
 		wantConfined bool
 		wantPorts    []uint16
 		wantLoopback bool
@@ -29,16 +30,16 @@ func TestCompileNftPlan(t *testing.T) {
 		wantDNS      bool
 		wantMetadata bool
 	}{
-		{name: "open egress: unconfined, no ruleset", net: effectiveNetPolicy{Open: true}, wantConfined: false},
-		{name: "zerotrust (all-false): confined, everything dropped, metadata denied", net: effectiveNetPolicy{}, wantConfined: true, wantMetadata: true},
+		{name: "open egress: unconfined, no ruleset", net: policy.NetPolicy{Open: true}, wantConfined: false},
+		{name: "zerotrust (all-false): confined, everything dropped, metadata denied", net: policy.NetPolicy{}, wantConfined: true, wantMetadata: true},
 		{
 			name:         "trusted: ports+loopback+private+dns, metadata denied",
-			net:          effectiveNetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true},
+			net:          policy.NetPolicy{Loopback: true, Private: true, Ports: []uint16{443}, DNS: true},
 			wantConfined: true, wantPorts: []uint16{443}, wantLoopback: true, wantPrivate: true, wantDNS: true, wantMetadata: true,
 		},
 		{
 			name:         "duplicate ports deduped",
-			net:          effectiveNetPolicy{Ports: []uint16{443, 443, 80}},
+			net:          policy.NetPolicy{Ports: []uint16{443, 443, 80}},
 			wantConfined: true, wantPorts: []uint16{443, 80}, wantMetadata: true,
 		},
 	}
@@ -203,7 +204,7 @@ func TestBuildRung1Ruleset(t *testing.T) {
 		Loopback:      true,
 		Private:       true,
 		DNS:           true,
-		MetadataCIDRs: metadataDenyCIDRs(),
+		MetadataCIDRs: policy.MetadataDenyCIDRs(),
 	}
 	if err := buildRung1Ruleset(conn, spec); err != nil {
 		t.Fatalf("buildRung1Ruleset: %v", err)

@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/policy"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -10,7 +11,7 @@ import (
 	"strings"
 )
 
-// This file is the darwin Seatbelt backend (SPEC §7.1): it compiles a effectivePolicy
+// This file is the darwin Seatbelt backend (SPEC §7.1): it compiles a policy.Effective
 // into an SBPL profile string and wraps every spawn with
 // `/usr/bin/sandbox-exec -p <profile> -- ...`. The network syntax is taken
 // verbatim from the Task M1 spike (docs/spikes/seatbelt-net.md), which
@@ -54,7 +55,7 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 // last-match-wins — is verified end-to-end by the real-sandbox-exec enforcement
 // tests in backend_seatbelt_test.go (the goldens alone only prove byte-equality to
 // the Go/RE2 glob translation, not that SBPL's engine enforces it identically).
-func compileSBPL(p effectivePolicy) (sbpl string, report CompileReport, level uint8, guaranteeBits uint64) {
+func compileSBPL(p policy.Effective) (sbpl string, report CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
 
@@ -76,16 +77,16 @@ func compileSBPL(p effectivePolicy) (sbpl string, report CompileReport, level ui
 
 // compileFS writes the filesystem section (SPEC §5.1, §7.5) into b, appending any
 // narrowing to report. See compileSBPL for the broad-to-narrow last-match-wins order.
-func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
+func compileFS(b *strings.Builder, report *CompileReport, fs []policy.FSEntry) {
 	b.WriteString("; --- filesystem ---\n")
 	compileAncestorMetadata(b, fs)
 
 	// Seatbelt is last-match-wins. Emit broad rules before narrow rules and, at
 	// one specificity, allows before denies. This realizes the same independent
-	// per-axis longest-match model as resolveFS.
+	// per-axis longest-match model as policy.ResolveFS.
 	rules := mergeSeatbeltRules(fs)
 	for _, rule := range rules {
-		if strings.ContainsAny(rule.Path, globMeta) {
+		if strings.ContainsAny(rule.Path, policy.GlobMeta) {
 			compileSeatbeltGlobRule(b, report, rule)
 			continue
 		}
@@ -96,13 +97,13 @@ func compileFS(b *strings.Builder, report *CompileReport, fs []fsEntry) {
 	}
 }
 
-func mergeSeatbeltRules(entries []fsEntry) []fsEntry {
+func mergeSeatbeltRules(entries []policy.FSEntry) []policy.FSEntry {
 	type ruleKey struct {
 		path      string
 		exact     bool
 		canonical bool
 	}
-	byPath := make(map[ruleKey]fsEntry, len(entries))
+	byPath := make(map[ruleKey]policy.FSEntry, len(entries))
 	for _, entry := range entries {
 		key := ruleKey{path: entry.Path, exact: entry.Exact, canonical: entry.Canonical}
 		merged := byPath[key]
@@ -110,20 +111,20 @@ func mergeSeatbeltRules(entries []fsEntry) []fsEntry {
 		merged.Exact = entry.Exact
 		merged.Canonical = entry.Canonical
 		merged.Access |= entry.Access
-		merged.Denied |= normalizedDenied(entry)
+		merged.Denied |= policy.NormalizedDenied(entry)
 		byPath[key] = merged
 	}
-	rules := make([]fsEntry, 0, len(byPath))
+	rules := make([]policy.FSEntry, 0, len(byPath))
 	for _, rule := range byPath {
 		rules = append(rules, rule)
 	}
 	sort.Slice(rules, func(i, j int) bool {
-		leftGlob := strings.ContainsAny(rules[i].Path, globMeta) && rules[i].Denied != 0
-		rightGlob := strings.ContainsAny(rules[j].Path, globMeta) && rules[j].Denied != 0
+		leftGlob := strings.ContainsAny(rules[i].Path, policy.GlobMeta) && rules[i].Denied != 0
+		rightGlob := strings.ContainsAny(rules[j].Path, policy.GlobMeta) && rules[j].Denied != 0
 		if leftGlob != rightGlob {
 			return !leftGlob
 		}
-		left, right := entryPrecedence(rules[i]), entryPrecedence(rules[j])
+		left, right := policy.EntryPrecedence(rules[i]), policy.EntryPrecedence(rules[j])
 		if left != right {
 			return left < right
 		}
@@ -132,24 +133,24 @@ func mergeSeatbeltRules(entries []fsEntry) []fsEntry {
 	return rules
 }
 
-func writeSeatbeltPathRule(b *strings.Builder, action string, access fsAccess, path string, exact bool) {
+func writeSeatbeltPathRule(b *strings.Builder, action string, access policy.FSAccess, path string, exact bool) {
 	path = sbplString(path)
 	selector := "subpath"
 	if exact {
 		selector = "literal"
 	}
-	if access&readFSAccess != 0 {
+	if access&policy.ReadAccess != 0 {
 		b.WriteString(`(` + action + ` file-read* (` + selector + ` "` + path + `"))` + "\n")
 	}
-	if access&execFSAccess != 0 {
+	if access&policy.ExecAccess != 0 {
 		b.WriteString(`(` + action + ` process-exec (` + selector + ` "` + path + `"))` + "\n")
 	}
-	if access&writeFSAccess != 0 {
+	if access&policy.WriteAccess != 0 {
 		b.WriteString(`(` + action + ` file-write* (` + selector + ` "` + path + `"))` + "\n")
 	}
 }
 
-func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule fsEntry) {
+func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule policy.FSEntry) {
 	// Glob allows are not part of the effective profile vocabulary; dropping one
 	// under-grants. Denies fail closed to a conservative fixed subtree if SBPL
 	// cannot represent the translated expression.
@@ -157,16 +158,16 @@ func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule fsE
 	if denied == 0 {
 		return
 	}
-	reSrc := globToRegexp(rule.Path)
-	representable := globRegexp(rule.Path) != nil
+	reSrc := policy.GlobToRegexp(rule.Path)
+	representable := policy.GlobRegexp(rule.Path) != nil
 	if representable && !strings.Contains(reSrc, `"`) {
-		if denied&readFSAccess != 0 {
+		if denied&policy.ReadAccess != 0 {
 			b.WriteString(`(deny file-read* (regex #"` + reSrc + `"))` + "\n")
 		}
-		if denied&execFSAccess != 0 {
+		if denied&policy.ExecAccess != 0 {
 			b.WriteString(`(deny process-exec (regex #"` + reSrc + `"))` + "\n")
 		}
-		if denied&writeFSAccess != 0 {
+		if denied&policy.WriteAccess != 0 {
 			b.WriteString(`(deny file-write* (regex #"` + reSrc + `"))` + "\n")
 		}
 		return
@@ -190,10 +191,10 @@ func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule fsE
 // nested writable/readable root; granting the root itself does not implicitly
 // grant lookup on its parents. This deliberately does not allow file data or
 // directory enumeration outside configured roots.
-func compileAncestorMetadata(b *strings.Builder, fs []fsEntry) {
+func compileAncestorMetadata(b *strings.Builder, fs []policy.FSEntry) {
 	seen := map[string]struct{}{string(filepath.Separator): {}}
 	for _, entry := range fs {
-		if entry.Access == denyFSAccess {
+		if entry.Access == policy.DenyAccess {
 			continue
 		}
 		for _, candidate := range seatbeltPathAliases(entry.Path, entry.Canonical) {
@@ -211,7 +212,7 @@ func compileAncestorMetadata(b *strings.Builder, fs []fsEntry) {
 // compileNet writes the network section (SPEC §5.2, §7.1) into b using the
 // M1-verified syntax, appending unenforced/narrowed features to report. The base
 // preamble does not allow network, so default-deny holds unless rules are added.
-func compileNet(b *strings.Builder, report *CompileReport, net effectiveNetPolicy) {
+func compileNet(b *strings.Builder, report *CompileReport, net policy.NetPolicy) {
 	b.WriteString("; --- network ---\n")
 
 	if net.Open {
@@ -257,7 +258,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net effectiveNetPolic
 			Status:  "vacuous",
 			Detail:  "SBPL cannot express an IP deny; metadata endpoints are blocked only vacuously because :80 is not in the allowed port set",
 		}
-		if containsPort(net.Ports, 80) {
+		if policy.ContainsPort(net.Ports, 80) {
 			entry.Status = "unenforced"
 			entry.Detail = "SBPL cannot express an IP deny and :80 IS in the allowed port set; cloud metadata is reachable and cannot be carved out"
 		}
@@ -268,7 +269,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net effectiveNetPolic
 // compileGuarantees derives the seam-facing guarantee bitmask from what the
 // Seatbelt profile actually enforces for this policy. Each bit is fail-closed:
 // set only when genuinely enforced.
-func compileGuarantees(p effectivePolicy) uint64 {
+func compileGuarantees(p policy.Effective) uint64 {
 	var bits uint64
 
 	// sandbox-exec always wraps the spawn in an isolating boundary.
@@ -279,13 +280,13 @@ func compileGuarantees(p effectivePolicy) uint64 {
 	// the claim would be dishonest. Probed with the SAME resolver the level
 	// demotion uses (one consistent probe), which also catches a "/"-matching
 	// write glob that a literal-"/" scan would miss.
-	if isFSAccessRestricted(p.FS, writeFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.WriteAccess) {
 		bits |= GuaranteeWriteBoundary
 	}
 
 	// Reads are confined whenever the effective policy does not grant broad root
 	// read. All process-exec and file-read allows are emitted per configured root.
-	if isFSAccessRestricted(p.FS, readFSAccess|execFSAccess) {
+	if policy.IsAccessRestricted(p.FS, policy.ReadAccess|policy.ExecAccess) {
 		bits |= GuaranteeReadBoundary
 	}
 
@@ -312,9 +313,9 @@ func compileGuarantees(p effectivePolicy) uint64 {
 
 // underWritableRoot reports whether path is nested strictly inside one of the
 // writable-root entries, i.e. it is a carveout that must have write removed.
-func underWritableRoot(path string, writableRoots []fsEntry) bool {
+func underWritableRoot(path string, writableRoots []policy.FSEntry) bool {
 	for _, w := range writableRoots {
-		if w.Path != path && literalMatches(w.Path, path, false) {
+		if w.Path != path && policy.LiteralMatches(w.Path, path, false) {
 			return true
 		}
 	}
@@ -322,9 +323,9 @@ func underWritableRoot(path string, writableRoots []fsEntry) bool {
 }
 
 // hasDenyEntry reports whether the policy carries any deny entry.
-func hasDenyEntry(fs []fsEntry) bool {
+func hasDenyEntry(fs []policy.FSEntry) bool {
 	for _, e := range fs {
-		if e.Access == denyFSAccess {
+		if e.Access == policy.DenyAccess {
 			return true
 		}
 	}
@@ -338,7 +339,7 @@ func hasDenyEntry(fs []fsEntry) bool {
 // leaking the secret the glob was meant to hide.
 func conservativeDenyRoot(glob string) string {
 	prefix := glob
-	if i := strings.IndexAny(glob, globMeta); i >= 0 {
+	if i := strings.IndexAny(glob, policy.GlobMeta); i >= 0 {
 		prefix = glob[:i]
 	}
 	prefix = filepath.Clean(prefix)
@@ -460,7 +461,7 @@ func newSeatbeltBackend() backend { return seatbeltBackend{} }
 // the future fallback is the temp-file `-f <path>` form of sandbox-exec, but the
 // inline form keeps the transform stateless (no temp file to create or clean up)
 // and is sufficient here.
-func (seatbeltBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (seatbeltBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	sbpl, report, level, bits := compileSBPL(p)
 	spec := spawnSpec{
 		// Prepend the sandbox-exec launcher to the inner argv. The executor has

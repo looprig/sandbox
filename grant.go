@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"github.com/looprig/sandbox/internal/policy"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -49,7 +49,7 @@ const (
 var grantEnc = base64.RawURLEncoding
 
 var (
-	ErrGrantMalformed             = errors.New("sandbox: grant token malformed")
+	ErrGrantMalformed             = policy.ErrMalformed
 	ErrGrantBadMAC                = errors.New("sandbox: grant token MAC mismatch")
 	ErrGrantExpired               = errors.New("sandbox: grant token expired")
 	ErrGrantWrongCommand          = errors.New("sandbox: grant token command mismatch")
@@ -58,11 +58,11 @@ var (
 	ErrGrantProfileMismatch       = errors.New("sandbox: grant token profile mismatch")
 	ErrGrantGuaranteeMismatch     = errors.New("sandbox: grant token guarantee mismatch")
 	ErrGrantRouteMismatch         = errors.New("sandbox: grant token route mismatch")
-	ErrGrantTargetChanged         = errors.New("sandbox: granted filesystem target changed")
+	ErrGrantTargetChanged         = policy.ErrTargetChanged
 	ErrGrantReplay                = errors.New("sandbox: grant token replay")
 	ErrGrantRequired              = errors.New("sandbox: approval grant required")
 	ErrGrantDenied                = errors.New("sandbox: capability denied")
-	ErrGrantUnsupported           = errors.New("sandbox: grant class unsupported")
+	ErrGrantUnsupported           = policy.ErrUnsupportedClass
 	// ErrExecutorClosed is defined by the egress layer and re-used verbatim here
 	// so that a refusal raised inside the proxy and one raised by the executor
 	// are the same value under errors.Is.
@@ -78,15 +78,9 @@ type grantPayload struct {
 	GuaranteeBits      uint64
 	Class              string
 	Target             string
-	PathBinding        *grantPathBinding
+	PathBinding        *policy.PathBinding
 	ExpiryUnixMilli    int64
 	Nonce              [16]byte
-}
-
-type grantPathBinding struct {
-	CanonicalPath string
-	ExistingPath  string
-	Identity      string
 }
 
 func newGrantKey() ([]byte, error) {
@@ -141,106 +135,11 @@ func canonicalWorkingDirectory(path string) (string, error) {
 	return profile.CanonicalRoot(path)
 }
 
-func canonicalGrantPath(path string) (string, error) {
-	if path == "" || !filepath.IsAbs(path) {
-		return "", errors.New("path is not absolute")
-	}
-	clean := filepath.Clean(path)
-	ancestor := clean
-	var suffix []string
-	for {
-		resolved, err := filepath.EvalSymlinks(ancestor)
-		if err == nil {
-			for i := len(suffix) - 1; i >= 0; i-- {
-				resolved = filepath.Join(resolved, suffix[i])
-			}
-			return filepath.Clean(resolved), nil
-		}
-		parent := filepath.Dir(ancestor)
-		if parent == ancestor {
-			return "", err
-		}
-		suffix = append(suffix, filepath.Base(ancestor))
-		ancestor = parent
-	}
-}
-
-func captureGrantPathBinding(path string) (grantPathBinding, error) {
-	canonical := filepath.Clean(path)
-	existing := canonical
-	for {
-		if _, err := os.Lstat(existing); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return grantPathBinding{}, err
-		}
-		parent := filepath.Dir(existing)
-		if parent == existing {
-			return grantPathBinding{}, os.ErrNotExist
-		}
-		existing = parent
-	}
-	if err := validateCanonicalPathNoFollow(existing); err != nil {
-		return grantPathBinding{}, err
-	}
-	identity, err := platformFileIdentity(existing)
-	if err != nil {
-		return grantPathBinding{}, err
-	}
-	return grantPathBinding{CanonicalPath: canonical, ExistingPath: existing, Identity: identity}, nil
-}
-
-func revalidateGrantPathBinding(binding *grantPathBinding, target string) error {
-	if binding == nil || binding.CanonicalPath != target || !filepath.IsAbs(binding.ExistingPath) {
-		return ErrGrantMalformed
-	}
-	if err := validateCanonicalPathNoFollow(binding.ExistingPath); err != nil {
-		return fmt.Errorf("%w: %v", ErrGrantTargetChanged, err)
-	}
-	identity, err := platformFileIdentity(binding.ExistingPath)
-	if err != nil || identity != binding.Identity {
-		return ErrGrantTargetChanged
-	}
-	if binding.ExistingPath != binding.CanonicalPath {
-		remainder, err := filepath.Rel(binding.ExistingPath, binding.CanonicalPath)
-		if err != nil || remainder == "." || strings.HasPrefix(remainder, ".."+string(filepath.Separator)) {
-			return ErrGrantMalformed
-		}
-		candidate := binding.ExistingPath
-		for _, component := range strings.Split(remainder, string(filepath.Separator)) {
-			candidate = filepath.Join(candidate, component)
-			if _, err := os.Lstat(candidate); err == nil || !errors.Is(err, os.ErrNotExist) {
-				return ErrGrantTargetChanged
-			}
-		}
-	}
-	return nil
-}
-
-func validateCanonicalPathNoFollow(path string) error {
-	clean := filepath.Clean(path)
-	current := string(filepath.Separator)
-	for _, component := range strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator)) {
-		if component == "" {
-			continue
-		}
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlink component %q", current)
-		}
-	}
-	return nil
-}
-
 func normalizeGrantScopeTarget(scope, class, target string) (string, string, error) {
 	if !strings.HasPrefix(class, "filesystem.") || strings.Contains(class, ".host.") {
 		return scope, target, nil
 	}
-	canonicalTarget, err := canonicalGrantPath(target)
+	canonicalTarget, err := policy.CanonicalPath(target)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
 	}
@@ -248,13 +147,13 @@ func normalizeGrantScopeTarget(scope, class, target string) (string, string, err
 		if !strings.HasPrefix(scope, "tree:") {
 			return "", "", ErrGrantMalformed
 		}
-		canonicalScope, err := canonicalGrantPath(strings.TrimPrefix(scope, "tree:"))
+		canonicalScope, err := policy.CanonicalPath(strings.TrimPrefix(scope, "tree:"))
 		if err != nil || canonicalScope != canonicalTarget {
 			return "", "", ErrGrantMalformed
 		}
 		return "tree:" + canonicalTarget, canonicalTarget, nil
 	}
-	canonicalScope, err := canonicalGrantPath(scope)
+	canonicalScope, err := policy.CanonicalPath(scope)
 	if err != nil || canonicalScope != canonicalTarget {
 		return "", "", ErrGrantMalformed
 	}
@@ -266,7 +165,7 @@ func validGrantText(value string) bool {
 }
 
 type grantDelta struct {
-	entry             *fsEntry
+	entry             *policy.FSEntry
 	port              uint16
 	class             string
 	target            *NetworkTarget
@@ -275,11 +174,11 @@ type grantDelta struct {
 }
 
 func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, error) {
-	filesystem := func(wantKind, wantScope, policyPath string, access fsAccess, guarantee uint64, exact bool) (grantDelta, uint64, error) {
+	filesystem := func(wantKind, wantScope, policyPath string, access policy.FSAccess, guarantee uint64, exact bool) (grantDelta, uint64, error) {
 		if kind != wantKind || scope != wantScope {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return grantDelta{entry: &fsEntry{Path: policyPath, Access: access, Exact: exact, Canonical: filepath.IsAbs(policyPath)}, class: class}, guarantee, nil
+		return grantDelta{entry: &policy.FSEntry{Path: policyPath, Access: access, Exact: exact, Canonical: filepath.IsAbs(policyPath)}, class: class}, guarantee, nil
 	}
 	switch class {
 	case GrantClassCommandStart:
@@ -292,29 +191,29 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		if class == GrantClassFilesystemPathRead {
-			return filesystem("filesystem.read", target, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, true)
+			return filesystem("filesystem.read", target, target, policy.ReadAccess|policy.ExecAccess, GuaranteeReadBoundary, true)
 		}
-		return filesystem("filesystem.write", target, target, writeFSAccess, GuaranteeWriteBoundary, true)
+		return filesystem("filesystem.write", target, target, policy.WriteAccess, GuaranteeWriteBoundary, true)
 	case GrantClassFilesystemTreeRead, GrantClassFilesystemTreeWrite:
 		if !filepath.IsAbs(target) || filepath.Clean(target) != target || scope != "tree:"+target {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		if class == GrantClassFilesystemTreeRead {
-			return filesystem("filesystem.read", scope, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
+			return filesystem("filesystem.read", scope, target, policy.ReadAccess|policy.ExecAccess, GuaranteeReadBoundary, false)
 		}
-		return filesystem("filesystem.write", scope, target, writeFSAccess, GuaranteeWriteBoundary, false)
+		return filesystem("filesystem.write", scope, target, policy.WriteAccess, GuaranteeWriteBoundary, false)
 	case GrantClassFilesystemHostRead:
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		delta, guarantee, err := filesystem("filesystem.read", "host:*", string(filepath.Separator), readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
+		delta, guarantee, err := filesystem("filesystem.read", "host:*", string(filepath.Separator), policy.ReadAccess|policy.ExecAccess, GuaranteeReadBoundary, false)
 		delta.droppedGuarantees = GuaranteeReadBoundary
 		return delta, guarantee, err
 	case GrantClassFilesystemHostWrite:
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		delta, guarantee, err := filesystem("filesystem.write", "host:*", string(filepath.Separator), writeFSAccess, GuaranteeWriteBoundary, false)
+		delta, guarantee, err := filesystem("filesystem.write", "host:*", string(filepath.Separator), policy.WriteAccess, GuaranteeWriteBoundary, false)
 		delta.droppedGuarantees = GuaranteeWriteBoundary
 		return delta, guarantee, err
 	case GrantClassNetworkBroad:

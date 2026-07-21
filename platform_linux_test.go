@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"testing"
 	"time"
 )
@@ -51,13 +52,13 @@ func TestSelectLinuxBackend(t *testing.T) {
 }
 
 func TestLinuxBackendsNeverClaimTargetNetwork(t *testing.T) {
-	policy := effectivePolicy{
-		Net:       effectiveNetPolicy{ProxyPort: 43123},
-		Env:       effectiveEnvPolicy{Set: map[string]string{}},
+	pol := policy.Effective{
+		Net:       policy.NetPolicy{ProxyPort: 43123},
+		Env:       policy.EnvPolicy{Set: map[string]string{}},
 		Isolation: Sandboxed,
 	}
 	for _, backend := range []*linuxBackend{{rung: rungOne}, {rung: rungTwo}} {
-		_, _, _, bits, err := backend.compile(policy)
+		_, _, _, bits, err := backend.compile(pol)
 		if err != nil {
 			t.Fatalf("rung %d compile: %v", backend.rung, err)
 		}

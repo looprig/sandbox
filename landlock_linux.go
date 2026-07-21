@@ -5,6 +5,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"runtime"
 	"syscall"
 
@@ -13,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file compiles a effectivePolicy's filesystem axis into a go-landlock ruleset for
+// This file compiles a policy.Effective's filesystem axis into a go-landlock ruleset for
 // the rung-2 backend (SPEC §7.2, §7.5). Landlock is ADDITIVE (allowlist-only, no
 // deny rules), so a fixed-path deny compiles by ENUMERATED SIBLING ALLOWS: at
 // spawn, grant the siblings of a denied path instead of the parent, inode-pinned
@@ -21,13 +22,13 @@ import (
 // inaccessible for that command — which errs narrow, §7.5).
 //
 // Two-phase design across the re-exec:
-//   - compile time (once, in linuxBackend.compile): distil the effectivePolicy's FS axis
-//     into a compiledFS — the literal ALLOW entries with their access bits and
+//   - compile time (once, in linuxBackend.compile): distil the policy.Effective's FS axis
+//     into a policy.CompiledFS — the literal ALLOW entries with their access bits and
 //     the literal DENY paths. Globs are not expressible at rung 2 and are
 //     dropped here (recorded in the CompileReport).
-//   - spawn time (per spawn, in the wrap/configure closure): enumerateFSRules
+//   - spawn time (per spawn, in the wrap/configure closure): policy.EnumerateFSRules
 //     walks the live filesystem, carving each deny/read-only-carveout out of its
-//     covering allow, and produces a flat []fsRule. That slice is gob-encoded
+//     covering allow, and produces a flat []policy.FSRule. That slice is gob-encoded
 //     into the stage2Spec and rebuilt into a go-landlock ruleset by the stage-2
 //     child (applyLandlockRules), which restricts itself BEFORE execve.
 //
@@ -52,7 +53,7 @@ import (
 // selecting host this always enforces. Every rule is IgnoreIfMissing so a path
 // removed between enumeration and application (TOCTOU) is skipped (narrower)
 // rather than aborting the whole ruleset.
-func applyLandlockRules(rules []fsRule) error {
+func applyLandlockRules(rules []policy.FSRule) error {
 	abi, err := llsys.LandlockGetABIVersion()
 	if err != nil || abi < 4 {
 		return fmt.Errorf("Landlock ABI v4 unavailable: ABI=%d err=%w", abi, err)
@@ -90,7 +91,7 @@ func applyLandlockRules(rules []fsRule) error {
 	return nil
 }
 
-func addLandlockFSRule(ruleset int, rule fsRule) error {
+func addLandlockFSRule(ruleset int, rule policy.FSRule) error {
 	access := uint64(landlockAccessSet(rule.Access, rule.IsDir))
 	if rule.LandlockAccess != 0 {
 		access = rule.LandlockAccess
@@ -121,14 +122,14 @@ func addLandlockFSRule(ruleset int, rule fsRule) error {
 	return nil
 }
 
-// landlockRule maps one fsRule to a go-landlock rule via PathAccess, honoring
+// landlockRule maps one policy.FSRule to a go-landlock rule via PathAccess, honoring
 // each of the Read/Exec/Write bits INDEPENDENTLY so the compiled access is never
 // WIDER than the policy entry (SPEC §7.5). The canned RODirs/RWDirs helpers bundle
 // execute into every read grant, which would over-grant execute on a read-only
 // (no-Exec) entry — e.g. a `.git` carveout or a hand-authored read-only path.
 // PathAccess with a precisely-assembled AccessFSSet avoids that; it also clamps
 // the set to the ABI's supported subset, so the mapping is kernel-version-safe.
-func landlockRule(r fsRule) landlock.Rule {
+func landlockRule(r policy.FSRule) landlock.Rule {
 	return landlock.PathAccess(landlockAccessSet(r.Access, r.IsDir), r.Path).IgnoreIfMissing()
 }
 
@@ -138,18 +139,18 @@ func landlockRule(r fsRule) landlock.Rule {
 // accessFSWrite set), with the directory-entry rights (make*/remove*) applied
 // only to a directory rule. Bits absent from the policy access are never set, so
 // a read-only entry grants no execute and no write.
-func landlockAccessSet(access fsAccess, isDir bool) landlock.AccessFSSet {
+func landlockAccessSet(access policy.FSAccess, isDir bool) landlock.AccessFSSet {
 	var set landlock.AccessFSSet
-	if access&readFSAccess != 0 {
+	if access&policy.ReadAccess != 0 {
 		set |= llsys.AccessFSReadFile
 		if isDir {
 			set |= llsys.AccessFSReadDir
 		}
 	}
-	if access&execFSAccess != 0 {
+	if access&policy.ExecAccess != 0 {
 		set |= llsys.AccessFSExecute
 	}
-	if access&writeFSAccess != 0 {
+	if access&policy.WriteAccess != 0 {
 		set |= llsys.AccessFSWriteFile | llsys.AccessFSTruncate
 		if isDir {
 			// make*/remove* operate on entries within a directory, so a writable

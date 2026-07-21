@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 )
 
 // defaultMaxPIDs is the pids.max applied when a policy does not set an explicit
-// effectiveLimits.MaxPIDs (SPEC §7.4). It is the load-bearing fork-bomb cap: a fork bomb
+// policy.Limits.MaxPIDs (SPEC §7.4). It is the load-bearing fork-bomb cap: a fork bomb
 // grows until it hits pids.max, so ANY finite cap stops it — the value only
 // needs to sit above real toolchain fan-out and below runaway growth.
 //
@@ -49,10 +50,10 @@ const (
 )
 
 // compiledCgroup is the resolved, per-executor cgroup v2 resource-limit plan
-// (SPEC §7.4). It is compiled once from the policy's effectiveLimits plus the backend's
+// (SPEC §7.4). It is compiled once from the policy's policy.Limits plus the backend's
 // probed delegated pids ancestor, then consumed by each spawn's configure to
 // build a transient scope. An empty ancestor means NO limits are applied
-// (delegation unavailable or effectiveLimits.Disabled) — the fail-secure default.
+// (delegation unavailable or policy.Limits.Disabled) — the fail-secure default.
 type compiledCgroup struct {
 	// ancestor is the writable cgroup v2 node distributing the pids controller
 	// under which each spawn's transient scope is created. "" ⇒ apply no limits.
@@ -64,7 +65,7 @@ type compiledCgroup struct {
 	memMax int64
 	// cpuPct is cpu.max as a percentage of one core; 0 ⇒ do not set (optional).
 	cpuPct int
-	// disabled records an explicit effectiveLimits.Disabled opt-out (vs delegation absent)
+	// disabled records an explicit policy.Limits.Disabled opt-out (vs delegation absent)
 	// so the compile report can distinguish the two when ancestor is "".
 	disabled bool
 }
@@ -74,13 +75,13 @@ type compiledCgroup struct {
 // no ancestor ⇒ no limits ⇒ no guarantee.
 func (c compiledCgroup) enforced() bool { return c.ancestor != "" }
 
-// compileCgroupPolicy resolves a effectiveLimits policy against the probed delegated pids
+// compileCgroupPolicy resolves a policy.Limits policy against the probed delegated pids
 // ancestor into a compiledCgroup (SPEC §7.4). Fail-secure: an empty ancestor (no
-// cgroup v2 pids delegation) or effectiveLimits.Disabled yields a plan that applies NO
+// cgroup v2 pids delegation) or policy.Limits.Disabled yields a plan that applies NO
 // limits (enforced() == false). Otherwise pids.max is the mandatory cap
-// (effectiveLimits.MaxPIDs when > 0, else defaultMaxPIDs); memory.max and cpu.max are
+// (policy.Limits.MaxPIDs when > 0, else defaultMaxPIDs); memory.max and cpu.max are
 // carried only when explicitly set (> 0).
-func compileCgroupPolicy(l effectiveLimits, ancestor string) compiledCgroup {
+func compileCgroupPolicy(l policy.Limits, ancestor string) compiledCgroup {
 	if l.Disabled {
 		return compiledCgroup{disabled: true}
 	}
@@ -104,7 +105,7 @@ func compileCgroupPolicy(l effectiveLimits, ancestor string) compiledCgroup {
 // cgroupCompileReport records how the cgroup v2 resource-limit axis compiled
 // (SPEC §7.4, §7.5). When a transient scope will be created it is enforced;
 // otherwise it is unenforced, distinguishing an explicit policy opt-out
-// (effectiveLimits.Disabled) from absent cgroup v2 pids delegation. Resource limits never
+// (policy.Limits.Disabled) from absent cgroup v2 pids delegation. Resource limits never
 // change the isolation Level — they are containment-of-cost, not authority.
 func cgroupCompileReport(cg compiledCgroup) ReportEntry {
 	if cg.enforced() {
@@ -121,7 +122,7 @@ func cgroupCompileReport(cg compiledCgroup) ReportEntry {
 		return ReportEntry{
 			Feature: "resource-limits",
 			Status:  "unenforced",
-			Detail:  "resource limits disabled by policy (effectiveLimits.Disabled); no cgroup scope applied (§7.4)",
+			Detail:  "resource limits disabled by policy (policy.Limits.Disabled); no cgroup scope applied (§7.4)",
 		}
 	}
 	return ReportEntry{

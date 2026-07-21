@@ -47,11 +47,11 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 	if !strings.Contains(environment, "HTTP_PROXY=http://exec-proxy:") || !strings.Contains(environment, "HTTPS_PROXY=http://exec-proxy:") || !strings.Contains(environment, "NO_PROXY=\n") {
 		t.Fatalf("proxy environment missing scoped values or NO_PROXY clear:\n%s", environment)
 	}
-	policy := backend.lastPolicy()
+	pol := backend.lastPolicy()
 	_, portText, _ := net.SplitHostPort(executor.proxy.Addr())
 	port, _ := strconv.ParseUint(portText, 10, 16)
-	if policy.Net.ProxyPort != uint16(port) || policy.Net.Open || policy.Net.Loopback || len(policy.Net.Ports) != 0 {
-		t.Fatalf("proxy policy = %+v, want exact listener port only", policy.Net)
+	if pol.Net.ProxyPort != uint16(port) || pol.Net.Open || pol.Net.Loopback || len(pol.Net.Ports) != 0 {
+		t.Fatalf("proxy policy = %+v, want exact listener port only", pol.Net)
 	}
 }
 
@@ -207,8 +207,8 @@ func TestNetworkAllowUsesExplicitRoute(t *testing.T) {
 	if !strings.Contains(string(out), "HTTP_PROXY=http://route-") || !strings.Contains(string(out), "NO_PROXY=\n") {
 		t.Fatalf("explicit route not injected:\n%s", out)
 	}
-	policy := backend.lastPolicy()
-	if policy.Net.Open || policy.Net.ProxyPort == 0 || policy.Net.Loopback || len(policy.Net.Ports) != 0 {
-		t.Fatalf("explicit route policy = %+v, want listener-only", policy.Net)
+	pol := backend.lastPolicy()
+	if pol.Net.Open || pol.Net.ProxyPort == 0 || pol.Net.Loopback || len(pol.Net.Ports) != 0 {
+		t.Fatalf("explicit route policy = %+v, want listener-only", pol.Net)
 	}
 }

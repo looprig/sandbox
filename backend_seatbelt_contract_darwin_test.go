@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,18 +12,18 @@ import (
 )
 
 func TestSeatbeltProfileUsesScopedRuntimeReadExecAndExactProxyListener(t *testing.T) {
-	policy := effectivePolicy{
+	pol := policy.Effective{
 		Workspace: "/workspace",
-		FS: []fsEntry{
-			{Path: "/usr", Access: readFSAccess | execFSAccess},
-			{Path: "/bin", Access: readFSAccess | execFSAccess},
-			{Path: "/workspace", Access: readFSAccess | writeFSAccess | execFSAccess},
+		FS: []policy.FSEntry{
+			{Path: "/usr", Access: policy.ReadAccess | policy.ExecAccess},
+			{Path: "/bin", Access: policy.ReadAccess | policy.ExecAccess},
+			{Path: "/workspace", Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess},
 		},
-		Net:       effectiveNetPolicy{ProxyPort: 43123},
-		Env:       effectiveEnvPolicy{Set: map[string]string{}},
+		Net:       policy.NetPolicy{ProxyPort: 43123},
+		Env:       policy.EnvPolicy{Set: map[string]string{}},
 		Isolation: Sandboxed,
 	}
-	profile, report, level, bits := compileSBPL(policy)
+	profile, report, level, bits := compileSBPL(pol)
 	for _, forbidden := range []string{
 		"(allow file-read*)\n",
 		"(allow file-read-metadata)\n",
@@ -56,11 +57,11 @@ func TestSeatbeltScopedRuntimeRulesLaunch(t *testing.T) {
 		WorkspaceRoot: t.TempDir(), WorkspaceRead: Allow, WorkspaceWrite: Allow,
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
-	policy, err := compileEffectivePolicy(accessProfile)
+	pol, err := policy.Compile(accessProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile, _, _, _ := compileSBPL(policy)
+	profile, _, _, _ := compileSBPL(pol)
 	if err := exec.Command("/usr/bin/sandbox-exec", "-p", profile, "--", "/bin/sh", "-c", "/usr/bin/true").Run(); err != nil {
 		t.Fatalf("narrow runtime profile could not launch shell + true: %v\n%s", err, profile)
 	}
@@ -72,11 +73,11 @@ func TestSeatbeltProfileCarvesNarrowerRootAxesFromHostAllow(t *testing.T) {
 		WorkspaceRoot: workspace, WorkspaceRead: Deny, WorkspaceWrite: Gated,
 		HostRead: Allow, HostWrite: Allow, Network: Deny, Command: Allow,
 	})
-	policy, err := compileEffectivePolicy(profile)
+	pol, err := policy.Compile(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sbpl, _, _, _ := compileSBPL(policy)
+	sbpl, _, _, _ := compileSBPL(pol)
 	rootAllow := `(allow file-read* (subpath "/"))`
 	workspacePath := sbplString(profile.Settings().WorkspaceRoot)
 	for _, deny := range []string{
@@ -92,9 +93,9 @@ func TestSeatbeltProfileCarvesNarrowerRootAxesFromHostAllow(t *testing.T) {
 }
 
 func TestSeatbeltProfileCompilesExactPathAsLiteralAndTreeAsSubpath(t *testing.T) {
-	profile, _, _, _ := compileSBPL(effectivePolicy{FS: []fsEntry{
-		{Path: "/workspace/exact", Access: writeFSAccess, Exact: true},
-		{Path: "/workspace/tree", Access: writeFSAccess},
+	profile, _, _, _ := compileSBPL(policy.Effective{FS: []policy.FSEntry{
+		{Path: "/workspace/exact", Access: policy.WriteAccess, Exact: true},
+		{Path: "/workspace/tree", Access: policy.WriteAccess},
 	}})
 	exact := `(allow file-write* (literal "/workspace/exact"))`
 	tree := `(allow file-write* (subpath "/workspace/tree"))`
@@ -119,8 +120,8 @@ func TestSeatbeltCanonicalGrantPathIsNotRefollowed(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	profile, _, _, _ := compileSBPL(effectivePolicy{FS: []fsEntry{{
-		Path: link, Access: writeFSAccess, Exact: true, Canonical: true,
+	profile, _, _, _ := compileSBPL(policy.Effective{FS: []policy.FSEntry{{
+		Path: link, Access: policy.WriteAccess, Exact: true, Canonical: true,
 	}}})
 	want := `(allow file-write* (literal "` + link + `"))`
 	if !strings.Contains(profile, want) {
@@ -132,9 +133,9 @@ func TestSeatbeltCanonicalGrantPathIsNotRefollowed(t *testing.T) {
 }
 
 func TestSeatbeltExactGrantFollowsTreeDenyAtSamePath(t *testing.T) {
-	profile, _, _, _ := compileSBPL(effectivePolicy{FS: []fsEntry{
-		{Path: "/workspace/target", Denied: writeFSAccess},
-		{Path: "/workspace/target", Access: writeFSAccess, Exact: true, Canonical: true},
+	profile, _, _, _ := compileSBPL(policy.Effective{FS: []policy.FSEntry{
+		{Path: "/workspace/target", Denied: policy.WriteAccess},
+		{Path: "/workspace/target", Access: policy.WriteAccess, Exact: true, Canonical: true},
 	}})
 	deny := `(deny file-write* (subpath "/workspace/target"))`
 	allow := `(allow file-write* (literal "/workspace/target"))`
@@ -154,11 +155,11 @@ func TestSeatbeltGuaranteesTrackIndependentDeniedAxes(t *testing.T) {
 		{name: "write denial does not imply read boundary", config: ProfileConfig{WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Deny, HostRead: Allow, HostWrite: Allow, Network: Allow, Command: Allow}, wantWrite: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			policy, err := compileEffectivePolicy(mustProfile(t, test.config))
+			pol, err := policy.Compile(mustProfile(t, test.config))
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, _, _, bits := compileSBPL(policy)
+			_, _, _, bits := compileSBPL(pol)
 			if got := bits&GuaranteeReadBoundary != 0; got != test.wantRead {
 				t.Fatalf("ReadBoundary = %v, want %v", got, test.wantRead)
 			}

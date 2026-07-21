@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +20,7 @@ type blockingConfigureBackend struct {
 	bits    uint64
 }
 
-func (b *blockingConfigureBackend) compile(effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b *blockingConfigureBackend) compile(policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, func(*exec.Cmd) error {
 			b.once.Do(func() { close(b.entered) })
@@ -75,10 +76,10 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	assertOwnerOnlyDir(t, beta.home)
 	assertOwnerOnlyDir(t, alpha.tmp)
 	assertOwnerOnlyDir(t, beta.tmp)
-	if access := resolveFS(alpha.policy.FS, alpha.home); access&(readFSAccess|writeFSAccess) != readFSAccess|writeFSAccess {
+	if access := policy.ResolveFS(alpha.policy.FS, alpha.home); access&(policy.ReadAccess|policy.WriteAccess) != policy.ReadAccess|policy.WriteAccess {
 		t.Fatalf("isolated HOME access = %d, want read and write", access)
 	}
-	if access := resolveFS(alpha.policy.FS, alpha.tmp); access&(readFSAccess|writeFSAccess) != readFSAccess|writeFSAccess {
+	if access := policy.ResolveFS(alpha.policy.FS, alpha.tmp); access&(policy.ReadAccess|policy.WriteAccess) != policy.ReadAccess|policy.WriteAccess {
 		t.Fatalf("isolated TMPDIR access = %d, want read and write", access)
 	}
 	if !containsEnv(alpha.env, "TMPDIR="+alpha.tmp) {

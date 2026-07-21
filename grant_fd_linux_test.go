@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,29 +18,29 @@ import (
 )
 
 type failingGrantPathBackend struct {
-	handles []*grantPathHandle
+	handles []*policy.PathHandle
 }
 
 type trackingGrantPathBackend struct {
 	rung          rung
 	grantCompiles int
 	configures    int
-	handles       []*grantPathHandle
+	handles       []*policy.PathHandle
 	spec          stage2Spec
 }
 
-func (backend *trackingGrantPathBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
-	return (&linuxBackend{rung: backend.rung}).compile(policy)
+func (backend *trackingGrantPathBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+	return (&linuxBackend{rung: backend.rung}).compile(pol)
 }
 
-func (backend *trackingGrantPathBackend) compileWithGrantPaths(policy effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (backend *trackingGrantPathBackend) compileWithGrantPaths(pol policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
 	backend.grantCompiles++
-	backend.handles = append([]*grantPathHandle(nil), handles...)
-	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).compileWithGrantPaths(policy, handles)
+	backend.handles = append([]*policy.PathHandle(nil), handles...)
+	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).compileWithGrantPaths(pol, handles)
 	if err != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
 	}
-	_, configure, cleanup := spawn.wrap(policy.Workspace, []string{"/bin/true"})
+	_, configure, cleanup := spawn.wrap(pol.Workspace, []string{"/bin/true"})
 	cmd := exec.Command("/proc/self/exe")
 	cmd.Env = []string{}
 	if err := configure(cmd); err != nil {
@@ -57,14 +58,14 @@ func (backend *trackingGrantPathBackend) compileWithGrantPaths(policy effectiveP
 	}}, report, level, bits, nil
 }
 
-func (backend *failingGrantPathBackend) compile(effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (backend *failingGrantPathBackend) compile(policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, nil, nil
 	}}, CompileReport{}, LevelNone, GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub, nil
 }
 
-func (backend *failingGrantPathBackend) compileWithGrantPaths(_ effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
-	backend.handles = append([]*grantPathHandle(nil), handles...)
+func (backend *failingGrantPathBackend) compileWithGrantPaths(_ policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+	backend.handles = append([]*policy.PathHandle(nil), handles...)
 	return spawnSpec{}, CompileReport{}, LevelNone, 0, errors.New("compile failed")
 }
 
@@ -94,15 +95,15 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 						}
 					}
 				}
-				binding, err := captureGrantPathBinding(target)
+				binding, err := policy.CapturePathBinding(target)
 				if err != nil {
 					t.Fatal(err)
 				}
-				handle, err := acquireGrantPathHandle(&binding, target, targetKind.exact)
+				handle, err := policy.AcquirePathHandle(&binding, target, targetKind.exact)
 				if err != nil {
 					t.Fatal(err)
 				}
-				handle.access = writeFSAccess
+				handle.SetAccess(policy.WriteAccess)
 				defer handle.Close()
 
 				if err := os.Rename(target, target+".approved"); err != nil {
@@ -112,12 +113,12 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				policy := effectivePolicy{FS: []fsEntry{
-					{Path: target, Access: readFSAccess, Exact: targetKind.exact},
-					{Path: target, Access: writeFSAccess, Exact: targetKind.exact, Canonical: true},
+				pol := policy.Effective{FS: []policy.FSEntry{
+					{Path: target, Access: policy.ReadAccess, Exact: targetKind.exact},
+					{Path: target, Access: policy.WriteAccess, Exact: targetKind.exact, Canonical: true},
 				}}
 				backend := &linuxBackend{rung: rung}
-				spawn, _, _, _, err := backend.compileWithGrantPaths(policy, []*grantPathHandle{handle})
+				spawn, _, _, _, err := backend.compileWithGrantPaths(pol, []*policy.PathHandle{handle})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -195,7 +196,7 @@ func TestLinuxGrantHandleClosesWhenSpawnCompilationFails(t *testing.T) {
 	if len(backend.handles) != 1 {
 		t.Fatalf("backend captured %d handles, want 1", len(backend.handles))
 	}
-	fd := int(backend.handles[0].file.Fd())
+	fd := int(backend.handles[0].File().Fd())
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("grant handle fd %d remains open after compile failure: %v", fd, err)
 	}
@@ -258,15 +259,15 @@ func TestLinuxSameTargetGrantIdentityMismatchFailsBeforeCompilation(t *testing.T
 					"filesystem.tree.write.v1": inodeB,
 				}
 				var acquiredFDs []int
-				acquire := func(binding *grantPathBinding, canonicalTarget string, exact bool) (*grantPathHandle, error) {
+				acquire := func(binding *policy.PathBinding, canonicalTarget string, exact bool) (*policy.PathHandle, error) {
 					if err := os.Rename(paths[order.classes[len(acquiredFDs)]], target); err != nil {
 						return nil, err
 					}
-					handle, err := acquireGrantPathHandle(binding, canonicalTarget, exact)
+					handle, err := policy.AcquirePathHandle(binding, canonicalTarget, exact)
 					if err != nil {
 						return nil, err
 					}
-					acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
+					acquiredFDs = append(acquiredFDs, int(handle.File().Fd()))
 					if err := os.Rename(target, paths[order.classes[len(acquiredFDs)-1]]); err != nil {
 						_ = handle.Close()
 						return nil, err
@@ -327,10 +328,10 @@ func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
 					tokens[0], tokens[1] = tokens[1], tokens[0]
 				}
 				var acquiredFDs []int
-				acquire := func(binding *grantPathBinding, canonicalTarget string, exact bool) (*grantPathHandle, error) {
-					handle, err := acquireGrantPathHandle(binding, canonicalTarget, exact)
+				acquire := func(binding *policy.PathBinding, canonicalTarget string, exact bool) (*policy.PathHandle, error) {
+					handle, err := policy.AcquirePathHandle(binding, canonicalTarget, exact)
 					if handle != nil {
-						acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
+						acquiredFDs = append(acquiredFDs, int(handle.File().Fd()))
 					}
 					return handle, err
 				}
@@ -343,14 +344,14 @@ func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
 				if len(backend.handles) != 1 {
 					t.Fatalf("compiled handles = %d, want one coalesced target", len(backend.handles))
 				}
-				if backend.handles[0].target != target || backend.handles[0].access != allFSAccess {
-					t.Fatalf("coalesced handle = target %q access %#x, want %q all axes", backend.handles[0].target, backend.handles[0].access, target)
+				if backend.handles[0].Target() != target || backend.handles[0].Access() != policy.AllAccess {
+					t.Fatalf("coalesced handle = target %q access %#x, want %q all axes", backend.handles[0].Target(), backend.handles[0].Access(), target)
 				}
-				if got, want := backend.spec.GrantFDs, []int{firstGrantPathChildFD}; !slices.Equal(got, want) {
+				if got, want := backend.spec.GrantFDs, []int{policy.FirstPathHandleChildFD}; !slices.Equal(got, want) {
 					t.Fatalf("GrantFDs = %v, want canonical collision-free %v", got, want)
 				}
 				for _, rule := range backend.spec.FSRules {
-					if rule.Target == target && (rule.ParentFD == 0 || rule.ParentFD != firstGrantPathChildFD) {
+					if rule.Target == target && (rule.ParentFD == 0 || rule.ParentFD != policy.FirstPathHandleChildFD) {
 						t.Fatalf("same-target rule used zero sentinel or collided: %+v", rule)
 					}
 				}
@@ -380,36 +381,36 @@ func TestLinuxGrantHandleSetSortsCanonicalTargetsAndPreservesLongestAncestor(t *
 			t.Fatal(err)
 		}
 	}
-	var set grantPathHandleSet
+	var set policy.PathHandleSet
 	var acquiredFDs []int
 	for i := len(targets) - 1; i >= 0; i-- {
-		binding, err := captureGrantPathBinding(targets[i])
+		binding, err := policy.CapturePathBinding(targets[i])
 		if err != nil {
 			t.Fatal(err)
 		}
-		handle, err := acquireGrantPathHandle(&binding, targets[i], false)
+		handle, err := policy.AcquirePathHandle(&binding, targets[i], false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		acquiredFDs = append(acquiredFDs, int(handle.file.Fd()))
-		if err := set.add(handle); err != nil {
+		acquiredFDs = append(acquiredFDs, int(handle.File().Fd()))
+		if err := set.Add(handle); err != nil {
 			t.Fatal(err)
 		}
 	}
-	handles := set.sorted()
+	handles := set.Sorted()
 	if len(handles) != len(targets) {
 		t.Fatalf("distinct handles = %d, want %d", len(handles), len(targets))
 	}
 	for i, target := range targets {
-		if handles[i].target != target {
-			t.Fatalf("canonical handle order = %q at %d, want %q", handles[i].target, i, target)
+		if handles[i].Target() != target {
+			t.Fatalf("canonical handle order = %q at %d, want %q", handles[i].Target(), i, target)
 		}
 	}
 	descendant := filepath.Join(targets[2], "leaf")
-	if got := matchingGrantPathIdentityAncestor(handles, descendant); got != 2 {
+	if got := policy.MatchingPathHandleIdentityAncestor(handles, descendant); got != 2 {
 		t.Fatalf("longest ancestor index = %d, want inner target at canonical index 2", got)
 	}
-	set.close()
+	set.Close()
 	for _, fd := range acquiredFDs {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 			t.Fatalf("ordered distinct handle fd %d remains open: %v", fd, err)
@@ -438,15 +439,15 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "escape"), filepath.Join(target, "link")); err != nil {
 		t.Fatal(err)
 	}
-	binding, err := captureGrantPathBinding(target)
+	binding, err := policy.CapturePathBinding(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := acquireGrantPathHandle(&binding, target, false)
+	handle, err := policy.AcquirePathHandle(&binding, target, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle.access = allFSAccess
+	handle.SetAccess(policy.AllAccess)
 	defer handle.Close()
 
 	if err := os.Rename(target, approved); err != nil {
@@ -456,36 +457,36 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	compiled := compileFSPolicyWithGrantPaths([]fsEntry{
-		{Path: target, Access: allFSAccess, Canonical: true},
-		{Path: filepath.Join(target, "denied"), Denied: readFSAccess},
-		{Path: filepath.Join(target, "missing"), Denied: readFSAccess},
-	}, []*grantPathHandle{handle})
-	rules, children, err := enumerateFSRulesWithGrantPaths(compiled, []*grantPathHandle{handle})
+	compiled := policy.CompileFSWithPathHandles([]policy.FSEntry{
+		{Path: target, Access: policy.AllAccess, Canonical: true},
+		{Path: filepath.Join(target, "denied"), Denied: policy.ReadAccess},
+		{Path: filepath.Join(target, "missing"), Denied: policy.ReadAccess},
+	}, []*policy.PathHandle{handle})
+	rules, children, err := policy.EnumerateFSRulesWithPathHandles(compiled, []*policy.PathHandle{handle})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeFiles(children)
 
-	const rootChildFD = firstGrantPathChildFD
-	var allowedRead *fsRule
+	const rootChildFD = policy.FirstPathHandleChildFD
+	var allowedRead *policy.FSRule
 	var rootExec, rootWrite bool
 	for i := range rules {
 		rule := &rules[i]
 		if rule.ParentFD != 0 && rule.Path != "" {
 			t.Fatalf("FD-bound rule re-resolved pathname: %+v", *rule)
 		}
-		if rule.Target == allowed && rule.Access&readFSAccess != 0 {
+		if rule.Target == allowed && rule.Access&policy.ReadAccess != 0 {
 			allowedRead = rule
 		}
 		if rule.Target == target && rule.ParentFD == rootChildFD {
-			rootExec = rootExec || rule.Access&execFSAccess != 0
-			rootWrite = rootWrite || rule.Access&writeFSAccess != 0
-			if rule.Access&readFSAccess != 0 {
+			rootExec = rootExec || rule.Access&policy.ExecAccess != 0
+			rootWrite = rootWrite || rule.Access&policy.WriteAccess != 0
+			if rule.Access&policy.ReadAccess != 0 {
 				t.Fatalf("read axis widened back to pinned root despite nested excludes: %+v", *rule)
 			}
 		}
-		if rule.Target == denied && rule.Access&readFSAccess != 0 {
+		if rule.Target == denied && rule.Access&policy.ReadAccess != 0 {
 			t.Fatalf("denied child received read rule: %+v", *rule)
 		}
 		if rule.Target == filepath.Join(target, "link") {
@@ -498,7 +499,7 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 	if !rootExec || !rootWrite {
 		t.Fatalf("rules = %+v, want independent exec and write axes to retain the pinned root FD", rules)
 	}
-	childIndex := allowedRead.ParentFD - firstGrantPathChildFD - 1
+	childIndex := allowedRead.ParentFD - policy.FirstPathHandleChildFD - 1
 	if childIndex < 0 || childIndex >= len(children) {
 		t.Fatalf("allowed child fd %d has no parent file in %d children", allowedRead.ParentFD, len(children))
 	}
@@ -514,7 +515,7 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, rule := range rules {
-		if rule.Access&readFSAccess != 0 && rule.Target == filepath.Join(target, "new-sibling") {
+		if rule.Access&policy.ReadAccess != 0 && rule.Target == filepath.Join(target, "new-sibling") {
 			t.Fatalf("post-enumeration sibling unexpectedly received authority: %+v", rule)
 		}
 	}
@@ -534,17 +535,17 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 func TestLinuxExactGrantNonexistentErrorTyping(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "future")
-	binding, err := captureGrantPathBinding(target)
+	binding, err := policy.CapturePathBinding(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireGrantPathHandle(&binding, target, true); !errors.Is(err, ErrGrantUnsupported) {
+	if _, err := policy.AcquirePathHandle(&binding, target, true); !errors.Is(err, ErrGrantUnsupported) {
 		t.Fatalf("unchanged nonexistent exact target error = %v, want ErrGrantUnsupported", err)
 	}
 	if err := os.WriteFile(target, []byte("appeared"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireGrantPathHandle(&binding, target, true); !errors.Is(err, ErrGrantTargetChanged) {
+	if _, err := policy.AcquirePathHandle(&binding, target, true); !errors.Is(err, ErrGrantTargetChanged) {
 		t.Fatalf("newly appeared exact target error = %v, want ErrGrantTargetChanged", err)
 	}
 }
@@ -564,15 +565,15 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			binding, err := captureGrantPathBinding(target)
+			binding, err := policy.CapturePathBinding(target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle, err := acquireGrantPathHandle(&binding, target, false)
+			handle, err := policy.AcquirePathHandle(&binding, target, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.access = allFSAccess
+			handle.SetAccess(policy.AllAccess)
 			defer handle.Close()
 			if err := os.Rename(target, target+".approved"); err != nil {
 				t.Fatal(err)
@@ -581,12 +582,12 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: target, Access: allFSAccess, Canonical: true},
-				{Path: denied, Denied: readFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: target, Access: policy.AllAccess, Canonical: true},
+				{Path: denied, Denied: policy.ReadAccess},
 			}}
 			backend := &linuxBackend{rung: rung}
-			spawn, _, _, _, err := backend.compileWithGrantPaths(policy, []*grantPathHandle{handle})
+			spawn, _, _, _, err := backend.compileWithGrantPaths(pol, []*policy.PathHandle{handle})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -603,16 +604,16 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var allowedRead fsRule
+			var allowedRead policy.FSRule
 			for _, rule := range spec.FSRules {
-				if rule.Target == allowed && rule.Access&readFSAccess != 0 {
+				if rule.Target == allowed && rule.Access&policy.ReadAccess != 0 {
 					allowedRead = rule
 				}
-				if rule.Target == denied && rule.Access&readFSAccess != 0 {
+				if rule.Target == denied && rule.Access&policy.ReadAccess != 0 {
 					t.Fatalf("denied read rule reached rung %d spec: %+v", rung, rule)
 				}
 			}
-			if allowedRead.ParentFD <= firstGrantPathChildFD || allowedRead.Path != "" {
+			if allowedRead.ParentFD <= policy.FirstPathHandleChildFD || allowedRead.Path != "" {
 				t.Fatalf("rung %d allowed read rule = %+v, want direct relative child FD", rung, allowedRead)
 			}
 			if rung == rungOne {
@@ -655,15 +656,15 @@ func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(restored, "identity"), []byte("approved"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			binding, err := captureGrantPathBinding(target)
+			binding, err := policy.CapturePathBinding(target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle, err := acquireGrantPathHandle(&binding, target, false)
+			handle, err := policy.AcquirePathHandle(&binding, target, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.access = allFSAccess
+			handle.SetAccess(policy.AllAccess)
 			defer handle.Close()
 
 			approved := target + ".approved"
@@ -677,20 +678,20 @@ func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: target, Access: allFSAccess, Canonical: true},
-				{Path: denied, Denied: readFSAccess},
-				{Path: restored, Access: readFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: target, Access: policy.AllAccess, Canonical: true},
+				{Path: denied, Denied: policy.ReadAccess},
+				{Path: restored, Access: policy.ReadAccess},
 			}}
-			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, policy, []*grantPathHandle{handle})
-			assertPinnedDescendantRule(t, spec, cmd, restored, readFSAccess, "approved", rung)
-			var rootAxes fsAccess
+			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{handle})
+			assertPinnedDescendantRule(t, spec, cmd, restored, policy.ReadAccess, "approved", rung)
+			var rootAxes policy.FSAccess
 			for _, rule := range spec.FSRules {
-				if rule.Target == target && rule.ParentFD == firstGrantPathChildFD {
+				if rule.Target == target && rule.ParentFD == policy.FirstPathHandleChildFD {
 					rootAxes |= rule.Access
 				}
 			}
-			if rootAxes != execFSAccess|writeFSAccess {
+			if rootAxes != policy.ExecAccess|policy.WriteAccess {
 				t.Fatalf("root unaffected axes = %#x, want exec|write", rootAxes)
 			}
 			cleanup()
@@ -710,15 +711,15 @@ func TestLinuxPinnedNestedAdditionalRootFeedsBothRungs(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(additional, "identity"), []byte("approved"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			binding, err := captureGrantPathBinding(target)
+			binding, err := policy.CapturePathBinding(target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle, err := acquireGrantPathHandle(&binding, target, false)
+			handle, err := policy.AcquirePathHandle(&binding, target, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.access = writeFSAccess
+			handle.SetAccess(policy.WriteAccess)
 			defer handle.Close()
 
 			if err := os.Rename(target, target+".approved"); err != nil {
@@ -731,12 +732,12 @@ func TestLinuxPinnedNestedAdditionalRootFeedsBothRungs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: target, Access: writeFSAccess, Canonical: true},
-				{Path: additional, Access: readFSAccess | execFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: target, Access: policy.WriteAccess, Canonical: true},
+				{Path: additional, Access: policy.ReadAccess | policy.ExecAccess},
 			}}
-			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, policy, []*grantPathHandle{handle})
-			assertPinnedDescendantRule(t, spec, cmd, additional, readFSAccess|execFSAccess, "approved", rung)
+			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{handle})
+			assertPinnedDescendantRule(t, spec, cmd, additional, policy.ReadAccess|policy.ExecAccess, "approved", rung)
 			cleanup()
 		})
 	}
@@ -755,25 +756,25 @@ func TestLinuxPinnedDescendantLongestAncestorFeedsBothRungs(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(leaf, "identity"), []byte("longest"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			outerBinding, err := captureGrantPathBinding(outer)
+			outerBinding, err := policy.CapturePathBinding(outer)
 			if err != nil {
 				t.Fatal(err)
 			}
-			outerHandle, err := acquireGrantPathHandle(&outerBinding, outer, false)
+			outerHandle, err := policy.AcquirePathHandle(&outerBinding, outer, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			outerHandle.access = writeFSAccess
+			outerHandle.SetAccess(policy.WriteAccess)
 			defer outerHandle.Close()
-			innerBinding, err := captureGrantPathBinding(inner)
+			innerBinding, err := policy.CapturePathBinding(inner)
 			if err != nil {
 				t.Fatal(err)
 			}
-			innerHandle, err := acquireGrantPathHandle(&innerBinding, inner, false)
+			innerHandle, err := policy.AcquirePathHandle(&innerBinding, inner, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			innerHandle.access = writeFSAccess
+			innerHandle.SetAccess(policy.WriteAccess)
 			defer innerHandle.Close()
 
 			if err := os.Rename(inner, inner+".approved"); err != nil {
@@ -786,13 +787,13 @@ func TestLinuxPinnedDescendantLongestAncestorFeedsBothRungs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: outer, Access: writeFSAccess, Canonical: true},
-				{Path: inner, Access: writeFSAccess, Canonical: true},
-				{Path: leaf, Access: readFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: outer, Access: policy.WriteAccess, Canonical: true},
+				{Path: inner, Access: policy.WriteAccess, Canonical: true},
+				{Path: leaf, Access: policy.ReadAccess},
 			}}
-			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, policy, []*grantPathHandle{outerHandle, innerHandle})
-			assertPinnedDescendantRule(t, spec, cmd, leaf, readFSAccess, "longest", rung)
+			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{outerHandle, innerHandle})
+			assertPinnedDescendantRule(t, spec, cmd, leaf, policy.ReadAccess, "longest", rung)
 			cleanup()
 		})
 	}
@@ -815,25 +816,25 @@ func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing
 			if err := os.WriteFile(filepath.Join(allowed, "identity"), []byte("longest"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			outerBinding, err := captureGrantPathBinding(outer)
+			outerBinding, err := policy.CapturePathBinding(outer)
 			if err != nil {
 				t.Fatal(err)
 			}
-			outerHandle, err := acquireGrantPathHandle(&outerBinding, outer, false)
+			outerHandle, err := policy.AcquirePathHandle(&outerBinding, outer, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			outerHandle.access = readFSAccess
+			outerHandle.SetAccess(policy.ReadAccess)
 			defer outerHandle.Close()
-			innerBinding, err := captureGrantPathBinding(inner)
+			innerBinding, err := policy.CapturePathBinding(inner)
 			if err != nil {
 				t.Fatal(err)
 			}
-			innerHandle, err := acquireGrantPathHandle(&innerBinding, inner, false)
+			innerHandle, err := policy.AcquirePathHandle(&innerBinding, inner, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			innerHandle.access = readFSAccess
+			innerHandle.SetAccess(policy.ReadAccess)
 			defer innerHandle.Close()
 
 			if err := os.Rename(inner, inner+".approved"); err != nil {
@@ -848,16 +849,16 @@ func TestLinuxPinnedCarveEnumerationReselectsLongestAncestorBothRungs(t *testing
 				t.Fatal(err)
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: outer, Access: readFSAccess, Canonical: true},
-				{Path: inner, Access: readFSAccess, Canonical: true},
-				{Path: denied, Denied: readFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: outer, Access: policy.ReadAccess, Canonical: true},
+				{Path: inner, Access: policy.ReadAccess, Canonical: true},
+				{Path: denied, Denied: policy.ReadAccess},
 			}}
-			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, policy, []*grantPathHandle{outerHandle, innerHandle})
+			spec, cmd, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{outerHandle, innerHandle})
 			defer cleanup()
 			var found bool
 			for _, rule := range spec.FSRules {
-				if rule.Target != allowed || rule.Access&readFSAccess == 0 {
+				if rule.Target != allowed || rule.Access&policy.ReadAccess == 0 {
 					continue
 				}
 				found = true
@@ -897,15 +898,15 @@ func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T)
 			if err := os.Symlink(outside, symlink); err != nil {
 				t.Fatal(err)
 			}
-			binding, err := captureGrantPathBinding(target)
+			binding, err := policy.CapturePathBinding(target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle, err := acquireGrantPathHandle(&binding, target, false)
+			handle, err := policy.AcquirePathHandle(&binding, target, false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			handle.access = writeFSAccess
+			handle.SetAccess(policy.WriteAccess)
 			defer handle.Close()
 
 			if err := os.Rename(target, target+".approved"); err != nil {
@@ -917,12 +918,12 @@ func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T)
 				}
 			}
 
-			policy := effectivePolicy{FS: []fsEntry{
-				{Path: target, Access: writeFSAccess, Canonical: true},
-				{Path: symlink, Access: readFSAccess},
-				{Path: missing, Access: readFSAccess},
+			pol := policy.Effective{FS: []policy.FSEntry{
+				{Path: target, Access: policy.WriteAccess, Canonical: true},
+				{Path: symlink, Access: policy.ReadAccess},
+				{Path: missing, Access: policy.ReadAccess},
 			}}
-			spec, _, cleanup := compilePinnedGrantSpec(t, rung, root, policy, []*grantPathHandle{handle})
+			spec, _, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{handle})
 			defer cleanup()
 			for _, rule := range spec.FSRules {
 				if rule.Target == symlink || rule.Target == missing || rule.Path == symlink || rule.Path == missing {
@@ -944,20 +945,20 @@ func TestLinuxPinnedExactFileIsNeverAnAncestor(t *testing.T) {
 	if err := os.WriteFile(target, []byte("approved"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binding, err := captureGrantPathBinding(target)
+	binding, err := policy.CapturePathBinding(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := acquireGrantPathHandle(&binding, target, true)
+	handle, err := policy.AcquirePathHandle(&binding, target, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer handle.Close()
 	descendant := filepath.Join(target, "child")
-	if got := matchingGrantPathAncestor([]*grantPathHandle{handle}, descendant, false); got != -1 {
+	if got := policy.MatchingPathHandleAncestor([]*policy.PathHandle{handle}, descendant, false); got != -1 {
 		t.Fatalf("exact-file handle selected as typed ancestor: %d", got)
 	}
-	if got := matchingGrantPathIdentityAncestor([]*grantPathHandle{handle}, descendant); got != -1 {
+	if got := policy.MatchingPathHandleIdentityAncestor([]*policy.PathHandle{handle}, descendant); got != -1 {
 		t.Fatalf("exact-file handle selected as identity ancestor: %d", got)
 	}
 }
@@ -969,25 +970,25 @@ func TestLinuxPinnedDescendantFDTransportAndCleanup(t *testing.T) {
 	if err := os.MkdirAll(descendant, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	binding, err := captureGrantPathBinding(target)
+	binding, err := policy.CapturePathBinding(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := acquireGrantPathHandle(&binding, target, false)
+	handle, err := policy.AcquirePathHandle(&binding, target, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle.access = writeFSAccess
+	handle.SetAccess(policy.WriteAccess)
 	defer handle.Close()
-	policy := effectivePolicy{FS: []fsEntry{
-		{Path: target, Access: writeFSAccess, Canonical: true},
-		{Path: descendant, Access: readFSAccess},
+	pol := policy.Effective{FS: []policy.FSEntry{
+		{Path: target, Access: policy.WriteAccess, Canonical: true},
+		{Path: descendant, Access: policy.ReadAccess},
 	}}
-	spec, cmd, cleanup := compilePinnedGrantSpec(t, rungTwo, root, policy, []*grantPathHandle{handle})
+	spec, cmd, cleanup := compilePinnedGrantSpec(t, rungTwo, root, pol, []*policy.PathHandle{handle})
 	if len(cmd.ExtraFiles) != 3 {
 		t.Fatalf("ExtraFiles = %d, want sealed spec + root + descendant", len(cmd.ExtraFiles))
 	}
-	wantFDs := []int{firstGrantPathChildFD, firstGrantPathChildFD + 1}
+	wantFDs := []int{policy.FirstPathHandleChildFD, policy.FirstPathHandleChildFD + 1}
 	if len(spec.GrantFDs) != len(wantFDs) {
 		t.Fatalf("GrantFDs = %v, want %v", spec.GrantFDs, wantFDs)
 	}
@@ -1022,15 +1023,15 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	binding, err := captureGrantPathBinding(target)
+	binding, err := policy.CapturePathBinding(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := acquireGrantPathHandle(&binding, target, false)
+	handle, err := policy.AcquirePathHandle(&binding, target, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle.access = allFSAccess
+	handle.SetAccess(policy.AllAccess)
 	defer handle.Close()
 
 	if err := os.Rename(target, target+".approved"); err != nil {
@@ -1044,12 +1045,12 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := effectivePolicy{FS: []fsEntry{
-		{Path: target, Access: allFSAccess, Canonical: true},
-		{Path: denied, Denied: allFSAccess},
-		{Path: "**/*.secret", Denied: allFSAccess},
+	pol := policy.Effective{FS: []policy.FSEntry{
+		{Path: target, Access: policy.AllAccess, Canonical: true},
+		{Path: denied, Denied: policy.AllAccess},
+		{Path: "**/*.secret", Denied: policy.AllAccess},
 	}}
-	spec, _, cleanup := compilePinnedGrantSpec(t, rungOne, root, policy, []*grantPathHandle{handle})
+	spec, _, cleanup := compilePinnedGrantSpec(t, rungOne, root, pol, []*policy.PathHandle{handle})
 	defer cleanup()
 	var foundDeny, foundOriginalGlob bool
 	for _, mask := range spec.MountView.Masks {
@@ -1070,10 +1071,10 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 	}
 }
 
-func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, policy effectivePolicy, handles []*grantPathHandle) (stage2Spec, *exec.Cmd, func()) {
+func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, pol policy.Effective, handles []*policy.PathHandle) (stage2Spec, *exec.Cmd, func()) {
 	t.Helper()
 	backend := &linuxBackend{rung: rung}
-	spawn, _, _, _, err := backend.compileWithGrantPaths(policy, handles)
+	spawn, _, _, _, err := backend.compileWithGrantPaths(pol, handles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1092,13 +1093,13 @@ func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, policy effectiv
 	return spec, cmd, cleanup
 }
 
-func assertPinnedDescendantRule(t *testing.T, spec stage2Spec, cmd *exec.Cmd, target string, access fsAccess, wantIdentity string, rung rung) {
+func assertPinnedDescendantRule(t *testing.T, spec stage2Spec, cmd *exec.Cmd, target string, access policy.FSAccess, wantIdentity string, rung rung) {
 	t.Helper()
-	var pinned *fsRule
+	var pinned *policy.FSRule
 	for i := range spec.FSRules {
 		rule := &spec.FSRules[i]
 		if rule.Target == target && rule.Access&access != 0 {
-			if rule.Path != "" || rule.ParentFD <= firstGrantPathChildFD {
+			if rule.Path != "" || rule.ParentFD <= policy.FirstPathHandleChildFD {
 				t.Fatalf("descendant rule = %+v, want direct child fd after root grant", *rule)
 			}
 			if rule.Access != access {

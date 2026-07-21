@@ -1,6 +1,6 @@
 //go:build linux
 
-package sandbox
+package policy
 
 import (
 	"errors"
@@ -13,61 +13,65 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type pinnedPathResolution struct {
-	file    *os.File
-	childFD int
-	isDir   bool
+// PinnedPathResolution is one path resolved through an identity-pinned handle:
+// the open descriptor, the number it will carry in the child, and whether it is
+// a directory.
+type PinnedPathResolution struct {
+	File    *os.File
+	ChildFD int
+	IsDir   bool
 }
 
-type pinnedPathResolver struct {
-	handles []*grantPathHandle
+type PinnedPathResolver struct {
+	handles []*PathHandle
 	firstFD int
 	files   []*os.File
-	paths   map[string]pinnedPathResolution
+	paths   map[string]PinnedPathResolution
 }
 
-func newPinnedPathResolver(handles []*grantPathHandle, firstFD int) *pinnedPathResolver {
-	return &pinnedPathResolver{
+func NewPinnedPathResolver(handles []*PathHandle, firstFD int) *PinnedPathResolver {
+	return &PinnedPathResolver{
 		handles: handles,
 		firstFD: firstFD,
-		paths:   make(map[string]pinnedPathResolution),
+		paths:   make(map[string]PinnedPathResolution),
 	}
 }
 
-func (resolver *pinnedPathResolver) resolve(target string, exact bool) (pinnedPathResolution, bool, error) {
+func (resolver *PinnedPathResolver) resolve(target string, exact bool) (PinnedPathResolution, bool, error) {
 	return resolver.resolveTyped(target, exact, true)
 }
 
-func (resolver *pinnedPathResolver) resolveAny(target string) (pinnedPathResolution, bool, error) {
+// ResolveAny resolves target against any pinned handle, exact or tree.
+func (resolver *PinnedPathResolver) ResolveAny(target string) (PinnedPathResolution, bool, error) {
 	return resolver.resolveTyped(target, false, false)
 }
 
-func (resolver *pinnedPathResolver) resolveTyped(target string, exact, checkType bool) (pinnedPathResolution, bool, error) {
+func (resolver *PinnedPathResolver) resolveTyped(target string, exact, checkType bool) (PinnedPathResolution, bool, error) {
 	target = filepath.Clean(target)
 	if cached, ok := resolver.paths[target]; ok {
 		if checkType {
-			if err := validatePinnedPathType(cached.isDir, exact, target); err != nil {
-				return pinnedPathResolution{}, false, err
+			if err := validatePinnedPathType(cached.IsDir, exact, target); err != nil {
+				return PinnedPathResolution{}, false, err
 			}
 		}
 		return cached, true, nil
 	}
-	index := matchingGrantPathIdentityAncestor(resolver.handles, target)
+	index := MatchingPathHandleIdentityAncestor(resolver.handles, target)
 	if checkType {
-		index = matchingGrantPathAncestor(resolver.handles, target, exact)
+		index = MatchingPathHandleAncestor(resolver.handles, target, exact)
 	}
 	if index < 0 {
-		return pinnedPathResolution{}, false, nil
+		return PinnedPathResolution{}, false, nil
 	}
 	handle := resolver.handles[index]
 	if handle.target == target {
-		resolved := pinnedPathResolution{
-			file: handle.file, childFD: firstGrantPathChildFD + index,
-			isDir: handle.isDir,
+		resolved := PinnedPathResolution{
+			File: handle.file, ChildFD: FirstPathHandleChildFD + index,
+			IsDir: handle.isDir,
 		}
 		if checkType {
-			if err := validatePinnedPathType(resolved.isDir, exact, target); err != nil {
-				return pinnedPathResolution{}, false, err
+			if err := validatePinnedPathType(resolved.IsDir, exact, target); err != nil {
+				return PinnedPathResolution{}, false, err
 			}
 		}
 		resolver.paths[target] = resolved
@@ -75,7 +79,7 @@ func (resolver *pinnedPathResolver) resolveTyped(target string, exact, checkType
 	}
 	relative, err := filepath.Rel(handle.target, target)
 	if err != nil || relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return pinnedPathResolution{}, false, ErrGrantUnsupported
+		return PinnedPathResolution{}, false, ErrUnsupportedClass
 	}
 	fd, err := unix.Openat2(int(handle.file.Fd()), relative, &unix.OpenHow{
 		Flags: uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC),
@@ -83,34 +87,34 @@ func (resolver *pinnedPathResolver) resolveTyped(target string, exact, checkType
 			unix.RESOLVE_NO_MAGICLINKS),
 	})
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
-		return pinnedPathResolution{}, false, nil
+		return PinnedPathResolution{}, false, nil
 	}
 	if err != nil {
-		return pinnedPathResolution{}, false, fmt.Errorf("%w: open pinned descendant %q: %v", ErrGrantUnsupported, target, err)
+		return PinnedPathResolution{}, false, fmt.Errorf("%w: open pinned descendant %q: %v", ErrUnsupportedClass, target, err)
 	}
 	file := os.NewFile(uintptr(fd), "sandbox-grant-descendant")
 	if file == nil {
 		_ = unix.Close(fd)
-		return pinnedPathResolution{}, false, ErrGrantUnsupported
+		return PinnedPathResolution{}, false, ErrUnsupportedClass
 	}
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		return pinnedPathResolution{}, false, fmt.Errorf("%w: stat pinned descendant %q: %v", ErrGrantUnsupported, target, err)
+		return PinnedPathResolution{}, false, fmt.Errorf("%w: stat pinned descendant %q: %v", ErrUnsupportedClass, target, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		_ = file.Close()
-		return pinnedPathResolution{}, false, nil
+		return PinnedPathResolution{}, false, nil
 	}
 	if checkType {
 		if err := validatePinnedPathType(info.IsDir(), exact, target); err != nil {
 			_ = file.Close()
-			return pinnedPathResolution{}, false, err
+			return PinnedPathResolution{}, false, err
 		}
 	}
-	resolved := pinnedPathResolution{
-		file: file, childFD: resolver.firstFD + len(resolver.files),
-		isDir: info.IsDir(),
+	resolved := PinnedPathResolution{
+		File: file, ChildFD: resolver.firstFD + len(resolver.files),
+		IsDir: info.IsDir(),
 	}
 	resolver.files = append(resolver.files, file)
 	resolver.paths[target] = resolved
@@ -119,23 +123,23 @@ func (resolver *pinnedPathResolver) resolveTyped(target string, exact, checkType
 
 func validatePinnedPathType(isDir, exact bool, target string) error {
 	if exact && isDir {
-		return fmt.Errorf("%w: pinned exact path %q is a directory", ErrGrantUnsupported, target)
+		return fmt.Errorf("%w: pinned exact path %q is a directory", ErrUnsupportedClass, target)
 	}
 	if !exact && !isDir {
-		return fmt.Errorf("%w: pinned tree path %q is not a directory", ErrGrantUnsupported, target)
+		return fmt.Errorf("%w: pinned tree path %q is not a directory", ErrUnsupportedClass, target)
 	}
 	return nil
 }
 
-func (resolver *pinnedPathResolver) addFile(file *os.File) int {
+func (resolver *PinnedPathResolver) addFile(file *os.File) int {
 	childFD := resolver.firstFD + len(resolver.files)
 	resolver.files = append(resolver.files, file)
 	return childFD
 }
 
-func enumerateGrantPathHandle(handle *grantPathHandle, target string, access fsAccess, excludes []string, firstFD int) ([]fsRule, []*os.File, error) {
-	if handle == nil || handle.file == nil || !handle.isDir || handle.target != target || firstFD <= stage2SpecFD {
-		return nil, nil, ErrGrantUnsupported
+func enumerateGrantPathHandle(handle *PathHandle, target string, access FSAccess, excludes []string, firstFD int) ([]FSRule, []*os.File, error) {
+	if handle == nil || handle.file == nil || !handle.isDir || handle.target != target || firstFD <= ReservedSpecFD {
+		return nil, nil, ErrUnsupportedClass
 	}
 	var files []*os.File
 	rules, err := enumeratePinnedTree(handle.file, target, access, excludes, func(file *os.File) int {
@@ -144,14 +148,14 @@ func enumerateGrantPathHandle(handle *grantPathHandle, target string, access fsA
 		return childFD
 	}, nil)
 	if err != nil {
-		closeGrantRuleFiles(files)
+		CloseRuleFiles(files)
 		return nil, nil, err
 	}
 	return rules, files, nil
 }
 
-func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes []string, addFile func(*os.File) int, resolver *pinnedPathResolver) ([]fsRule, error) {
-	var rules []fsRule
+func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes []string, addFile func(*os.File) int, resolver *PinnedPathResolver) ([]FSRule, error) {
+	var rules []FSRule
 	var walk func(int, string, []string) error
 	walk = func(dirFD int, dirTarget string, nestedExcludes []string) error {
 		readFD, err := unix.Openat2(dirFD, ".", &unix.OpenHow{
@@ -160,17 +164,17 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 				unix.RESOLVE_NO_MAGICLINKS),
 		})
 		if err != nil {
-			return fmt.Errorf("%w: enumerate pinned tree %q: %v", ErrGrantUnsupported, dirTarget, err)
+			return fmt.Errorf("%w: enumerate pinned tree %q: %v", ErrUnsupportedClass, dirTarget, err)
 		}
 		readDir := os.NewFile(uintptr(readFD), "sandbox-grant-enumerate")
 		if readDir == nil {
 			_ = unix.Close(readFD)
-			return ErrGrantUnsupported
+			return ErrUnsupportedClass
 		}
 		entries, err := readDir.ReadDir(-1)
 		_ = readDir.Close()
 		if err != nil {
-			return fmt.Errorf("%w: enumerate pinned tree %q: %v", ErrGrantUnsupported, dirTarget, err)
+			return fmt.Errorf("%w: enumerate pinned tree %q: %v", ErrUnsupportedClass, dirTarget, err)
 		}
 		for _, entry := range entries {
 			childTarget := filepath.Join(dirTarget, entry.Name())
@@ -181,15 +185,15 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 			var ruleFD int
 			owned := false
 			if resolver != nil {
-				resolved, ok, err := resolver.resolveAny(childTarget)
+				resolved, ok, err := resolver.ResolveAny(childTarget)
 				if err != nil {
 					return err
 				}
 				if !ok {
 					continue
 				}
-				child = resolved.file
-				ruleFD = resolved.childFD
+				child = resolved.File
+				ruleFD = resolved.ChildFD
 			} else {
 				childFD, err := unix.Openat2(dirFD, entry.Name(), &unix.OpenHow{
 					Flags: uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC),
@@ -200,12 +204,12 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 					continue
 				}
 				if err != nil {
-					return fmt.Errorf("%w: open pinned child %q: %v", ErrGrantUnsupported, childTarget, err)
+					return fmt.Errorf("%w: open pinned child %q: %v", ErrUnsupportedClass, childTarget, err)
 				}
 				child = os.NewFile(uintptr(childFD), "sandbox-grant-child")
 				if child == nil {
 					_ = unix.Close(childFD)
-					return ErrGrantUnsupported
+					return ErrUnsupportedClass
 				}
 				owned = true
 			}
@@ -214,7 +218,7 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 				if owned {
 					_ = child.Close()
 				}
-				return fmt.Errorf("%w: stat pinned child %q: %v", ErrGrantUnsupported, childTarget, err)
+				return fmt.Errorf("%w: stat pinned child %q: %v", ErrUnsupportedClass, childTarget, err)
 			}
 			if info.Mode()&os.ModeSymlink != 0 {
 				if owned {
@@ -228,7 +232,7 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 					ruleFD = addFile(child)
 					owned = false
 				}
-				rules = append(rules, fsRule{
+				rules = append(rules, FSRule{
 					Target: childTarget, ParentFD: ruleFD,
 					Access: access, IsDir: info.IsDir(),
 				})
@@ -250,4 +254,13 @@ func enumeratePinnedTree(root *os.File, target string, access fsAccess, excludes
 		return nil, err
 	}
 	return rules, nil
+}
+
+// Files returns the descriptors the resolver opened while enumerating rules.
+// The caller takes responsibility for closing them via CloseRuleFiles.
+func (resolver *PinnedPathResolver) Files() []*os.File {
+	if resolver == nil {
+		return nil
+	}
+	return resolver.files
 }

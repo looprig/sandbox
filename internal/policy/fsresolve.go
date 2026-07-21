@@ -1,4 +1,4 @@
-package sandbox
+package policy
 
 import (
 	"path/filepath"
@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// resolveFS computes the effective fsAccess a policy grants to an absolute target
+// ResolveFS computes the effective FSAccess a policy grants to an absolute target
 // path, applying the SPEC §5.1 precedence model. It is a pure function: it makes
 // no OS or filesystem calls and only reasons over the entries and the path
 // string, so it is a faithful statement of policy intent shared by the OS
@@ -20,26 +20,26 @@ import (
 // no entry controls a bit, that bit is denied.
 //
 // Contract: target must be an absolute, canonical, symlink-resolved path.
-// resolveFS is purely lexical — it does no symlink, case-fold, or "." /".."
+// ResolveFS is purely lexical — it does no symlink, case-fold, or "." /".."
 // resolution beyond filepath.Clean — so resolving symlinks and case variants is
 // the caller's/backend's responsibility. Passing an unresolved path
 // could let a deny be bypassed via a symlink or a case variant on macOS.
-func resolveFS(entries []fsEntry, path string) fsAccess {
+func ResolveFS(entries []FSEntry, path string) FSAccess {
 	target := filepath.Clean(path)
-	var globDenied fsAccess
+	var globDenied FSAccess
 	for _, entry := range entries {
-		if strings.ContainsAny(entry.Path, globMeta) && denyMatches(entry, target) {
-			globDenied |= normalizedDenied(entry)
+		if strings.ContainsAny(entry.Path, GlobMeta) && denyMatches(entry, target) {
+			globDenied |= NormalizedDenied(entry)
 		}
 	}
 
-	var result fsAccess
-	for _, bit := range []fsAccess{readFSAccess, execFSAccess, writeFSAccess} {
+	var result FSAccess
+	for _, bit := range []FSAccess{ReadAccess, ExecAccess, WriteAccess} {
 		bestSpec := -1
 		allowed := false
 		denied := false
 		for _, entry := range entries {
-			entryDenied := normalizedDenied(entry)
+			entryDenied := NormalizedDenied(entry)
 			if entry.Access&bit == 0 && entryDenied&bit == 0 {
 				continue
 			}
@@ -50,7 +50,7 @@ func resolveFS(entries []fsEntry, path string) fsAccess {
 			if !matches {
 				continue
 			}
-			spec := entryPrecedence(entry)
+			spec := EntryPrecedence(entry)
 			switch {
 			case spec > bestSpec:
 				bestSpec = spec
@@ -68,46 +68,46 @@ func resolveFS(entries []fsEntry, path string) fsAccess {
 	return result &^ globDenied
 }
 
-func normalizedDenied(entry fsEntry) fsAccess {
+func NormalizedDenied(entry FSEntry) FSAccess {
 	if entry.Access == 0 && entry.Denied == 0 {
-		return allFSAccess
+		return AllAccess
 	}
 	return entry.Denied
 }
 
-// globMeta are the glob metacharacters whose presence makes an entry a glob
+// GlobMeta are the glob metacharacters whose presence makes an entry a glob
 // rather than a literal path.
-const globMeta = "*?["
+const GlobMeta = "*?["
 
 // entryMatches reports whether an ALLOW entry's Path matches an already-cleaned
 // target path, dispatching on whether the entry is a glob or a literal. It fails
-// closed by under-granting: an uncompilable allow glob (globRegexp == nil)
+// closed by under-granting: an uncompilable allow glob (GlobRegexp == nil)
 // simply grants nothing, so a malformed allow never widens access.
-func entryMatches(entry fsEntry, target string) bool {
-	if strings.ContainsAny(entry.Path, globMeta) {
-		re := globRegexp(entry.Path)
+func entryMatches(entry FSEntry, target string) bool {
+	if strings.ContainsAny(entry.Path, GlobMeta) {
+		re := GlobRegexp(entry.Path)
 		return re != nil && re.MatchString(target)
 	}
-	return literalMatches(entry.Path, target, entry.Exact)
+	return LiteralMatches(entry.Path, target, entry.Exact)
 }
 
 // denyMatches reports whether a DENY entry matches an already-cleaned target
 // path. Unlike entryMatches it fails closed by over-denying: an uncompilable
-// deny glob (globRegexp == nil) is treated as a MATCH so a malformed pattern
+// deny glob (GlobRegexp == nil) is treated as a MATCH so a malformed pattern
 // over-denies rather than silently letting the path through. A deny that
 // silently does not deny is the one failure mode this resolver must never have.
-func denyMatches(entry fsEntry, target string) bool {
-	if strings.ContainsAny(entry.Path, globMeta) {
-		re := globRegexp(entry.Path)
+func denyMatches(entry FSEntry, target string) bool {
+	if strings.ContainsAny(entry.Path, GlobMeta) {
+		re := GlobRegexp(entry.Path)
 		return re == nil || re.MatchString(target)
 	}
-	return literalMatches(entry.Path, target, entry.Exact)
+	return LiteralMatches(entry.Path, target, entry.Exact)
 }
 
-// literalMatches reports whether target is entryPath or is nested under it at a
+// LiteralMatches reports whether target is entryPath or is nested under it at a
 // path boundary, so "/work/repo" matches "/work/repo" and "/work/repo/src" but
 // not "/work/repository". The root "/" matches everything.
-func literalMatches(entryPath, target string, exact bool) bool {
+func LiteralMatches(entryPath, target string, exact bool) bool {
 	ep := filepath.Clean(entryPath)
 	if exact {
 		return target == ep
@@ -127,7 +127,7 @@ func literalMatches(entryPath, target string, exact bool) bool {
 // keeps the ranking symmetric so a non-canonical glob prefix cannot over-count.
 func entrySpecificity(entryPath string) int {
 	prefix := entryPath
-	if i := strings.IndexAny(entryPath, globMeta); i >= 0 {
+	if i := strings.IndexAny(entryPath, GlobMeta); i >= 0 {
 		prefix = entryPath[:i]
 	}
 	if prefix == "" {
@@ -138,10 +138,10 @@ func entrySpecificity(entryPath string) int {
 	return len(filepath.Clean(prefix))
 }
 
-// entryPrecedence refines lexical specificity with scope shape. An exact path
+// EntryPrecedence refines lexical specificity with scope shape. An exact path
 // controls only one object and therefore outranks a recursive tree rooted at
 // the same spelling, without opening any child of that tree.
-func entryPrecedence(entry fsEntry) int {
+func EntryPrecedence(entry FSEntry) int {
 	precedence := entrySpecificity(entry.Path) * 2
 	if entry.Exact {
 		precedence++
@@ -149,27 +149,27 @@ func entryPrecedence(entry fsEntry) int {
 	return precedence
 }
 
-// globRegexp compiles a glob pattern into an anchored regexp implementing the
+// GlobRegexp compiles a glob pattern into an anchored regexp implementing the
 // §5.1 glob semantics: "**" crosses directory separators, "*" and "?" stay
 // within a single segment, and all other characters are matched literally. It
 // returns nil if the pattern cannot be compiled (a malformed bracket
 // expression). The nil is not itself a match verdict: callers decide the
 // fail-closed direction — denyMatches treats nil as a match (over-deny), while
 // entryMatches treats nil as a non-match (under-grant on the allow side).
-func globRegexp(glob string) *regexp.Regexp {
-	re, err := regexp.Compile(globToRegexp(glob))
+func GlobRegexp(glob string) *regexp.Regexp {
+	re, err := regexp.Compile(GlobToRegexp(glob))
 	if err != nil {
 		return nil
 	}
 	return re
 }
 
-// globToRegexp translates a glob into an anchored regexp source string.
+// GlobToRegexp translates a glob into an anchored regexp source string.
 // filepath.Match has no "**", so the translation is done by hand: "**" -> ".*",
 // "*" -> "[^/]*", "?" -> "[^/]", bracket expressions are carried through (with a
 // leading "!" negation rewritten to regexp "^"), and every other byte is escaped
 // via regexp.QuoteMeta so metacharacters such as "." match literally.
-func globToRegexp(glob string) string {
+func GlobToRegexp(glob string) string {
 	var b strings.Builder
 	b.WriteByte('^')
 	for i := 0; i < len(glob); {

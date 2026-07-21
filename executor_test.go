@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"strings"
 	"testing"
@@ -169,7 +170,7 @@ func TestEnvAllowAndInherit(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "secret")
 
 	// Allow: CARGO_* is admitted; GITHUB_TOKEN still is not.
-	allowed := assembleEnv(effectivePolicy{Env: effectiveEnvPolicy{Allow: []string{"CARGO_*"}}})
+	allowed := assembleEnv(policy.Effective{Env: policy.EnvPolicy{Allow: []string{"CARGO_*"}}})
 	if !containsEnv(allowed, "CARGO_HOME=/cargo") {
 		t.Errorf("Allow CARGO_*: CARGO_HOME missing from %v", allowed)
 	}
@@ -178,7 +179,7 @@ func TestEnvAllowAndInherit(t *testing.T) {
 	}
 
 	// Inherit: everything passes through, and Set is forced on top.
-	inherited := assembleEnv(effectivePolicy{Env: effectiveEnvPolicy{
+	inherited := assembleEnv(policy.Effective{Env: policy.EnvPolicy{
 		Inherit: true,
 		Set:     map[string]string{"GITHUB_TOKEN": "forced"},
 	}})
@@ -295,7 +296,7 @@ func TestRunArgvNonexistentBinary(t *testing.T) {
 func TestAssembleEnvBadAllowGlob(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "secret")
 
-	env := assembleEnv(effectivePolicy{Env: effectiveEnvPolicy{Allow: []string{"LC_["}}})
+	env := assembleEnv(policy.Effective{Env: policy.EnvPolicy{Allow: []string{"LC_["}}})
 	if env == nil {
 		t.Fatal("assembleEnv(scrub) = nil for a bad-glob scrub policy; want non-nil")
 	}
@@ -313,7 +314,7 @@ func TestAssembleEnvBadAllowGlob(t *testing.T) {
 func TestAssembleEnvScrubNeverNil(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "secret")
 
-	env := assembleEnv(effectivePolicy{Env: effectiveEnvPolicy{}})
+	env := assembleEnv(policy.Effective{Env: policy.EnvPolicy{}})
 	if env == nil {
 		t.Fatal("assembleEnv(scrub) = nil; want non-nil empty slice (nil => exec inherits ALL parent env)")
 	}
@@ -321,10 +322,10 @@ func TestAssembleEnvScrubNeverNil(t *testing.T) {
 		t.Errorf("scrub env leaked GITHUB_TOKEN: %v", env)
 	}
 
-	// End-to-end: a scrub effectivePolicy with an EMPTY effectiveEnvPolicy (no TMPDIR in Set) must
+	// End-to-end: a scrub policy.Effective with an EMPTY policy.EnvPolicy (no TMPDIR in Set) must
 	// still keep the secret out of the child's environment.
 	ws := t.TempDir()
-	e, err := newExecutorForEffectivePolicy(effectivePolicy{Workspace: ws, Env: effectiveEnvPolicy{}})
+	e, err := newExecutorForEffectivePolicy(policy.Effective{Workspace: ws, Env: policy.EnvPolicy{}})
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)
 	}

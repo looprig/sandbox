@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 
 type captureBackend struct {
 	mu         sync.Mutex
-	policies   []effectivePolicy
+	policies   []policy.Effective
 	bits       uint64
 	compileErr error
 }
@@ -24,24 +25,24 @@ type boundaryBackend struct {
 	baseBits uint64
 }
 
-func (b *boundaryBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b *boundaryBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	b.captureBackend.mu.Lock()
-	b.captureBackend.policies = append(b.captureBackend.policies, cloneEffectivePolicy(policy))
+	b.captureBackend.policies = append(b.captureBackend.policies, policy.Clone(pol))
 	b.captureBackend.mu.Unlock()
 	bits := b.baseBits
-	if resolveFS(policy.FS, string(os.PathSeparator))&readFSAccess != 0 {
+	if policy.ResolveFS(pol.FS, string(os.PathSeparator))&policy.ReadAccess != 0 {
 		bits &^= GuaranteeReadBoundary
 	}
-	if resolveFS(policy.FS, string(os.PathSeparator))&writeFSAccess != 0 {
+	if policy.ResolveFS(pol.FS, string(os.PathSeparator))&policy.WriteAccess != 0 {
 		bits &^= GuaranteeWriteBoundary
 	}
 	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
 	return spec, CompileReport{}, LevelFull, bits, nil
 }
 
-func (b *captureBackend) compile(policy effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b *captureBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
 	b.mu.Lock()
-	b.policies = append(b.policies, cloneEffectivePolicy(policy))
+	b.policies = append(b.policies, policy.Clone(pol))
 	b.mu.Unlock()
 	if b.compileErr != nil {
 		return spawnSpec{}, CompileReport{}, LevelNone, 0, b.compileErr
@@ -50,10 +51,10 @@ func (b *captureBackend) compile(policy effectivePolicy) (spawnSpec, CompileRepo
 	return spec, CompileReport{}, LevelNone, b.bits, nil
 }
 
-func (b *captureBackend) lastPolicy() effectivePolicy {
+func (b *captureBackend) lastPolicy() policy.Effective {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return cloneEffectivePolicy(b.policies[len(b.policies)-1])
+	return policy.Clone(b.policies[len(b.policies)-1])
 }
 
 func TestGrantVersionAndCommandStart(t *testing.T) {
@@ -274,10 +275,10 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-fs", workspace, "true", []string{token}); err != nil {
 		t.Fatalf("RunCommandWithGrants: %v", err)
 	}
-	if got := resolveFS(backend.lastPolicy().FS, target); got&writeFSAccess == 0 {
+	if got := policy.ResolveFS(backend.lastPolicy().FS, target); got&policy.WriteAccess == 0 {
 		t.Fatalf("verified filesystem grant did not alter compiled policy: access %d", got)
 	}
-	if got := resolveFS(backend.lastPolicy().FS, target+"/child"); got&writeFSAccess != 0 {
+	if got := policy.ResolveFS(backend.lastPolicy().FS, target+"/child"); got&policy.WriteAccess != 0 {
 		t.Fatalf("path grant widened recursively to a child: access %d", got)
 	}
 
@@ -286,7 +287,7 @@ func TestGrantFilesystemDeltaAppliedAndDriftRejected(t *testing.T) {
 	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-tree", workspace, "true", []string{tree}); err != nil {
 		t.Fatalf("RunCommandWithGrants tree: %v", err)
 	}
-	if got := resolveFS(backend.lastPolicy().FS, target+"/child"); got&writeFSAccess == 0 {
+	if got := policy.ResolveFS(backend.lastPolicy().FS, target+"/child"); got&policy.WriteAccess == 0 {
 		t.Fatalf("tree grant did not apply recursively: access %d", got)
 	}
 
@@ -376,7 +377,7 @@ func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.
 	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-host-read", workspace, "true", []string{token}); err != nil {
 		t.Fatalf("RunCommandWithGrants host read: %v", err)
 	}
-	if got := resolveFS(backend.lastPolicy().FS, string(os.PathSeparator)); got&readFSAccess == 0 {
+	if got := policy.ResolveFS(backend.lastPolicy().FS, string(os.PathSeparator)); got&policy.ReadAccess == 0 {
 		t.Fatalf("host read grant did not apply at filesystem root: access %#x", got)
 	}
 
@@ -390,7 +391,7 @@ func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.
 	if _, _, err := writeExecutor.RunCommandWithGrants(context.Background(), "exec-host-write", workspace, "true", []string{writeToken}); err != nil {
 		t.Fatalf("RunCommandWithGrants host write: %v", err)
 	}
-	if got := resolveFS(writeBackend.lastPolicy().FS, string(os.PathSeparator)); got&writeFSAccess == 0 {
+	if got := policy.ResolveFS(writeBackend.lastPolicy().FS, string(os.PathSeparator)); got&policy.WriteAccess == 0 {
 		t.Fatalf("host write grant did not apply at filesystem root: access %#x", got)
 	}
 }
@@ -412,9 +413,9 @@ func TestBroadNetworkGrantIncludesDNSForHostnameResolution(t *testing.T) {
 	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-network-broad", workspace, "true", []string{token}); err != nil {
 		t.Fatalf("RunCommandWithGrants network broad: %v", err)
 	}
-	policy := backend.lastPolicy()
-	if !containsPort(policy.Net.Ports, 443) || !policy.Net.DNS {
-		t.Fatalf("broad network policy = %+v, want port 443 plus DNS", policy.Net)
+	pol := backend.lastPolicy()
+	if !policy.ContainsPort(pol.Net.Ports, 443) || !pol.Net.DNS {
+		t.Fatalf("broad network policy = %+v, want port 443 plus DNS", pol.Net)
 	}
 }
 

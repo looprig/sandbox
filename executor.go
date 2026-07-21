@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
 	"net"
 	"os"
@@ -63,7 +64,7 @@ type executorConfig struct {
 	lifecycle *executorLifecycle
 }
 
-// Executor compiles a effectivePolicy once via the platform backend and then runs
+// Executor compiles a policy.Effective once via the platform backend and then runs
 // commands under the resulting stateless per-spawn transform (SPEC §6, §7). It
 // holds the compiled policy, the chosen backend, its spawnSpec, the compilation
 // report, the achieved level and guarantee bits, and the assembled child
@@ -74,7 +75,7 @@ type Executor struct {
 	// construction because a Profile is immutable. It is the read path for every
 	// authority check on the spawn hot path.
 	settings      profile.Settings
-	policy        effectivePolicy
+	policy        policy.Effective
 	backend       backend
 	spec          spawnSpec
 	report        CompileReport
@@ -102,20 +103,20 @@ type Executor struct {
 type snapshot struct {
 	spec   spawnSpec
 	env    []string
-	policy effectivePolicy
+	policy policy.Effective
 }
 
 // newExecutor is the internal direct-construction seam for focused unit tests.
 // Production ownership always enters through ExecutorSet.
 func newExecutor(prof *Profile, config executorConfig) (*Executor, error) {
-	p, err := compileEffectivePolicy(prof)
+	p, err := policy.Compile(prof)
 	if err != nil {
 		return nil, err
 	}
 	return newExecutorFromEffective(prof, p, config)
 }
 
-func newExecutorFromEffective(prof *Profile, p effectivePolicy, config executorConfig) (*Executor, error) {
+func newExecutorFromEffective(prof *Profile, p policy.Effective, config executorConfig) (*Executor, error) {
 	// The profile is immutable, so its normalized authority is snapshotted once
 	// here and read from the Executor thereafter. A nil profile — only reachable
 	// from the unexported unit-test seam — yields the zero Settings, whose every
@@ -297,11 +298,11 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 	if err != nil {
 		return snapshot{}, "", err
 	}
-	policy := cloneEffectivePolicy(s.policy)
+	pol := policy.Clone(s.policy)
 	proxyURL := e.proxy.URL(executionID, credential)
-	applyChildProxyEnv(policy.Env.Set, proxyURL)
-	s.policy = policy
-	s.env = assembleEnv(policy)
+	applyChildProxyEnv(pol.Env.Set, proxyURL)
+	s.policy = pol
+	s.env = assembleEnv(pol)
 	return s, executionID, nil
 }
 
@@ -475,9 +476,9 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if class == GrantClassNetworkProxyTarget && e.proxy == nil {
 		return "", ErrGrantUnsupported
 	}
-	var pathBinding *grantPathBinding
+	var pathBinding *policy.PathBinding
 	if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-		binding, err := captureGrantPathBinding(delta.entry.Path)
+		binding, err := policy.CapturePathBinding(delta.entry.Path)
 		if err != nil {
 			return "", fmt.Errorf("%w: bind target: %v", ErrGrantMalformed, err)
 		}
@@ -521,10 +522,10 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 // RunCommandWithGrants verifies all grants, compiles their least-authority
 // deltas for this spawn, atomically consumes them, and then starts the command.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string) ([]byte, int, error) {
-	return e.runCommandWithGrants(ctx, executionID, dir, command, grants, acquireGrantPathHandle)
+	return e.runCommandWithGrants(ctx, executionID, dir, command, grants, policy.AcquirePathHandle)
 }
 
-type grantPathAcquirer func(*grantPathBinding, string, bool) (*grantPathHandle, error)
+type grantPathAcquirer func(*policy.PathBinding, string, bool) (*policy.PathHandle, error)
 
 func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string, acquire grantPathAcquirer) ([]byte, int, error) {
 	lease, err := e.beginExecution(ctx)
@@ -550,15 +551,15 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	if e.profile == nil {
 		return nil, -1, ErrInvalidProfile
 	}
-	policy := cloneEffectivePolicy(e.policy)
+	pol := policy.Clone(e.policy)
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
 	seen := make(map[[32]byte]int64, len(grants))
 	commandGrant := e.settings.Command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
-	var pathHandles grantPathHandleSet
-	defer pathHandles.close()
+	var pathHandles policy.PathHandleSet
+	defer pathHandles.Close()
 	for _, token := range grants {
 		id := grantID(token)
 		if _, ok := e.usedGrants[id]; ok {
@@ -589,8 +590,8 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 				return nil, -1, err
 			}
 			if handle != nil {
-				handle.access = delta.entry.Access
-				if err := pathHandles.add(handle); err != nil {
+				handle.SetAccess(delta.entry.Access)
+				if err := pathHandles.Add(handle); err != nil {
 					return nil, -1, err
 				}
 			}
@@ -602,20 +603,20 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			commandGrant = true
 		}
 		if delta.entry != nil {
-			policy.FS = applyFilesystemGrant(policy.FS, *delta.entry)
+			pol.FS = applyFilesystemGrant(pol.FS, *delta.entry)
 		}
 		dropped := delta.droppedGuarantees
-		if dropped&GuaranteeReadBoundary != 0 && isFSAccessRestricted(policy.FS, readFSAccess|execFSAccess) {
+		if dropped&GuaranteeReadBoundary != 0 && policy.IsAccessRestricted(pol.FS, policy.ReadAccess|policy.ExecAccess) {
 			dropped &^= GuaranteeReadBoundary
 		}
-		if dropped&GuaranteeWriteBoundary != 0 && isFSAccessRestricted(policy.FS, writeFSAccess) {
+		if dropped&GuaranteeWriteBoundary != 0 && policy.IsAccessRestricted(pol.FS, policy.WriteAccess) {
 			dropped &^= GuaranteeWriteBoundary
 		}
 		expectedGuarantees &^= dropped
-		if delta.port != 0 && !containsPort(policy.Net.Ports, delta.port) {
-			policy.Net.Ports = append(policy.Net.Ports, delta.port)
+		if delta.port != 0 && !policy.ContainsPort(pol.Net.Ports, delta.port) {
+			pol.Net.Ports = append(pol.Net.Ports, delta.port)
 		}
-		policy.Net.DNS = policy.Net.DNS || delta.dns
+		pol.Net.DNS = pol.Net.DNS || delta.dns
 		if delta.target != nil {
 			proxyTargets = append(proxyTargets, *delta.target)
 		}
@@ -638,9 +639,9 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		if err != nil || port == 0 {
 			return nil, -1, ErrGrantUnsupported
 		}
-		policy.Net = effectiveNetPolicy{ProxyPort: uint16(port)}
+		pol.Net = policy.NetPolicy{ProxyPort: uint16(port)}
 	}
-	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, policy, pathHandles.sorted())
+	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, pol, pathHandles.Sorted())
 	if err != nil {
 		return nil, -1, err
 	}
@@ -654,12 +655,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, err
 		}
 		proxyURL := e.proxy.URL(executionID, credential)
-		applyChildProxyEnv(policy.Env.Set, proxyURL)
+		applyChildProxyEnv(pol.Env.Set, proxyURL)
 	}
 	for id, expiryUnixMilli := range seen {
 		e.usedGrants[id] = expiryUnixMilli
 	}
-	s := snapshot{spec: spec, env: assembleEnv(policy), policy: policy}
+	s := snapshot{spec: spec, env: assembleEnv(pol), policy: pol}
 	e.grantMu.Unlock()
 	out, code, runErr := e.run(lease, canonicalCWD, shellArgv(command), s)
 	var denial error
@@ -686,16 +687,16 @@ func (e *Executor) pruneUsedGrantsLocked(nowUnixMilli int64) {
 }
 
 type grantPathBackend interface {
-	compileWithGrantPaths(effectivePolicy, []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error)
+	compileWithGrantPaths(policy.Effective, []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error)
 }
 
-func compileBackendWithGrantPaths(b backend, policy effectivePolicy, handles []*grantPathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func compileBackendWithGrantPaths(b backend, pol policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
 	if len(handles) != 0 {
 		if pathBackend, ok := b.(grantPathBackend); ok {
-			return pathBackend.compileWithGrantPaths(policy, handles)
+			return pathBackend.compileWithGrantPaths(pol, handles)
 		}
 	}
-	return b.compile(policy)
+	return b.compile(pol)
 }
 
 func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {
@@ -709,7 +710,7 @@ func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {
 	return bits
 }
 
-func applyFilesystemGrant(entries []fsEntry, grant fsEntry) []fsEntry {
+func applyFilesystemGrant(entries []policy.FSEntry, grant policy.FSEntry) []policy.FSEntry {
 	for i := range entries {
 		if entries[i].Path == grant.Path && entries[i].Exact == grant.Exact {
 			entries[i].Denied &^= grant.Access
@@ -760,27 +761,27 @@ func applyChildProxyEnv(set map[string]string, proxyURL string) {
 	set["no_proxy"] = ""
 }
 
-// assembleEnv builds the child environment from a effectivePolicy's effectiveEnvPolicy (SPEC §5.5).
+// assembleEnv builds the child environment from a policy.Effective's policy.EnvPolicy (SPEC §5.5).
 // It is shared by every backend and lives on the executor side because env
 // scrubbing holds regardless of OS mechanism.
 //
 //   - Inherit: start from the full parent environment (os.Environ), then force
 //     the Set overrides. Used by unconfined and explicit opt-in.
 //   - otherwise (the fail-closed default): keep only parent variables whose NAME
-//     matches the §5.5 baseline allowlist or one of effectiveEnvPolicy.Allow (name globs
+//     matches the §5.5 baseline allowlist or one of policy.EnvPolicy.Allow (name globs
 //     via filepath.Match), then force the Set overrides (including TMPDIR).
 //     Everything else — GITHUB_TOKEN, AWS_*, LLM keys, SSH_AUTH_SOCK, … — is
 //     absent.
 //
 // The result is a KEY=VALUE slice suitable for exec.Cmd.Env.
-func assembleEnv(p effectivePolicy) []string {
+func assembleEnv(p policy.Effective) []string {
 	if p.Env.Inherit {
 		return applySet(os.Environ(), p.Env.Set)
 	}
 
-	// Baseline allowlist plus caller additions. baselineEnvAllowlist returns a
+	// Baseline allowlist plus caller additions. policy.BaselineEnvAllowlist returns a
 	// fresh slice, so appending never mutates shared state.
-	allow := append(baselineEnvAllowlist(), p.Env.Allow...)
+	allow := append(policy.BaselineEnvAllowlist(), p.Env.Allow...)
 
 	// A non-nil empty slice is load-bearing: a scrub policy that admits no vars
 	// and has an empty Set must yield an empty (not nil) env, because cmd.Env ==
@@ -816,7 +817,7 @@ func envNameMatches(name string, patterns []string) bool {
 	return false
 }
 
-// applySet forces the effectiveEnvPolicy.Set values onto an assembled env slice: an
+// applySet forces the policy.EnvPolicy.Set values onto an assembled env slice: an
 // existing KEY is overwritten in place (so no duplicate keys), and a new KEY is
 // appended. Newly appended keys are sorted for a deterministic result. env is
 // assumed to be freshly owned by the caller (os.Environ() or a freshly built

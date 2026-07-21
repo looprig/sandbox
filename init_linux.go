@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/policy"
 	"io"
 	"os"
 	"path/filepath"
@@ -45,7 +46,7 @@ const stage2SentinelValue = "1"
 // gob-encoded stage2Spec to the child. The parent appends the pipe's read end to
 // cmd.ExtraFiles, and since fds 0/1/2 are stdio, ExtraFiles[0] becomes fd 3 in
 // the child.
-const stage2SpecFD = 3
+const stage2SpecFD = policy.ReservedSpecFD
 
 // stage2FailExitCode is the child exit code used when stage-2 setup fails before
 // execve. It is non-zero so a fail-closed child is always distinguishable from a
@@ -78,10 +79,10 @@ type stage2Spec struct {
 	Env  []string // the scrubbed child environment the TARGET should see (KEY=VALUE)
 	// FSRules is the compiled, spawn-time-enumerated Landlock FS allowlist (Task
 	// 12a, SPEC §7.2 rung 2). The parent enumerates the policy's FS axis against
-	// the live filesystem at spawn (enumerateFSRules) and the stage-2 child
+	// the live filesystem at spawn (policy.EnumerateFSRules) and the stage-2 child
 	// rebuilds a go-landlock ruleset from it (applyLandlockRules) and restricts
-	// itself before chdir/execve. fsRule is a concrete, gob-encodable type.
-	FSRules []fsRule
+	// itself before chdir/execve. policy.FSRule is a concrete, gob-encodable type.
+	FSRules []policy.FSRule
 	// Seccomp requests the rung-2 seccomp-BPF filter (Task 12b, SPEC §7.2). When
 	// true the stage-2 child installs buildSeccompFilter() AFTER Landlock and
 	// BEFORE chdir/execve (installSeccompFilter), so the target inherits it across
@@ -92,11 +93,11 @@ type stage2Spec struct {
 	// §7.2, §5.2). When true the stage-2 child calls applyLandlockNet(NetTCPPorts)
 	// AFTER seccomp and BEFORE chdir/execve, confining TCP connect to NetTCPPorts
 	// (and denying all other TCP) — inherited across the execve. It is false only
-	// for open/unconfined egress (effectiveNetPolicy.Open), where TCP is left unrestricted.
+	// for open/unconfined egress (policy.NetPolicy.Open), where TCP is left unrestricted.
 	NetConfined bool
 	// NetTCPPorts are the TCP ports the target may connect to (Task 12c). An empty
 	// slice with NetConfined denies ALL TCP connect.
-	// []uint16 is gob-encodable; the rung-2 backend fills it from the effectiveNetPolicy.
+	// []uint16 is gob-encodable; the rung-2 backend fills it from the policy.NetPolicy.
 	NetTCPPorts []uint16
 	// Rung tags the confinement tier (Task 13, SPEC §7.2): stage2RungOne applies
 	// the namespaces + mount view + nftables below; stage2RungTwo (or the zero
@@ -270,10 +271,10 @@ func stage2Setup() error {
 		return &stage2Error{Op: "chdir " + spec.Dir, Err: err}
 	}
 
-	// resolveFS the executable path. syscall.Exec is a raw execve: unlike the
+	// policy.ResolveFS the executable path. syscall.Exec is a raw execve: unlike the
 	// exec.Command path that null/seatbelt use, it does NOT search PATH for a bare
 	// argv[0]. Without this, RunArgv([]string{"rg", ...}) would run on null/seatbelt
-	// but fail here — an unfaithful drop-in. resolveFS a name with no slash against
+	// but fail here — an unfaithful drop-in. policy.ResolveFS a name with no slash against
 	// the TARGET's PATH (spec.Env, not the parent's), so lookups match the confined
 	// environment. argv is passed through unchanged so the target still sees its
 	// invoked name in argv[0] (execve's path and argv[0] are independent).
