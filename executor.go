@@ -231,14 +231,8 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if executionID != "" {
 		defer e.proxy.Release(executionID)
 	}
-	return e.run(lease, dir, shellArgv(command), s)
+	return e.run(lease, dir, enforce.ShellArgv(command), s)
 }
-
-// shellArgv is the universal shell-normalization: running a command STRING means
-// executing /bin/sh -c <command> under confinement, on every backend. The enforce.Backend
-// wraps this inner argv (sandbox-exec prefix, stage-2 re-exec, or nothing); the
-// executor owns the shell form so the backends only ever wrap an argv.
-func shellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }
 
 // resolve returns the immutable compiled snapshot for one spawn.
 func (e *Executor) resolve() (snapshot, error) {
@@ -668,7 +662,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	s := snapshot{spec: spec, env: assembleEnv(pol), policy: pol}
 	e.grantMu.Unlock()
-	out, code, runErr := e.run(lease, canonicalCWD, shellArgv(command), s)
+	out, code, runErr := e.run(lease, canonicalCWD, enforce.ShellArgv(command), s)
 	var denial error
 	if len(proxyTargets) != 0 {
 		denial = e.proxy.Denial(executionID)

@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/darwin"
 	"github.com/looprig/sandbox/internal/enforce"
 )
 
@@ -16,4 +17,4 @@ import (
 // would silently drop all OS enforcement). A test may still pin the null enforce.Backend
 // through the unexported withBackend seam to keep executor UNIT tests
 // backend-independent.
-func platformBackend() (enforce.Backend, error) { return newSeatbeltBackend(), nil }
+func platformBackend() (enforce.Backend, error) { return darwin.NewBackend(), nil }

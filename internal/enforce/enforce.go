@@ -58,3 +58,9 @@ type Spec struct {
 type Backend interface {
 	Compile(p policy.Effective) (spec Spec, report profile.CompileReport, level uint8, guaranteeBits uint64, err error)
 }
+
+// ShellArgv is the universal shell-normalization: running a command STRING means
+// executing /bin/sh -c <command> under confinement, on every backend. The enforce.Backend
+// wraps this inner argv (sandbox-exec prefix, stage-2 re-exec, or nothing); the
+// executor owns the shell form so the backends only ever wrap an argv.
+func ShellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }

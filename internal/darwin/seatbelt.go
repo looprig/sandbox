@@ -1,10 +1,11 @@
 //go:build darwin
 
-package sandbox
+package darwin
 
 import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -56,20 +57,20 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 // last-match-wins — is verified end-to-end by the real-sandbox-exec enforcement
 // tests in backend_seatbelt_test.go (the goldens alone only prove byte-equality to
 // the Go/RE2 glob translation, not that SBPL's engine enforces it identically).
-func compileSBPL(p policy.Effective) (sbpl string, report CompileReport, level uint8, guaranteeBits uint64) {
+func compileSBPL(p policy.Effective) (sbpl string, report profile.CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
 
 	compileFS(&b, &report, p.FS)
 	compileNet(&b, &report, p.Net)
 
-	level = LevelFull
+	level = profile.LevelFull
 
 	if p.Net.Private {
 		// Private requests address-scoped egress, which SBPL cannot express
 		// (§5.2, M1): its AddressNetwork guarantee can never be satisfied, so the
 		// policy tops out at Degraded even though everything else is enforced.
-		level = LevelDegraded
+		level = profile.LevelDegraded
 	}
 
 	guaranteeBits = compileGuarantees(p)
@@ -78,7 +79,7 @@ func compileSBPL(p policy.Effective) (sbpl string, report CompileReport, level u
 
 // compileFS writes the filesystem section (SPEC §5.1, §7.5) into b, appending any
 // narrowing to report. See compileSBPL for the broad-to-narrow last-match-wins order.
-func compileFS(b *strings.Builder, report *CompileReport, fs []policy.FSEntry) {
+func compileFS(b *strings.Builder, report *profile.CompileReport, fs []policy.FSEntry) {
 	b.WriteString("; --- filesystem ---\n")
 	compileAncestorMetadata(b, fs)
 
@@ -151,7 +152,7 @@ func writeSeatbeltPathRule(b *strings.Builder, action string, access policy.FSAc
 	}
 }
 
-func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule policy.FSEntry) {
+func compileSeatbeltGlobRule(b *strings.Builder, report *profile.CompileReport, rule policy.FSEntry) {
 	// Glob allows are not part of the effective profile vocabulary; dropping one
 	// under-grants. Denies fail closed to a conservative fixed subtree if SBPL
 	// cannot represent the translated expression.
@@ -181,7 +182,7 @@ func compileSeatbeltGlobRule(b *strings.Builder, report *CompileReport, rule pol
 	if representable && strings.Contains(reSrc, `"`) {
 		detail = "deny glob contains a quote and was widened to a conservative subtree deny"
 	}
-	report.Entries = append(report.Entries, ReportEntry{
+	report.Entries = append(report.Entries, profile.ReportEntry{
 		Feature: "glob-deny", Status: "narrowed",
 		Detail: detail,
 	})
@@ -213,11 +214,11 @@ func compileAncestorMetadata(b *strings.Builder, fs []policy.FSEntry) {
 // compileNet writes the network section (SPEC §5.2, §7.1) into b using the
 // M1-verified syntax, appending unenforced/narrowed features to report. The base
 // preamble does not allow network, so default-deny holds unless rules are added.
-func compileNet(b *strings.Builder, report *CompileReport, net policy.NetPolicy) {
+func compileNet(b *strings.Builder, report *profile.CompileReport, net policy.NetPolicy) {
 	b.WriteString("; --- network ---\n")
 
 	if net.Open {
-		// Unconfined only. Everything else stays default-deny.
+		// profile.Unconfined only. Everything else stays default-deny.
 		b.WriteString("(allow network*)\n")
 		return
 	}
@@ -230,7 +231,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net policy.NetPolicy)
 	}
 	if net.Loopback {
 		b.WriteString(`(allow network-outbound (remote ip "localhost:*"))` + "\n")
-		report.Entries = append(report.Entries, ReportEntry{
+		report.Entries = append(report.Entries, profile.ReportEntry{
 			Feature: "loopback",
 			Status:  "narrowed",
 			Detail:  "SBPL 'localhost' matches all of this host's own addresses (loopback plus its own interface IPs) — wider than 127.0.0.0/8 — but never reaches a remote host",
@@ -242,7 +243,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net policy.NetPolicy)
 	if net.Private {
 		// Not expressible in SBPL (host token is * or localhost only); compile to
 		// blocked and record it (§5.2, M1).
-		report.Entries = append(report.Entries, ReportEntry{
+		report.Entries = append(report.Entries, profile.ReportEntry{
 			Feature: "address-network",
 			Status:  "unenforced",
 			Detail:  "SBPL cannot address-scope; Private compiled to blocked",
@@ -254,7 +255,7 @@ func compileNet(b *strings.Builder, report *CompileReport, net policy.NetPolicy)
 	if len(net.Ports) > 0 {
 		// The §5.4 metadata hard-deny cannot be expressed as a positive IP deny;
 		// it holds only vacuously when :80 is not in the allowed port set.
-		entry := ReportEntry{
+		entry := profile.ReportEntry{
 			Feature: "metadata-deny",
 			Status:  "vacuous",
 			Detail:  "SBPL cannot express an IP deny; metadata endpoints are blocked only vacuously because :80 is not in the allowed port set",
@@ -274,7 +275,7 @@ func compileGuarantees(p policy.Effective) uint64 {
 	var bits uint64
 
 	// sandbox-exec always wraps the spawn in an isolating boundary.
-	bits |= GuaranteeProcessBoundary
+	bits |= profile.GuaranteeProcessBoundary
 
 	// Writes are confined to policy-writable roots unless the policy itself grants
 	// write at "/" (unconfined full access), in which case nothing is confined and
@@ -282,28 +283,28 @@ func compileGuarantees(p policy.Effective) uint64 {
 	// demotion uses (one consistent probe), which also catches a "/"-matching
 	// write glob that a literal-"/" scan would miss.
 	if policy.IsAccessRestricted(p.FS, policy.WriteAccess) {
-		bits |= GuaranteeWriteBoundary
+		bits |= profile.GuaranteeWriteBoundary
 	}
 
 	// Reads are confined whenever the effective policy does not grant broad root
 	// read. All process-exec and file-read allows are emitted per configured root.
 	if policy.IsAccessRestricted(p.FS, policy.ReadAccess|policy.ExecAccess) {
-		bits |= GuaranteeReadBoundary
+		bits |= profile.GuaranteeReadBoundary
 	}
 
 	// The executor scrubs the child environment unless the policy inherits it
 	// (mirrors the null backend's honesty fix).
 	if !p.Env.Inherit {
-		bits |= GuaranteeEnvScrub
+		bits |= profile.GuaranteeEnvScrub
 	}
 
 	// Egress is default-deny + port/loopback/DNS allows, i.e. at least
 	// port-restricted, unless the policy opens the network entirely.
 	if !p.Net.Open {
-		bits |= GuaranteeNetworkBoundary
+		bits |= profile.GuaranteeNetworkBoundary
 	}
 	if p.Net.ProxyPort != 0 && !p.Net.Open {
-		bits |= GuaranteeTargetNetwork
+		bits |= profile.GuaranteeTargetNetwork
 	}
 
 	// AddressNetwork is FALSE always on macOS: SBPL cannot address-scope (§5.2,
@@ -374,7 +375,7 @@ func canonPath(p string) string {
 // the caller's symlink spelling to a Seatbelt operation, the cleaned configured
 // path second. Current macOS reports some /var/folders operations through the
 // raw /var alias even though other operations use /private/var. Emitting both
-// spellings confines access to the same configured filesystem object. Deny
+// spellings confines access to the same configured filesystem object. profile.Deny
 // callers use this helper too, so a writable alias cannot bypass a carveout.
 func seatbeltPathAliases(p string, alreadyCanonical bool) []string {
 	canonical := filepath.Clean(p)
@@ -430,7 +431,8 @@ func sbplString(s string) string {
 type seatbeltBackend struct{}
 
 // newSeatbeltBackend returns the stateless Seatbelt backend.
-func newSeatbeltBackend() enforce.Backend { return seatbeltBackend{} }
+// NewBackend returns the darwin Seatbelt enforcement backend.
+func NewBackend() enforce.Backend { return seatbeltBackend{} }
 
 // compile generates the SBPL profile for the policy and returns a enforce.Spec that
 // wraps every command/argv with `sandbox-exec -p <profile> -- ...`, plus the
@@ -441,7 +443,7 @@ func newSeatbeltBackend() enforce.Backend { return seatbeltBackend{} }
 // the future fallback is the temp-file `-f <path>` form of sandbox-exec, but the
 // inline form keeps the transform stateless (no temp file to create or clean up)
 // and is sufficient here.
-func (seatbeltBackend) Compile(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+func (seatbeltBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 	sbpl, report, level, bits := compileSBPL(p)
 	spec := enforce.Spec{
 		// Prepend the sandbox-exec launcher to the inner argv. The executor has
