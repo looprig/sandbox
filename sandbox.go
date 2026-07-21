@@ -2,8 +2,10 @@ package sandbox
 
 import (
 	"context"
+	"time"
 
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/exec"
 	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
@@ -124,3 +126,71 @@ func NewEgressRouteResolver(routes []EgressRoute, selector func(context.Context,
 // ErrSandboxUnavailable reports that no production OS confinement backend is
 // available on this host, so a Sandboxed profile cannot be honoured.
 var ErrSandboxUnavailable = enforce.ErrUnavailable
+
+// Executor ownership. The executor and the single-spawn grant tokens it mints
+// and verifies live in internal/exec; these are the names consumers use.
+type (
+	// Executor compiles a policy once and runs commands under it.
+	Executor = exec.Executor
+	// ExecutorSet owns per-key executors, their grant keys, and isolated HOMEs.
+	ExecutorSet = exec.ExecutorSet
+	// ExecutorSetOption configures executor ownership and resource limits.
+	ExecutorSetOption = exec.ExecutorSetOption
+)
+
+// NewExecutorSet creates one owner-only child beneath a required scratch root.
+func NewExecutorSet(p *Profile, options ...ExecutorSetOption) (*ExecutorSet, error) {
+	return exec.NewExecutorSet(p, options...)
+}
+
+// WithScratchRoot supplies the caller-owned parent for the set's owned child.
+func WithScratchRoot(path string) ExecutorSetOption { return exec.WithScratchRoot(path) }
+
+// WithMaxExecutors sets the hard number of memoized executor identities.
+func WithMaxExecutors(max int) ExecutorSetOption { return exec.WithMaxExecutors(max) }
+
+// WithGrantTTL sets the maximum lifetime of grants minted by every executor.
+func WithGrantTTL(duration time.Duration) ExecutorSetOption { return exec.WithGrantTTL(duration) }
+
+// WithEgressRoute configures the explicit route used by target-scoped grants.
+func WithEgressRoute(route EgressRoute) ExecutorSetOption { return exec.WithEgressRoute(route) }
+
+// Executor lifecycle sentinels.
+var (
+	ErrExecutorLimit     = exec.ErrExecutorLimit
+	ErrExecutorSetClosed = exec.ErrExecutorSetClosed
+	ErrExecutorClosed    = exec.ErrExecutorClosed
+)
+
+// Grant sentinels. Each is the single value raised anywhere in the module, so
+// errors.Is answers the same regardless of which layer refused.
+var (
+	ErrGrantMalformed             = exec.ErrGrantMalformed
+	ErrGrantBadMAC                = exec.ErrGrantBadMAC
+	ErrGrantExpired               = exec.ErrGrantExpired
+	ErrGrantWrongCommand          = exec.ErrGrantWrongCommand
+	ErrGrantWrongExecution        = exec.ErrGrantWrongExecution
+	ErrGrantWrongWorkingDirectory = exec.ErrGrantWrongWorkingDirectory
+	ErrGrantProfileMismatch       = exec.ErrGrantProfileMismatch
+	ErrGrantGuaranteeMismatch     = exec.ErrGrantGuaranteeMismatch
+	ErrGrantRouteMismatch         = exec.ErrGrantRouteMismatch
+	ErrGrantTargetChanged         = exec.ErrGrantTargetChanged
+	ErrGrantReplay                = exec.ErrGrantReplay
+	ErrGrantRequired              = exec.ErrGrantRequired
+	ErrGrantDenied                = exec.ErrGrantDenied
+	ErrGrantUnsupported           = exec.ErrGrantUnsupported
+)
+
+// Grant enforcement-class identifiers. These string VALUES are the shipped
+// wire contract between this module and whatever mints grants against it.
+const (
+	GrantClassCommandStart        = exec.GrantClassCommandStart
+	GrantClassNetworkProxyTarget  = exec.GrantClassNetworkProxyTarget
+	GrantClassNetworkBroad        = exec.GrantClassNetworkBroad
+	GrantClassFilesystemPathRead  = exec.GrantClassFilesystemPathRead
+	GrantClassFilesystemTreeRead  = exec.GrantClassFilesystemTreeRead
+	GrantClassFilesystemHostRead  = exec.GrantClassFilesystemHostRead
+	GrantClassFilesystemPathWrite = exec.GrantClassFilesystemPathWrite
+	GrantClassFilesystemTreeWrite = exec.GrantClassFilesystemTreeWrite
+	GrantClassFilesystemHostWrite = exec.GrantClassFilesystemHostWrite
+)
