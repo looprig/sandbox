@@ -117,6 +117,113 @@ only that exact command and one spawn. `Allow` starts require no token, `Deny`
 never mints one, and command plus filesystem/network requirements share one
 combined approval rather than opening a second prompt.
 
+## The gate seam: using `Gated` standalone
+
+There is **no gate interface to implement**. This module deliberately defines no
+`Gate`, `Approver`, or `Prompter` type, because doing so would drag an approval
+model — prompts, rule files, TTLs, persistence — into a package whose only job
+is OS confinement. Instead `Gated` is wired through two plain method calls, and
+everything between them is yours.
+
+**1. Ask the profile.** `AccessFor` is the read side. It is dependency-free and
+answers with the fixed numeric `Access` for a normalized capability:
+
+```go
+if p.AccessVersion() != 1 {
+	return errors.New("unsupported profile ABI") // fail closed on an unknown version
+}
+access, err := p.AccessFor("filesystem.write", "/srv/app/build")
+// access is 0 Deny, 1 Gated, 2 Allow
+```
+
+| `kind` | valid `scope` | meaning |
+| --- | --- | --- |
+| `command.execute` | `""` | may a command start at all |
+| `network` | `""` | may the process reach the network |
+| `filesystem.read` | `/abs/path` | read at one exact path |
+| `filesystem.read` | `tree:/abs/path` | read anywhere under a configured root |
+| `filesystem.read` | `host:*` | read anywhere outside the configured roots |
+| `filesystem.write` | same three scopes | the write equivalents |
+
+Unknown kinds, malformed scopes, a `tree:` scope naming a path that is not a
+configured root, and an unconstructed profile all return an error rather than a
+permissive value.
+
+**2. Run your own approval.** `Deny` is final and `Allow` needs nothing, so only
+`Gated` reaches your gate. What happens there is entirely your product's
+business: an interactive prompt, a saved rule, a policy server, a CI allowlist.
+This module never sees it.
+
+You cannot get this step wrong by accident. `IssueGrant` does not trust the
+caller to have asked: it re-reads `AccessFor(kind, scope)` itself and refuses
+anything that is not `Gated` — `ErrGrantDenied` for `Deny`, `ErrGrantUnsupported`
+for `Allow`. A bug in your gate therefore fails closed rather than minting
+authority the profile never offered.
+
+**3. Tell the executor.** Once *you* have decided yes, mint a token and spend it:
+
+```go
+token, err := executor.IssueGrant(ctx,
+	executionID,      // your identifier for this one execution
+	"go build ./...", // the exact normalized command
+	"/srv/app",       // canonical working directory
+	"filesystem.write", "/srv/app/build",     // the kind/scope you approved
+	sandbox.GrantClassFilesystemPathWrite,    // the enforcement class
+	"/srv/app/build",                         // the normalized target
+	time.Now().Add(30*time.Second).UnixMilli(),
+)
+out, code, err := executor.RunCommandWithGrants(ctx, executionID, "/srv/app", "go build ./...", []string{token})
+```
+
+`class` selects the enforcement, and `scope`/`target` must agree with it exactly
+or the mint fails closed:
+
+| class | `kind` | `scope` | `target` |
+| --- | --- | --- | --- |
+| `command.start.v1` | `command.execute` | `""` | the exact normalized command |
+| `filesystem.path.read.v1` | `filesystem.read` | `/abs/path` | the same `/abs/path` |
+| `filesystem.path.write.v1` | `filesystem.write` | `/abs/path` | the same `/abs/path` |
+| `filesystem.tree.read.v1` | `filesystem.read` | `tree:/abs/path` | `/abs/path` |
+| `filesystem.tree.write.v1` | `filesystem.write` | `tree:/abs/path` | `/abs/path` |
+| `filesystem.host.read.v1` | `filesystem.read` | `host:*` | `host:*` |
+| `filesystem.host.write.v1` | `filesystem.write` | `host:*` | `host:*` |
+| `network.proxy-target.v1` | `network` | `""` | `tcp:host:port` |
+| `network.broad.v1` | `network` | `""` | `tcp:*:port` |
+
+Use the exported `sandbox.GrantClass*` constants rather than the literals: the
+strings are the shipped enforcement contract, and the constants are what a
+rename is checked against.
+
+### Errors your gate keys on
+
+`RunCommand` is the shortest path — it needs no execution ID and no tokens — and
+it tells you when a gate is required:
+
+- `ErrGrantRequired` — a capability is `Gated` and no token covered it. **This is
+  the signal to open your gate**, then retry via `RunCommandWithGrants`.
+- `ErrGrantDenied` — the capability is `Deny`. Do not prompt; there is nothing a
+  user could approve.
+- `ErrGrantExpired`, `ErrGrantReplay`, `ErrGrantWrongCommand`,
+  `ErrGrantWrongExecution`, `ErrGrantWrongWorkingDirectory` — the token did not
+  bind to this spawn. Treat these as bugs in the calling code, not as prompts.
+- `ErrGrantTargetChanged` — the granted path was replaced or symlink-swapped
+  between approval and spawn. Never retry automatically.
+
+Match them with `errors.Is`.
+
+### What a token is, and is not
+
+A token is a single-spawn capability, not a saved permission. It is bound to the
+executor, execution ID, exact command, canonical working directory, profile
+fingerprint, route fingerprint, achieved guarantees, class, normalized target,
+and expiry — and for filesystem classes, to the identity of the target's deepest
+existing ancestor. It is consumed by one spawn and then refused as a replay.
+
+So a durable rule in *your* system ("always allow `go build` in this workspace")
+is perfectly reasonable; it just means your gate answers without asking a human.
+It never means a longer-lived token. Persistence belongs to you; enforcement
+belongs here.
+
 ## Target-scoped network enforcement
 
 On macOS, target-scoped HTTP and HTTPS traffic uses an authenticated loopback
