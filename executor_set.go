@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/looprig/sandbox/pkg/profile"
 )
 
 var (
@@ -55,6 +57,7 @@ func WithEgressRoute(route EgressRoute) ExecutorSetOption {
 type ExecutorSet struct {
 	mu        sync.Mutex
 	profile   *Profile
+	settings  profile.Settings
 	ownedRoot string
 	max       int
 	executor  executorConfig
@@ -67,8 +70,8 @@ type ExecutorSet struct {
 }
 
 // NewExecutorSet creates one owner-only child beneath a required scratch root.
-func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSet, error) {
-	if err := profile.validate(); err != nil {
+func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, error) {
+	if err := prof.Validate(); err != nil {
 		return nil, err
 	}
 	var config executorSetConfig
@@ -91,7 +94,7 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 			return nil, err
 		}
 	}
-	scratch, err := canonicalRoot(config.scratchRoot)
+	scratch, err := profile.CanonicalRoot(config.scratchRoot)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: executor set scratch root: %w", err)
 	}
@@ -104,7 +107,7 @@ func NewExecutorSet(profile *Profile, options ...ExecutorSetOption) (*ExecutorSe
 		return nil, fmt.Errorf("sandbox: secure executor set root: %w", err)
 	}
 	return &ExecutorSet{
-		profile: profile, ownedRoot: owned, max: config.max,
+		profile: prof, settings: prof.Settings(), ownedRoot: owned, max: config.max,
 		executor:  config.executor,
 		route:     config.route,
 		executors: make(map[string]*Executor),
@@ -139,7 +142,7 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	}
 	var home string
 	var ownedHome bool
-	if set.profile.home == RealHome {
+	if set.settings.Home == RealHome {
 		home, err = realHome()
 	} else {
 		home, err = os.MkdirTemp(set.ownedRoot, "home-")

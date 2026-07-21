@@ -78,7 +78,7 @@ func TestSeatbeltProfileCarvesNarrowerRootAxesFromHostAllow(t *testing.T) {
 	}
 	sbpl, _, _, _ := compileSBPL(policy)
 	rootAllow := `(allow file-read* (subpath "/"))`
-	workspacePath := sbplString(profile.workspaceRoot)
+	workspacePath := sbplString(profile.Settings().WorkspaceRoot)
 	for _, deny := range []string{
 		`(deny file-read* (subpath "` + workspacePath + `"))`,
 		`(deny process-exec (subpath "` + workspacePath + `"))`,

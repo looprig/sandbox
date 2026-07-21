@@ -1,4 +1,4 @@
-package sandbox
+package profile
 
 // ReportEntry records how one requested feature was compiled by a backend.
 type ReportEntry struct {
@@ -41,7 +41,8 @@ const (
 	GuaranteeTargetNetwork
 )
 
-func guaranteesFromBits(bits uint64) Guarantees {
+// GuaranteesFromBits expands a backend guarantee bitmask into its named form.
+func GuaranteesFromBits(bits uint64) Guarantees {
 	return Guarantees{
 		ProcessBoundary: bits&GuaranteeProcessBoundary != 0,
 		WriteBoundary:   bits&GuaranteeWriteBoundary != 0,
@@ -54,7 +55,8 @@ func guaranteesFromBits(bits uint64) Guarantees {
 	}
 }
 
-func (g Guarantees) bits() uint64 {
+// Bits packs named guarantees back into the bitmask backends report.
+func (g Guarantees) Bits() uint64 {
 	var bits uint64
 	if g.ProcessBoundary {
 		bits |= GuaranteeProcessBoundary

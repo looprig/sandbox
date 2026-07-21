@@ -77,16 +77,17 @@ const (
 	nullDevicePath = "/dev/null"
 )
 
-func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
-	if err := profile.validate(); err != nil {
+func compileEffectivePolicy(prof *Profile) (effectivePolicy, error) {
+	if err := prof.Validate(); err != nil {
 		return effectivePolicy{}, err
 	}
+	settings := prof.Settings()
 	p := effectivePolicy{
-		Workspace: profile.workspaceRoot,
-		Isolation: profile.isolation,
-		Home:      profile.home,
+		Workspace: settings.WorkspaceRoot,
+		Isolation: settings.Isolation,
+		Home:      settings.Home,
 	}
-	if profile.isolation == Unconfined {
+	if settings.Isolation == Unconfined {
 		p.FS = []fsEntry{{Path: string(filepath.Separator), Access: readFSAccess | writeFSAccess | execFSAccess}}
 		p.Net.Open = true
 		return p, nil
@@ -94,12 +95,12 @@ func compileEffectivePolicy(profile *Profile) (effectivePolicy, error) {
 
 	p.FS = append(p.FS, minimalRuntimeEntries()...)
 	p.FS = append(p.FS, fsEntry{Path: nullDevicePath, Access: readFSAccess | writeFSAccess, Exact: true})
-	appendRootAccess(&p.FS, profile.workspaceRoot, profile.workspaceRead, profile.workspaceWrite)
-	for _, root := range profile.additionalRoots {
+	appendRootAccess(&p.FS, settings.WorkspaceRoot, settings.WorkspaceRead, settings.WorkspaceWrite)
+	for _, root := range settings.AdditionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
 	}
-	appendRootAccess(&p.FS, string(filepath.Separator), profile.hostRead, profile.hostWrite)
-	if profile.network == Allow {
+	appendRootAccess(&p.FS, string(filepath.Separator), settings.HostRead, settings.HostWrite)
+	if settings.Network == Allow {
 		p.Net.Open = true
 	}
 	return p, nil

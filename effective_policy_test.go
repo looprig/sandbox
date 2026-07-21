@@ -24,20 +24,20 @@ func TestCompileEffectivePolicyDenyAndGatedStayClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compileEffectivePolicy: %v", err)
 	}
-	if got := resolveFS(policy.FS, profile.workspaceRoot); got != denyFSAccess {
+	if got := resolveFS(policy.FS, profile.Settings().WorkspaceRoot); got != denyFSAccess {
 		t.Fatalf("workspace access = %d, want denied until grant", got)
 	}
-	if got := resolveFS(policy.FS, profile.additionalRoots[0].Path); got != denyFSAccess {
+	if got := resolveFS(policy.FS, profile.Settings().AdditionalRoots[0].Path); got != denyFSAccess {
 		t.Fatalf("additional-root access = %d, want denied until grant", got)
 	}
 	if !netBlocked(policy) {
 		t.Fatalf("network policy = %#v, want blocked until grant", policy.Net)
 	}
 	want := GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub
-	if profile.requiredGuarantees&want != want {
-		t.Fatalf("required guarantees = %#b, want at least %#b", profile.requiredGuarantees, want)
+	if profile.Settings().RequiredGuarantees&want != want {
+		t.Fatalf("required guarantees = %#b, want at least %#b", profile.Settings().RequiredGuarantees, want)
 	}
-	if resolveFS(policy.FS, filepath.Join(profile.workspaceRoot, ".env")) != denyFSAccess {
+	if resolveFS(policy.FS, filepath.Join(profile.Settings().WorkspaceRoot, ".env")) != denyFSAccess {
 		t.Fatal("denied workspace unexpectedly readable")
 	}
 }
@@ -54,7 +54,7 @@ func TestCompileEffectivePolicyAllow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{profile.workspaceRoot, profile.additionalRoots[0].Path} {
+	for _, path := range []string{profile.Settings().WorkspaceRoot, profile.Settings().AdditionalRoots[0].Path} {
 		got := resolveFS(policy.FS, path)
 		want := readFSAccess | writeFSAccess | execFSAccess
 		if got != want {
@@ -64,7 +64,7 @@ func TestCompileEffectivePolicyAllow(t *testing.T) {
 	if !policy.Net.Open {
 		t.Fatal("Network Allow did not compile to open base egress")
 	}
-	if got := resolveFS(policy.FS, filepath.Join(profile.workspaceRoot, ".git")); got&writeFSAccess == 0 {
+	if got := resolveFS(policy.FS, filepath.Join(profile.Settings().WorkspaceRoot, ".git")); got&writeFSAccess == 0 {
 		t.Fatal("compiler retained an implicit .git carveout")
 	}
 }
@@ -120,9 +120,9 @@ func TestCompileEffectivePolicyPreservesIndependentRootPrecedence(t *testing.T) 
 			}
 			target := test.path
 			if target == workspace {
-				target = profile.workspaceRoot
+				target = profile.Settings().WorkspaceRoot
 			} else if target == additional {
-				target = profile.additionalRoots[0].Path
+				target = profile.Settings().AdditionalRoots[0].Path
 			}
 			got := resolveFS(policy.FS, target)
 			if read := got&readFSAccess != 0; read != test.wantRead {

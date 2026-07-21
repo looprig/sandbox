@@ -478,7 +478,7 @@ func TestGrantRejectsCWDProfileAndRouteDrift(t *testing.T) {
 	profileExecutor := newExecutor()
 	profileToken := issueTestGrant(t, profileExecutor, now, "exec-profile", "true", workspace,
 		"command.execute", "", "command.start.v1", "true")
-	profileExecutor.profile.fingerprint = "drifted"
+	profileExecutor.settings.Fingerprint = "drifted"
 	if _, _, err := profileExecutor.RunCommandWithGrants(context.Background(), "exec-profile", workspace, "true", []string{profileToken}); !errors.Is(err, ErrGrantProfileMismatch) {
 		t.Fatalf("profile drift error = %v, want ErrGrantProfileMismatch", err)
 	}

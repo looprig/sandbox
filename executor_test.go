@@ -205,7 +205,7 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 		if bits&^all != 0 {
 			continue // skip values with bits outside the defined set
 		}
-		if got := guaranteesFromBits(bits).bits(); got != bits {
+		if got := guaranteesFromBits(bits).Bits(); got != bits {
 			t.Fatalf("round-trip bits %#b -> struct -> %#b, want identity", bits, got)
 		}
 	}
@@ -229,7 +229,7 @@ func TestGuaranteesFromBitsRoundTrip(t *testing.T) {
 		if !c.get(g) {
 			t.Errorf("bit %#b did not set its matching field: %+v", c.bit, g)
 		}
-		if g.bits() != c.bit {
+		if g.Bits() != c.bit {
 			t.Errorf("single-bit %#b lit extra fields: %+v", c.bit, g)
 		}
 	}

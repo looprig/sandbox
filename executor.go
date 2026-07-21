@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/looprig/sandbox/pkg/profile"
 )
 
 // defaultGrantTTL is the lifetime of a minted grant token when WithGrantTTL is
@@ -66,7 +68,11 @@ type executorConfig struct {
 // report, the achieved level and guarantee bits, and the assembled child
 // environment — everything a spawn needs, precomputed at construction.
 type Executor struct {
-	profile       *Profile
+	profile *Profile
+	// settings is the snapshot of profile's normalized authority, taken once at
+	// construction because a Profile is immutable. It is the read path for every
+	// authority check on the spawn hot path.
+	settings      profile.Settings
 	policy        effectivePolicy
 	backend       backend
 	spec          spawnSpec
@@ -100,15 +106,23 @@ type snapshot struct {
 
 // newExecutor is the internal direct-construction seam for focused unit tests.
 // Production ownership always enters through ExecutorSet.
-func newExecutor(profile *Profile, config executorConfig) (*Executor, error) {
-	p, err := compileEffectivePolicy(profile)
+func newExecutor(prof *Profile, config executorConfig) (*Executor, error) {
+	p, err := compileEffectivePolicy(prof)
 	if err != nil {
 		return nil, err
 	}
-	return newExecutorFromEffective(profile, p, config)
+	return newExecutorFromEffective(prof, p, config)
 }
 
-func newExecutorFromEffective(profile *Profile, p effectivePolicy, config executorConfig) (*Executor, error) {
+func newExecutorFromEffective(prof *Profile, p effectivePolicy, config executorConfig) (*Executor, error) {
+	// The profile is immutable, so its normalized authority is snapshotted once
+	// here and read from the Executor thereafter. A nil profile — only reachable
+	// from the unexported unit-test seam — yields the zero Settings, whose every
+	// Access is Deny and whose required guarantees are empty.
+	var settings profile.Settings
+	if prof != nil {
+		settings = prof.Settings()
+	}
 	// Backend selection: platformBackend() for production; a test may pin one via
 	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
 	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
@@ -116,7 +130,7 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, config execut
 	// closed rather than building an executor that would spawn incorrectly.
 	b := config.backend
 	if b == nil {
-		if profile != nil && profile.isolation == Unconfined {
+		if prof != nil && settings.Isolation == Unconfined {
 			b = newNullBackend()
 		} else {
 			var berr error
@@ -130,8 +144,8 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, config execut
 	if err != nil {
 		return nil, err
 	}
-	if profile != nil {
-		missing := profile.requiredGuarantees &^ bits
+	if prof != nil {
+		missing := settings.RequiredGuarantees &^ bits
 		if missing != 0 {
 			return nil, fmt.Errorf("%w: backend missing required guarantees %#x", ErrSandboxUnavailable, missing)
 		}
@@ -147,7 +161,8 @@ func newExecutorFromEffective(profile *Profile, p effectivePolicy, config execut
 		lifecycle = newExecutorLifecycle()
 	}
 	return &Executor{
-		profile:          profile,
+		profile:          prof,
+		settings:         settings,
 		policy:           p,
 		backend:          b,
 		spec:             spec,
@@ -269,7 +284,7 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 }
 
 func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
-	if e.profile == nil || e.profile.network != Allow || e.proxy == nil {
+	if e.profile == nil || e.settings.Network != Allow || e.proxy == nil {
 		return s, "", nil
 	}
 	random := make([]byte, 18)
@@ -391,7 +406,7 @@ func (e *Executor) Report() CompileReport {
 
 // Guarantees returns the rich per-property statement of what the backend
 // actually enforced. Each field is fail-closed.
-func (e *Executor) Guarantees() Guarantees { return guaranteesFromBits(e.GuaranteeBits()) }
+func (e *Executor) Guarantees() Guarantees { return profile.GuaranteesFromBits(e.GuaranteeBits()) }
 
 // GuaranteeBits returns the same guarantees as the seam-facing bitmask so a
 // consumer can probe interface{ GuaranteeBits() uint64 } without importing this
@@ -412,7 +427,7 @@ func (e *Executor) commandAccess() error {
 	if e.profile == nil {
 		return nil
 	}
-	switch e.profile.command {
+	switch e.settings.Command {
 	case Allow:
 		return nil
 	case Gated:
@@ -435,7 +450,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if e == nil || e.profile == nil || e.profile.validate() != nil {
+	if e == nil || e.profile == nil || e.profile.Validate() != nil {
 		return "", ErrInvalidProfile
 	}
 	if !validGrantText(executionID) || !validGrantText(command) {
@@ -496,7 +511,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	}
 	return mintGrant(e.grantKey, grantPayload{
 		ExecutionID: executionID, Command: command, WorkingDirectory: canonicalCWD,
-		ProfileFingerprint: e.profile.fingerprint, RouteFingerprint: e.routeFingerprint,
+		ProfileFingerprint: e.settings.Fingerprint, RouteFingerprint: e.routeFingerprint,
 		GuaranteeBits: e.guaranteeBits, Class: class, Target: target,
 		PathBinding: pathBinding, ExpiryUnixMilli: expiryUnixMilli, Nonce: nonce,
 	})
@@ -538,7 +553,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
 	seen := make(map[[32]byte]int64, len(grants))
-	commandGrant := e.profile.command == Allow
+	commandGrant := e.settings.Command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
 	var pathHandles grantPathHandleSet
@@ -556,7 +571,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		if err != nil {
 			return nil, -1, err
 		}
-		if err := verifyGrantBinding(payload, now, executionID, command, canonicalCWD, e.profile.fingerprint, e.routeFingerprint, e.guaranteeBits); err != nil {
+		if err := verifyGrantBinding(payload, now, executionID, command, canonicalCWD, e.settings.Fingerprint, e.routeFingerprint, e.guaranteeBits); err != nil {
 			return nil, -1, err
 		}
 		seen[id] = payload.ExpiryUnixMilli
@@ -604,7 +619,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			proxyTargets = append(proxyTargets, *delta.target)
 		}
 	}
-	if e.profile.command == Deny {
+	if e.settings.Command == Deny {
 		return nil, -1, ErrGrantDenied
 	}
 	if !commandGrant {

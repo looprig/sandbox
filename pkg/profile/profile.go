@@ -1,4 +1,4 @@
-package sandbox
+package profile
 
 import (
 	"crypto/sha256"
@@ -85,7 +85,7 @@ type Profile struct {
 
 // NewProfile validates, canonicalizes, and owns a copy of config.
 func NewProfile(config ProfileConfig) (*Profile, error) {
-	workspace, err := canonicalRoot(config.WorkspaceRoot)
+	workspace, err := CanonicalRoot(config.WorkspaceRoot)
 	if err != nil {
 		return nil, fmt.Errorf("%w: workspace root: %v", ErrInvalidProfile, err)
 	}
@@ -114,7 +114,7 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		if !validAccess(root.Read) || !validAccess(root.Write) {
 			return nil, fmt.Errorf("%w: additional root %d has unknown access", ErrInvalidProfile, i)
 		}
-		path, err := canonicalRoot(root.Path)
+		path, err := CanonicalRoot(root.Path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: additional root %d: %v", ErrInvalidProfile, i, err)
 		}
@@ -158,7 +158,9 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 	return p, nil
 }
 
-func canonicalRoot(path string) (string, error) {
+// CanonicalRoot resolves path to an absolute, symlink-free, existing
+// directory. It is the canonicalization every configured root is held to.
+func CanonicalRoot(path string) (string, error) {
 	if path == "" {
 		return "", errors.New("path is empty")
 	}
@@ -181,7 +183,9 @@ func canonicalRoot(path string) (string, error) {
 
 func validAccess(access Access) bool { return access <= Allow }
 
-func (p *Profile) validate() error {
+// Validate reports whether p was constructed by NewProfile and carries the
+// current ABI. It returns ErrInvalidProfile for a nil, zero, or stale Profile.
+func (p *Profile) Validate() error {
 	if p == nil || p.version != currentAccessVersion || p.workspaceRoot == "" || p.fingerprint == "" {
 		return ErrInvalidProfile
 	}
@@ -220,7 +224,7 @@ func (p *Profile) AccessVersion() uint16 {
 
 // AccessFor returns the fixed numeric Access value for a normalized kind/scope.
 func (p *Profile) AccessFor(kind, scope string) (uint8, error) {
-	if err := p.validate(); err != nil {
+	if err := p.Validate(); err != nil {
 		return 0, err
 	}
 	switch kind {
@@ -278,7 +282,7 @@ func (p *Profile) isConfiguredRoot(path string) bool {
 func (p *Profile) accessAtPath(write bool, path string) Access {
 	bestPath := ""
 	var best Access
-	if pathWithin(path, p.workspaceRoot) {
+	if PathWithin(path, p.workspaceRoot) {
 		bestPath = p.workspaceRoot
 		if write {
 			best = p.workspaceWrite
@@ -287,7 +291,7 @@ func (p *Profile) accessAtPath(write bool, path string) Access {
 		}
 	}
 	for _, root := range p.additionalRoots {
-		if pathWithin(path, root.Path) && len(root.Path) > len(bestPath) {
+		if PathWithin(path, root.Path) && len(root.Path) > len(bestPath) {
 			bestPath = root.Path
 			if write {
 				best = root.Write
@@ -305,7 +309,8 @@ func (p *Profile) accessAtPath(write bool, path string) Access {
 	return p.hostRead
 }
 
-func pathWithin(path, root string) bool {
+// PathWithin reports whether path is root itself or lies beneath it.
+func PathWithin(path, root string) bool {
 	if root == string(filepath.Separator) {
 		return true
 	}
@@ -314,7 +319,7 @@ func pathWithin(path, root string) bool {
 
 // Fingerprint returns the deterministic digest of all normalized authority.
 func (p *Profile) Fingerprint() string {
-	if p == nil || p.validate() != nil {
+	if p == nil || p.Validate() != nil {
 		return ""
 	}
 	return p.fingerprint
@@ -350,10 +355,10 @@ func profileFingerprint(p *Profile) (string, error) {
 
 // Restrict returns the component-wise intersection of base and ceiling.
 func Restrict(base, ceiling *Profile) (*Profile, error) {
-	if err := base.validate(); err != nil {
+	if err := base.Validate(); err != nil {
 		return nil, err
 	}
-	if err := ceiling.validate(); err != nil {
+	if err := ceiling.Validate(); err != nil {
 		return nil, err
 	}
 	if base.workspaceRoot != ceiling.workspaceRoot {

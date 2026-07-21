@@ -26,8 +26,8 @@ func TestCompiledFSPreservesRealProfileAxisPrecedence(t *testing.T) {
 		path                string
 		wantRead, wantWrite bool
 	}{
-		{"workspace independent axes", profile.workspaceRoot, false, true},
-		{"additional independent axes", profile.additionalRoots[0].Path, true, false},
+		{"workspace independent axes", profile.Settings().WorkspaceRoot, false, true},
+		{"additional independent axes", profile.Settings().AdditionalRoots[0].Path, true, false},
 		{"host access outside carveouts", outside, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

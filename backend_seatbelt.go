@@ -54,7 +54,7 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 // last-match-wins — is verified end-to-end by the real-sandbox-exec enforcement
 // tests in backend_seatbelt_test.go (the goldens alone only prove byte-equality to
 // the Go/RE2 glob translation, not that SBPL's engine enforces it identically).
-func compileSBPL(p effectivePolicy) (profile string, report CompileReport, level uint8, guaranteeBits uint64) {
+func compileSBPL(p effectivePolicy) (sbpl string, report CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
 
@@ -461,7 +461,7 @@ func newSeatbeltBackend() backend { return seatbeltBackend{} }
 // inline form keeps the transform stateless (no temp file to create or clean up)
 // and is sufficient here.
 func (seatbeltBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uint8, uint64, error) {
-	profile, report, level, bits := compileSBPL(p)
+	sbpl, report, level, bits := compileSBPL(p)
 	spec := spawnSpec{
 		// Prepend the sandbox-exec launcher to the inner argv. The executor has
 		// already shell-normalized a RunCommand to innerArgv == /bin/sh -c command,
@@ -471,7 +471,7 @@ func (seatbeltBackend) compile(p effectivePolicy) (spawnSpec, CompileReport, uin
 		// there are no per-spawn resources, so configure and cleanup are nil.
 		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 			wrapped := make([]string, 0, 4+len(innerArgv))
-			wrapped = append(wrapped, "/usr/bin/sandbox-exec", "-p", profile, "--")
+			wrapped = append(wrapped, "/usr/bin/sandbox-exec", "-p", sbpl, "--")
 			wrapped = append(wrapped, innerArgv...)
 			return wrapped, nil, nil
 		},

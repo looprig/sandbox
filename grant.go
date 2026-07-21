@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/looprig/sandbox/pkg/profile"
 )
 
 const (
@@ -132,7 +134,7 @@ func authenticateGrant(key []byte, token string) (grantPayload, error) {
 func grantID(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 
 func canonicalWorkingDirectory(path string) (string, error) {
-	return canonicalRoot(path)
+	return profile.CanonicalRoot(path)
 }
 
 func canonicalGrantPath(path string) (string, error) {
