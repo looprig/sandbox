@@ -111,6 +111,9 @@ const plantedSecretKey = "LRSANDBOXTEST_PLANTED_SECRET"
 
 // plantedSecretVal is the sentinel value written to plantedSecretKey. The suite
 // asserts this exact string never reaches a scrubbed child.
+// #nosec G101 -- this is the opposite of a credential: it is the sentinel the
+// suite plants in the parent environment precisely to assert it never reaches
+// a scrubbed child. It grants nothing and authenticates to nothing.
 const plantedSecretVal = "lrsandboxtest-must-not-leak"
 
 // RunSuite runs the full conformance suite against newSUT under a named subtest.

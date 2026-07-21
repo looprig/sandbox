@@ -311,27 +311,6 @@ func compileGuarantees(p policy.Effective) uint64 {
 	return bits
 }
 
-// underWritableRoot reports whether path is nested strictly inside one of the
-// writable-root entries, i.e. it is a carveout that must have write removed.
-func underWritableRoot(path string, writableRoots []policy.FSEntry) bool {
-	for _, w := range writableRoots {
-		if w.Path != path && policy.LiteralMatches(w.Path, path, false) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasDenyEntry reports whether the policy carries any deny entry.
-func hasDenyEntry(fs []policy.FSEntry) bool {
-	for _, e := range fs {
-		if e.Access == policy.DenyAccess {
-			return true
-		}
-	}
-	return false
-}
-
 // conservativeDenyRoot returns the broadest safe subpath to deny for an
 // untranslatable glob: its literal prefix (the substring before the first glob
 // metacharacter), or "/" when there is no usable absolute prefix. Denying a

@@ -182,8 +182,8 @@ type FSRule struct {
 	IsDir          bool
 }
 
-func (rule FSRule) writable() bool { return rule.Access&WriteAccess != 0 }
-
+// EnumerateFSRules compiles the rule set for a policy carrying no grant path
+// handles, closing the descriptors the enumeration opened.
 func EnumerateFSRules(compiled CompiledFS) []FSRule {
 	rules, files, _ := EnumerateFSRulesWithPathHandles(compiled, nil)
 	CloseRuleFiles(files)

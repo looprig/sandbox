@@ -104,6 +104,9 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: create executor set root: %w", err)
 	}
+	// #nosec G302 -- 0700 is correct for a DIRECTORY: G302 assumes a regular
+	// file, but stripping the owner execute bit here would make the directory
+	// non-traversable and unusable. 0700 is already owner-only.
 	if err := os.Chmod(owned, 0o700); err != nil {
 		_ = os.RemoveAll(owned)
 		return nil, fmt.Errorf("sandbox: secure executor set root: %w", err)
@@ -150,6 +153,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		home, err = os.MkdirTemp(set.ownedRoot, "home-")
 		ownedHome = err == nil
 		if err == nil {
+			// #nosec G302 -- 0700 is correct for a DIRECTORY: G302 assumes a regular
+			// file, but stripping the owner execute bit here would make the directory
+			// non-traversable and unusable. 0700 is already owner-only.
 			err = os.Chmod(home, 0o700)
 		}
 	}
@@ -161,6 +167,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	}
 	tmp, err := os.MkdirTemp(set.ownedRoot, "tmp-")
 	if err == nil {
+		// #nosec G302 -- 0700 is correct for a DIRECTORY: G302 assumes a regular
+		// file, but stripping the owner execute bit here would make the directory
+		// non-traversable and unusable. 0700 is already owner-only.
 		err = os.Chmod(tmp, 0o700)
 	}
 	if err != nil {
@@ -264,16 +273,6 @@ func (set *ExecutorSet) Close() error {
 	close(set.closeDone)
 	set.mu.Unlock()
 	return err
-}
-
-func (e *Executor) revoke() {
-	if e == nil {
-		return
-	}
-	e.lifecycle.beginClose()
-	e.markClosed()
-	e.lifecycle.wait()
-	e.revokeResources()
 }
 
 func (e *Executor) markClosed() {

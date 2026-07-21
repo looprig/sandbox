@@ -57,12 +57,3 @@ func (*testPassthroughBackend) compile(p policy.Effective) (spawnSpec, CompileRe
 		return argv, nil, nil
 	}}, CompileReport{}, LevelNone, bits, nil
 }
-
-func containsStr(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}

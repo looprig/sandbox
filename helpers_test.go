@@ -17,10 +17,6 @@ func mustProfile(t *testing.T, config ProfileConfig) *Profile {
 	return testsupport.MustProfile(t, config)
 }
 
-func unconfinedConfig(workspace string, ack bool) ProfileConfig {
-	return testsupport.UnconfinedConfig(workspace, ack)
-}
-
 func pathWithin(path, root string) bool { return profile.PathWithin(path, root) }
 
 func canonicalRoot(path string) (string, error) { return profile.CanonicalRoot(path) }

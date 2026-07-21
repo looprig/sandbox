@@ -332,6 +332,11 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		return nil, -1, errors.New("sandbox: backend produced an empty argv")
 	}
 
+	// #nosec G204 -- launching a caller-supplied command IS this module's purpose.
+	// argv is not raw caller input: it is the argument list the selected backend
+	// produced from the compiled policy, and it is passed as a list rather than a
+	// shell string, so nothing here is word-split or expanded by a shell.
+	// Whether the command may run at all was decided before this point.
 	cmd := exec.CommandContext(lease.ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.WaitDelay = spawnWaitGrace // bound deadline latency when a forked grandchild holds the output pipe

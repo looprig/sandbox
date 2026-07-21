@@ -89,12 +89,3 @@ func acceptRowEnvScrub(t *testing.T) {
 		t.Errorf("child env missing TMPDIR=/tmp (writable tmp):\n%s", got)
 	}
 }
-
-// assertGuarantees fails unless got exactly equals want across all seven
-// properties — the exhaustive per-row posture check.
-func assertGuarantees(t *testing.T, got, want Guarantees) {
-	t.Helper()
-	if got != want {
-		t.Errorf("Guarantees() = %+v, want %+v", got, want)
-	}
-}

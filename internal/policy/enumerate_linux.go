@@ -137,23 +137,6 @@ func (resolver *PinnedPathResolver) addFile(file *os.File) int {
 	return childFD
 }
 
-func enumerateGrantPathHandle(handle *PathHandle, target string, access FSAccess, excludes []string, firstFD int) ([]FSRule, []*os.File, error) {
-	if handle == nil || handle.file == nil || !handle.isDir || handle.target != target || firstFD <= ReservedSpecFD {
-		return nil, nil, ErrUnsupportedClass
-	}
-	var files []*os.File
-	rules, err := enumeratePinnedTree(handle.file, target, access, excludes, func(file *os.File) int {
-		childFD := firstFD + len(files)
-		files = append(files, file)
-		return childFD
-	}, nil)
-	if err != nil {
-		CloseRuleFiles(files)
-		return nil, nil, err
-	}
-	return rules, files, nil
-}
-
 func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes []string, addFile func(*os.File) int, resolver *PinnedPathResolver) ([]FSRule, error) {
 	var rules []FSRule
 	var walk func(int, string, []string) error
