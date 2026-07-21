@@ -1,6 +1,6 @@
 //go:build !darwin && !linux
 
-package sandbox
+package platform
 
 import (
 	"errors"
@@ -9,8 +9,8 @@ import (
 )
 
 func TestUnsupportedPlatformHasNoSandboxBackend(t *testing.T) {
-	backend, err := platformBackend()
+	backend, err := Backend()
 	if enforce.Backend != nil || !errors.Is(err, enforce.ErrUnavailable) {
-		t.Fatalf("platformBackend = %T, %v; want nil, enforce.ErrUnavailable", backend, err)
+		t.Fatalf("Backend = %T, %v; want nil, enforce.ErrUnavailable", backend, err)
 	}
 }

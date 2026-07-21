@@ -5,53 +5,18 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"github.com/looprig/sandbox/internal/enforce"
-	"github.com/looprig/sandbox/internal/linux"
-	"github.com/looprig/sandbox/internal/policy"
 	"testing"
 	"time"
+
+	"github.com/looprig/sandbox/internal/linux"
+	"github.com/looprig/sandbox/internal/platform"
+	"github.com/looprig/sandbox/internal/policy"
 )
 
-// TestSelectLinuxBackend covers the rung × Init-called matrix that platformBackend
-// uses: a re-exec rung (1/2) needs Init() and yields the linux.Backend, else
-// linux.ErrInitNotCalled; rung none yields the null backend regardless of Init.
-func TestSelectLinuxBackend(t *testing.T) {
-	tests := []struct {
-		name       string
-		Rung       linux.Rung
-		initCalled bool
-		wantErr    error
-		wantType   string // "linux" | "null"
-	}{
-		{"rung2 with Init -> linux backend", linux.RungTwo, true, nil, "linux"},
-		{"rung1 with Init -> linux backend", linux.RungOne, true, nil, "linux"},
-		{"rung2 without Init -> linux.ErrInitNotCalled", linux.RungTwo, false, linux.ErrInitNotCalled, ""},
-		{"rung1 without Init -> linux.ErrInitNotCalled", linux.RungOne, false, linux.ErrInitNotCalled, ""},
-		{"linux.Rung none with Init -> unavailable", linux.RungNone, true, enforce.ErrUnavailable, ""},
-		{"linux.Rung none without Init -> unavailable", linux.RungNone, false, enforce.ErrUnavailable, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			b, err := linux.SelectBackend(tt.Rung, tt.initCalled)
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("linux.SelectBackend err = %v, want %v", err, tt.wantErr)
-			}
-			if tt.wantErr != nil {
-				if b != nil {
-					t.Errorf("backend = %v, want nil on error", b)
-				}
-				return
-			}
-			switch tt.wantType {
-			case "linux":
-				if _, ok := b.(*linux.Backend); !ok {
-					t.Errorf("backend = %T, want *linux.Backend", b)
-				}
-			}
-		})
-	}
-}
+// These live with the executor rather than with internal/platform: they build
+// real Executors, and the package the platform selector resolves TO cannot
+// import the executor that resolves through it. The pure selection matrix
+// (TestSelectLinuxBackend) stayed in internal/platform.
 
 func TestLinuxBackendsNeverClaimTargetNetwork(t *testing.T) {
 	pol := policy.Effective{
@@ -103,21 +68,6 @@ func TestLinuxTargetGrantFailsClosed(t *testing.T) {
 	}
 }
 
-// TestPlatformBackendLiveOnThisHost asserts the real selector picks the re-exec
-// linux backend on this ABI-v4 (rung-2) host — Init() was called by the package
-// TestMain, so the gate is satisfied. This is the proof that the Linux backend is
-// WIRED LIVE (platformBackend no longer returns null on linux).
-func TestPlatformBackendLiveOnThisHost(t *testing.T) {
-	requireLandlockV4(t)
-	b, err := platformBackend()
-	if err != nil {
-		t.Fatalf("platformBackend: %v", err)
-	}
-	if _, ok := b.(*linux.Backend); !ok {
-		t.Fatalf("platformBackend = %T, want *linux.Backend (linux.Rung 2 live on this host)", b)
-	}
-}
-
 // TestUnpinnedExecutorUsesLinuxBackend confirms an executor built WITHOUT the
 // withBackend seam (the production path) reports the rung-2 posture — proving the
 // wiring flows end to end through NewExecutor.
@@ -138,5 +88,20 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"echo", "wired"})
 	if err != nil || code != 0 {
 		t.Fatalf("RunArgv: err=%v code=%d out=%q", err, code, out)
+	}
+}
+
+// TestPlatformBackendLiveOnThisHost asserts the real selector picks the re-exec
+// linux backend on this ABI-v4 (rung-2) host — Init() was called by the package
+// TestMain, so the gate is satisfied. This is the proof that the Linux backend is
+// WIRED LIVE (platform.Backend no longer returns null on linux).
+func TestPlatformBackendLiveOnThisHost(t *testing.T) {
+	requireLandlockV4(t)
+	b, err := platform.Backend()
+	if err != nil {
+		t.Fatalf("platform.Backend: %v", err)
+	}
+	if _, ok := b.(*linux.Backend); !ok {
+		t.Fatalf("Backend = %T, want *linux.Backend (rung 2 live on this host)", b)
 	}
 }

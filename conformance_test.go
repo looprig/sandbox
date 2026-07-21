@@ -7,7 +7,7 @@ package sandbox
 //     unexported withBackend seam, so the "no OS enforcement" conformance target
 //     — the branch that proves the suite accepts a backend which HONESTLY reports
 //     no WriteBoundary — must be constructed here. (The external-consumer proof
-//     against the live and external backends lives in sandboxtest/sandboxtest_test.go.)
+//     against the live and external backends lives in pkg/sandboxtest/sandboxtest_test.go.)
 //  2. sandboxtest mirrors the guarantee-bit and level constants from this
 //     package's stdlib seam (so it need not import sandbox, which keeps this very
 //     file cycle-free). TestSandboxtestSeamConstantsMatch is the drift guard that
@@ -20,7 +20,7 @@ package sandbox
 import (
 	"testing"
 
-	"github.com/looprig/sandbox/sandboxtest"
+	"github.com/looprig/sandbox/pkg/sandboxtest"
 )
 
 // TestSandboxtestAgainstNullBackend runs the conformance suite against the null

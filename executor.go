@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
 	"net"
@@ -126,7 +127,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	if prof != nil {
 		settings = prof.Settings()
 	}
-	// Backend selection: platformBackend() for production; a test may pin one via
+	// Backend selection: platform.Backend() for production; a test may pin one via
 	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
 	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
 	// backend selected without Init() having been called), which fails construction
@@ -137,7 +138,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 			b = enforce.NewNull()
 		} else {
 			var berr error
-			b, berr = platformBackend()
+			b, berr = platform.Backend()
 			if berr != nil {
 				return nil, berr
 			}

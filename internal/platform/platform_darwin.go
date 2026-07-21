@@ -1,13 +1,13 @@
 //go:build darwin
 
-package sandbox
+package platform
 
 import (
 	"github.com/looprig/sandbox/internal/darwin"
 	"github.com/looprig/sandbox/internal/enforce"
 )
 
-// platformBackend selects the OS enforcement backend on darwin: Seatbelt via
+// Backend selects the OS enforcement backend on darwin: Seatbelt via
 // /usr/bin/sandbox-exec (SPEC §7.1). Every non-external executor on macOS
 // compiles its policy to an SBPL profile and wraps each spawn with sandbox-exec.
 //
@@ -17,4 +17,4 @@ import (
 // would silently drop all OS enforcement). A test may still pin the null enforce.Backend
 // through the unexported withBackend seam to keep executor UNIT tests
 // backend-independent.
-func platformBackend() (enforce.Backend, error) { return darwin.NewBackend(), nil }
+func Backend() (enforce.Backend, error) { return darwin.NewBackend(), nil }

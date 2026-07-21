@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/looprig/sandbox"
-	"github.com/looprig/sandbox/sandboxtest"
+	"github.com/looprig/sandbox/pkg/sandboxtest"
 )
 
 // TestMain dispatches any re-exec'd stage-2 child before running the suite: the
