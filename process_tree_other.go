@@ -2,6 +2,10 @@
 
 package sandbox
 
+import (
+	"github.com/looprig/sandbox/internal/enforce"
+)
+
 import "os/exec"
 
 // Unsupported platforms have no process-tree primitive with the required
@@ -9,7 +13,7 @@ import "os/exec"
 // killing only the immediate child revokes the run.
 type processTree struct{}
 
-func newProcessTree(*exec.Cmd) (*processTree, error) { return nil, ErrSandboxUnavailable }
-func (*processTree) start(*exec.Cmd) error           { return ErrSandboxUnavailable }
+func newProcessTree(*exec.Cmd) (*processTree, error) { return nil, enforce.ErrUnavailable }
+func (*processTree) start(*exec.Cmd) error           { return enforce.ErrUnavailable }
 func (*processTree) terminateAndWait() error         { return nil }
 func (*processTree) close()                          {}

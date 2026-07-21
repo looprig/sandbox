@@ -14,6 +14,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"strings"
@@ -46,9 +47,9 @@ func TestAcceptanceMatrixCrossPlatform(t *testing.T) {
 // acceptRowSandboxUnavailable proves the production direct backend cannot be
 // selected for a Sandboxed policy.
 func acceptRowSandboxUnavailable(t *testing.T) {
-	_, _, _, _, err := newNullBackend().compile(policy.Effective{Isolation: Sandboxed})
-	if !errors.Is(err, ErrSandboxUnavailable) {
-		t.Fatalf("sandboxed direct backend error = %v, want ErrSandboxUnavailable", err)
+	_, _, _, _, err := enforce.NewNull().Compile(policy.Effective{Isolation: Sandboxed})
+	if !errors.Is(err, enforce.ErrUnavailable) {
+		t.Fatalf("sandboxed direct backend error = %v, want enforce.ErrUnavailable", err)
 	}
 }
 

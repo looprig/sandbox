@@ -1,12 +1,13 @@
-package sandbox
+package enforce
 
 import (
 	"errors"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os/exec"
 )
 
-var ErrSandboxUnavailable = errors.New("sandbox: OS confinement unavailable")
+var ErrUnavailable = errors.New("sandbox: OS confinement unavailable")
 
 // This file defines the internal backend seam: the shape every OS enforcement
 // backend (Seatbelt on darwin, the namespace/Landlock ladder on Linux) implements.
@@ -17,11 +18,11 @@ var ErrSandboxUnavailable = errors.New("sandbox: OS confinement unavailable")
 // exit-code/error convention — so that behaviour stays identical across
 // backends and only the enforcement transform varies.
 
-// spawnSpec is a backend's compiled per-spawn transform (SPEC §7: "enforcement
+// Spec is a backend's compiled per-spawn transform (SPEC §7: "enforcement
 // is a stateless per-spawn transform"). It holds nothing long-lived and is
 // reused across every RunCommand/RunArgv on an executor; the PER-SPAWN state
 // lives in the fresh closures its wrap func returns, not on the spec.
-type spawnSpec struct {
+type Spec struct {
 	// wrap turns a target spawn — the working directory and the inner argv to run
 	// under confinement — into the actual argv the executor execs, plus a fresh
 	// per-spawn configure hook and cleanup func.
@@ -43,17 +44,17 @@ type spawnSpec struct {
 	// dir. The executor applies configure to the assembled *exec.Cmd; a configure
 	// error fails before Start. If cleanup is non-nil, the executor calls it after
 	// configure or spawn completes.
-	wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
+	Wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
 }
 
-// backend compiles a policy.Effective into a reusable spawnSpec plus the achieved isolation
+// backend compiles a policy.Effective into a reusable Spec plus the achieved isolation
 // rollup: the coarse level (SPEC §6), the per-property guarantee bitmask (SPEC
 // and a compilation report of what was enforced, narrowed, or left
 // unenforced (SPEC §7.5). Compilation is where the soundness invariant lives:
 // compiled enforcement is never wider than the policy, and every gap is recorded.
 // It returns an error when a policy cannot be compiled at all; a backend
 // that merely enforces less than requested reports that via level/bits/report,
-// not via err. The direct backend accepts only Unconfined.
-type backend interface {
-	compile(p policy.Effective) (spec spawnSpec, report CompileReport, level uint8, guaranteeBits uint64, err error)
+// not via err. The direct backend accepts only profile.Unconfined.
+type Backend interface {
+	Compile(p policy.Effective) (spec Spec, report profile.CompileReport, level uint8, guaranteeBits uint64, err error)
 }

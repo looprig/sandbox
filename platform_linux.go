@@ -2,6 +2,10 @@
 
 package sandbox
 
+import (
+	"github.com/looprig/sandbox/internal/enforce"
+)
+
 // platformBackend selects the OS enforcement backend on Linux by PROBING the host
 // for the strongest achievable rung (SPEC §7.2) and returning the matching backend:
 //
@@ -14,7 +18,7 @@ package sandbox
 //     (never wider than policy — it enforces less than rung 1 could) and honestly
 //     reported as LevelDegraded. The probe keeps the selection honest: a host that
 //     cannot enforce even rung 2 does NOT get a re-exec backend claiming confinement.
-//   - rung none → ErrSandboxUnavailable. Sandboxed execution never falls through
+//   - rung none → enforce.ErrUnavailable. Sandboxed execution never falls through
 //     to a direct backend.
 //
 // Init() gate (fail-closed): the re-exec Linux backend requires the consumer to
@@ -28,14 +32,14 @@ package sandbox
 // A test may still pin a backend through the unexported withBackend seam, which
 // bypasses this selector entirely (and the package TestMain calls Init(), so the
 // gate is satisfied for tests that do reach this path).
-func platformBackend() (backend, error) {
+func platformBackend() (enforce.Backend, error) {
 	return selectLinuxBackend(probeLinuxCaps().selectRung(), initWasCalled.Load())
 }
 
 // selectLinuxBackend is the pure selection logic behind platformBackend, split out
 // so the rung×Init-called matrix is unit-testable without touching the process
 // globals. A re-exec rung (1/2) requires initCalled; rung none fails closed.
-func selectLinuxBackend(r rung, initCalled bool) (backend, error) {
+func selectLinuxBackend(r rung, initCalled bool) (enforce.Backend, error) {
 	switch r {
 	case rungOne:
 		if !initCalled {
@@ -51,6 +55,6 @@ func selectLinuxBackend(r rung, initCalled bool) (backend, error) {
 		}
 		return newLinuxBackend(), nil
 	default: // rungNone
-		return nil, ErrSandboxUnavailable
+		return nil, enforce.ErrUnavailable
 	}
 }

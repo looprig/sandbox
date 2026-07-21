@@ -323,7 +323,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 	t.Setenv("HOME", "/lrsbx-home/tester")
 	p := backendFixturePolicy(fixtureWorkspaceWrite, "/ws")
 	b := newSeatbeltBackend()
-	spec, report, level, bits, err := b.compile(p)
+	spec, report, level, bits, err := b.Compile(p)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 
 	// Shell path: the executor shell-normalizes a command string to /bin/sh -c
 	// (shellArgv) and hands that inner argv to the backend's wrap; dir is ignored.
-	shell, shellCfg, shellClean := spec.wrap("/work", shellArgv("echo hi"))
+	shell, shellCfg, shellClean := spec.Wrap("/work", shellArgv("echo hi"))
 	wantShell := []string{"/usr/bin/sandbox-exec", "-p", wantProfile, "--", "/bin/sh", "-c", "echo hi"}
 	if !equalStrings(shell, wantShell) {
 		t.Errorf("wrap(shell) = %v\nwant %v", shell, wantShell)
@@ -354,7 +354,7 @@ func TestSeatbeltBackendSpawnSpec(t *testing.T) {
 	}
 
 	// Direct argv path (RunArgv): the backend wraps the caller's argv verbatim.
-	argv, argvCfg, argvClean := spec.wrap("/work", []string{"ls", "-l"})
+	argv, argvCfg, argvClean := spec.Wrap("/work", []string{"ls", "-l"})
 	wantArgv := []string{"/usr/bin/sandbox-exec", "-p", wantProfile, "--", "ls", "-l"}
 	if !equalStrings(argv, wantArgv) {
 		t.Errorf("wrap(argv) = %v\nwant %v", argv, wantArgv)

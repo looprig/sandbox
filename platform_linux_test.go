@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"testing"
 	"time"
@@ -25,8 +26,8 @@ func TestSelectLinuxBackend(t *testing.T) {
 		{"rung1 with Init -> linux backend", rungOne, true, nil, "linux"},
 		{"rung2 without Init -> ErrInitNotCalled", rungTwo, false, ErrInitNotCalled, ""},
 		{"rung1 without Init -> ErrInitNotCalled", rungOne, false, ErrInitNotCalled, ""},
-		{"rung none with Init -> unavailable", rungNone, true, ErrSandboxUnavailable, ""},
-		{"rung none without Init -> unavailable", rungNone, false, ErrSandboxUnavailable, ""},
+		{"rung none with Init -> unavailable", rungNone, true, enforce.ErrUnavailable, ""},
+		{"rung none without Init -> unavailable", rungNone, false, enforce.ErrUnavailable, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -58,7 +59,7 @@ func TestLinuxBackendsNeverClaimTargetNetwork(t *testing.T) {
 		Isolation: Sandboxed,
 	}
 	for _, backend := range []*linuxBackend{{rung: rungOne}, {rung: rungTwo}} {
-		_, _, _, bits, err := backend.compile(pol)
+		_, _, _, bits, err := backend.Compile(pol)
 		if err != nil {
 			t.Fatalf("rung %d compile: %v", backend.rung, err)
 		}
@@ -127,7 +128,7 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 		t.Fatalf("NewExecutor: %v", err)
 	}
 	if e.Level() != LevelDegraded {
-		t.Errorf("Level() = %d, want LevelDegraded (rung-2 linux backend)", e.Level())
+		t.Errorf("Level() = %d, want LevelDegraded (rung-2 linux enforce.Backend)", e.Level())
 	}
 	if !e.Guarantees().WriteBoundary {
 		t.Errorf("Guarantees().WriteBoundary = false, want true (rung-2 FS confinement live)")

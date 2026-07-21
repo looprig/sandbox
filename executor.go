@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
 	"net"
@@ -60,13 +61,13 @@ const spawnWaitGrace = time.Second
 type executorConfig struct {
 	grantTTL  time.Duration
 	clock     func() time.Time // nil means default time.Now
-	backend   backend          // nil means select via platformBackend (test seam)
+	backend   enforce.Backend  // nil means select via platformBackend (test seam)
 	lifecycle *executorLifecycle
 }
 
 // Executor compiles a policy.Effective once via the platform backend and then runs
 // commands under the resulting stateless per-spawn transform (SPEC §6, §7). It
-// holds the compiled policy, the chosen backend, its spawnSpec, the compilation
+// holds the compiled policy, the chosen backend, its enforce.Spec, the compilation
 // report, the achieved level and guarantee bits, and the assembled child
 // environment — everything a spawn needs, precomputed at construction.
 type Executor struct {
@@ -76,8 +77,8 @@ type Executor struct {
 	// authority check on the spawn hot path.
 	settings      profile.Settings
 	policy        policy.Effective
-	backend       backend
-	spec          spawnSpec
+	backend       enforce.Backend
+	spec          enforce.Spec
 	report        CompileReport
 	level         uint8
 	guaranteeBits uint64
@@ -101,7 +102,7 @@ type Executor struct {
 
 // snapshot is the compiled state a single spawn needs.
 type snapshot struct {
-	spec   spawnSpec
+	spec   enforce.Spec
 	env    []string
 	policy policy.Effective
 }
@@ -133,7 +134,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	b := config.backend
 	if b == nil {
 		if prof != nil && settings.Isolation == Unconfined {
-			b = newNullBackend()
+			b = enforce.NewNull()
 		} else {
 			var berr error
 			b, berr = platformBackend()
@@ -142,14 +143,14 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 			}
 		}
 	}
-	spec, report, level, bits, err := b.compile(p)
+	spec, report, level, bits, err := b.Compile(p)
 	if err != nil {
 		return nil, err
 	}
 	if prof != nil {
 		missing := settings.RequiredGuarantees &^ bits
 		if missing != 0 {
-			return nil, fmt.Errorf("%w: backend missing required guarantees %#x", ErrSandboxUnavailable, missing)
+			return nil, fmt.Errorf("%w: backend missing required guarantees %#x", enforce.ErrUnavailable, missing)
 		}
 	}
 
@@ -198,7 +199,7 @@ func ttlOrDefault(d time.Duration) time.Duration {
 }
 
 // RunCommand runs a shell command string in dir under the compiled policy (SPEC
-// It wraps the command via the backend's spawnSpec, sets the working
+// It wraps the command via the backend's enforce.Spec, sets the working
 // directory and the assembled environment, applies any spawn attributes, and
 // runs to completion capturing combined stdout+stderr.
 //
@@ -234,7 +235,7 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 }
 
 // shellArgv is the universal shell-normalization: running a command STRING means
-// executing /bin/sh -c <command> under confinement, on every backend. The backend
+// executing /bin/sh -c <command> under confinement, on every backend. The enforce.Backend
 // wraps this inner argv (sandbox-exec prefix, stage-2 re-exec, or nothing); the
 // executor owns the shell form so the backends only ever wrap an argv.
 func shellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }
@@ -251,7 +252,7 @@ func (e *Executor) resolveErr(compileErr error) error {
 	if compileErr != nil {
 		return compileErr
 	}
-	if e.spec.wrap == nil {
+	if e.spec.Wrap == nil {
 		return errors.New("sandbox: executor spawn spec not compiled")
 	}
 	return nil
@@ -308,7 +309,7 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 
 // run is the shared execution path for RunCommand, RunArgv, and
 // RunCommandWithGrants. It hands the backend the (dir, innerArgv) via the
-// snapshot's spawnSpec.wrap to obtain the final argv plus a fresh per-spawn
+// snapshot's enforce.Spec.Wrap to obtain the final argv plus a fresh per-spawn
 // configure/cleanup pair, builds the command, applies the snapshot's environment
 // and the backend's spawn attributes, runs it, and normalizes the result to the
 // (output, exit, err) convention. The caller supplies one immutable snapshot for
@@ -317,14 +318,14 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
 	// Fail closed if the spawn spec never compiled: resolve already guards this,
 	// but a nil transform must never reach a spawn (defense in depth).
-	if s.spec.wrap == nil {
+	if s.spec.Wrap == nil {
 		return nil, -1, errors.New("sandbox: executor spawn spec not compiled")
 	}
 	if len(innerArgv) == 0 {
 		return nil, -1, errors.New("sandbox: empty argv")
 	}
 
-	argv, configure, cleanup := s.spec.wrap(dir, innerArgv)
+	argv, configure, cleanup := s.spec.Wrap(dir, innerArgv)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -333,7 +334,7 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 
 	// #nosec G204 -- launching a caller-supplied command IS this module's purpose.
-	// argv is not raw caller input: it is the argument list the selected backend
+	// argv is not raw caller input: it is the argument list the selected enforce.Backend
 	// produced from the compiled policy, and it is passed as a list rather than a
 	// shell string, so nothing here is word-split or expanded by a shell.
 	// Whether the command may run at all was decided before this point.
@@ -405,13 +406,13 @@ func (e *Executor) Level() uint8 {
 	return e.level
 }
 
-// Report returns the per-feature compilation outcomes for the chosen backend
+// Report returns the per-feature compilation outcomes for the chosen enforce.Backend
 // what was enforced, narrowed, or left unenforced.
 func (e *Executor) Report() CompileReport {
 	return e.report
 }
 
-// Guarantees returns the rich per-property statement of what the backend
+// Guarantees returns the rich per-property statement of what the enforce.Backend
 // actually enforced. Each field is fail-closed.
 func (e *Executor) Guarantees() Guarantees { return profile.GuaranteesFromBits(e.GuaranteeBits()) }
 
@@ -692,16 +693,16 @@ func (e *Executor) pruneUsedGrantsLocked(nowUnixMilli int64) {
 }
 
 type grantPathBackend interface {
-	compileWithGrantPaths(policy.Effective, []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error)
+	CompileWithPathHandles(policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
 }
 
-func compileBackendWithGrantPaths(b backend, pol policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func compileBackendWithGrantPaths(b enforce.Backend, pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 	if len(handles) != 0 {
 		if pathBackend, ok := b.(grantPathBackend); ok {
-			return pathBackend.compileWithGrantPaths(pol, handles)
+			return pathBackend.CompileWithPathHandles(pol, handles)
 		}
 	}
-	return b.compile(pol)
+	return b.Compile(pol)
 }
 
 func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {

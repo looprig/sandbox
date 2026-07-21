@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -25,7 +26,7 @@ type boundaryBackend struct {
 	baseBits uint64
 }
 
-func (b *boundaryBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b *boundaryBackend) Compile(pol policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	b.captureBackend.mu.Lock()
 	b.captureBackend.policies = append(b.captureBackend.policies, policy.Clone(pol))
 	b.captureBackend.mu.Unlock()
@@ -36,18 +37,18 @@ func (b *boundaryBackend) compile(pol policy.Effective) (spawnSpec, CompileRepor
 	if policy.ResolveFS(pol.FS, string(os.PathSeparator))&policy.WriteAccess != 0 {
 		bits &^= GuaranteeWriteBoundary
 	}
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
+	spec := enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
 	return spec, CompileReport{}, LevelFull, bits, nil
 }
 
-func (b *captureBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b *captureBackend) Compile(pol policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	b.mu.Lock()
 	b.policies = append(b.policies, policy.Clone(pol))
 	b.mu.Unlock()
 	if b.compileErr != nil {
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, b.compileErr
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, b.compileErr
 	}
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
+	spec := enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
 	return spec, CompileReport{}, LevelNone, b.bits, nil
 }
 

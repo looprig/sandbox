@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"strings"
@@ -370,7 +371,7 @@ func TestNewExecutorRejectsMissingRequiredGuarantees(t *testing.T) {
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	backend := &captureBackend{bits: GuaranteeEnvScrub}
-	if _, err := newTestExecutor(profile, withBackend(backend)); !errors.Is(err, ErrSandboxUnavailable) {
-		t.Fatalf("NewExecutor error = %v, want ErrSandboxUnavailable", err)
+	if _, err := newTestExecutor(profile, withBackend(backend)); !errors.Is(err, enforce.ErrUnavailable) {
+		t.Fatalf("NewExecutor error = %v, want enforce.ErrUnavailable", err)
 	}
 }

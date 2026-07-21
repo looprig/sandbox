@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -11,7 +12,7 @@ import (
 )
 
 // linuxBackend is the Linux OS-enforcement backend (SPEC §7.2). It compiles a
-// policy into a spawnSpec whose wrap re-execs THIS binary (/proc/self/exe) into
+// policy into a enforce.Spec whose wrap re-execs THIS binary (/proc/self/exe) into
 // a stage-2 helper (Init -> runStage2) that becomes the confined target.
 //
 // Task 12a wires the RUNG-2 filesystem axis: compile distils the policy's FS
@@ -47,7 +48,7 @@ func newLinuxBackend() *linuxBackend {
 	return &linuxBackend{cgroupPids: probeDelegatedPidsAncestor(), rung: rungTwo}
 }
 
-// newLinuxBackendRung1 constructs the RUNG-1 (full-isolation) Linux backend
+// newLinuxBackendRung1 constructs the RUNG-1 (full-isolation) Linux enforce.Backend
 // (Task 13, SPEC §7.2 rung 1): user+mount+pid+net namespaces via the stage-2
 // SysProcAttr cloneflags, a bind-mount view (restricted-read + deny-by-mask),
 // in-netns nftables address filtering, then Landlock + seccomp + cgroup. It is
@@ -63,18 +64,18 @@ func newLinuxBackendRung1() *linuxBackend {
 // newLinuxBackend, which existing tests pin) compiles the Landlock+seccomp tier
 // (compileRung2). It never errors — a policy that compiles to a narrower ruleset
 // is reported via level/bits/report, not via err.
-func (b linuxBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
-	return b.compileWithGrantPaths(p, nil)
+func (b linuxBackend) Compile(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+	return b.CompileWithPathHandles(p, nil)
 }
 
-func (b linuxBackend) compileWithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) CompileWithPathHandles(p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	if b.rung == rungOne {
 		return b.compileRung1WithGrantPaths(p, handles)
 	}
 	return b.compileRung2WithGrantPaths(p, handles)
 }
 
-// compileRung2 builds the re-exec spawnSpec and applies rung-2 FS confinement. It
+// compileRung2 builds the re-exec enforce.Spec and applies rung-2 FS confinement. It
 // distils the policy's FS axis into a policy.CompiledFS (literal allows + literal
 // denies; globs dropped), which the per-spawn wrap enumerates into a Landlock
 // allowlist. It reports LevelDegraded (rung 2 enforces the write boundary and
@@ -83,13 +84,13 @@ func (b linuxBackend) compileWithGrantPaths(p policy.Effective, handles []*polic
 // policy carries an enforceable fixed-path deny), and GuaranteeEnvScrub (when
 // !Env.Inherit). The CompileReport records what was enforced vs narrowed vs
 // unenforced.
-func (b linuxBackend) compileRung2(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung2(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	return b.compileRung2WithGrantPaths(p, nil)
 }
 
-func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
 	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
 	cnet := compileNetPolicy(p.Net)
@@ -127,7 +128,7 @@ func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*
 		bits |= GuaranteeResourceLimits
 	}
 
-	spec := spawnSpec{wrap: linuxWrapTransform(cfs, cnet, cg, nil, handles)}
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, cnet, cg, nil, handles)}
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the rung-2 seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
@@ -148,7 +149,7 @@ func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*
 	return spec, report, LevelDegraded, bits, nil
 }
 
-// compileRung1 builds the RUNG-1 (full-isolation) spawnSpec (SPEC §7.2 rung 1,
+// compileRung1 builds the RUNG-1 (full-isolation) enforce.Spec (SPEC §7.2 rung 1,
 // §7.5). It compiles four mechanisms that COMPOSE on the stage-2 child:
 //   - the bind-mount view (compileMountView): rw/ro binds for writable/read
 //     roots, ro re-mask binds for carveouts, empty-mask binds for fixed-path
@@ -169,13 +170,13 @@ func (b linuxBackend) compileRung2WithGrantPaths(p policy.Effective, handles []*
 // Degraded and be recorded; for the standard tested profile shapes the mechanisms reach all of
 // them, so rung 1 is LevelFull. Resource limits are containment-of-cost and never
 // change Level (§7.4).
-func (b linuxBackend) compileRung1(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung1(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	return b.compileRung1WithGrantPaths(p, nil)
 }
 
-func (b linuxBackend) compileRung1WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (b linuxBackend) compileRung1WithGrantPaths(p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
 	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
 	cg := compileCgroupPolicy(p.Limits, b.cgroupPids)
@@ -207,7 +208,7 @@ func (b linuxBackend) compileRung1WithGrantPaths(p policy.Effective, handles []*
 	r1 := &rung1Plan{mount: mvp, nft: nft}
 	// cnet is empty: rung 1 does NOT use the Landlock TCP-port net (nftables covers
 	// egress), so linuxWrap sets NetConfined=false and injects no RES_OPTIONS.
-	spec := spawnSpec{wrap: linuxWrapTransform(cfs, compiledNet{}, cg, r1, handles)}
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, compiledNet{}, cg, r1, handles)}
 	report := rung1CompileReport(p, mvp, nft)
 	report.Entries = append(report.Entries, cgroupCompileReport(cg))
 	return spec, report, LevelFull, bits, nil

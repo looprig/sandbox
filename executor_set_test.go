@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -20,8 +21,8 @@ type blockingConfigureBackend struct {
 	bits    uint64
 }
 
-func (b *blockingConfigureBackend) compile(policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
-	spec := spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+func (b *blockingConfigureBackend) Compile(policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+	spec := enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, func(*exec.Cmd) error {
 			b.once.Do(func() { close(b.entered) })
 			<-b.release

@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os/exec"
 	"path/filepath"
@@ -425,13 +426,13 @@ func sbplString(s string) string {
 
 // seatbeltBackend is the darwin OS enforcement backend (SPEC §7.1). It is
 // stateless: compile builds a fixed SBPL profile per policy and captures it in
-// the spawnSpec closures.
+// the enforce.Spec closures.
 type seatbeltBackend struct{}
 
 // newSeatbeltBackend returns the stateless Seatbelt backend.
-func newSeatbeltBackend() backend { return seatbeltBackend{} }
+func newSeatbeltBackend() enforce.Backend { return seatbeltBackend{} }
 
-// compile generates the SBPL profile for the policy and returns a spawnSpec that
+// compile generates the SBPL profile for the policy and returns a enforce.Spec that
 // wraps every command/argv with `sandbox-exec -p <profile> -- ...`, plus the
 // achieved level, guarantee bits, and compilation report.
 //
@@ -440,16 +441,16 @@ func newSeatbeltBackend() backend { return seatbeltBackend{} }
 // the future fallback is the temp-file `-f <path>` form of sandbox-exec, but the
 // inline form keeps the transform stateless (no temp file to create or clean up)
 // and is sufficient here.
-func (seatbeltBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (seatbeltBackend) Compile(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	sbpl, report, level, bits := compileSBPL(p)
-	spec := spawnSpec{
+	spec := enforce.Spec{
 		// Prepend the sandbox-exec launcher to the inner argv. The executor has
 		// already shell-normalized a RunCommand to innerArgv == /bin/sh -c command,
 		// so a shell command becomes `sandbox-exec -p <profile> -- /bin/sh -c cmd`
 		// and a RunArgv becomes `sandbox-exec -p <profile> -- <argv...>`, identical
 		// to the pre-reshape wrapShell/wrapArgv. dir needs no special handling and
 		// there are no per-spawn resources, so configure and cleanup are nil.
-		wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
+		Wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 			wrapped := make([]string, 0, 4+len(innerArgv))
 			wrapped = append(wrapped, "/usr/bin/sandbox-exec", "-p", sbpl, "--")
 			wrapped = append(wrapped, innerArgv...)

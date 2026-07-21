@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"github.com/looprig/sandbox/internal/enforce"
 	"os/exec"
 	"time"
 
@@ -15,7 +16,7 @@ func newTestExecutor(profile *Profile, configs ...executorConfig) (*Executor, er
 	return newExecutor(profile, mergeExecutorConfigs(configs...))
 }
 
-func withBackend(value backend) executorConfig { return executorConfig{backend: value} }
+func withBackend(value enforce.Backend) executorConfig { return executorConfig{backend: value} }
 
 func withClock(value func() time.Time) executorConfig { return executorConfig{clock: value} }
 
@@ -48,12 +49,12 @@ type testPassthroughBackend struct{}
 
 func newTestPassthroughBackend() *testPassthroughBackend { return &testPassthroughBackend{} }
 
-func (*testPassthroughBackend) compile(p policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (*testPassthroughBackend) Compile(p policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	bits := uint64(0)
 	if !p.Env.Inherit {
 		bits = GuaranteeEnvScrub
 	}
-	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+	return enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, nil, nil
 	}}, CompileReport{}, LevelNone, bits, nil
 }

@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
 	"os/exec"
@@ -29,44 +30,44 @@ type trackingGrantPathBackend struct {
 	spec          stage2Spec
 }
 
-func (backend *trackingGrantPathBackend) compile(pol policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
-	return (&linuxBackend{rung: backend.rung}).compile(pol)
+func (backend *trackingGrantPathBackend) Compile(pol policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+	return (&linuxBackend{rung: backend.rung}).Compile(pol)
 }
 
-func (backend *trackingGrantPathBackend) compileWithGrantPaths(pol policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (backend *trackingGrantPathBackend) CompileWithPathHandles(pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	backend.grantCompiles++
 	backend.handles = append([]*policy.PathHandle(nil), handles...)
-	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).compileWithGrantPaths(pol, handles)
+	spawn, report, level, bits, err := (&linuxBackend{rung: backend.rung}).CompileWithPathHandles(pol, handles)
 	if err != nil {
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
-	_, configure, cleanup := spawn.wrap(pol.Workspace, []string{"/bin/true"})
+	_, configure, cleanup := spawn.Wrap(pol.Workspace, []string{"/bin/true"})
 	cmd := exec.Command("/proc/self/exe")
 	cmd.Env = []string{}
 	if err := configure(cmd); err != nil {
 		cleanup()
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
 	backend.configures++
 	backend.spec, err = decodeStage2Spec(cmd.ExtraFiles[0])
 	cleanup()
 	if err != nil {
-		return spawnSpec{}, CompileReport{}, LevelNone, 0, err
+		return enforce.Spec{}, CompileReport{}, LevelNone, 0, err
 	}
-	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+	return enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, nil, nil
 	}}, report, level, bits, nil
 }
 
-func (backend *failingGrantPathBackend) compile(policy.Effective) (spawnSpec, CompileReport, uint8, uint64, error) {
-	return spawnSpec{wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
+func (backend *failingGrantPathBackend) Compile(policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+	return enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
 		return argv, nil, nil
 	}}, CompileReport{}, LevelNone, GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub, nil
 }
 
-func (backend *failingGrantPathBackend) compileWithGrantPaths(_ policy.Effective, handles []*policy.PathHandle) (spawnSpec, CompileReport, uint8, uint64, error) {
+func (backend *failingGrantPathBackend) CompileWithPathHandles(_ policy.Effective, handles []*policy.PathHandle) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	backend.handles = append([]*policy.PathHandle(nil), handles...)
-	return spawnSpec{}, CompileReport{}, LevelNone, 0, errors.New("compile failed")
+	return enforce.Spec{}, CompileReport{}, LevelNone, 0, errors.New("compile failed")
 }
 
 func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
@@ -118,11 +119,11 @@ func TestLinuxGrantEnforcementCarriesPinnedFDPastPathSwap(t *testing.T) {
 					{Path: target, Access: policy.WriteAccess, Exact: targetKind.exact, Canonical: true},
 				}}
 				backend := &linuxBackend{rung: rung}
-				spawn, _, _, _, err := backend.compileWithGrantPaths(pol, []*policy.PathHandle{handle})
+				spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, configure, cleanup := spawn.wrap(root, []string{"/bin/true"})
+				_, configure, cleanup := spawn.Wrap(root, []string{"/bin/true"})
 				defer cleanup()
 				cmd := exec.Command("/proc/self/exe")
 				cmd.Env = []string{}
@@ -587,11 +588,11 @@ func TestLinuxPinnedTreeEnumerationFeedsBothRungs(t *testing.T) {
 				{Path: denied, Denied: policy.ReadAccess},
 			}}
 			backend := &linuxBackend{rung: rung}
-			spawn, _, _, _, err := backend.compileWithGrantPaths(pol, []*policy.PathHandle{handle})
+			spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, configure, cleanup := spawn.wrap(root, []string{"/bin/true"})
+			_, configure, cleanup := spawn.Wrap(root, []string{"/bin/true"})
 			cmd := exec.Command("/proc/self/exe")
 			cmd.Env = []string{}
 			if err := configure(cmd); err != nil {
@@ -1074,11 +1075,11 @@ func TestLinuxPinnedDenyMaskAndGlobScanUseOriginalTree(t *testing.T) {
 func compilePinnedGrantSpec(t *testing.T, rung rung, dir string, pol policy.Effective, handles []*policy.PathHandle) (stage2Spec, *exec.Cmd, func()) {
 	t.Helper()
 	backend := &linuxBackend{rung: rung}
-	spawn, _, _, _, err := backend.compileWithGrantPaths(pol, handles)
+	spawn, _, _, _, err := backend.CompileWithPathHandles(pol, handles)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, configure, cleanup := spawn.wrap(dir, []string{"/bin/true"})
+	_, configure, cleanup := spawn.Wrap(dir, []string{"/bin/true"})
 	cmd := exec.Command("/proc/self/exe")
 	cmd.Env = []string{}
 	if err := configure(cmd); err != nil {

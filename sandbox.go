@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
@@ -119,3 +120,7 @@ func NewUpstreamEgressRoute(rawURL string, trustedAddressGuarantee bool) (Egress
 func NewEgressRouteResolver(routes []EgressRoute, selector func(context.Context, NetworkTarget) string) (*EgressRouteResolver, error) {
 	return network.NewRouteResolver(routes, selector)
 }
+
+// ErrSandboxUnavailable reports that no production OS confinement backend is
+// available on this host, so a Sandboxed profile cannot be honoured.
+var ErrSandboxUnavailable = enforce.ErrUnavailable

@@ -25,6 +25,6 @@
 // portable. If it is not called, constructing an Executor with a Linux
 // enforcement backend fails closed with ErrInitNotCalled rather than running
 // commands unconfined. A sandboxed profile also fails closed with
-// ErrSandboxUnavailable on a host without a production backend; direct
+// enforce.ErrUnavailable on a host without a production backend; direct
 // execution exists only for an explicitly acknowledged Unconfined profile.
 package sandbox

@@ -304,7 +304,7 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			b := newLinuxBackendRung1()
-			_, report, level, bits, err := b.compile(tt.policy)
+			_, report, level, bits, err := b.Compile(tt.policy)
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
