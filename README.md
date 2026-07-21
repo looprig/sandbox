@@ -4,6 +4,39 @@
 access profiles and enforcing them around spawned commands. It does not import
 Harness, open approval prompts, parse tool arguments, or persist permissions.
 
+## Module layout
+
+Consumers import one path — `github.com/looprig/sandbox` — and never anything
+below it. The root package is a facade of type aliases and thin forwarders, so
+`sandbox.Profile` and `profile.Profile` are the *same* type and `errors.Is`
+works against the re-exported sentinels.
+
+```
+sandbox.go              the public facade: aliases + forwarders
+init_{linux,other}.go   Init(), at the path every main() calls it from
+
+pkg/                    importable by consumers
+  profile/              Profile, the authority enums, CompileReport, Guarantees
+  network/              Target, Route, RouteResolver, route dialing, the egress Proxy
+  sandboxtest/          the reusable executor conformance suite
+
+internal/               implementation; not importable outside this module
+  policy/               effective policy, FS vocabulary, compiled rules, path handles
+  enforce/              the Backend contract and per-spawn Spec every backend implements
+  darwin/               Seatbelt: SBPL generation and the darwin backend
+  linux/                the enforcement ladder: namespaces, Landlock, seccomp,
+                        nftables, cgroups, capability probing, stage-2 re-exec
+  platform/             backend selection; the only importer of darwin/ and linux/
+  exec/                 Executor, ExecutorSet, process tree, and the grant tokens
+  safetext/             the shared untrusted-identifier predicate
+  testsupport/          fixtures shared across the suites
+```
+
+Dependencies point one way: `pkg/*` ← `policy` ← `enforce` ← `{darwin,linux}` ←
+`platform` ← `exec` ← the facade. Nothing under `internal/` imports the root
+package, which is why the executor's own tests live beside it in
+`internal/exec` rather than at the root.
+
 ## Profile contract
 
 Consumers choose every access value directly:
