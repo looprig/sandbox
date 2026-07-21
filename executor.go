@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/pkg/network"
 	"net"
 	"os"
 	"os/exec"
@@ -88,7 +89,7 @@ type Executor struct {
 	clock            func() time.Time
 	grantTTL         time.Duration
 	routeFingerprint string
-	proxy            *egressProxy
+	proxy            *network.Proxy
 	home             string
 	tmp              string
 	grantMu          sync.Mutex
@@ -292,7 +293,7 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 		return snapshot{}, "", fmt.Errorf("sandbox: route execution identity: %w", err)
 	}
 	executionID := "route-" + base64.RawURLEncoding.EncodeToString(random)
-	credential, err := e.proxy.authorizeAll(executionID)
+	credential, err := e.proxy.AuthorizeAll(executionID)
 	if err != nil {
 		return snapshot{}, "", err
 	}
@@ -668,7 +669,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	e.grantMu.Lock()
 	if denial != nil {
-		return out, code, &NetworkTargetDeniedError{ExitCode: code, ProcessError: runErr, denial: denial}
+		return out, code, network.NewTargetDeniedError(code, runErr, denial)
 	}
 	return out, code, runErr
 }
@@ -702,7 +703,7 @@ func (e *Executor) composeRouteGuarantees(bits uint64) uint64 {
 		return bits
 	}
 	bits &^= GuaranteeAddressNetwork
-	if bits&GuaranteeTargetNetwork != 0 && e.proxy.route.AddressGuarantee() {
+	if bits&GuaranteeTargetNetwork != 0 && e.proxy.Route().AddressGuarantee() {
 		bits |= GuaranteeAddressNetwork
 	}
 	return bits

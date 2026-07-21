@@ -26,3 +26,14 @@ func pathWithin(path, root string) bool { return profile.PathWithin(path, root) 
 func canonicalRoot(path string) (string, error) { return profile.CanonicalRoot(path) }
 
 func guaranteesFromBits(bits uint64) Guarantees { return profile.GuaranteesFromBits(bits) }
+
+// mustTarget parses a normalized egress target or fails the test. It used to
+// live in proxy_test.go, which moved to pkg/network with the proxy itself.
+func mustTarget(t *testing.T, raw string) NetworkTarget {
+	t.Helper()
+	target, err := ParseNetworkTarget(raw)
+	if err != nil {
+		t.Fatalf("ParseNetworkTarget(%q): %v", raw, err)
+	}
+	return target
+}

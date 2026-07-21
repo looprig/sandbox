@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"github.com/looprig/sandbox/pkg/network"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,14 +65,16 @@ func TestExecutorComposesAddressGuaranteeWithSelectedRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	direct.lookup = func(context.Context, string) ([]net.IP, error) {
-		return []net.IP{net.ParseIP("100.100.100.200")}, nil
-	}
 	directDialed := false
-	direct.dial = func(context.Context, string, string) (net.Conn, error) {
-		directDialed = true
-		return nil, errors.New("special-use address reached dial")
-	}
+	direct = direct.WithDialer(
+		func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("100.100.100.200")}, nil
+		},
+		func(context.Context, string, string) (net.Conn, error) {
+			directDialed = true
+			return nil, errors.New("special-use address reached dial")
+		},
+	)
 	untrusted, err := NewUpstreamEgressRoute("http://proxy.example:8080", false)
 	if err != nil {
 		t.Fatal(err)
@@ -101,9 +104,9 @@ func TestExecutorComposesAddressGuaranteeWithSelectedRoute(t *testing.T) {
 				t.Fatalf("AddressNetwork = %v, want %v", got, test.want)
 			}
 			if test.verifyRefusal {
-				_, err := executor.proxy.route.dialTarget(context.Background(), mustTarget(t, "tcp:metadata.example:80"))
-				if !errors.Is(err, errNetworkAddressDenied) {
-					t.Fatalf("composed direct route error = %v, want errNetworkAddressDenied", err)
+				_, err := executor.proxy.Route().DialTarget(context.Background(), mustTarget(t, "tcp:metadata.example:80"))
+				if !errors.Is(err, network.ErrAddressDenied) {
+					t.Fatalf("composed direct route error = %v, want network.ErrAddressDenied", err)
 				}
 				if directDialed {
 					t.Fatal("composed AddressNetwork guarantee allowed a special-use address to reach dial")

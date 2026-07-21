@@ -13,8 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/looprig/sandbox/internal/safetext"
+	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
 
@@ -62,7 +63,10 @@ var (
 	ErrGrantRequired              = errors.New("sandbox: approval grant required")
 	ErrGrantDenied                = errors.New("sandbox: capability denied")
 	ErrGrantUnsupported           = errors.New("sandbox: grant class unsupported")
-	ErrExecutorClosed             = errors.New("sandbox: executor closed")
+	// ErrExecutorClosed is defined by the egress layer and re-used verbatim here
+	// so that a refusal raised inside the proxy and one raised by the executor
+	// are the same value under errors.Is.
+	ErrExecutorClosed = network.ErrClosed
 )
 
 type grantPayload struct {
@@ -258,7 +262,7 @@ func normalizeGrantScopeTarget(scope, class, target string) (string, string, err
 }
 
 func validGrantText(value string) bool {
-	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+	return safetext.Valid(value)
 }
 
 type grantDelta struct {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
 
@@ -90,7 +91,7 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 		return nil, errors.New("sandbox: executor set grant TTL must be positive")
 	}
 	if config.route != nil {
-		if err := config.route.validate(); err != nil {
+		if err := config.route.Validate(); err != nil {
 			return nil, err
 		}
 	}
@@ -179,9 +180,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		policy.FS = append(policy.FS, fsEntry{Path: home, Access: readFSAccess | writeFSAccess | execFSAccess})
 	}
 	policy.FS = append(policy.FS, fsEntry{Path: tmp, Access: readFSAccess | writeFSAccess | execFSAccess})
-	var proxy *egressProxy
+	var proxy *network.Proxy
 	if set.route != nil {
-		proxy, err = newEgressProxy(*set.route)
+		proxy, err = network.NewProxy(*set.route)
 		if err != nil {
 			if ownedHome {
 				_ = os.RemoveAll(home)

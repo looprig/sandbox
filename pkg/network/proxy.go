@@ -1,4 +1,4 @@
-package sandbox
+package network
 
 import (
 	"bufio"
@@ -6,40 +6,37 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/safetext"
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
 
-var ErrNetworkTargetDenied = errors.New("sandbox: network target denied")
+var ErrTargetDenied = errors.New("sandbox: network target denied")
 
-var errNetworkAddressDenied = errors.New("sandbox: resolved network address denied")
-
-// NetworkTargetDeniedError preserves the completed process result while making
+// TargetDeniedError preserves the completed process result while making
 // an authenticated proxy denial the primary typed error.
-type NetworkTargetDeniedError struct {
+type TargetDeniedError struct {
 	ExitCode     int
 	ProcessError error
 	denial       error
 }
 
-func (err *NetworkTargetDeniedError) Error() string {
+func (err *TargetDeniedError) Error() string {
 	if err == nil {
-		return ErrNetworkTargetDenied.Error()
+		return ErrTargetDenied.Error()
 	}
 	return fmt.Sprintf("%v (process exit %d)", err.denial, err.ExitCode)
 }
 
-func (err *NetworkTargetDeniedError) Unwrap() error { return ErrNetworkTargetDenied }
+func (err *TargetDeniedError) Unwrap() error { return ErrTargetDenied }
 
 const (
 	proxyHeaderTimeout           = 10 * time.Second
@@ -57,8 +54,8 @@ type proxyAuthorization struct {
 	cancel         context.CancelFunc
 }
 
-type egressProxy struct {
-	route      EgressRoute
+type Proxy struct {
+	route      Route
 	listener   net.Listener
 	server     *http.Server
 	mu         sync.Mutex
@@ -82,15 +79,15 @@ type proxyTunnel struct {
 	upstream net.Conn
 }
 
-func newEgressProxy(route EgressRoute) (*egressProxy, error) {
-	if err := route.validate(); err != nil {
+func NewProxy(route Route) (*Proxy, error) {
+	if err := route.Validate(); err != nil {
 		return nil, err
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: listen for egress proxy: %w", err)
 	}
-	proxy := &egressProxy{
+	proxy := &Proxy{
 		route: route, listener: listener, executions: make(map[string]*proxyAuthorization),
 		tunnels: make(map[*proxyTunnel]struct{}), connectHandshakeTimeout: proxyCONNECTHandshakeTimeout,
 	}
@@ -102,26 +99,29 @@ func newEgressProxy(route EgressRoute) (*egressProxy, error) {
 	return proxy, nil
 }
 
-func (proxy *egressProxy) Addr() string {
+func (proxy *Proxy) Addr() string {
 	if proxy == nil || proxy.listener == nil {
 		return ""
 	}
 	return proxy.listener.Addr().String()
 }
 
-func (proxy *egressProxy) Authorize(executionID string, targets []NetworkTarget) (string, error) {
-	if proxy == nil || !validGrantText(executionID) || len(targets) == 0 {
+func (proxy *Proxy) Authorize(executionID string, targets []Target) (string, error) {
+	if proxy == nil || !safetext.Valid(executionID) || len(targets) == 0 {
 		return "", errors.New("sandbox: invalid proxy authorization")
 	}
 	return proxy.authorize(executionID, targets, false)
 }
 
-func (proxy *egressProxy) authorizeAll(executionID string) (string, error) {
+// AuthorizeAll authorizes an execution for every target the route permits. It
+// backs a profile whose network access is Allow, where the executor holds no
+// per-target list to enumerate.
+func (proxy *Proxy) AuthorizeAll(executionID string) (string, error) {
 	return proxy.authorize(executionID, nil, true)
 }
 
-func (proxy *egressProxy) authorize(executionID string, targets []NetworkTarget, allowAll bool) (string, error) {
-	if proxy == nil || !validGrantText(executionID) || (!allowAll && len(targets) == 0) {
+func (proxy *Proxy) authorize(executionID string, targets []Target, allowAll bool) (string, error) {
+	if proxy == nil || !safetext.Valid(executionID) || (!allowAll && len(targets) == 0) {
 		return "", errors.New("sandbox: invalid proxy authorization")
 	}
 	secret := make([]byte, 32)
@@ -141,7 +141,7 @@ func (proxy *egressProxy) authorize(executionID string, targets []NetworkTarget,
 	defer proxy.mu.Unlock()
 	if proxy.closing || proxy.executions == nil {
 		authorization.cancel()
-		return "", ErrExecutorClosed
+		return "", ErrClosed
 	}
 	if _, exists := proxy.executions[executionID]; exists {
 		return "", errors.New("sandbox: execution already authorized")
@@ -150,14 +150,14 @@ func (proxy *egressProxy) authorize(executionID string, targets []NetworkTarget,
 	return credential, nil
 }
 
-func (proxy *egressProxy) URL(executionID, credential string) string {
-	if proxy == nil || !validGrantText(executionID) || credential == "" {
+func (proxy *Proxy) URL(executionID, credential string) string {
+	if proxy == nil || !safetext.Valid(executionID) || credential == "" {
 		return ""
 	}
 	return (&url.URL{Scheme: "http", Host: proxy.Addr(), User: url.UserPassword(executionID, credential)}).String()
 }
 
-func (proxy *egressProxy) Release(executionID string) {
+func (proxy *Proxy) Release(executionID string) {
 	if proxy == nil {
 		return
 	}
@@ -170,7 +170,7 @@ func (proxy *egressProxy) Release(executionID string) {
 	}
 }
 
-func (proxy *egressProxy) Denial(executionID string) error {
+func (proxy *Proxy) Denial(executionID string) error {
 	if proxy == nil {
 		return nil
 	}
@@ -182,7 +182,7 @@ func (proxy *egressProxy) Denial(executionID string) error {
 	return nil
 }
 
-func (proxy *egressProxy) authenticate(request *http.Request) (string, *proxyAuthorization, bool) {
+func (proxy *Proxy) authenticate(request *http.Request) (string, *proxyAuthorization, bool) {
 	header := request.Header.Get("Proxy-Authorization")
 	const prefix = "Basic "
 	if !strings.HasPrefix(header, prefix) {
@@ -206,15 +206,15 @@ func (proxy *egressProxy) authenticate(request *http.Request) (string, *proxyAut
 	return executionID, authorization, true
 }
 
-func (proxy *egressProxy) recordDenial(executionID string, target NetworkTarget) {
+func (proxy *Proxy) recordDenial(executionID string, target Target) {
 	proxy.mu.Lock()
 	defer proxy.mu.Unlock()
 	if authorization := proxy.executions[executionID]; authorization != nil && authorization.denial == nil {
-		authorization.denial = fmt.Errorf("%w: %s", ErrNetworkTargetDenied, target.String())
+		authorization.denial = fmt.Errorf("%w: %s", ErrTargetDenied, target.String())
 	}
 }
 
-func (proxy *egressProxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+func (proxy *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	executionID, authorization, authenticated := proxy.authenticate(request)
 	if !authenticated {
 		writer.Header().Set("Proxy-Authenticate", `Basic realm="sandbox"`)
@@ -230,7 +230,7 @@ func (proxy *egressProxy) ServeHTTP(writer http.ResponseWriter, request *http.Re
 	request = request.WithContext(requestContext)
 	target, err := targetForRequest(request)
 	if err != nil {
-		proxy.recordDenial(executionID, NetworkTarget{transport: "tcp", host: "invalid", port: 1})
+		proxy.recordDenial(executionID, UnparseableTarget)
 		http.Error(writer, "network target denied", http.StatusForbidden)
 		return
 	}
@@ -247,11 +247,11 @@ func (proxy *egressProxy) ServeHTTP(writer http.ResponseWriter, request *http.Re
 	proxy.serveHTTP(writer, request, executionID, target)
 }
 
-func targetForRequest(request *http.Request) (NetworkTarget, error) {
+func targetForRequest(request *http.Request) (Target, error) {
 	address := request.Host
 	if request.Method != http.MethodConnect {
 		if request.URL == nil || !request.URL.IsAbs() || request.URL.Scheme != "http" {
-			return NetworkTarget{}, errors.New("sandbox: proxy requires an absolute HTTP URL")
+			return Target{}, errors.New("sandbox: proxy requires an absolute HTTP URL")
 		}
 		address = request.URL.Host
 	}
@@ -260,13 +260,13 @@ func targetForRequest(request *http.Request) (NetworkTarget, error) {
 		if request.Method != http.MethodConnect && !strings.Contains(address, ":") {
 			host, port = address, "80"
 		} else {
-			return NetworkTarget{}, err
+			return Target{}, err
 		}
 	}
-	return ParseNetworkTarget("tcp:" + net.JoinHostPort(host, port))
+	return ParseTarget("tcp:" + net.JoinHostPort(host, port))
 }
 
-func (proxy *egressProxy) serveHTTP(writer http.ResponseWriter, request *http.Request, executionID string, target NetworkTarget) {
+func (proxy *Proxy) serveHTTP(writer http.ResponseWriter, request *http.Request, executionID string, target Target) {
 	outbound := request.Clone(request.Context())
 	outbound.RequestURI = ""
 	outbound.Header = request.Header.Clone()
@@ -275,7 +275,7 @@ func (proxy *egressProxy) serveHTTP(writer http.ResponseWriter, request *http.Re
 	if proxy.route.kind == routeDirect {
 		transport.Proxy = nil
 		transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return proxy.route.dialTarget(ctx, target)
+			return proxy.route.DialTarget(ctx, target)
 		}
 	} else {
 		transport.Proxy = http.ProxyURL(proxy.route.upstream)
@@ -284,7 +284,7 @@ func (proxy *egressProxy) serveHTTP(writer http.ResponseWriter, request *http.Re
 	defer transport.CloseIdleConnections()
 	response, err := transport.RoundTrip(outbound)
 	if err != nil {
-		if errors.Is(err, errNetworkAddressDenied) {
+		if errors.Is(err, ErrAddressDenied) {
 			proxy.recordDenial(executionID, target)
 		}
 		http.Error(writer, "upstream unavailable", http.StatusBadGateway)
@@ -301,10 +301,10 @@ func (proxy *egressProxy) serveHTTP(writer http.ResponseWriter, request *http.Re
 	_, _ = io.Copy(writer, response.Body)
 }
 
-func (proxy *egressProxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, target NetworkTarget) {
+func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, target Target) {
 	upstream, err := proxy.dialTunnel(request.Context(), target)
 	if err != nil {
-		if errors.Is(err, errNetworkAddressDenied) {
+		if errors.Is(err, ErrAddressDenied) {
 			proxy.recordDenial(executionID, target)
 		}
 		http.Error(writer, "upstream unavailable", http.StatusBadGateway)
@@ -350,11 +350,11 @@ func (proxy *egressProxy) serveConnect(writer http.ResponseWriter, request *http
 	proxy.mu.Unlock()
 }
 
-func (proxy *egressProxy) dialTunnel(ctx context.Context, target NetworkTarget) (net.Conn, error) {
+func (proxy *Proxy) dialTunnel(ctx context.Context, target Target) (net.Conn, error) {
 	if proxy.route.kind == routeDirect {
-		return proxy.route.dialTarget(ctx, target)
+		return proxy.route.DialTarget(ctx, target)
 	}
-	upstream, err := proxy.route.dialUpstream(ctx)
+	upstream, err := proxy.route.DialUpstream(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +372,7 @@ func (proxy *egressProxy) dialTunnel(ctx context.Context, target NetworkTarget) 
 	if err := owned.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
-	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target.address()}, Host: target.address(), Header: make(http.Header)}
+	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target.Address()}, Host: target.Address(), Header: make(http.Header)}
 	if proxy.route.upstream.User != nil {
 		username := proxy.route.upstream.User.Username()
 		password, _ := proxy.route.upstream.User.Password()
@@ -437,101 +437,10 @@ func (connection *idleTimeoutConn) Write(buffer []byte) (int, error) {
 	return connection.Conn.Write(buffer)
 }
 
-func (route EgressRoute) dialTarget(ctx context.Context, target NetworkTarget) (net.Conn, error) {
-	addresses, err := route.lookup(ctx, target.host)
-	if err != nil || len(addresses) == 0 {
-		return nil, errors.New("sandbox: target resolution failed")
-	}
-	for _, address := range addresses {
-		if !publicDestination(address) {
-			return nil, errNetworkAddressDenied
-		}
-	}
-	var lastErr error
-	for _, address := range addresses {
-		connection, err := route.dial(ctx, "tcp", net.JoinHostPort(address.String(), fmt.Sprint(target.port)))
-		if err == nil {
-			return connection, nil
-		}
-		lastErr = err
-	}
-	return nil, fmt.Errorf("sandbox: target connection failed: %w", lastErr)
-}
-
 // deniedDestinationPrefixes is deliberately explicit and conservative. A
 // direct route claims address-class enforcement, so an ambiguous IANA
 // special-purpose destination is denied rather than treated as public. Keep
 // this table auditable alongside TestPublicDestinationRejectsSpecialUsePrefixes.
-var deniedDestinationPrefixes = []netip.Prefix{
-	// IPv4 special-purpose, local, metadata, documentation, and reserved space.
-	netip.MustParsePrefix("0.0.0.0/8"),          // this network
-	netip.MustParsePrefix("10.0.0.0/8"),         // private-use
-	netip.MustParsePrefix("100.64.0.0/10"),      // shared address space / CGNAT
-	netip.MustParsePrefix("100.100.100.200/32"), // known cloud metadata endpoint
-	netip.MustParsePrefix("127.0.0.0/8"),        // loopback
-	netip.MustParsePrefix("169.254.0.0/16"),     // link-local and common metadata
-	netip.MustParsePrefix("172.16.0.0/12"),      // private-use
-	netip.MustParsePrefix("192.0.0.0/24"),       // IETF protocol assignments
-	netip.MustParsePrefix("192.0.2.0/24"),       // TEST-NET-1
-	netip.MustParsePrefix("192.31.196.0/24"),    // AS112-v4
-	netip.MustParsePrefix("192.52.193.0/24"),    // AMT
-	netip.MustParsePrefix("192.88.99.0/24"),     // deprecated 6to4 relay anycast
-	netip.MustParsePrefix("192.168.0.0/16"),     // private-use
-	netip.MustParsePrefix("192.175.48.0/24"),    // AS112 direct delegation
-	netip.MustParsePrefix("198.18.0.0/15"),      // benchmarking
-	netip.MustParsePrefix("198.51.100.0/24"),    // TEST-NET-2
-	netip.MustParsePrefix("203.0.113.0/24"),     // TEST-NET-3
-	netip.MustParsePrefix("224.0.0.0/4"),        // multicast
-	netip.MustParsePrefix("240.0.0.0/4"),        // reserved and limited broadcast
-
-	// IPv6 special-purpose, transition, local, documentation, and multicast.
-	netip.MustParsePrefix("::/96"),             // unspecified/IPv4-compatible
-	netip.MustParsePrefix("::1/128"),           // loopback
-	netip.MustParsePrefix("::ffff:0:0:0/96"),   // IPv4-translated
-	netip.MustParsePrefix("64:ff9b::/96"),      // NAT64 well-known prefix
-	netip.MustParsePrefix("64:ff9b:1::/48"),    // NAT64 local-use prefix
-	netip.MustParsePrefix("100::/64"),          // discard-only
-	netip.MustParsePrefix("2001::/23"),         // IETF protocol assignments
-	netip.MustParsePrefix("2001:db8::/32"),     // documentation
-	netip.MustParsePrefix("2002::/16"),         // 6to4
-	netip.MustParsePrefix("2620:4f:8000::/48"), // AS112 direct delegation
-	netip.MustParsePrefix("3fff::/20"),         // documentation
-	netip.MustParsePrefix("5f00::/16"),         // segment-routing SIDs
-	netip.MustParsePrefix("fc00::/7"),          // unique-local
-	netip.MustParsePrefix("fe80::/10"),         // link-local
-	netip.MustParsePrefix("fec0::/10"),         // deprecated site-local
-	netip.MustParsePrefix("ff00::/8"),          // multicast
-}
-
-func publicDestination(ip net.IP) bool {
-	address, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	address = address.Unmap()
-	for _, denied := range deniedDestinationPrefixes {
-		if denied.Contains(address) {
-			return false
-		}
-	}
-	return true
-}
-
-func (route EgressRoute) dialUpstream(ctx context.Context) (net.Conn, error) {
-	connection, err := route.dial(ctx, "tcp", route.upstream.Host)
-	if err != nil {
-		return nil, errors.New("sandbox: upstream proxy unavailable")
-	}
-	if route.upstream.Scheme == "https" {
-		tlsConnection := tls.Client(connection, &tls.Config{ServerName: route.upstream.Hostname(), MinVersion: tls.VersionTLS12})
-		if err := tlsConnection.HandshakeContext(ctx); err != nil {
-			_ = connection.Close()
-			return nil, errors.New("sandbox: upstream proxy TLS failed")
-		}
-		return tlsConnection, nil
-	}
-	return connection, nil
-}
 
 func removeHopHeaders(header http.Header) {
 	for _, value := range header.Values("Connection") {
@@ -561,7 +470,7 @@ func tunnel(left, right net.Conn) {
 	_ = right.Close()
 }
 
-func (proxy *egressProxy) Close() error {
+func (proxy *Proxy) Close() error {
 	if proxy == nil {
 		return nil
 	}

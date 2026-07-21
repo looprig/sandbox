@@ -1,4 +1,4 @@
-package sandbox
+package network
 
 import (
 	"context"
@@ -13,41 +13,41 @@ import (
 	"strings"
 )
 
-var ErrEgressRouteDenied = errors.New("sandbox: egress route denied")
+var ErrRouteDenied = errors.New("sandbox: egress route denied")
 
-type egressRouteKind uint8
+type routeKind uint8
 
 const (
-	routeDirect egressRouteKind = iota + 1
+	routeDirect routeKind = iota + 1
 	routeUpstream
 )
 
-// NetworkTarget is a normalized transport, hostname, and port tuple.
-type NetworkTarget struct {
+// Target is a normalized transport, hostname, and port tuple.
+type Target struct {
 	transport string
 	host      string
 	port      uint16
 }
 
-// ParseNetworkTarget accepts the v1 tcp:<host>:<port> grant target.
-func ParseNetworkTarget(raw string) (NetworkTarget, error) {
+// ParseTarget accepts the v1 tcp:<host>:<port> grant target.
+func ParseTarget(raw string) (Target, error) {
 	const prefix = "tcp:"
 	if !strings.HasPrefix(raw, prefix) {
-		return NetworkTarget{}, errors.New("sandbox: network target transport must be tcp")
+		return Target{}, errors.New("sandbox: network target transport must be tcp")
 	}
 	host, portText, err := net.SplitHostPort(strings.TrimPrefix(raw, prefix))
 	if err != nil {
-		return NetworkTarget{}, fmt.Errorf("sandbox: network target: %w", err)
+		return Target{}, fmt.Errorf("sandbox: network target: %w", err)
 	}
 	host, err = normalizeTargetHost(host)
 	if err != nil {
-		return NetworkTarget{}, err
+		return Target{}, err
 	}
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil || port == 0 {
-		return NetworkTarget{}, errors.New("sandbox: network target port is invalid")
+		return Target{}, errors.New("sandbox: network target port is invalid")
 	}
-	return NetworkTarget{transport: "tcp", host: host, port: uint16(port)}, nil
+	return Target{transport: "tcp", host: host, port: uint16(port)}, nil
 }
 
 func normalizeTargetHost(host string) (string, error) {
@@ -74,25 +74,25 @@ func normalizeTargetHost(host string) (string, error) {
 	return host, nil
 }
 
-func (target NetworkTarget) String() string {
+func (target Target) String() string {
 	if target.transport == "" || target.host == "" || target.port == 0 {
 		return ""
 	}
 	return target.transport + ":" + net.JoinHostPort(target.host, strconv.Itoa(int(target.port)))
 }
 
-func (target NetworkTarget) Transport() string { return target.transport }
-func (target NetworkTarget) Hostname() string  { return target.host }
-func (target NetworkTarget) Port() uint16      { return target.port }
+func (target Target) Transport() string { return target.transport }
+func (target Target) Hostname() string  { return target.host }
+func (target Target) Port() uint16      { return target.port }
 
-func (target NetworkTarget) address() string {
+func (target Target) Address() string {
 	return net.JoinHostPort(target.host, strconv.Itoa(int(target.port)))
 }
 
-// EgressRoute is a validated, immutable route description. Secret upstream
+// Route is a validated, immutable route description. Secret upstream
 // credentials are kept only in the private URL and excluded from identity.
-type EgressRoute struct {
-	kind             egressRouteKind
+type Route struct {
+	kind             routeKind
 	upstream         *url.URL
 	fingerprint      string
 	targetGuarantee  bool
@@ -101,10 +101,10 @@ type EgressRoute struct {
 	dial             func(context.Context, string, string) (net.Conn, error)
 }
 
-// NewDirectEgressRoute creates an explicit direct route with local DNS and
+// NewDirectRoute creates an explicit direct route with local DNS and
 // address-class validation.
-func NewDirectEgressRoute() (EgressRoute, error) {
-	route := EgressRoute{
+func NewDirectRoute() (Route, error) {
+	route := Route{
 		kind: routeDirect, targetGuarantee: true, addressGuarantee: true,
 		lookup: func(ctx context.Context, host string) ([]net.IP, error) {
 			return net.DefaultResolver.LookupIP(ctx, "ip", host)
@@ -115,28 +115,28 @@ func NewDirectEgressRoute() (EgressRoute, error) {
 	return route, nil
 }
 
-// NewUpstreamEgressRoute creates an explicit HTTP or HTTPS organization proxy
+// NewUpstreamRoute creates an explicit HTTP or HTTPS organization proxy
 // route. trustedAddressGuarantee is asserted only when the upstream contract
 // guarantees resolved-address filtering.
-func NewUpstreamEgressRoute(rawURL string, trustedAddressGuarantee bool) (EgressRoute, error) {
+func NewUpstreamRoute(rawURL string, trustedAddressGuarantee bool) (Route, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return EgressRoute{}, errors.New("sandbox: upstream proxy must use http or https")
+		return Route{}, errors.New("sandbox: upstream proxy must use http or https")
 	}
 	if parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return EgressRoute{}, errors.New("sandbox: upstream proxy URL must contain only authority")
+		return Route{}, errors.New("sandbox: upstream proxy URL must contain only authority")
 	}
 	host, err := normalizeTargetHost(parsed.Hostname())
 	if err != nil {
-		return EgressRoute{}, errors.New("sandbox: upstream proxy host is invalid")
+		return Route{}, errors.New("sandbox: upstream proxy host is invalid")
 	}
 	portText := parsed.Port()
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil || port == 0 {
-		return EgressRoute{}, errors.New("sandbox: upstream proxy port is invalid")
+		return Route{}, errors.New("sandbox: upstream proxy port is invalid")
 	}
 	parsed.Host = net.JoinHostPort(host, strconv.Itoa(int(port)))
-	route := EgressRoute{
+	route := Route{
 		kind: routeUpstream, upstream: parsed, targetGuarantee: true,
 		addressGuarantee: trustedAddressGuarantee,
 		dial:             (&net.Dialer{}).DialContext,
@@ -156,7 +156,7 @@ func fingerprintRoute(kind, endpoint string, addressGuarantee bool) string {
 	return "route-v1:" + hex.EncodeToString(digest[:])
 }
 
-func (route EgressRoute) validate() error {
+func (route Route) Validate() error {
 	if route.fingerprint == "" || !route.targetGuarantee || route.dial == nil {
 		return errors.New("sandbox: invalid egress route")
 	}
@@ -169,22 +169,22 @@ func (route EgressRoute) validate() error {
 	return nil
 }
 
-func (route EgressRoute) Fingerprint() string {
-	if route.validate() != nil {
+func (route Route) Fingerprint() string {
+	if route.Validate() != nil {
 		return ""
 	}
 	return route.fingerprint
 }
 
-func (route EgressRoute) TargetGuarantee() bool {
-	return route.validate() == nil && route.targetGuarantee
+func (route Route) TargetGuarantee() bool {
+	return route.Validate() == nil && route.targetGuarantee
 }
-func (route EgressRoute) AddressGuarantee() bool {
-	return route.validate() == nil && route.addressGuarantee
+func (route Route) AddressGuarantee() bool {
+	return route.Validate() == nil && route.addressGuarantee
 }
 
-func (route EgressRoute) String() string {
-	if route.validate() != nil {
+func (route Route) String() string {
+	if route.Validate() != nil {
 		return "invalid"
 	}
 	if route.kind == routeDirect {
@@ -193,19 +193,19 @@ func (route EgressRoute) String() string {
 	return route.upstream.Scheme + "://" + route.upstream.Host
 }
 
-// EgressRouteResolver confines a consumer selector to prevalidated routes.
-type EgressRouteResolver struct {
-	routes      map[string]EgressRoute
-	selectRoute func(context.Context, NetworkTarget) string
+// RouteResolver confines a consumer selector to prevalidated routes.
+type RouteResolver struct {
+	routes      map[string]Route
+	selectRoute func(context.Context, Target) string
 }
 
-func NewEgressRouteResolver(routes []EgressRoute, selector func(context.Context, NetworkTarget) string) (*EgressRouteResolver, error) {
+func NewRouteResolver(routes []Route, selector func(context.Context, Target) string) (*RouteResolver, error) {
 	if len(routes) == 0 || selector == nil {
 		return nil, errors.New("sandbox: route resolver requires routes and selector")
 	}
-	configured := make(map[string]EgressRoute, len(routes))
+	configured := make(map[string]Route, len(routes))
 	for _, route := range routes {
-		if err := route.validate(); err != nil {
+		if err := route.Validate(); err != nil {
 			return nil, err
 		}
 		if _, duplicate := configured[route.fingerprint]; duplicate {
@@ -213,20 +213,20 @@ func NewEgressRouteResolver(routes []EgressRoute, selector func(context.Context,
 		}
 		configured[route.fingerprint] = route
 	}
-	return &EgressRouteResolver{routes: configured, selectRoute: selector}, nil
+	return &RouteResolver{routes: configured, selectRoute: selector}, nil
 }
 
-func (resolver *EgressRouteResolver) Resolve(ctx context.Context, target NetworkTarget) (EgressRoute, error) {
+func (resolver *RouteResolver) Resolve(ctx context.Context, target Target) (Route, error) {
 	if resolver == nil || resolver.selectRoute == nil || target.String() == "" {
-		return EgressRoute{}, ErrEgressRouteDenied
+		return Route{}, ErrRouteDenied
 	}
 	identity := resolver.selectRoute(ctx, target)
 	if err := ctx.Err(); err != nil {
-		return EgressRoute{}, err
+		return Route{}, err
 	}
 	route, ok := resolver.routes[identity]
 	if !ok {
-		return EgressRoute{}, ErrEgressRouteDenied
+		return Route{}, ErrRouteDenied
 	}
 	return route, nil
 }

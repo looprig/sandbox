@@ -1,4 +1,4 @@
-package sandbox
+package network
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestEgressRouteValidationFingerprintAndGuarantees(t *testing.T) {
-	direct, err := NewDirectEgressRoute()
+	direct, err := NewDirectRoute()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -17,7 +17,7 @@ func TestEgressRouteValidationFingerprintAndGuarantees(t *testing.T) {
 	}
 
 	const secret = "route-password"
-	upstream, err := NewUpstreamEgressRoute("https://proxy-user:"+secret+"@proxy.example:8443", false)
+	upstream, err := NewUpstreamRoute("https://proxy-user:"+secret+"@proxy.example:8443", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,28 +30,28 @@ func TestEgressRouteValidationFingerprintAndGuarantees(t *testing.T) {
 	if !upstream.TargetGuarantee() || upstream.AddressGuarantee() {
 		t.Fatalf("upstream guarantees = target %v address %v", upstream.TargetGuarantee(), upstream.AddressGuarantee())
 	}
-	trusted, err := NewUpstreamEgressRoute("http://proxy.example:8080", true)
+	trusted, err := NewUpstreamRoute("http://proxy.example:8080", true)
 	if err != nil || !trusted.AddressGuarantee() {
 		t.Fatalf("trusted upstream = %#v, %v", trusted, err)
 	}
 
 	for _, raw := range []string{"", "socks5://proxy.example:1080", "http://proxy.example/path", "http://proxy.example:0"} {
-		if _, err := NewUpstreamEgressRoute(raw, false); err == nil {
+		if _, err := NewUpstreamRoute(raw, false); err == nil {
 			t.Errorf("invalid upstream %q accepted", raw)
 		}
 	}
 }
 
 func TestRouteResolverCanOnlySelectConfiguredRoutes(t *testing.T) {
-	direct, _ := NewDirectEgressRoute()
-	upstream, _ := NewUpstreamEgressRoute("http://proxy.example:8080", false)
-	resolver, err := NewEgressRouteResolver([]EgressRoute{direct, upstream}, func(context.Context, NetworkTarget) string {
+	direct, _ := NewDirectRoute()
+	upstream, _ := NewUpstreamRoute("http://proxy.example:8080", false)
+	resolver, err := NewRouteResolver([]Route{direct, upstream}, func(context.Context, Target) string {
 		return upstream.Fingerprint()
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := ParseNetworkTarget("tcp:example.com:443")
+	target, err := ParseTarget("tcp:example.com:443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +60,11 @@ func TestRouteResolverCanOnlySelectConfiguredRoutes(t *testing.T) {
 		t.Fatalf("Resolve = %q, %v", got.Fingerprint(), err)
 	}
 
-	bad, err := NewEgressRouteResolver([]EgressRoute{direct}, func(context.Context, NetworkTarget) string { return "not-configured" })
+	bad, err := NewRouteResolver([]Route{direct}, func(context.Context, Target) string { return "not-configured" })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := bad.Resolve(context.Background(), target); !errors.Is(err, ErrEgressRouteDenied) {
-		t.Fatalf("unconfigured selection error = %v, want ErrEgressRouteDenied", err)
+	if _, err := bad.Resolve(context.Background(), target); !errors.Is(err, ErrRouteDenied) {
+		t.Fatalf("unconfigured selection error = %v, want ErrRouteDenied", err)
 	}
 }
