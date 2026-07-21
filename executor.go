@@ -283,11 +283,7 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 	}
 	policy := cloneEffectivePolicy(s.policy)
 	proxyURL := e.proxy.URL(executionID, credential)
-	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
-		policy.Env.Set[name] = proxyURL
-	}
-	policy.Env.Set["NO_PROXY"] = ""
-	policy.Env.Set["no_proxy"] = ""
+	applyChildProxyEnv(policy.Env.Set, proxyURL)
 	s.policy = policy
 	s.env = assembleEnv(policy)
 	return s, executionID, nil
@@ -457,10 +453,10 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if err != nil {
 		return "", err
 	}
-	if class == "command.start.v1" && target != command {
+	if class == GrantClassCommandStart && target != command {
 		return "", ErrGrantWrongCommand
 	}
-	if class == "network.proxy-target.v1" && e.proxy == nil {
+	if class == GrantClassNetworkProxyTarget && e.proxy == nil {
 		return "", ErrGrantUnsupported
 	}
 	var pathBinding *grantPathBinding
@@ -583,7 +579,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 				}
 			}
 		}
-		if delta.class == "command.start.v1" {
+		if delta.class == GrantClassCommandStart {
 			if payload.Target != command {
 				return nil, -1, ErrGrantWrongCommand
 			}
@@ -642,11 +638,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, err
 		}
 		proxyURL := e.proxy.URL(executionID, credential)
-		for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
-			policy.Env.Set[name] = proxyURL
-		}
-		policy.Env.Set["NO_PROXY"] = ""
-		policy.Env.Set["no_proxy"] = ""
+		applyChildProxyEnv(policy.Env.Set, proxyURL)
 	}
 	for id, expiryUnixMilli := range seen {
 		e.usedGrants[id] = expiryUnixMilli
@@ -712,7 +704,7 @@ func applyFilesystemGrant(entries []fsEntry, grant fsEntry) []fsEntry {
 
 func classKind(class string) string {
 	switch {
-	case class == "command.start.v1":
+	case class == GrantClassCommandStart:
 		return "command.execute"
 	case strings.HasPrefix(class, "filesystem.") && strings.HasSuffix(class, ".read.v1"):
 		return "filesystem.read"
@@ -736,6 +728,20 @@ func classScope(class, target string) string {
 	default:
 		return ""
 	}
+}
+
+// applyChildProxyEnv forces the loopback proxy environment onto a child's
+// env-Set overrides: it points all four proxy variables at proxyURL and clears
+// both spellings of NO_PROXY so nothing can bypass the loopback proxy. It is
+// the single proxy-env injection path shared by the plain allowed-route run
+// (prepareAllowedRoute) and the grant-bound run (runCommandWithGrants) so the
+// two egress-containment paths can never inject different proxy env.
+func applyChildProxyEnv(set map[string]string, proxyURL string) {
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		set[name] = proxyURL
+	}
+	set["NO_PROXY"] = ""
+	set["no_proxy"] = ""
 }
 
 // assembleEnv builds the child environment from a effectivePolicy's effectiveEnvPolicy (SPEC §5.5).

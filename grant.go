@@ -13,12 +13,34 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	grantTokenPrefix     = "lrsx1"
 	currentGrantVersion  = uint16(1)
 	defaultRouteIdentity = "direct:v1"
+)
+
+// Grant enforcement-class identifiers. These string VALUES are the shipped
+// wire/enforcement contract between the sandbox (which authenticates and
+// enforces grants) and its producers (the harness/tools permission layer,
+// which mints them). They are the single source of truth within sandbox:
+// validateGrantClass and the executor switch on these constants rather than
+// bare literals, and grant_class_test.go pins each value so a rename that
+// silently changes a value fails here. The tools module independently pins the
+// same literals (it must not depend on sandbox), so drift on either side is
+// caught by a value test on that side.
+const (
+	GrantClassCommandStart        = "command.start.v1"
+	GrantClassNetworkProxyTarget  = "network.proxy-target.v1"
+	GrantClassNetworkBroad        = "network.broad.v1"
+	GrantClassFilesystemPathRead  = "filesystem.path.read.v1"
+	GrantClassFilesystemTreeRead  = "filesystem.tree.read.v1"
+	GrantClassFilesystemHostRead  = "filesystem.host.read.v1"
+	GrantClassFilesystemPathWrite = "filesystem.path.write.v1"
+	GrantClassFilesystemTreeWrite = "filesystem.tree.write.v1"
+	GrantClassFilesystemHostWrite = "filesystem.host.write.v1"
 )
 
 var grantEnc = base64.RawURLEncoding
@@ -234,7 +256,7 @@ func normalizeGrantScopeTarget(scope, class, target string) (string, string, err
 }
 
 func validGrantText(value string) bool {
-	return value != "" && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
 }
 
 type grantDelta struct {
@@ -254,42 +276,42 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 		return grantDelta{entry: &fsEntry{Path: policyPath, Access: access, Exact: exact, Canonical: filepath.IsAbs(policyPath)}, class: class}, guarantee, nil
 	}
 	switch class {
-	case "command.start.v1":
+	case GrantClassCommandStart:
 		if kind != "command.execute" || scope != "" || !validGrantText(target) {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		return grantDelta{class: class}, 0, nil
-	case "filesystem.path.read.v1", "filesystem.path.write.v1":
+	case GrantClassFilesystemPathRead, GrantClassFilesystemPathWrite:
 		if !filepath.IsAbs(target) || filepath.Clean(target) != target || scope != target {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		if class == "filesystem.path.read.v1" {
+		if class == GrantClassFilesystemPathRead {
 			return filesystem("filesystem.read", target, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, true)
 		}
 		return filesystem("filesystem.write", target, target, writeFSAccess, GuaranteeWriteBoundary, true)
-	case "filesystem.tree.read.v1", "filesystem.tree.write.v1":
+	case GrantClassFilesystemTreeRead, GrantClassFilesystemTreeWrite:
 		if !filepath.IsAbs(target) || filepath.Clean(target) != target || scope != "tree:"+target {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		if class == "filesystem.tree.read.v1" {
+		if class == GrantClassFilesystemTreeRead {
 			return filesystem("filesystem.read", scope, target, readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
 		}
 		return filesystem("filesystem.write", scope, target, writeFSAccess, GuaranteeWriteBoundary, false)
-	case "filesystem.host.read.v1":
+	case GrantClassFilesystemHostRead:
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		delta, guarantee, err := filesystem("filesystem.read", "host:*", string(filepath.Separator), readFSAccess|execFSAccess, GuaranteeReadBoundary, false)
 		delta.droppedGuarantees = GuaranteeReadBoundary
 		return delta, guarantee, err
-	case "filesystem.host.write.v1":
+	case GrantClassFilesystemHostWrite:
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		delta, guarantee, err := filesystem("filesystem.write", "host:*", string(filepath.Separator), writeFSAccess, GuaranteeWriteBoundary, false)
 		delta.droppedGuarantees = GuaranteeWriteBoundary
 		return delta, guarantee, err
-	case "network.broad.v1":
+	case GrantClassNetworkBroad:
 		parts := strings.Split(target, ":")
 		if kind != "network" || scope != "" || len(parts) != 3 || parts[0] != "tcp" || parts[1] != "*" {
 			return grantDelta{}, 0, ErrGrantMalformed
@@ -299,7 +321,7 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
 		return grantDelta{port: uint16(port), class: class, dns: true}, GuaranteeNetworkBoundary, nil
-	case "network.proxy-target.v1":
+	case GrantClassNetworkProxyTarget:
 		if kind != "network" || scope != "" || !validGrantText(target) {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
