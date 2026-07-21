@@ -321,12 +321,12 @@ func buildEgressRuleset(conn *nftables.Conn) *nftables.Table {
 	})
 	policyDrop := nftables.ChainPolicyDrop
 	output := conn.AddChain(&nftables.Chain{
-		Name:            "output",
-		Table:           table,
-		Type:            nftables.ChainTypeFilter,
-		Hooknum:         nftables.ChainHookOutput,
-		Priority:        nftables.ChainPriorityFilter,
-		effectivePolicy: &policyDrop,
+		Name:     "output",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &policyDrop,
 	})
 
 	// ct state established,related accept.
