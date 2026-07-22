@@ -5,6 +5,7 @@ package exec
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -56,5 +57,30 @@ func TestWindowsIssueGrantRejectsBroadHostReadAndWrite(t *testing.T) {
 	}
 	if len(executor.retainedGrantPaths) != 0 {
 		t.Fatalf("host grant rejection consumed handles: %d", len(executor.retainedGrantPaths))
+	}
+}
+
+func TestWindowsIssueGrantRejectsNonexistentExactTarget(t *testing.T) {
+	now := time.Date(2026, 7, 21, 19, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	target := filepath.Join(workspace, "not-created.txt")
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := executor.IssueGrant(context.Background(), "missing-exact", "true", workspace,
+		"filesystem.write", target, GrantClassFilesystemPathWrite, target, now.Add(time.Minute).UnixMilli()); !errors.Is(err, ErrGrantUnsupported) {
+		t.Fatalf("IssueGrant(nonexistent exact target) error = %v, want ErrGrantUnsupported", err)
+	}
+	if len(executor.retainedGrantPaths) != 0 {
+		t.Fatalf("rejected exact grant retained handles: %d", len(executor.retainedGrantPaths))
 	}
 }

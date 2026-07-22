@@ -86,8 +86,8 @@ const GlobMeta = "*?["
 // simply grants nothing, so a malformed allow never widens access.
 func entryMatches(entry FSEntry, target string) bool {
 	if strings.ContainsAny(entry.Path, GlobMeta) {
-		re := GlobRegexp(entry.Path)
-		return re != nil && re.MatchString(target)
+		matched, valid := globMatches(entry.Path, target)
+		return valid && matched
 	}
 	return LiteralMatches(entry.Path, target, entry.Exact)
 }
@@ -99,8 +99,8 @@ func entryMatches(entry FSEntry, target string) bool {
 // silently does not deny is the one failure mode this resolver must never have.
 func denyMatches(entry FSEntry, target string) bool {
 	if strings.ContainsAny(entry.Path, GlobMeta) {
-		re := GlobRegexp(entry.Path)
-		return re == nil || re.MatchString(target)
+		matched, valid := globMatches(entry.Path, target)
+		return !valid || matched
 	}
 	return LiteralMatches(entry.Path, target, entry.Exact)
 }

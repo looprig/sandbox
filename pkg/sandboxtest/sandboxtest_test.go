@@ -30,6 +30,14 @@ func (sut conservativeSUT) RunCommand(_ context.Context, dir string, command str
 	if command == "env" || command == "set" {
 		return []byte(strings.Join(os.Environ(), "\n")), 0, nil
 	}
+	if strings.HasSuffix(strings.ToLower(command), ".cmd") && !strings.ContainsAny(command, `/\\`) {
+		body, err := os.ReadFile(filepath.Join(dir, command))
+		if err != nil {
+			return nil, 1, nil
+		}
+		lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+		command = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[len(lines)-2]), "@"))
+	}
 	if strings.HasPrefix(command, "type ") && !strings.HasPrefix(command, "type nul > ") {
 		path := strings.Trim(strings.TrimPrefix(command, "type "), `"`)
 		out, err := os.ReadFile(resolveCommandPath(dir, strings.ReplaceAll(path, "%%", "%")))

@@ -23,6 +23,11 @@ func pathKey(path string) string { return filepath.Clean(path) }
 
 func globPathKey(path string) string { return path }
 
+func globMatches(glob, target string) (bool, bool) {
+	re := GlobRegexp(glob)
+	return re != nil && re.MatchString(target), re != nil
+}
+
 func pathKeyIsRoot(key string) bool { return key == pathKeySeparator }
 
 func pathKeyVolume(string) string { return "" }

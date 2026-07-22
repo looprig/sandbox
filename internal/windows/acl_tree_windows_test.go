@@ -11,14 +11,26 @@ import (
 )
 
 func TestParseFileIDBothDirectoryInfo(t *testing.T) {
-	buffer := append(directoryInfoRecord(t, ".", true), directoryInfoRecord(t, "Beta.txt", true)...)
-	buffer = append(buffer, directoryInfoRecord(t, "alpha", false)...)
-	names, err := parseFileIDBothDirectoryInfo(buffer)
+	dot := directoryInfoRecord(t, ".", true)
+	beta := directoryInfoRecord(t, "Beta.txt", true)
+	binary.LittleEndian.PutUint32(beta[56:60], win.FILE_ATTRIBUTE_DIRECTORY)
+	alpha := directoryInfoRecord(t, "alpha", false)
+	binary.LittleEndian.PutUint32(alpha[56:60], win.FILE_ATTRIBUTE_REPARSE_POINT)
+	buffer := append(dot, beta...)
+	buffer = append(buffer, alpha...)
+	entries, err := parseFileIDBothDirectoryInfo(buffer)
 	if err != nil {
 		t.Fatal(err)
 	}
+	names := make([]string, len(entries))
+	for index := range entries {
+		names[index] = entries[index].name
+	}
 	if !slices.Equal(names, []string{"Beta.txt", "alpha"}) {
 		t.Fatalf("names = %q", names)
+	}
+	if !entries[0].directory || entries[0].reparse || entries[1].directory || !entries[1].reparse {
+		t.Fatalf("entry types = %+v, want directory then reparse", entries)
 	}
 }
 

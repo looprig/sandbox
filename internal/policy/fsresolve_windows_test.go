@@ -42,9 +42,34 @@ func TestWindowsLiteralComparisonUsesOrdinalUnicodeSemantics(t *testing.T) {
 	}
 }
 
-func TestWindowsGlobMatchingNormalizesSeparators(t *testing.T) {
+func TestWindowsGlobMatchingUsesOrdinalPathKeySemantics(t *testing.T) {
 	entries := []FSEntry{{Path: `C:/work/**/.env*`, Denied: AllAccess}}
-	for _, target := range []string{`C:\work\src\.env`, `C:/work/src/.env.local`} {
+	for _, target := range []string{
+		`C:\work\src\.env`,
+		`C:/work/src/.env.local`,
+		`c:\WORK/src\.ENV`,
+		`C:\WoRk\SRC\.EnV.Local`,
+	} {
+		if got := ResolveFS(entries, target); got != DenyAccess {
+			t.Fatalf("ResolveFS(%q) = %v, want deny", target, got)
+		}
+	}
+	ordinary := append([]FSEntry{{Path: `C:\work`, Access: AllAccess}}, entries...)
+	if access := ResolveFS(ordinary, `C:\work\src\env`); access != AllAccess {
+		t.Fatalf("ordinary filename access = %v, want allow", access)
+	}
+}
+
+func TestWindowsGlobClassesAndQuestionMarksIgnoreCaseButNotSeparators(t *testing.T) {
+	entries := []FSEntry{
+		{Path: `C:\work\[a-c]onfig\?.TXT`, Access: ReadAccess},
+	}
+	for _, target := range []string{`c:/WORK/Config/x.txt`, `C:\work\bONFIG\Z.TxT`} {
+		if got := ResolveFS(entries, target); got != ReadAccess {
+			t.Fatalf("ResolveFS(%q) = %v, want read", target, got)
+		}
+	}
+	for _, target := range []string{`C:\work\config\deep\x.txt`, `C:\work\donfig\x.txt`} {
 		if got := ResolveFS(entries, target); got != DenyAccess {
 			t.Fatalf("ResolveFS(%q) = %v, want deny", target, got)
 		}

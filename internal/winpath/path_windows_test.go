@@ -227,6 +227,64 @@ func TestWindowsComponentWalkClosesChainWhenReparseAppears(t *testing.T) {
 	}
 }
 
+func TestWindowsACLComponentWalkOpensAuthorityOnFinalHandleOnly(t *testing.T) {
+	type call struct {
+		name      string
+		directory bool
+		access    uint32
+		share     uint32
+	}
+	var calls []call
+	handles, err := walkACLPathComponents(`C:\one\tree`, true, true,
+		func(name string, access, share uint32) (windows.Handle, error) {
+			calls = append(calls, call{name: name, directory: true, access: access, share: share})
+			return 1, nil
+		},
+		func(parent windows.Handle, name string, directory bool, access, share uint32) (windows.Handle, error) {
+			calls = append(calls, call{name: name, directory: directory, access: access, share: share})
+			return parent + 1, nil
+		}, func(windows.Handle) (bool, error) { return false, nil }, func(windows.Handle) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(handles) != 3 || len(calls) != 3 {
+		t.Fatalf("handles=%v calls=%v, want three retained components", handles, calls)
+	}
+	allSharing := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	for _, ancestor := range calls[:2] {
+		if ancestor.access&(windows.READ_CONTROL|windows.WRITE_DAC) != 0 || ancestor.share != allSharing {
+			t.Fatalf("ancestor call = %+v, want traversal-only access and full sharing", ancestor)
+		}
+	}
+	final := calls[2]
+	wantAccess := uint32(windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES | windows.FILE_LIST_DIRECTORY)
+	if !final.directory || final.access&wantAccess != wantAccess || final.share != windows.FILE_SHARE_READ {
+		t.Fatalf("final call = %+v, want directory ACL authority %#x and frozen sharing", final, wantAccess)
+	}
+}
+
+func TestWindowsACLComponentWalkClosesAncestorsWhenFinalOpenFails(t *testing.T) {
+	wantErr := errors.New("injected final ACL open failure")
+	var closed []windows.Handle
+	_, err := walkACLPathComponents(`C:\one\leaf`, false, false,
+		func(string, uint32, uint32) (windows.Handle, error) { return 1, nil },
+		func(parent windows.Handle, name string, _ bool, _ uint32, _ uint32) (windows.Handle, error) {
+			if name == "leaf" {
+				return windows.InvalidHandle, wantErr
+			}
+			return parent + 1, nil
+		}, func(windows.Handle) (bool, error) { return false, nil },
+		func(handle windows.Handle) error { closed = append(closed, handle); return nil },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("walk error = %v, want injected failure", err)
+	}
+	if want := []windows.Handle{2, 1}; !slices.Equal(closed, want) {
+		t.Fatalf("closed handles = %v, want %v", closed, want)
+	}
+}
+
 func TestWindowsOpenNeverEscapesDuringConcurrentSymlinkSwap(t *testing.T) {
 	parent := t.TempDir()
 	safe := filepath.Join(parent, "slot")

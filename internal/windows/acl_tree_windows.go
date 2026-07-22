@@ -17,6 +17,12 @@ import (
 
 const fileIDBothDirectoryInfoHeaderSize = 104
 
+type aclDirectoryEntry struct {
+	name      string
+	directory bool
+	reparse   bool
+}
+
 // ACLTreeEntry is one deterministic, no-follow enumeration result. Reparse
 // entries are represented for planning and audit, but never retained or
 // traversed. RelativePath is descriptive only and is never used for mutation.
@@ -41,7 +47,7 @@ func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error)
 	if root == nil || root.NativeHandle() == 0 || root.Exact() || !root.IsDir() {
 		return nil, errors.New("sandbox: retained ACL tree requires an open directory handle")
 	}
-	rootObject, err := reopenDirectoryACLObject(win.Handle(root.NativeHandle()), root.Target())
+	rootObject, err := openBoundWin32ACLObject(win.Handle(root.NativeHandle()), root.Target(), true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -69,16 +75,6 @@ func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error)
 		return winpath.Compare(left.RelativePath, right.RelativePath)
 	})
 	return tree, nil
-}
-
-func reopenDirectoryACLObject(handle win.Handle, target string) (*win32ACLObject, error) {
-	desired := uintptr(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES | win.FILE_LIST_DIRECTORY)
-	reopened, _, callErr := procReOpenFile.Call(uintptr(handle), desired,
-		win.FILE_SHARE_READ, win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
-	if reopened == uintptr(win.InvalidHandle) {
-		return nil, fmt.Errorf("retain ACL directory handle: %w", callErr)
-	}
-	return &win32ACLObject{handle: win.Handle(reopened), target: target}, nil
 }
 
 // Root returns the identity captured from the retained root handle.
@@ -157,18 +153,18 @@ func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative s
 	if err != nil || before.identity.Kind != ACLObjectDirectory {
 		return errors.Join(fmt.Errorf("%w: enumerated directory changed", policy.ErrTargetChanged), err)
 	}
-	names, err := directoryNames(directory.handle)
+	entries, err := directoryEntries(directory.handle)
 	if err != nil {
 		return fmt.Errorf("enumerate retained directory handle: %w", err)
 	}
-	for _, name := range names {
-		child, identity, err := openRelativeACLChild(directory.handle, name)
+	for _, entry := range entries {
+		child, identity, err := openRelativeACLChild(directory.handle, entry)
 		if err != nil {
 			return err
 		}
-		childRelative := name
+		childRelative := entry.name
 		if relative != "" {
-			childRelative = relative + `\` + name
+			childRelative = relative + `\` + entry.name
 		}
 		entry := ACLTreeEntry{Object: identity, RelativePath: childRelative}
 		if identity.Kind == ACLObjectReparsePoint {
@@ -201,10 +197,10 @@ func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative s
 	return nil
 }
 
-func directoryNames(handle win.Handle) ([]string, error) {
+func directoryEntries(handle win.Handle) ([]aclDirectoryEntry, error) {
 	buffer := make([]byte, 64*1024)
 	class := uint32(win.FileIdBothDirectoryRestartInfo)
-	var names []string
+	var entries []aclDirectoryEntry
 	for {
 		err := win.GetFileInformationByHandleEx(handle, class, &buffer[0], uint32(len(buffer)))
 		class = win.FileIdBothDirectoryInfo
@@ -218,19 +214,19 @@ func directoryNames(handle win.Handle) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		names = append(names, batch...)
+		entries = append(entries, batch...)
 	}
-	slices.SortFunc(names, winpath.Compare)
-	for index := 1; index < len(names); index++ {
-		if winpath.EqualPath(names[index-1], names[index]) {
+	slices.SortFunc(entries, func(left, right aclDirectoryEntry) int { return winpath.Compare(left.name, right.name) })
+	for index := 1; index < len(entries); index++ {
+		if winpath.EqualPath(entries[index-1].name, entries[index].name) {
 			return nil, errors.New("sandbox: duplicate directory entry name")
 		}
 	}
-	return names, nil
+	return entries, nil
 }
 
-func parseFileIDBothDirectoryInfo(buffer []byte) ([]string, error) {
-	var names []string
+func parseFileIDBothDirectoryInfo(buffer []byte) ([]aclDirectoryEntry, error) {
+	var entries []aclDirectoryEntry
 	for offset := 0; ; {
 		if offset < 0 || len(buffer)-offset < fileIDBothDirectoryInfoHeaderSize {
 			return nil, errors.New("sandbox: malformed directory enumeration record")
@@ -245,6 +241,7 @@ func parseFileIDBothDirectoryInfo(buffer []byte) ([]string, error) {
 			recordSize = next
 		}
 		nameBytes := int(binary.LittleEndian.Uint32(record[60:64]))
+		fileAttributes := binary.LittleEndian.Uint32(record[56:60])
 		if nameBytes == 0 || nameBytes&1 != 0 || nameBytes > recordSize-fileIDBothDirectoryInfoHeaderSize {
 			return nil, errors.New("sandbox: malformed directory entry name")
 		}
@@ -254,17 +251,20 @@ func parseFileIDBothDirectoryInfo(buffer []byte) ([]string, error) {
 			if name == "" || strings.ContainsAny(name, `\/`) || strings.IndexByte(name, 0) >= 0 {
 				return nil, errors.New("sandbox: unsafe directory entry name")
 			}
-			names = append(names, name)
+			entries = append(entries, aclDirectoryEntry{
+				name: name, directory: fileAttributes&win.FILE_ATTRIBUTE_DIRECTORY != 0,
+				reparse: fileAttributes&win.FILE_ATTRIBUTE_REPARSE_POINT != 0,
+			})
 		}
 		if next == 0 {
-			return names, nil
+			return entries, nil
 		}
 		offset += next
 	}
 }
 
-func openRelativeACLChild(parent win.Handle, name string) (*win32ACLObject, ACLObjectIdentity, error) {
-	objectName, err := win.NewNTUnicodeString(name)
+func openRelativeACLChild(parent win.Handle, entry aclDirectoryEntry) (*win32ACLObject, ACLObjectIdentity, error) {
+	objectName, err := win.NewNTUnicodeString(entry.name)
 	if err != nil {
 		return nil, ACLObjectIdentity{}, err
 	}
@@ -276,10 +276,16 @@ func openRelativeACLChild(parent win.Handle, name string) (*win32ACLObject, ACLO
 	attributes.Length = uint32(unsafe.Sizeof(attributes))
 	var candidate win.Handle
 	var status win.IO_STATUS_BLOCK
-	err = win.NtCreateFile(&candidate, win.FILE_READ_ATTRIBUTES, &attributes, &status, nil, 0,
-		win.FILE_SHARE_READ, win.FILE_OPEN, win.FILE_OPEN_REPARSE_POINT, 0, 0)
+	desired := uint32(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
+	options := uint32(win.FILE_OPEN_REPARSE_POINT)
+	if entry.directory && !entry.reparse {
+		desired |= win.FILE_LIST_DIRECTORY
+		options |= win.FILE_DIRECTORY_FILE
+	}
+	err = win.NtCreateFile(&candidate, desired, &attributes, &status, nil, 0,
+		win.FILE_SHARE_READ, win.FILE_OPEN, options, 0, 0)
 	if err != nil {
-		return nil, ACLObjectIdentity{}, fmt.Errorf("open retained relative ACL child: %w", err)
+		return nil, ACLObjectIdentity{}, fmt.Errorf("open retained relative ACL child %q: %w", entry.name, err)
 	}
 	target, err := finalPathFromHandle(candidate)
 	if err != nil {
@@ -291,24 +297,16 @@ func openRelativeACLChild(parent win.Handle, name string) (*win32ACLObject, ACLO
 		_ = win.CloseHandle(candidate)
 		return nil, ACLObjectIdentity{}, err
 	}
-	if identity.Kind == ACLObjectReparsePoint {
-		return &win32ACLObject{handle: candidate, target: target}, identity, nil
+	if identity.Kind == ACLObjectDirectory != (entry.directory && !entry.reparse) ||
+		(identity.Kind == ACLObjectReparsePoint) != entry.reparse {
+		_ = win.CloseHandle(candidate)
+		return nil, ACLObjectIdentity{}, fmt.Errorf("%w: relative ACL child %q changed type", policy.ErrTargetChanged, target)
 	}
-	desired := uint32(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
-	if identity.Kind == ACLObjectDirectory {
-		desired |= win.FILE_LIST_DIRECTORY
-	}
-	reopened, _, callErr := procReOpenFile.Call(uintptr(candidate), uintptr(desired),
-		win.FILE_SHARE_READ, win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
-	_ = win.CloseHandle(candidate)
-	if reopened == uintptr(win.InvalidHandle) {
-		return nil, ACLObjectIdentity{}, fmt.Errorf("retain relative ACL child: %w", callErr)
-	}
-	object := &win32ACLObject{handle: win.Handle(reopened), target: target}
+	object := &win32ACLObject{handle: candidate, target: target}
 	retained, err := object.snapshot()
 	if err != nil || retained.identity != identity {
 		_ = object.close()
-		return nil, ACLObjectIdentity{}, errors.Join(fmt.Errorf("%w: relative ACL child changed while retaining", policy.ErrTargetChanged), err)
+		return nil, ACLObjectIdentity{}, errors.Join(fmt.Errorf("%w: relative ACL child %q changed while retaining", policy.ErrTargetChanged, target), err)
 	}
 	return object, identity, nil
 }

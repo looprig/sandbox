@@ -534,6 +534,9 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if !validGrantText(executionID) || !validGrantText(command) {
 		return "", ErrGrantMalformed
 	}
+	if err := validateGrantTargetAvailability(scope, class, target); err != nil {
+		return "", err
+	}
 	canonicalCWD, err := canonicalWorkingDirectory(cwd)
 	if err != nil {
 		return "", fmt.Errorf("%w: cwd: %v", ErrGrantMalformed, err)

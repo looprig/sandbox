@@ -4,6 +4,8 @@ package sandboxtest
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -16,31 +18,55 @@ func runEnvironment(ctx context.Context, sut SUT, dir string) ([]byte, int, erro
 }
 
 func runRead(ctx context.Context, sut SUT, dir, path string) ([]byte, int, error) {
-	// TYPE is a cmd builtin and avoids assuming PowerShell, Unix utilities, or
-	// optional Windows components are installed.
-	return sut.RunCommand(ctx, dir, "type "+cmdPath(dir, path))
+	operand, err := batchPath(path)
+	if err != nil {
+		return nil, -1, err
+	}
+	return runPathScript(ctx, sut, dir, "@type "+operand+"\r\n")
 }
 
 func platformWrite(ctx context.Context, sut SUT, dir, path string) ([]byte, int, error) {
-	// NUL and redirection are cmd syntax; TYPE emits no bytes and creates or
-	// truncates the target without requiring an external executable.
-	return sut.RunCommand(ctx, dir, "type nul > "+cmdPath(dir, path))
-}
-
-func cmdPath(dir, path string) string {
-	// Suite positive controls live directly in cmd.Dir and use generated safe
-	// filenames. A relative operand avoids cmd.exe's special /S quote grammar.
-	// Outside-boundary probes retain the absolute quoted form.
-	if relative, err := filepath.Rel(dir, path); err == nil && relative != "." &&
-		relative != ".." && !strings.HasPrefix(relative, `..\`) &&
-		!strings.ContainsAny(relative, ` &|<>^()%!"`) {
-		return relative
+	operand, err := batchPath(path)
+	if err != nil {
+		return nil, -1, err
 	}
-	return cmdQuote(path)
+	return runPathScript(ctx, sut, dir, "@type nul > "+operand+"\r\n")
 }
 
-func cmdQuote(value string) string {
-	// Temp and home paths cannot contain a double quote. Doubling percent signs
-	// prevents environment expansion inside cmd's quoted argument.
-	return `"` + strings.ReplaceAll(value, "%", "%%") + `"`
+// runPathScript transports a path through a temporary batch file rather than
+// interpolating it into cmd.exe's /C command string. Percent escaping has batch
+// semantics there (%% means a literal %), and the script disables delayed
+// expansion before parsing the path-bearing line so ! remains literal even if
+// the caller enabled it. The launched command contains only a generated safe
+// basename, so metacharacters in dir or path never pass through the /C parser.
+func runPathScript(ctx context.Context, sut SUT, dir, body string) ([]byte, int, error) {
+	script, err := os.CreateTemp(dir, ".lrsandboxtest-path-*.cmd")
+	if err != nil {
+		return nil, -1, fmt.Errorf("create Windows path probe: %w", err)
+	}
+	name := script.Name()
+	defer os.Remove(name)
+	if _, err := script.WriteString("@setlocal DisableDelayedExpansion\r\n" + body); err != nil {
+		_ = script.Close()
+		return nil, -1, fmt.Errorf("write Windows path probe: %w", err)
+	}
+	if err := script.Close(); err != nil {
+		return nil, -1, fmt.Errorf("close Windows path probe: %w", err)
+	}
+	base := filepath.Base(name)
+	if strings.ContainsAny(base, ` &|<>^()%!"`) {
+		return nil, -1, fmt.Errorf("unsafe generated Windows path-probe name %q", base)
+	}
+	return sut.RunCommand(ctx, dir, base)
+}
+
+func batchPath(value string) (string, error) {
+	// A double quote and CR/LF cannot occur in a valid Windows path. Escaping %
+	// is necessary in a batch file; runPathScript disables delayed expansion
+	// before this path-bearing line, so ! remains literal. Quoting neutralizes the
+	// remaining command metacharacters, including &, parentheses, and spaces.
+	if strings.ContainsAny(value, "\"\r\n") {
+		return "", fmt.Errorf("unsupported Windows probe path %q", value)
+	}
+	return `"` + strings.ReplaceAll(value, "%", "%%") + `"`, nil
 }

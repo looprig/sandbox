@@ -67,15 +67,8 @@ func requireWindowsDisposableStandardSourceToken(t *testing.T) {
 		t.Fatalf("inspect disposable-worker source token: %v", err)
 	}
 	defer token.Close()
-	restricted, err := token.IsRestricted()
-	if err != nil {
-		t.Fatalf("inspect disposable-worker restriction state: %v", err)
-	}
-	if restricted {
-		t.Fatal("disposable restricted acceptance requires a non-restricted source token")
-	}
-	if token.IsElevated() {
-		t.Fatal("disposable restricted acceptance requires a standard-user, non-elevated source token")
+	if err := windows.ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("disposable restricted acceptance source token: %v", err)
 	}
 }
 

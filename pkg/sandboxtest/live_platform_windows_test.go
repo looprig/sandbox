@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	sandboxwindows "github.com/looprig/sandbox/internal/windows"
 	win "golang.org/x/sys/windows"
 )
 
@@ -25,14 +26,7 @@ func requireLivePlatformBackend(t *testing.T) {
 		t.Fatalf("inspect external live-suite source token: %v", err)
 	}
 	defer token.Close()
-	restricted, err := token.IsRestricted()
-	if err != nil {
-		t.Fatalf("inspect external live-suite restriction state: %v", err)
-	}
-	if restricted {
-		t.Fatal("external live Windows ACL suite requires a non-restricted source token")
-	}
-	if token.IsElevated() {
-		t.Fatal("external live Windows ACL suite requires a standard-user, non-elevated source token")
+	if err := sandboxwindows.ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("external live Windows ACL suite source token: %v", err)
 	}
 }

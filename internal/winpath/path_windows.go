@@ -344,6 +344,72 @@ func OpenPinned(path string) (*Object, error) {
 	return open(path, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)
 }
 
+// OpenForACL performs the same no-follow component walk as Open, but opens the
+// final object with the authority needed to inspect and replace its DACL. The
+// returned handle never grants delete sharing. freezeWrites additionally
+// denies data-write sharing while a tree is enumerated and projected.
+//
+// This operation exists here, rather than being assembled by ACL callers,
+// because handles created by NtCreateFile during the component walk cannot be
+// safely assumed to be valid ReOpenFile inputs. The ACL-capable handle is the
+// final result of the identity-preserving walk itself.
+func OpenForACL(path string, directory, freezeWrites bool) (*Object, error) {
+	normalized, err := Normalize(path)
+	if err != nil {
+		return nil, err
+	}
+	handles, err := walkACLPathComponents(normalized, directory, freezeWrites, openRawAccess, openRelativeAccess,
+		handleIsReparse, windows.CloseHandle)
+	if err != nil {
+		return nil, fmt.Errorf("open ACL target %q: %w", normalized, err)
+	}
+	object := &Object{Handle: handles[len(handles)-1], ancestors: handles[:len(handles)-1]}
+	if err := object.loadIdentity(); err != nil {
+		_ = object.Close()
+		return nil, fmt.Errorf("inspect ACL target %q: %w", normalized, err)
+	}
+	if directory && object.Kind != KindDirectory || !directory && object.Kind == KindDirectory {
+		_ = object.Close()
+		return nil, fmt.Errorf("%w: ACL target %q has unexpected object type", ErrUnsupportedPath, normalized)
+	}
+	return object, nil
+}
+
+type accessRootComponentOpener func(string, uint32, uint32) (windows.Handle, error)
+type accessRelativeComponentOpener func(windows.Handle, string, bool, uint32, uint32) (windows.Handle, error)
+
+func walkACLPathComponents(path string, directory, freezeWrites bool, openRootAccess accessRootComponentOpener,
+	openRelativeAccess accessRelativeComponentOpener, isReparse reparseInspector, closeHandle handleCloser,
+) ([]windows.Handle, error) {
+	shareMode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+	if freezeWrites {
+		shareMode = windows.FILE_SHARE_READ
+	}
+	desired := uint32(windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES)
+	if directory {
+		desired |= windows.FILE_LIST_DIRECTORY
+	}
+	return walkPathComponentsSelected(path, shareMode,
+		func(root string, final bool, share uint32) (windows.Handle, error) {
+			if final {
+				return openRootAccess(root, desired, share)
+			}
+			return openRootAccess(root, windows.FILE_READ_ATTRIBUTES|windows.FILE_TRAVERSE,
+				windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)
+		},
+		func(parent windows.Handle, name string, componentDirectory, final bool, share uint32) (windows.Handle, error) {
+			if final {
+				return openRelativeAccess(parent, name, directory, desired, share)
+			}
+			access := uint32(windows.FILE_READ_ATTRIBUTES)
+			if componentDirectory {
+				access |= windows.FILE_TRAVERSE
+			}
+			return openRelativeAccess(parent, name, componentDirectory, access,
+				windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)
+		}, isReparse, closeHandle)
+}
+
 func open(path string, shareMode uint32) (*Object, error) {
 	normalized, err := Normalize(path)
 	if err != nil {
@@ -362,23 +428,37 @@ func open(path string, shareMode uint32) (*Object, error) {
 }
 
 func openRawShared(path string, shareMode uint32) (windows.Handle, error) {
+	return openRawAccess(path, windows.FILE_READ_ATTRIBUTES|windows.FILE_TRAVERSE, shareMode)
+}
+
+func openRawAccess(path string, access, shareMode uint32) (windows.Handle, error) {
 	name, err := windows.UTF16PtrFromString(`\\?\` + path)
 	if err != nil {
 		return windows.InvalidHandle, err
 	}
-	return windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.FILE_TRAVERSE, shareMode,
+	return windows.CreateFile(name, access, shareMode,
 		nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 }
 
 type rootComponentOpener func(string, uint32) (windows.Handle, error)
 type relativeComponentOpener func(windows.Handle, string, bool, uint32) (windows.Handle, error)
+type selectedRootComponentOpener func(string, bool, uint32) (windows.Handle, error)
+type selectedRelativeComponentOpener func(windows.Handle, string, bool, bool, uint32) (windows.Handle, error)
 type reparseInspector func(windows.Handle) (bool, error)
 type handleCloser func(windows.Handle) error
 
 func walkPathComponents(path string, shareMode uint32, openRoot rootComponentOpener, openRelative relativeComponentOpener, isReparse reparseInspector, closeHandle handleCloser) ([]windows.Handle, error) {
+	return walkPathComponentsSelected(path, shareMode,
+		func(path string, _ bool, share uint32) (windows.Handle, error) { return openRoot(path, share) },
+		func(parent windows.Handle, name string, directory, _ bool, share uint32) (windows.Handle, error) {
+			return openRelative(parent, name, directory, share)
+		}, isReparse, closeHandle)
+}
+
+func walkPathComponentsSelected(path string, shareMode uint32, openRoot selectedRootComponentOpener, openRelative selectedRelativeComponentOpener, isReparse reparseInspector, closeHandle handleCloser) ([]windows.Handle, error) {
 	root := path[:3]
-	rootHandle, err := openRoot(root, shareMode)
+	rootHandle, err := openRoot(root, len(path) == 3, shareMode)
 	if err != nil {
 		return nil, fmt.Errorf("open volume root: %w", err)
 	}
@@ -407,7 +487,8 @@ func walkPathComponents(path string, shareMode uint32, openRoot rootComponentOpe
 		if component == "" {
 			continue
 		}
-		handle, openErr := openRelative(handles[len(handles)-1], component, i < len(components)-1, shareMode)
+		final := i == len(components)-1
+		handle, openErr := openRelative(handles[len(handles)-1], component, !final, final, shareMode)
 		if openErr != nil {
 			closeAll()
 			if errors.Is(openErr, windows.STATUS_REPARSE_POINT_ENCOUNTERED) || errors.Is(openErr, windows.STATUS_STOPPED_ON_SYMLINK) {
@@ -425,6 +506,14 @@ func walkPathComponents(path string, shareMode uint32, openRoot rootComponentOpe
 }
 
 func openRelativeComponent(parent windows.Handle, name string, directory bool, shareMode uint32) (windows.Handle, error) {
+	access := uint32(windows.FILE_READ_ATTRIBUTES)
+	if directory {
+		access |= windows.FILE_TRAVERSE
+	}
+	return openRelativeAccess(parent, name, directory, access, shareMode)
+}
+
+func openRelativeAccess(parent windows.Handle, name string, directory bool, access, shareMode uint32) (windows.Handle, error) {
 	objectName, err := windows.NewNTUnicodeString(name)
 	if err != nil {
 		return windows.InvalidHandle, err
@@ -436,10 +525,8 @@ func openRelativeComponent(parent windows.Handle, name string, directory bool, s
 	}
 	attributes.Length = uint32(unsafe.Sizeof(attributes))
 	options := uint32(windows.FILE_OPEN_REPARSE_POINT)
-	access := uint32(windows.FILE_READ_ATTRIBUTES)
 	if directory {
 		options |= windows.FILE_DIRECTORY_FILE
-		access |= windows.FILE_TRAVERSE
 	}
 	var handle windows.Handle
 	var status windows.IO_STATUS_BLOCK

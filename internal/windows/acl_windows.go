@@ -22,8 +22,6 @@ const (
 )
 
 var (
-	kernel32DLL              = win.NewLazySystemDLL("kernel32.dll")
-	procReOpenFile           = kernel32DLL.NewProc("ReOpenFile")
 	errACLIdenticalCollision = errors.New("sandbox: byte-identical ACL mutation collision")
 )
 
@@ -115,9 +113,9 @@ func aclMutationSignature(record ACLMutationRecord) string {
 		record.Rollback.Role, record.Rollback.ACEHash, record.BaselineIdentical)
 }
 
-// ACLProjection owns no path handles. It borrows identity-pinned PathHandles
-// for its lifetime and reopens each by handle (never by name) with READ_CONTROL
-// and WRITE_DAC authority.
+// ACLProjection owns no policy path handles. It binds separately owned,
+// ACL-capable no-follow handles to the complete identity of each borrowed
+// PathHandle before any mutation.
 type ACLProjection struct {
 	plan             ACLPlan
 	objects          map[aclIdentityKey]aclProjectionObject
@@ -510,23 +508,41 @@ func containsExpectedACE(aces [][]byte, kind ACLObjectKind, expected ACLACEExpec
 }
 
 type win32ACLObject struct {
-	handle win.Handle
-	target string
+	handle    win.Handle
+	target    string
+	closeOnce func() error
 }
 
 func newWin32ACLObject(handle *policy.PathHandle) (*win32ACLObject, error) {
-	return reopenWin32ACLObject(win.Handle(handle.NativeHandle()), handle.Target())
+	if handle == nil || handle.NativeHandle() == 0 {
+		return nil, errors.New("sandbox: ACL projection requires an open retained handle")
+	}
+	return openBoundWin32ACLObject(win.Handle(handle.NativeHandle()), handle.Target(), handle.IsDir(), false)
 }
 
-func reopenWin32ACLObject(handle win.Handle, target string) (*win32ACLObject, error) {
-	reopened, _, callErr := procReOpenFile.Call(uintptr(handle), win.READ_CONTROL|win.WRITE_DAC,
-		// Denying delete sharing pins the name/object relationship across the
-		// final revalidation and SetSecurityInfo call.
-		win.FILE_SHARE_READ|win.FILE_SHARE_WRITE, win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
-	if reopened == uintptr(win.InvalidHandle) {
-		return nil, fmt.Errorf("reopen retained handle for ACL access: %w", callErr)
+func openBoundWin32ACLObject(source win.Handle, target string, directory, freezeWrites bool) (*win32ACLObject, error) {
+	expected, err := identityFromHandle(source, target)
+	if err != nil {
+		return nil, fmt.Errorf("inspect ACL source %q: %w", target, err)
 	}
-	return &win32ACLObject{handle: win.Handle(reopened), target: target}, nil
+	object, err := openWin32ACLObject(target, directory, freezeWrites)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := object.snapshot()
+	if err != nil || actual.identity != expected {
+		_ = object.close()
+		return nil, errors.Join(fmt.Errorf("%w: ACL target %q changed while acquiring authority", policy.ErrTargetChanged, target), err)
+	}
+	return object, nil
+}
+
+func openWin32ACLObject(target string, directory, freezeWrites bool) (*win32ACLObject, error) {
+	pinned, err := winpath.OpenForACL(target, directory, freezeWrites)
+	if err != nil {
+		return nil, fmt.Errorf("open retained ACL target %q: %w", target, err)
+	}
+	return &win32ACLObject{handle: pinned.Handle, target: pinned.DOSPath, closeOnce: pinned.Close}, nil
 }
 
 func (object *win32ACLObject) prepareWriteShared() (aclProjectionObject, error) {
@@ -537,17 +553,11 @@ func (object *win32ACLObject) prepareWriteShared() (aclProjectionObject, error) 
 	if err != nil {
 		return nil, err
 	}
-	desired := uintptr(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
-	if snapshot.identity.Kind == ACLObjectDirectory {
-		desired |= win.FILE_LIST_DIRECTORY
+	replacement, err := openWin32ACLObject(object.target, snapshot.identity.Kind == ACLObjectDirectory, false)
+	if err != nil {
+		return nil, fmt.Errorf("prepare write-shared ACL target %q: %w", object.target, err)
 	}
-	reopened, _, callErr := procReOpenFile.Call(uintptr(object.handle), desired,
-		win.FILE_SHARE_READ|win.FILE_SHARE_WRITE,
-		win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
-	if reopened == uintptr(win.InvalidHandle) {
-		return nil, fmt.Errorf("reopen retained ACL tree with write sharing: %w", callErr)
-	}
-	return &win32ACLObject{handle: win.Handle(reopened), target: object.target}, nil
+	return replacement, nil
 }
 
 // RestrictedACLCleaner is the allow-only crash-recovery half of restricted ACL
@@ -564,14 +574,9 @@ func (RestrictedACLCleaner) RemoveRestrictedAllowACE(record RestrictedCleanupRec
 		sha256.Sum256(record.ACE) != record.Rollback.ACEHash {
 		return false, errors.New("sandbox: untrusted restricted cleanup record")
 	}
-	pinned, err := winpath.Open(record.Path)
+	object, err := openWin32ACLObject(record.Path, record.Object.Kind == ACLObjectDirectory, false)
 	if err != nil {
-		return false, fmt.Errorf("open restricted cleanup candidate: %w", err)
-	}
-	defer pinned.Close()
-	object, err := reopenWin32ACLObject(pinned.Handle, pinned.DOSPath)
-	if err != nil {
-		return false, err
+		return false, fmt.Errorf("open restricted cleanup candidate %q: %w", record.Path, err)
 	}
 	defer object.close()
 	snapshot, err := object.snapshot()
@@ -638,7 +643,13 @@ func (object *win32ACLObject) close() error {
 	if object == nil || object.handle == 0 || object.handle == win.InvalidHandle {
 		return nil
 	}
-	err := win.CloseHandle(object.handle)
+	var err error
+	if object.closeOnce != nil {
+		err = object.closeOnce()
+		object.closeOnce = nil
+	} else {
+		err = win.CloseHandle(object.handle)
+	}
 	object.handle = win.InvalidHandle
 	return err
 }
@@ -743,5 +754,9 @@ func finalPathFromHandle(handle win.Handle) (string, error) {
 	if err != nil || n >= uint32(len(buffer)) {
 		return "", errors.New("sandbox: final ACL handle path changed while reading")
 	}
-	return win.UTF16ToString(buffer[:n]), nil
+	path, err := winpath.Normalize(win.UTF16ToString(buffer[:n]))
+	if err != nil {
+		return "", fmt.Errorf("sandbox: normalize final ACL handle path: %w", err)
+	}
+	return path, nil
 }

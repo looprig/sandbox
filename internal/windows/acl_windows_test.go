@@ -455,6 +455,90 @@ func equalACELists(left, right [][]byte) bool {
 	return slices.EqualFunc(left, right, bytes.Equal)
 }
 
+func TestACLHandleAcquisitionFromSecureWalkHasRequiredAuthority(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "exact.txt")
+	if err := os.WriteFile(path, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := policy.CapturePathBinding(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := policy.AcquirePathHandle(&binding, binding.CanonicalPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+
+	object, err := newWin32ACLObject(handle)
+	if err != nil {
+		t.Fatalf("acquire ACL handle from NtCreateFile-backed policy handle: %v", err)
+	}
+	defer object.close()
+	snapshot, err := object.snapshot()
+	if err != nil {
+		t.Fatalf("read DACL through acquired handle: %v", err)
+	}
+	wantIdentity, err := identityFromHandle(win.Handle(handle.NativeHandle()), handle.Target())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.identity != wantIdentity {
+		t.Fatalf("ACL handle identity = %+v, want %+v", snapshot.identity, wantIdentity)
+	}
+	granted, err := handleGrantedAccess(object.handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAccess := uint32(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
+	if granted&wantAccess != wantAccess {
+		t.Fatalf("ACL handle access = %#x, want at least %#x", granted, wantAccess)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "unchanged" {
+		t.Fatalf("non-mutating acquisition changed fixture: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestACLTreeEnumerationRetainsACLAuthorityWithoutReopen(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(root, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "child", "leaf.txt"), []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := policy.CapturePathBinding(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := policy.AcquirePathHandle(&binding, binding.CanonicalPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	tree, err := EnumerateRetainedACLTree(handle)
+	if err != nil {
+		t.Fatalf("enumerate ACL tree from NtCreateFile-backed policy handle: %v", err)
+	}
+	defer tree.Close()
+	if len(tree.entries) != 2 || len(tree.objects) != 3 {
+		t.Fatalf("entries=%d objects=%d, want 2 entries and 3 retained objects", len(tree.entries), len(tree.objects))
+	}
+	for _, retained := range tree.objects {
+		object := retained.(*win32ACLObject)
+		granted, err := handleGrantedAccess(object.handle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := uint32(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
+		if granted&want != want {
+			t.Fatalf("retained ACL access = %#x, want at least %#x", granted, want)
+		}
+	}
+}
+
 func TestACLProjectionDisposableExactAndReadback(t *testing.T) {
 	if os.Getenv("SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST") != "1" {
 		t.Skip("destructive ACL integration is restricted to a disposable Windows worker")
