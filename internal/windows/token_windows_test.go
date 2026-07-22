@@ -145,7 +145,7 @@ func TestCreateRestrictedTokenRejectsInvalidInput(t *testing.T) {
 	for _, invalid := range []SID{
 		{text: "S-1-5-12", kind: sidKindExecutor},
 		{text: "S-1-15-2-1", kind: sidKindExecutor},
-		{text: "S-1-5-21-314159-265358-979323-1001", kind: sidKindExecutor},
+		{text: "S-1-5-21-314159-265358-979323", kind: sidKindExecutor},
 		{text: "S-1-15-3-1-2-3-4-5-6-7-8", kind: sidKindExecutor},
 		{text: "S-1-15-3-1024-1-2-3-4-5-6-7", kind: sidKindExecutor},
 		{text: "S-1-15-3-1024-1-2-3-4-5-6-7-not-a-word", kind: sidKindExecutor},

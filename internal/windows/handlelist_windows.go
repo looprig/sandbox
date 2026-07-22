@@ -136,9 +136,10 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 
 func narrowStandardHandles(cmd *exec.Cmd) (func(), error) {
 	// os/exec creates directional anonymous pipes for non-*os.File streams and
-	// opens NUL read-only for a nil stdin. A supplied *os.File bypasses that
-	// construction and is inherited directly, so classify its kernel object and
-	// replace it with an executor-owned least-access duplicate before Start.
+	// opens NUL read-only for a nil stdin. Those CreatePipe endpoints carry the
+	// fixed Windows anonymous-pipe access masks. A supplied *os.File bypasses
+	// that construction and is inherited directly, so classify its kernel object
+	// and replace it with an executor-owned least-access duplicate before Start.
 	streams := []struct {
 		name   string
 		value  any

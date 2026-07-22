@@ -286,25 +286,51 @@ func TestWindowsOpenNeverEscapesDuringConcurrentSymlinkSwap(t *testing.T) {
 	<-done
 }
 
-func TestWindowsOpenPinnedBlocksRootSwapUntilClose(t *testing.T) {
-	root := t.TempDir()
-	file := filepath.Join(root, "pinned.txt")
-	if err := os.WriteFile(file, []byte("pinned"), 0o600); err != nil {
+func TestWindowsOpenPinnedDetectsPermittedRootSwap(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "pinned-root")
+	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	object, err := OpenPinned(file)
+	object, err := OpenPinned(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	moved := filepath.Join(root, "moved.txt")
-	if err := os.Rename(file, moved); err == nil {
-		object.Close()
-		t.Fatal("rename succeeded while a no-delete-sharing identity handle was retained")
+	defer object.Close()
+	moved := filepath.Join(parent, "moved-root")
+	if err := os.Rename(root, moved); err != nil {
+		// Older Windows/filesystem combinations honor the missing
+		// FILE_SHARE_DELETE as a name lock. That is a useful strengthening,
+		// but the security contract cannot depend on it because NTFS can
+		// advertise POSIX-style rename support.
+		if err := object.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(root, moved); err != nil {
+			t.Fatalf("rename after Close: %v", err)
+		}
+		return
 	}
-	if err := object.Close(); err != nil {
+	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(file, moved); err != nil {
-		t.Fatalf("rename after Close: %v", err)
+	replacement, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if object.SameIdentity(replacement) {
+		t.Fatal("replacement path compared equal to the retained object")
+	}
+
+	movedObject, err := Open(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer movedObject.Close()
+	if object.VolumeSerial != movedObject.VolumeSerial || object.FileID != movedObject.FileID ||
+		object.Kind != movedObject.Kind || object.ReparseTag != movedObject.ReparseTag ||
+		object.LinkCount != movedObject.LinkCount {
+		t.Fatal("retained handle identity changed after its name moved")
 	}
 }

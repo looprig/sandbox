@@ -44,15 +44,15 @@ func TestSIDNamespacesAreDeterministicAndSeparated(t *testing.T) {
 	if installation != again {
 		t.Fatalf("installation SID is not deterministic: %q != %q", installation, again)
 	}
-	const wantInstallation = "S-1-15-3-1024-2604559594-2853295540-4076106329-3836222237-423985849-404046517-3599841232-3403418328"
+	const wantInstallation = "S-1-5-21-2604559594-2853295540-4076106329-3836222237"
 	if installation.String() != wantInstallation {
 		t.Fatalf("installation SID ABI changed: %q, want %q", installation, wantInstallation)
 	}
 	if installation == executor {
 		t.Fatalf("domain-separated SIDs collided: %q", installation)
 	}
-	if got := installation.String(); len(got) < len("S-1-15-3-1024-") || got[:len("S-1-15-3-1024-")] != "S-1-15-3-1024-" {
-		t.Fatalf("installation SID = %q, want private capability namespace", got)
+	if got := installation.String(); len(got) < len("S-1-5-21-") || got[:len("S-1-5-21-")] != "S-1-5-21-" {
+		t.Fatalf("installation SID = %q, want token-compatible private namespace", got)
 	}
 	if !installation.isPrivateCapability() || (SID{text: "S-1-5-12", kind: sidKindExecutor}).isPrivateCapability() {
 		t.Fatal("private capability validation accepted the wrong SID shape")
@@ -154,11 +154,11 @@ func TestSIDBinaryRoundTripsStableShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := sid.binary()
-	if len(binary) != 8+10*4 || binary[0] != 1 || binary[1] != 10 {
+	if len(binary) != 8+5*4 || binary[0] != 1 || binary[1] != 5 {
 		t.Fatalf("binary SID shape = %x", binary)
 	}
-	if got := binary[12:16]; !bytes.Equal(got, []byte{0, 4, 0, 0}) {
-		t.Fatalf("capability namespace subauthority = %x, want 1024", got)
+	if got := binary[8:12]; !bytes.Equal(got, []byte{21, 0, 0, 0}) {
+		t.Fatalf("private namespace subauthority = %x, want 21", got)
 	}
 	binary[0] = 0
 	if sid.binary()[0] != 1 {

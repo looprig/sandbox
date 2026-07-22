@@ -327,8 +327,13 @@ func Open(path string) (*Object, error) {
 	return open(path, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)
 }
 
-// OpenPinned is Open with delete-sharing denied. Holding the returned object
-// prevents replacement of the named leaf until Close.
+// OpenPinned is Open with delete-sharing denied. This prevents ordinary Win32
+// delete opens while the returned object is held, but it is only defense in
+// depth: filesystems that support POSIX-style rename can still move a named
+// object without honoring this sharing exclusion. Callers that rely on a path
+// continuing to name this object must re-open and compare the complete identity
+// before use. The retained handle itself continues to identify the original
+// object even when its name moves.
 func OpenPinned(path string) (*Object, error) {
 	return open(path, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)
 }

@@ -76,8 +76,14 @@ func writeHashField(writer io.Writer, value []byte) {
 
 func capabilitySID(kind sidKind, digest []byte) SID {
 	var builder strings.Builder
-	builder.WriteString("S-1-15-3-1024")
-	for offset := 0; offset < sha256.Size; offset += 4 {
+	// CreateRestrictedToken rejects synthetic S-1-15 capability-authority SIDs
+	// that were not derived by Windows, even though ConvertStringSidToSid and
+	// IsValidSid accept their structure. A private NT-authority SID with four
+	// digest subauthorities is accepted both as an ACL principal and as a
+	// restricting SID. The 128-bit suffix keeps collision resistance while
+	// staying in the conventional S-1-5-21 token-compatible shape.
+	builder.WriteString("S-1-5-21")
+	for offset := 0; offset < 16; offset += 4 {
 		builder.WriteByte('-')
 		builder.WriteString(strconv.FormatUint(uint64(binary.LittleEndian.Uint32(digest[offset:offset+4])), 10))
 	}
@@ -134,21 +140,20 @@ func (generator *OneShotSIDGenerator) Next() (SID, error) {
 
 func (sid SID) binary() []byte {
 	parts := strings.Split(sid.text, "-")
-	if len(parts) != 13 || parts[0] != "S" || parts[1] != "1" || parts[2] != "15" || parts[3] != "3" || parts[4] != "1024" {
+	if len(parts) != 8 || parts[0] != "S" || parts[1] != "1" || parts[2] != "5" || parts[3] != "21" {
 		return nil
 	}
-	result := make([]byte, 8+10*4)
+	result := make([]byte, 8+5*4)
 	result[0] = 1
-	result[1] = 10
-	result[7] = 15
-	binary.LittleEndian.PutUint32(result[8:12], 3)
-	binary.LittleEndian.PutUint32(result[12:16], 1024)
-	for index, part := range parts[5:] {
+	result[1] = 5
+	result[7] = 5
+	binary.LittleEndian.PutUint32(result[8:12], 21)
+	for index, part := range parts[4:] {
 		value, err := strconv.ParseUint(part, 10, 32)
 		if err != nil {
 			return nil
 		}
-		binary.LittleEndian.PutUint32(result[16+index*4:20+index*4], uint32(value))
+		binary.LittleEndian.PutUint32(result[12+index*4:16+index*4], uint32(value))
 	}
 	return result
 }
@@ -156,7 +161,7 @@ func (sid SID) binary() []byte {
 func (sid SID) isPrivateCapability() bool {
 	switch sid.kind {
 	case sidKindInstallation, sidKindExecutor, sidKindOneShot:
-		return len(sid.binary()) == 8+10*4
+		return len(sid.binary()) == 8+5*4
 	default:
 		return false
 	}

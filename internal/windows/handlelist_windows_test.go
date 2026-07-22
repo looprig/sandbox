@@ -22,6 +22,15 @@ import (
 
 var getHandleInformation = winapi.NewLazySystemDLL("kernel32.dll").NewProc("GetHandleInformation")
 
+const (
+	// CreatePipe grants these exact mapped masks to its read and write
+	// endpoints. FILE_WRITE_ATTRIBUTES on the read endpoint and
+	// FILE_READ_ATTRIBUTES on the write endpoint are properties of Windows'
+	// anonymous-pipe objects, not handles leaked outside the explicit list.
+	anonymousPipeReadAccess  = winapi.FILE_GENERIC_READ | winapi.FILE_WRITE_ATTRIBUTES
+	anonymousPipeWriteAccess = winapi.FILE_GENERIC_WRITE | winapi.FILE_READ_ATTRIBUTES
+)
+
 func TestConfigureExplicitHandleListRejectsInvalidCommand(t *testing.T) {
 	if _, err := ConfigureExplicitHandleList(nil, nil); err == nil {
 		t.Fatal("ConfigureExplicitHandleList(nil) succeeded")
@@ -288,21 +297,39 @@ func TestSuppliedStandardFilesHaveExactChildAccess(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = stdinWriter.Close()
-		if err := cmd.Run(); err != nil {
-			t.Fatal(err)
+		type readResult struct {
+			data []byte
+			err  error
 		}
+		read := func(file *os.File) <-chan readResult {
+			result := make(chan readResult, 1)
+			go func() {
+				data, err := io.ReadAll(file)
+				result <- readResult{data: data, err: err}
+			}()
+			return result
+		}
+		// The handle probe emits enough JSON to fill an anonymous-pipe buffer.
+		// Drain both streams while it runs so cmd.Wait cannot deadlock behind a
+		// child blocked in WriteFile.
+		stdoutResult := read(stdoutReader)
+		stderrResult := read(stderrReader)
+		runErr := cmd.Run()
 		cleanup()
 		_ = stdout.Close()
 		_ = stderr.Close()
-		stdoutBytes, err := io.ReadAll(stdoutReader)
-		if err != nil {
-			t.Fatal(err)
+		stdoutRead := <-stdoutResult
+		stderrRead := <-stderrResult
+		if runErr != nil {
+			t.Fatal(runErr)
 		}
-		stderrBytes, err := io.ReadAll(stderrReader)
-		if err != nil {
-			t.Fatal(err)
+		if stdoutRead.err != nil {
+			t.Fatal(stdoutRead.err)
 		}
-		assertProbeStandardAuthority(t, stdoutBytes, stderrBytes)
+		if stderrRead.err != nil {
+			t.Fatal(stderrRead.err)
+		}
+		assertProbeStandardAuthority(t, stdoutRead.data, stderrRead.data)
 	})
 
 	t.Run("regular", func(t *testing.T) {
@@ -399,6 +426,18 @@ func assertHandleNonInheritable(t *testing.T, file *os.File) {
 	}
 }
 
+func TestWindowsAnonymousPipeAccessMasks(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+
+	assertHandleAccess(t, read, anonymousPipeReadAccess)
+	assertHandleAccess(t, write, anonymousPipeWriteAccess)
+}
+
 func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	helper := buildHandleProbe(t)
 	r, w, err := os.Pipe()
@@ -476,7 +515,7 @@ func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	if !found {
 		t.Fatalf("declared duplicate %#x was not inherited", uintptr(duplicate))
 	}
-	assertStandardHandleAccess(t, report, winapi.FILE_GENERIC_READ, winapi.FILE_GENERIC_WRITE)
+	assertStandardHandleAccess(t, report, anonymousPipeReadAccess, anonymousPipeWriteAccess)
 }
 
 func readHandleInformation(handle winapi.Handle, flags *uint32) error {
@@ -497,10 +536,35 @@ type probeReport struct {
 	} `json:"handles"`
 }
 
+type handleCanary struct {
+	Handle winapi.Handle
+	Type   string
+	Access uint32
+}
+
 func TestInheritedHandleCanariesAreExcluded(t *testing.T) {
 	helper := buildHandleProbe(t)
 	canaries := createHandleCanaries(t)
 	runHandleProbe(t, helper, canaries)
+}
+
+func TestCanaryMatchRequiresKernelObjectFingerprint(t *testing.T) {
+	canary := handleCanary{Handle: 0x40, Type: "Token", Access: winapi.TOKEN_QUERY}
+	for _, handle := range []struct {
+		Value  uintptr
+		Type   string
+		Access uint32
+	}{
+		{Value: uintptr(canary.Handle), Type: "Event", Access: canary.Access},
+		{Value: uintptr(canary.Handle), Type: canary.Type, Access: winapi.TOKEN_DUPLICATE},
+	} {
+		if inheritedCanary(handle.Value, handle.Type, handle.Access, canary) {
+			t.Fatalf("reused handle value %#x matched canary with type=%q access=%#x", handle.Value, handle.Type, handle.Access)
+		}
+	}
+	if !inheritedCanary(uintptr(canary.Handle), canary.Type, canary.Access, canary) {
+		t.Fatal("exact canary fingerprint did not match")
+	}
 }
 
 func TestHandleListRunnerRequestIsExcludedFromTarget(t *testing.T) {
@@ -575,7 +639,7 @@ func buildHandleProbe(t *testing.T) string {
 	return output
 }
 
-func runHandleProbe(t *testing.T, helper string, canaries map[string]winapi.Handle) {
+func runHandleProbe(t *testing.T, helper string, canaries map[string]handleCanary) {
 	t.Helper()
 	cmd := exec.Command(helper)
 	cmd.Stdin = strings.NewReader("stdio-ok")
@@ -601,14 +665,21 @@ func runHandleProbe(t *testing.T, helper string, canaries map[string]winapi.Hand
 	if got := stderr.String(); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
 		t.Fatalf("probe stderr = %q, want stderr-ok", got)
 	}
-	assertStandardHandleAccess(t, report, winapi.FILE_GENERIC_READ, winapi.FILE_GENERIC_WRITE)
+	assertStandardHandleAccess(t, report, anonymousPipeReadAccess, anonymousPipeWriteAccess)
 	for name, canary := range canaries {
 		for _, inherited := range report.Handles {
-			if inherited.Value == uintptr(canary) {
-				t.Errorf("target inherited %s canary handle %#x (type=%s access=%#x)", name, uintptr(canary), inherited.Type, inherited.Access)
+			if inheritedCanary(inherited.Value, inherited.Type, inherited.Access, canary) {
+				t.Errorf("target inherited %s canary handle %#x (type=%s access=%#x)", name, uintptr(canary.Handle), inherited.Type, inherited.Access)
 			}
 		}
 	}
+}
+
+func inheritedCanary(value uintptr, objectType string, access uint32, canary handleCanary) bool {
+	// Handle values are process-local and may be reused by an unrelated object
+	// created during child startup. Type and granted access distinguish that
+	// reuse from inheritance of the original kernel-object authority.
+	return value == uintptr(canary.Handle) && objectType == canary.Type && access == canary.Access
 }
 
 func assertStandardHandleAccess(t *testing.T, report probeReport, inputAccess, outputAccess uint32) {
@@ -651,13 +722,21 @@ func ExampleConfigureExplicitHandleList() {
 	// Output: 0
 }
 
-func createHandleCanaries(t *testing.T) map[string]winapi.Handle {
+func createHandleCanaries(t *testing.T) map[string]handleCanary {
 	t.Helper()
-	result := make(map[string]winapi.Handle)
+	result := make(map[string]handleCanary)
 	add := func(name string, handle winapi.Handle, close func() error) {
 		t.Helper()
 		makeInheritable(t, handle)
-		result[name] = handle
+		objectType, err := handleObjectType(handle)
+		if err != nil {
+			t.Fatalf("inspect %s canary type: %v", name, err)
+		}
+		access, err := handleGrantedAccess(handle)
+		if err != nil {
+			t.Fatalf("inspect %s canary access: %v", name, err)
+		}
+		result[name] = handleCanary{Handle: handle, Type: objectType, Access: access}
 		t.Cleanup(func() { _ = close() })
 	}
 
