@@ -15,9 +15,7 @@ func ShellArgv(command string) []string {
 }
 
 func system32CommandInterpreter() string {
-	systemDirectory, err := windows.GetSystemDirectory()
-	if err != nil || systemDirectory == "" {
-		return `C:\Windows\System32\cmd.exe`
-	}
-	return filepath.Join(systemDirectory, "cmd.exe")
+	return windowsCommandInterpreter(windows.GetSystemDirectory, func(directory, executable string) string {
+		return filepath.Join(directory, executable)
+	})
 }
