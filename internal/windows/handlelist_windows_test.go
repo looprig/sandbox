@@ -598,6 +598,10 @@ func runTwoStageHandleProbe(t *testing.T, helper string) {
 	}
 	defer cleanup()
 	requestHandle := uintptr(cmd.SysProcAttr.AdditionalInheritedHandles[0])
+	requestIdentity, err := CaptureHandleObjectIdentity(winapi.Handle(requestHandle))
+	if err != nil {
+		t.Fatalf("capture runner request identity: %v", err)
+	}
 	cmd.Args[2] = strconv.FormatUint(uint64(requestHandle), 16)
 	if _, err := requestWrite.Write([]byte{0x7f}); err != nil {
 		t.Fatal(err)
@@ -621,8 +625,12 @@ func runTwoStageHandleProbe(t *testing.T, helper string) {
 	}
 	assertStandardHandleAccess(t, report, standardInputAccess, standardOutputAccess)
 	for _, inherited := range report.Handles {
-		if inherited.Value == requestHandle {
-			t.Fatalf("target has runner request handle value %#x (type=%s access=%#x)", requestHandle, inherited.Type, inherited.Access)
+		same, conclusive := requestIdentity.CompareCandidate(inherited.Value, inherited.Object)
+		if inherited.Value == requestHandle && !conclusive {
+			t.Fatalf("target request-handle candidate %#x had no kernel object identity (type=%s access=%#x)", requestHandle, inherited.Type, inherited.Access)
+		}
+		if same {
+			t.Fatalf("target inherited runner request object at handle %#x (type=%s access=%#x)", requestHandle, inherited.Type, inherited.Access)
 		}
 	}
 }

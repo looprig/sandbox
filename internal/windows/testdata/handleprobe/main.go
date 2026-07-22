@@ -134,7 +134,10 @@ func runRunner() {
 		fatal(fmt.Errorf("clear request inheritance: %w", err))
 	}
 
-	cmd := exec.Command(os.Args[0], "target")
+	// Ask the target to report kernel-object identity only for the runner's
+	// request-handle value. If Windows reuses that numeric value after the
+	// request is excluded, the parent can distinguish the unrelated object.
+	cmd := exec.Command(os.Args[0], "objects", os.Args[2])
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
