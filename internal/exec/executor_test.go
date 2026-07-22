@@ -94,7 +94,7 @@ func TestRunArgv(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	out, code, err := e.RunArgv(ctx, ws, []string{"echo", "hi"})
+	out, code, err := e.RunArgv(ctx, ws, portableEchoArgv(t, "hi"))
 	if err != nil {
 		t.Fatalf("RunArgv(echo hi): unexpected err %v", err)
 	}
@@ -106,7 +106,7 @@ func TestRunArgv(t *testing.T) {
 	}
 
 	// No shell: a would-be shell substitution is passed through literally.
-	out, _, err = e.RunArgv(ctx, ws, []string{"echo", "$HOME"})
+	out, _, err = e.RunArgv(ctx, ws, portableEchoArgv(t, "$HOME"))
 	if err != nil {
 		t.Fatalf("RunArgv(echo $HOME): unexpected err %v", err)
 	}
@@ -150,7 +150,7 @@ func TestEnvScrub(t *testing.T) {
 		t.Fatalf("newExecutor: %v", err)
 	}
 
-	out, _, err := e.RunCommand(context.Background(), ws, "env")
+	out, _, err := e.RunCommand(context.Background(), ws, portableEnvironmentCommand())
 	if err != nil {
 		t.Fatalf("RunCommand(env): %v", err)
 	}
@@ -261,7 +261,7 @@ func TestRunCommandContextTimeout(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, code, err := e.RunCommand(ctx, ws, "sleep 5")
+	_, code, err := e.RunCommand(ctx, ws, portableSleepCommand(5))
 	if err == nil {
 		t.Fatal("RunCommand under a short deadline: err = nil, want ctx.Err()")
 	}
@@ -334,7 +334,7 @@ func TestAssembleEnvScrubNeverNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)
 	}
-	out, _, err := e.RunCommand(context.Background(), ws, "env")
+	out, _, err := e.RunCommand(context.Background(), ws, portableEnvironmentCommand())
 	if err != nil {
 		t.Fatalf("RunCommand(env): %v", err)
 	}

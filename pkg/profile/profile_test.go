@@ -15,7 +15,7 @@ func TestNewProfileAccessValues(t *testing.T) {
 	workspace := t.TempDir()
 	root := t.TempDir()
 	config := ProfileConfig{
-		WorkspaceRoot:   workspace + string(os.PathSeparator) + ".",
+		WorkspaceRoot:   equivalentRootSpelling(workspace),
 		WorkspaceRead:   Allow,
 		WorkspaceWrite:  Gated,
 		HostRead:        Deny,
@@ -24,7 +24,7 @@ func TestNewProfileAccessValues(t *testing.T) {
 		Command:         Gated,
 		Home:            IsolatedHome,
 		Isolation:       Sandboxed,
-		AdditionalRoots: []RootAccess{{Path: root + string(os.PathSeparator) + ".", Read: Allow, Write: Deny}},
+		AdditionalRoots: []RootAccess{{Path: equivalentRootSpelling(root), Read: Allow, Write: Deny}},
 	}
 	p, err := NewProfile(config)
 	if err != nil {
@@ -68,7 +68,7 @@ func TestNewProfileValidation(t *testing.T) {
 		{name: "unknown home", config: ProfileConfig{WorkspaceRoot: workspace, Home: Home(2)}},
 		{name: "unknown isolation", config: ProfileConfig{WorkspaceRoot: workspace, Isolation: Isolation(2)}},
 		{name: "relative additional root", config: ProfileConfig{WorkspaceRoot: workspace, AdditionalRoots: []RootAccess{{Path: "relative"}}}},
-		{name: "contradictory duplicate root", config: ProfileConfig{WorkspaceRoot: workspace, AdditionalRoots: []RootAccess{{Path: root, Read: Allow}, {Path: root + string(os.PathSeparator) + ".", Read: Deny}}}},
+		{name: "contradictory duplicate root", config: ProfileConfig{WorkspaceRoot: workspace, AdditionalRoots: []RootAccess{{Path: root, Read: Allow}, {Path: equivalentRootSpelling(root), Read: Deny}}}},
 		{name: "unacknowledged unconfined", config: unconfinedConfig(workspace, false)},
 		{name: "restricted unconfined", config: func() ProfileConfig { c := unconfinedConfig(workspace, true); c.HostWrite = Gated; return c }()},
 	}
@@ -208,7 +208,7 @@ func TestProfileFingerprint(t *testing.T) {
 		AdditionalRoots: []RootAccess{{Path: rootB, Read: Gated}, {Path: rootA, Write: Allow}},
 	})
 	b := mustProfile(t, ProfileConfig{
-		WorkspaceRoot: workspace + string(os.PathSeparator) + ".", WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		WorkspaceRoot: equivalentRootSpelling(workspace), WorkspaceRead: Allow, WorkspaceWrite: Gated,
 		AdditionalRoots: []RootAccess{{Path: rootA, Write: Allow}, {Path: rootB, Read: Gated}},
 	})
 	if a.Fingerprint() == "" || a.Fingerprint() != b.Fingerprint() {

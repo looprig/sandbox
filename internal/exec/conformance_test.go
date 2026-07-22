@@ -15,7 +15,9 @@ package exec
 //
 // No build tag: it compiles on every platform (excluded from `go build`, compiled
 // by `go test -c` on darwin) and runs on the host. The null target runs
-// everywhere; the live target is whatever platformBackend selects here (rung 2).
+// everywhere. Non-Windows live targets use the platform-selected backend;
+// Windows uses the explicitly opted-in production restricted tier because its
+// conformance lease mutates ACLs on the disposable worker.
 
 import (
 	"testing"
@@ -37,28 +39,13 @@ func TestSandboxtestAgainstNullBackend(t *testing.T) {
 	})
 }
 
-// TestSandboxtestAgainstLiveBackend runs the suite against the platform-selected
-// backend (rung 2 on this host). This mirrors the external-consumer proof but
-// runs in-package so the null and live targets are exercised together. Init() is
-// called by the package TestMain (reexec_main_test.go), satisfying the re-exec
-// backend's gate.
+// TestSandboxtestAgainstLiveBackend runs the suite against the platform live
+// fixture. This mirrors the external-consumer proof but runs in-package so the
+// null and live targets are exercised together. Init() is called by the package
+// TestMain (reexec_main_test.go), satisfying the re-exec backend's gate.
 func TestSandboxtestAgainstLiveBackend(t *testing.T) {
-	sandboxtest.RunSuite(t, "live", func(t *testing.T, ws string) sandboxtest.SUT {
-		profile := mustProfile(t, ProfileConfig{
-			WorkspaceRoot: ws, WorkspaceRead: Allow, WorkspaceWrite: Allow,
-			HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
-		})
-		set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1))
-		if err != nil {
-			t.Fatalf("NewExecutorSet(live): %v", err)
-		}
-		t.Cleanup(func() { _ = set.Close() })
-		e, err := set.For("conformance")
-		if err != nil {
-			t.Fatalf("ExecutorSet.For(live): %v", err)
-		}
-		return e
-	})
+	requireLiveConformanceBackend(t)
+	sandboxtest.RunSuite(t, "live", newLiveConformanceExecutor)
 }
 
 // TestSandboxtestSeamConstantsMatch is the drift guard: sandboxtest mirrors the

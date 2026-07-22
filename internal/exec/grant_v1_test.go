@@ -200,26 +200,28 @@ func TestGrantVersionAndCommandStart(t *testing.T) {
 		t.Fatalf("GrantVersion = %d, want 1", executor.GrantVersion())
 	}
 
-	if _, _, err := executor.RunCommand(context.Background(), workspace, "true"); !errors.Is(err, ErrGrantRequired) {
+	successCommand := portableSuccessCommand()
+	failureCommand := portableFailureCommand()
+	if _, _, err := executor.RunCommand(context.Background(), workspace, successCommand); !errors.Is(err, ErrGrantRequired) {
 		t.Fatalf("gated RunCommand error = %v, want ErrGrantRequired", err)
 	}
-	token := issueTestGrant(t, executor, now, "exec-1", "true", workspace,
-		"command.execute", "", "command.start.v1", "true")
-	if _, code, err := executor.RunCommandWithGrants(context.Background(), "exec-1", workspace, "true", []string{token}); err != nil || code != 0 {
+	token := issueTestGrant(t, executor, now, "exec-1", successCommand, workspace,
+		"command.execute", "", "command.start.v1", successCommand)
+	if _, code, err := executor.RunCommandWithGrants(context.Background(), "exec-1", workspace, successCommand, []string{token}); err != nil || code != 0 {
 		t.Fatalf("RunCommandWithGrants = code %d err %v", code, err)
 	}
-	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-1", workspace, "true", []string{token}); !errors.Is(err, ErrGrantReplay) {
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-1", workspace, successCommand, []string{token}); !errors.Is(err, ErrGrantReplay) {
 		t.Fatalf("replay error = %v, want ErrGrantReplay", err)
 	}
 
-	wrongCommand := issueTestGrant(t, executor, now, "exec-2", "true", workspace,
-		"command.execute", "", "command.start.v1", "true")
-	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-2", workspace, "false", []string{wrongCommand}); !errors.Is(err, ErrGrantWrongCommand) {
+	wrongCommand := issueTestGrant(t, executor, now, "exec-2", successCommand, workspace,
+		"command.execute", "", "command.start.v1", successCommand)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-2", workspace, failureCommand, []string{wrongCommand}); !errors.Is(err, ErrGrantWrongCommand) {
 		t.Fatalf("cross-command error = %v, want ErrGrantWrongCommand", err)
 	}
-	wrongExecution := issueTestGrant(t, executor, now, "exec-3", "true", workspace,
-		"command.execute", "", "command.start.v1", "true")
-	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-other", workspace, "true", []string{wrongExecution}); !errors.Is(err, ErrGrantWrongExecution) {
+	wrongExecution := issueTestGrant(t, executor, now, "exec-3", successCommand, workspace,
+		"command.execute", "", "command.start.v1", successCommand)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-other", workspace, successCommand, []string{wrongExecution}); !errors.Is(err, ErrGrantWrongExecution) {
 		t.Fatalf("cross-execution error = %v, want ErrGrantWrongExecution", err)
 	}
 }
@@ -304,6 +306,10 @@ func TestGrantReplayStateRemainsBoundedAfterHighVolumeExpiry(t *testing.T) {
 func TestIssueGrantClassesAndBindings(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	pathTarget := filepath.Join(workspace, "grant-target.txt")
+	if err := os.WriteFile(pathTarget, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	profile := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Gated,
 		HostRead: Gated, HostWrite: Gated, Network: Gated, Command: Gated,
@@ -318,13 +324,17 @@ func TestIssueGrantClassesAndBindings(t *testing.T) {
 		kind, scope, class, target string
 	}{
 		{"command.execute", "", "command.start.v1", "true"},
-		{"filesystem.read", workspace, "filesystem.path.read.v1", workspace},
+		{"filesystem.read", pathTarget, "filesystem.path.read.v1", pathTarget},
 		{"filesystem.read", "tree:" + workspace, "filesystem.tree.read.v1", workspace},
-		{"filesystem.read", "host:*", "filesystem.host.read.v1", "host:*"},
-		{"filesystem.write", workspace, "filesystem.path.write.v1", workspace},
+		{"filesystem.write", pathTarget, "filesystem.path.write.v1", pathTarget},
 		{"filesystem.write", "tree:" + workspace, "filesystem.tree.write.v1", workspace},
-		{"filesystem.write", "host:*", "filesystem.host.write.v1", "host:*"},
 		{"network", "", "network.broad.v1", "tcp:*:22"},
+	}
+	if hostFilesystemGrantsSupported() {
+		tests = append(tests,
+			struct{ kind, scope, class, target string }{"filesystem.read", "host:*", "filesystem.host.read.v1", "host:*"},
+			struct{ kind, scope, class, target string }{"filesystem.write", "host:*", "filesystem.host.write.v1", "host:*"},
+		)
 	}
 	for i, tt := range tests {
 		if _, err := executor.IssueGrant(context.Background(), "exec-class", "true", workspace,
@@ -441,7 +451,7 @@ func TestFilesystemGrantRejectsTargetAndAncestorIdentitySwaps(t *testing.T) {
 		return executor
 	}
 
-	t.Run("target replaced by symlink", func(t *testing.T) {
+	t.Run("target identity replaced", func(t *testing.T) {
 		target := filepath.Join(workspace, "target")
 		outside := filepath.Join(t.TempDir(), "outside")
 		for _, path := range []string{target, outside} {
@@ -455,32 +465,33 @@ func TestFilesystemGrantRejectsTargetAndAncestorIdentitySwaps(t *testing.T) {
 		if err := os.Remove(target); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(outside, target); err != nil {
-			t.Fatal(err)
-		}
+		replaceGrantIdentityFixture(t, target, outside)
 		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-target-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
 			t.Fatalf("target swap error = %v, want ErrGrantTargetChanged", err)
 		}
 	})
 
-	t.Run("existing Ancestor replaced by symlink", func(t *testing.T) {
+	t.Run("existing ancestor identity replaced", func(t *testing.T) {
 		Ancestor := filepath.Join(workspace, "generated")
 		outside := t.TempDir()
 		if err := os.Mkdir(Ancestor, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		target := filepath.Join(Ancestor, "future.txt")
+		prepareGrantAncestorIdentityFixture(t, target, outside)
 		executor := newExecutor()
-		token := issueTestGrant(t, executor, now, "exec-Ancestor-swap", "true", workspace,
-			"filesystem.write", target, "filesystem.path.write.v1", target)
-		if err := os.Rename(Ancestor, Ancestor+".old"); err != nil {
-			t.Fatal(err)
+		token, err := executor.IssueGrant(context.Background(), "exec-Ancestor-swap", "true", workspace,
+			"filesystem.write", target, GrantClassFilesystemPathWrite, target, now.Add(time.Minute).UnixMilli())
+		if err != nil {
+			t.Fatalf("IssueGrant(%s): %v", GrantClassFilesystemPathWrite, err)
 		}
-		if err := os.Symlink(outside, Ancestor); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-Ancestor-swap", workspace, "true", []string{token}); !errors.Is(err, ErrGrantTargetChanged) {
+		replaced := replaceGrantAncestorIdentityFixture(t, Ancestor, outside)
+		_, _, err = executor.RunCommandWithGrants(context.Background(), "exec-Ancestor-swap", workspace, "true", []string{token})
+		if replaced && !errors.Is(err, ErrGrantTargetChanged) {
 			t.Fatalf("Ancestor swap error = %v, want ErrGrantTargetChanged", err)
+		}
+		if !replaced && err != nil {
+			t.Fatalf("grant after OS prevented ancestor replacement = %v, want nil", err)
 		}
 	})
 }
@@ -496,6 +507,20 @@ func TestBroadHostGrantAppliesRootAuthorityAndExpectedGuaranteeDelta(t *testing.
 	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !hostFilesystemGrantsSupported() {
+		for _, request := range []struct {
+			kind, class string
+		}{
+			{"filesystem.read", GrantClassFilesystemHostRead},
+			{"filesystem.write", GrantClassFilesystemHostWrite},
+		} {
+			if _, err := executor.IssueGrant(context.Background(), "exec-host-unsupported", "true", workspace,
+				request.kind, "host:*", request.class, "host:*", now.Add(time.Minute).UnixMilli()); !errors.Is(err, ErrGrantUnsupported) {
+				t.Fatalf("IssueGrant(%s) error = %v, want ErrGrantUnsupported", request.class, err)
+			}
+		}
+		return
 	}
 	token := issueTestGrant(t, executor, now, "exec-host-read", "true", workspace,
 		"filesystem.read", "host:*", "filesystem.host.read.v1", "host:*")

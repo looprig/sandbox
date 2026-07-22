@@ -31,6 +31,9 @@ func CanonicalPath(path string) (string, error) {
 			}
 			return winpath.Normalize(resolved)
 		}
+		if errors.Is(openErr, winpath.ErrReparsePoint) {
+			return "", ErrUnsupportedClass
+		}
 		if !errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) {
 			return "", openErr
 		}

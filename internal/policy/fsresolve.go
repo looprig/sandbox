@@ -26,7 +26,7 @@ import (
 // and separator sensitive. Passing an unresolved path could let a deny be
 // bypassed via a symlink or a case variant on macOS.
 func ResolveFS(entries []FSEntry, path string) FSAccess {
-	target := filepath.Clean(path)
+	target := pathKey(filepath.Clean(path))
 	var globDenied FSAccess
 	for _, entry := range entries {
 		if strings.ContainsAny(entry.Path, GlobMeta) && denyMatches(entry, target) {
@@ -173,10 +173,12 @@ func GlobRegexp(glob string) *regexp.Regexp {
 
 // GlobToRegexp translates a glob into an anchored regexp source string.
 // filepath.Match has no "**", so the translation is done by hand: "**" -> ".*",
-// "*" -> "[^/]*", "?" -> "[^/]", bracket expressions are carried through (with a
-// leading "!" negation rewritten to regexp "^"), and every other byte is escaped
-// via regexp.QuoteMeta so metacharacters such as "." match literally.
+// "*" and "?" stay within the current platform's path separator, bracket
+// expressions are carried through (with a leading "!" negation rewritten to
+// regexp "^"), and every other byte is escaped via regexp.QuoteMeta so
+// metacharacters such as "." match literally.
 func GlobToRegexp(glob string) string {
+	glob = globPathKey(glob)
 	var b strings.Builder
 	b.WriteByte('^')
 	for i := 0; i < len(glob); {
@@ -186,11 +188,11 @@ func GlobToRegexp(glob string) string {
 				b.WriteString(".*") // cross-directory
 				i += 2
 			} else {
-				b.WriteString("[^/]*") // within a single segment
+				b.WriteString("[^" + regexp.QuoteMeta(pathKeySeparator) + "]*") // within a single segment
 				i++
 			}
 		case '?':
-			b.WriteString("[^/]")
+			b.WriteString("[^" + regexp.QuoteMeta(pathKeySeparator) + "]")
 			i++
 		case '[':
 			if class, next, ok := scanClass(glob, i); ok {

@@ -13,6 +13,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -25,13 +26,13 @@ type conservativeSUT struct {
 	bits      uint64
 }
 
-func (sut conservativeSUT) RunCommand(_ context.Context, _ string, command string) ([]byte, int, error) {
+func (sut conservativeSUT) RunCommand(_ context.Context, dir string, command string) ([]byte, int, error) {
 	if command == "env" || command == "set" {
 		return []byte(strings.Join(os.Environ(), "\n")), 0, nil
 	}
 	if strings.HasPrefix(command, "type ") && !strings.HasPrefix(command, "type nul > ") {
 		path := strings.Trim(strings.TrimPrefix(command, "type "), `"`)
-		out, err := os.ReadFile(strings.ReplaceAll(path, "%%", "%"))
+		out, err := os.ReadFile(resolveCommandPath(dir, strings.ReplaceAll(path, "%%", "%")))
 		if err != nil {
 			return nil, 1, nil
 		}
@@ -42,6 +43,10 @@ func (sut conservativeSUT) RunCommand(_ context.Context, _ string, command strin
 		path = strings.Trim(strings.TrimPrefix(command, "type nul > "), `"`)
 		path = strings.ReplaceAll(path, "%%", "%")
 	}
+	path = resolveCommandPath(dir, path)
+	if !filepath.IsAbs(path) {
+		return nil, 1, nil
+	}
 	rel, err := filepath.Rel(sut.workspace, path)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return nil, 1, nil
@@ -50,6 +55,17 @@ func (sut conservativeSUT) RunCommand(_ context.Context, _ string, command strin
 		return nil, 1, nil
 	}
 	return nil, 0, nil
+}
+
+// resolveCommandPath gives this in-process test double the same working-directory
+// semantics as a real shell. Windows suite controls intentionally use relative
+// operands to avoid cmd.exe's /S quote edge cases; absolute boundary probes stay
+// absolute.
+func resolveCommandPath(dir, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(dir, path)
 }
 
 func (sut conservativeSUT) RunArgv(_ context.Context, _ string, argv []string) ([]byte, int, error) {
@@ -83,12 +99,24 @@ func TestMain(m *testing.M) {
 // proof: the write-boundary and env-scrub checks spawn through the live OS
 // enforcement path.
 func TestSuiteAgainstLivePlatformBackend(t *testing.T) {
+	requireLivePlatformBackend(t)
 	sandboxtest.RunSuite(t, "live-platform", func(t *testing.T, ws string) sandboxtest.SUT {
-		profile, err := sandbox.NewProfile(sandbox.ProfileConfig{
+		config := sandbox.ProfileConfig{
 			WorkspaceRoot: ws, WorkspaceRead: sandbox.Allow, WorkspaceWrite: sandbox.Allow,
 			HostRead: sandbox.Allow, HostWrite: sandbox.Deny,
 			Network: sandbox.Deny, Command: sandbox.Allow,
-		})
+		}
+		if runtime.GOOS == "windows" {
+			// The Phase 3 restricted-token tier intentionally claims only
+			// EnvScrub until the Task 5 runtime decision and elevated tier land.
+			// Keep this consumer smoke test on the real Windows backend without
+			// asking Auto for guarantees that only the elevated tier can provide.
+			// The dedicated disposable-worker acceptance suite owns the stronger
+			// Windows boundary assertions and must never be weakened or skipped.
+			config.HostWrite = sandbox.Allow
+			config.Network = sandbox.Allow
+		}
+		profile, err := sandbox.NewProfile(config)
 		if err != nil {
 			t.Fatalf("NewProfile: %v", err)
 		}

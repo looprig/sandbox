@@ -27,6 +27,8 @@ func pathKey(path string) string {
 	return filepath.Clean(path)
 }
 
+func globPathKey(path string) string { return strings.ReplaceAll(path, "/", pathKeySeparator) }
+
 func pathKeyIsRoot(key string) bool {
 	volume := filepath.VolumeName(key)
 	return volume != "" && literalPathEqual(key, volume+pathKeySeparator)

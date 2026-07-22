@@ -37,7 +37,7 @@ func TestWindowsIssueGrantRejectsBroadHostReadAndWrite(t *testing.T) {
 		HostRead: Gated, HostWrite: Gated, Network: Deny, Command: Allow,
 	})
 	executor, err := newTestExecutor(profile,
-		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeEnvScrub}),
+		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
 		withClock(func() time.Time { return now }),
 	)
 	if err != nil {

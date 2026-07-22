@@ -10,7 +10,7 @@ import (
 )
 
 func TestWindowsCanonicalRootRejectsUnsupportedSpelling(t *testing.T) {
-	for _, path := range []string{`C:relative`, `\\server\share`, `\\.\C:\`, `C:\root:stream`} {
+	for _, path := range []string{`C:relative`, `\\server\share`, `\\.\C:\`, `C:\root:stream`, `C:\root\.`} {
 		if _, err := CanonicalRoot(path); !errors.Is(err, winpath.ErrUnsupportedPath) {
 			t.Fatalf("CanonicalRoot(%q) error = %v, want ErrUnsupportedPath", path, err)
 		}

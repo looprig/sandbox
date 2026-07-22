@@ -37,15 +37,16 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 		t.Fatal("executor did not own the configured proxy route")
 	}
 	target := "tcp:example.test:443"
-	token := issueTestGrant(t, executor, now, "exec-proxy", "env", workspace,
+	command := portableEnvironmentCommand()
+	token := issueTestGrant(t, executor, now, "exec-proxy", command, workspace,
 		"network", "", "network.proxy-target.v1", target)
-	out, code, err := executor.RunCommandWithGrants(context.Background(), "exec-proxy", workspace, "env", []string{token})
+	out, code, err := executor.RunCommandWithGrants(context.Background(), "exec-proxy", workspace, command, []string{token})
 	if err != nil || code != 0 {
 		t.Fatalf("proxy grant run = code %d err %v out %q", code, err, out)
 	}
-	environment := string(out)
-	if !strings.Contains(environment, "HTTP_PROXY=http://exec-proxy:") || !strings.Contains(environment, "HTTPS_PROXY=http://exec-proxy:") || !strings.Contains(environment, "NO_PROXY=\n") {
-		t.Fatalf("proxy environment missing scoped values or NO_PROXY clear:\n%s", environment)
+	environment := parsedEnvironment(out)
+	if !strings.HasPrefix(environment["HTTP_PROXY"], "http://exec-proxy:") || !strings.HasPrefix(environment["HTTPS_PROXY"], "http://exec-proxy:") || environment["NO_PROXY"] != "" {
+		t.Fatalf("proxy environment missing scoped values or NO_PROXY clear:\n%v", environment)
 	}
 	pol := backend.lastPolicy()
 	_, portText, _ := net.SplitHostPort(executor.proxy.Addr())
@@ -132,7 +133,7 @@ func TestAuthenticatedProxyDenialPrecedesProcessResultAndCredentialIsRevoked(t *
 	t.Cleanup(func() { _ = set.Close() })
 	executor, _ := set.For("proxy-denial")
 	proxyFile := workspace + "/proxy-url"
-	command := "printf '%s' \"$HTTP_PROXY\" > " + proxyFile + "; sleep 1; exit 7"
+	command := portableProxyExposureCommand(proxyFile)
 	token := issueTestGrant(t, executor, now, "exec-denial", command, workspace,
 		"network", "", "network.proxy-target.v1", "tcp:allowed.test:80")
 
@@ -158,7 +159,7 @@ func TestAuthenticatedProxyDenialPrecedesProcessResultAndCredentialIsRevoked(t *
 	if len(rawProxy) == 0 {
 		t.Fatal("command never exposed its scoped proxy URL")
 	}
-	parsed, err := url.Parse(string(rawProxy))
+	parsed, err := url.Parse(strings.TrimSpace(string(rawProxy)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,11 +201,12 @@ func TestNetworkAllowUsesExplicitRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, code, err := executor.RunCommand(context.Background(), workspace, "env")
+	out, code, err := executor.RunCommand(context.Background(), workspace, portableEnvironmentCommand())
 	if err != nil || code != 0 {
 		t.Fatalf("RunCommand = code %d err %v", code, err)
 	}
-	if !strings.Contains(string(out), "HTTP_PROXY=http://route-") || !strings.Contains(string(out), "NO_PROXY=\n") {
+	environment := parsedEnvironment(out)
+	if !strings.HasPrefix(environment["HTTP_PROXY"], "http://route-") || environment["NO_PROXY"] != "" {
 		t.Fatalf("explicit route not injected:\n%s", out)
 	}
 	pol := backend.lastPolicy()

@@ -73,9 +73,10 @@ func acceptRowEnvScrub(t *testing.T) {
 		t.Errorf("Guarantees().EnvScrub = false, want true for a non-inherit policy")
 	}
 
-	out, code, err := e.RunCommand(context.Background(), ws, "env")
+	command := portableEnvironmentCommand()
+	out, code, err := e.RunCommand(context.Background(), ws, command)
 	if err != nil {
-		t.Fatalf("RunCommand(env): %v (out=%q)", err, out)
+		t.Fatalf("RunCommand(%s): %v (out=%q)", command, err, out)
 	}
 	if code != 0 {
 		t.Fatalf("env exit=%d, want 0 (out=%q)", code, out)

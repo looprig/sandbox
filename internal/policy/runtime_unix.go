@@ -21,6 +21,8 @@ func sortHostRoots(roots []string) { slices.Sort(roots) }
 
 func pathKey(path string) string { return filepath.Clean(path) }
 
+func globPathKey(path string) string { return path }
+
 func pathKeyIsRoot(key string) bool { return key == pathKeySeparator }
 
 func pathKeyVolume(string) string { return "" }

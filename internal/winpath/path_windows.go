@@ -15,7 +15,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-var ErrUnsupportedPath = errors.New("sandbox: unsupported Windows path")
+var (
+	ErrUnsupportedPath = errors.New("sandbox: unsupported Windows path")
+	// ErrReparsePoint identifies the unsupported-path subset caused by a
+	// reparse-point component. Callers that expose policy vocabulary can map
+	// this filesystem-mechanism error without parsing an error string.
+	ErrReparsePoint = errors.New("sandbox: Windows reparse-point path")
+)
 
 type Kind uint8
 
@@ -388,7 +394,7 @@ func walkPathComponents(path string, shareMode uint32, openRoot rootComponentOpe
 			return inspectErr
 		}
 		if reparse {
-			return fmt.Errorf("%w: reparse-point component", ErrUnsupportedPath)
+			return fmt.Errorf("%w: %w", ErrUnsupportedPath, ErrReparsePoint)
 		}
 		return nil
 	}
@@ -405,7 +411,7 @@ func walkPathComponents(path string, shareMode uint32, openRoot rootComponentOpe
 		if openErr != nil {
 			closeAll()
 			if errors.Is(openErr, windows.STATUS_REPARSE_POINT_ENCOUNTERED) || errors.Is(openErr, windows.STATUS_STOPPED_ON_SYMLINK) {
-				return nil, fmt.Errorf("%w: relative component %q", ErrUnsupportedPath, component)
+				return nil, fmt.Errorf("%w: %w: relative component %q", ErrUnsupportedPath, ErrReparsePoint, component)
 			}
 			return nil, fmt.Errorf("open relative component %q: %w", component, openErr)
 		}

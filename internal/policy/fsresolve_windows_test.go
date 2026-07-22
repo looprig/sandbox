@@ -28,16 +28,25 @@ func TestLiteralMatchesWindowsPathKeysIgnoreCaseAndSeparatorSpelling(t *testing.
 }
 
 func TestWindowsLiteralComparisonUsesOrdinalUnicodeSemantics(t *testing.T) {
-	if !literalPathEqual(`C:\Straße`, `c:\STRAẞE`) {
-		t.Fatal("ordinal case-insensitive equality rejected sharp-s case pair")
+	if literalPathEqual(`C:\Straße`, `c:\STRAẞE`) {
+		t.Fatal("ordinal comparison performed a linguistic sharp-s expansion")
 	}
-	if !literalPathHasComponentPrefix(`c:\STRAẞE\child`, `C:\Straße`) {
-		t.Fatal("ordinal component prefix rejected sharp-s case pair")
+	if literalPathHasComponentPrefix(`c:\STRAẞE\child`, `C:\Straße`) {
+		t.Fatal("ordinal component prefix performed a linguistic sharp-s expansion")
 	}
 	if literalPathHasComponentPrefix(`C:\Straße-other`, `c:\STRAẞE`) {
 		t.Fatal("ordinal prefix crossed a component boundary")
 	}
 	if !literalVolumeEqual(`c:`, `C:`) || literalVolumeEqual(`C:`, `D:`) {
 		t.Fatal("ordinal volume comparison contract violated")
+	}
+}
+
+func TestWindowsGlobMatchingNormalizesSeparators(t *testing.T) {
+	entries := []FSEntry{{Path: `C:/work/**/.env*`, Denied: AllAccess}}
+	for _, target := range []string{`C:\work\src\.env`, `C:/work/src/.env.local`} {
+		if got := ResolveFS(entries, target); got != DenyAccess {
+			t.Fatalf("ResolveFS(%q) = %v, want deny", target, got)
+		}
 	}
 }

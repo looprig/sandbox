@@ -370,7 +370,7 @@ func TestExecutorSetCloseBlocksCommandsBeforeStart(t *testing.T) {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(workspace, "started")
-			command := "printf started > " + marker
+			command := portableWriteCommand(marker, "started")
 			runDone := make(chan error, 1)
 			go func() {
 				if commandAccess == Allow {
@@ -431,7 +431,7 @@ func TestExecutorSetCloseCancelsAndWaitsForActiveCommand(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() {
 		_, _, err := executor.RunCommand(context.Background(), workspace,
-			"printf started > "+started+"; sleep 30; printf completed > "+completed)
+			portableWriteSleepWriteCommand(started, completed, 30))
 		returned.Store(true)
 		runDone <- err
 	}()
@@ -476,7 +476,10 @@ func assertOwnerOnlyDir(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+	if !info.IsDir() {
+		t.Fatalf("%q mode = %v, want directory", path, info.Mode())
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 		t.Fatalf("%q mode = %v, want owner-only directory", path, info.Mode())
 	}
 	if !filepath.IsAbs(path) {
