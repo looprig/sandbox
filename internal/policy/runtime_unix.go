@@ -2,7 +2,10 @@
 
 package policy
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"slices"
+)
 
 const (
 	NullDevicePath   = "/dev/null"
@@ -11,7 +14,9 @@ const (
 
 func runtimeBaselines() []string { return nil }
 
-func hostRootPath(string) string { return string(filepath.Separator) }
+func hostRootPaths() ([]string, error) { return []string{string(filepath.Separator)}, nil }
+
+func sortHostRoots(roots []string) { slices.Sort(roots) }
 
 func pathKey(path string) string { return filepath.Clean(path) }
 

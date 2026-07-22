@@ -206,12 +206,18 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
+		if !hostFilesystemGrantsSupported() {
+			return grantDelta{}, 0, ErrGrantUnsupported
+		}
 		delta, guarantee, err := filesystem("filesystem.read", "host:*", string(filepath.Separator), policy.ReadAccess|policy.ExecAccess, GuaranteeReadBoundary, false)
 		delta.droppedGuarantees = GuaranteeReadBoundary
 		return delta, guarantee, err
 	case GrantClassFilesystemHostWrite:
 		if target != "host:*" {
 			return grantDelta{}, 0, ErrGrantMalformed
+		}
+		if !hostFilesystemGrantsSupported() {
+			return grantDelta{}, 0, ErrGrantUnsupported
 		}
 		delta, guarantee, err := filesystem("filesystem.write", "host:*", string(filepath.Separator), policy.WriteAccess, GuaranteeWriteBoundary, false)
 		delta.droppedGuarantees = GuaranteeWriteBoundary

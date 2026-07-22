@@ -47,6 +47,36 @@ func TestWindowsNormalizeUnifiesDriveAndExtendedSpellings(t *testing.T) {
 	}
 }
 
+func TestWindowsCompareUsesOrdinalUTF16Ordering(t *testing.T) {
+	if got := Compare(`C:\x`, `c:\X`); got != 0 {
+		t.Fatalf("case-insensitive Compare = %d, want 0", got)
+	}
+	// CompareStringOrdinal orders UTF-16 code units. A supplementary-plane
+	// character starts with a surrogate below U+E000, which is the opposite of
+	// Go's UTF-8 string ordering and catches strings.ToUpper(a) < strings.ToUpper(b).
+	if got := Compare("C:\\"+string(rune(0x10000)), "C:\\"+string(rune(0xe000))); got >= 0 {
+		t.Fatalf("supplementary/BMP ordinal Compare = %d, want negative", got)
+	}
+	if got := Compare(`C:\b`, `C:\a`); got <= 0 {
+		t.Fatalf("descending Compare = %d, want positive", got)
+	}
+}
+
+func TestWindowsSupportedVolumeRootsFiltersDeduplicatesAndOrders(t *testing.T) {
+	got := filterVolumeRoots([]string{`D:\`, `z:\`, `c:\`, `C:\`}, func(root string) bool {
+		return !EqualPath(root, `Z:\`)
+	})
+	want := []string{`C:\`, `D:\`}
+	if len(got) != len(want) {
+		t.Fatalf("roots = %q, want %q", got, want)
+	}
+	for i := range want {
+		if !EqualPath(got[i], want[i]) {
+			t.Fatalf("roots[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestWindowsOpenCapturesCompleteLocalIdentity(t *testing.T) {
 	root := t.TempDir()
 	file := filepath.Join(root, "identity.txt")

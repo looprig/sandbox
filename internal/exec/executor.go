@@ -89,19 +89,20 @@ type Executor struct {
 	// Grant wiring (SPEC §9.2). The HMAC key is per-executor and never serialized.
 	// Tokens also bind the immutable profile, route identity, and guarantee bits.
 	// usedGrants provides one-shot replay protection; Close revokes the key.
-	grantKey         []byte
-	clock            func() time.Time
-	grantTTL         time.Duration
-	routeFingerprint string
-	proxy            *network.Proxy
-	home             string
-	tmp              string
-	grantMu          sync.Mutex
-	usedGrants       map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
-	closed           bool
-	lifecycle        *executorLifecycle
-	specReleaseOnce  sync.Once
-	specReleaseErr   error
+	grantKey           []byte
+	clock              func() time.Time
+	grantTTL           time.Duration
+	routeFingerprint   string
+	proxy              *network.Proxy
+	home               string
+	tmp                string
+	grantMu            sync.Mutex
+	usedGrants         map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	retainedGrantPaths retainedGrantPaths
+	closed             bool
+	lifecycle          *executorLifecycle
+	specReleaseOnce    sync.Once
+	specReleaseErr     error
 }
 
 // snapshot is the compiled state a single spawn needs.
@@ -169,21 +170,22 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		lifecycle = newExecutorLifecycle()
 	}
 	return &Executor{
-		profile:          prof,
-		settings:         settings,
-		policy:           p,
-		backend:          b,
-		spec:             spec,
-		report:           report,
-		level:            level,
-		guaranteeBits:    bits,
-		env:              assembleEnv(p),
-		grantKey:         key,
-		clock:            clockOrDefault(config.clock),
-		grantTTL:         ttlOrDefault(config.grantTTL),
-		routeFingerprint: defaultRouteIdentity,
-		usedGrants:       make(map[[32]byte]int64),
-		lifecycle:        lifecycle,
+		profile:            prof,
+		settings:           settings,
+		policy:             p,
+		backend:            b,
+		spec:               spec,
+		report:             report,
+		level:              level,
+		guaranteeBits:      bits,
+		env:                assembleEnv(p),
+		grantKey:           key,
+		clock:              clockOrDefault(config.clock),
+		grantTTL:           ttlOrDefault(config.grantTTL),
+		routeFingerprint:   defaultRouteIdentity,
+		usedGrants:         make(map[[32]byte]int64),
+		retainedGrantPaths: make(retainedGrantPaths),
+		lifecycle:          lifecycle,
 	}, nil
 }
 
@@ -489,14 +491,6 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if class == GrantClassNetworkProxyTarget && e.proxy == nil {
 		return "", ErrGrantUnsupported
 	}
-	var pathBinding *policy.PathBinding
-	if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-		binding, err := policy.CapturePathBinding(delta.entry.Path)
-		if err != nil {
-			return "", fmt.Errorf("%w: bind target: %v", ErrGrantMalformed, err)
-		}
-		pathBinding = &binding
-	}
 	access, err := e.profile.AccessFor(kind, scope)
 	if err != nil {
 		return "", err
@@ -513,6 +507,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 		return "", ErrExecutorClosed
 	}
 	now := e.clock()
+	e.retainedGrantPaths.prune(now.UnixMilli())
 	expiry := expiryFromMillis(expiryUnixMilli)
 	if !expiry.After(now) || expiry.After(now.Add(e.grantTTL)) {
 		return "", ErrGrantExpired
@@ -524,12 +519,52 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return "", fmt.Errorf("sandbox: grant nonce: %w", err)
 	}
-	return mintGrant(e.grantKey, grantPayload{
+	var pathBinding *policy.PathBinding
+	var retained retainedPathHandle
+	if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
+		binding, err := policy.CapturePathBinding(delta.entry.Path)
+		if err != nil {
+			if errors.Is(err, policy.ErrUnsupportedClass) {
+				return "", ErrGrantUnsupported
+			}
+			return "", fmt.Errorf("%w: bind target: %v", ErrGrantMalformed, err)
+		}
+		handle, err := policy.AcquirePathHandle(&binding, delta.entry.Path, delta.entry.Exact)
+		if err != nil {
+			if errors.Is(err, policy.ErrUnsupportedClass) {
+				return "", ErrGrantUnsupported
+			}
+			return "", err
+		}
+		if handle == nil {
+			retained = noOpRetainedPathHandle{}
+		} else {
+			retained = handle
+		}
+		pathBinding = &binding
+	}
+	payload := grantPayload{
 		ExecutionID: executionID, Command: command, WorkingDirectory: canonicalCWD,
 		ProfileFingerprint: e.settings.Fingerprint, RouteFingerprint: e.routeFingerprint,
 		GuaranteeBits: e.guaranteeBits, Class: class, Target: target,
 		PathBinding: pathBinding, ExpiryUnixMilli: expiryUnixMilli, Nonce: nonce,
-	})
+	}
+	token, err := mintGrant(e.grantKey, payload)
+	if err != nil {
+		if retained != nil {
+			_ = retained.Close()
+		}
+		return "", err
+	}
+	if retained != nil {
+		if err := e.retainedGrantPaths.add(grantID(token), retainedGrantPath{
+			binding: *pathBinding, target: delta.entry.Path, exact: delta.entry.Exact,
+			expiryUnixMilli: expiryUnixMilli, handle: retained,
+		}); err != nil {
+			return "", err
+		}
+	}
+	return token, nil
 }
 
 // RunCommandWithGrants verifies all grants, compiles their least-authority
@@ -567,6 +602,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	pol := policy.Clone(e.policy)
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
+	e.retainedGrantPaths.prune(now.UnixMilli())
 	seen := make(map[[32]byte]int64, len(grants))
 	commandGrant := e.settings.Command == Allow
 	expectedGuarantees := e.guaranteeBits
@@ -598,15 +634,36 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, ErrGrantGuaranteeMismatch
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-			handle, err := acquire(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
+			validation, err := acquire(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
 			if err != nil {
 				return nil, -1, err
 			}
-			if handle != nil {
+			retained, err := e.retainedGrantPaths.take(id, payload.PathBinding, delta.entry.Path, delta.entry.Exact, payload.ExpiryUnixMilli)
+			if err != nil {
+				if validation != nil {
+					_ = validation.Close()
+				}
+				return nil, -1, err
+			}
+			handle, retainedIsPathHandle := retained.(*policy.PathHandle)
+			if retainedIsPathHandle != (validation != nil) ||
+				(retainedIsPathHandle && !policy.SamePathHandleIdentity(handle, validation)) {
+				if validation != nil {
+					_ = validation.Close()
+				}
+				_ = retained.Close()
+				return nil, -1, ErrGrantTargetChanged
+			}
+			if validation != nil {
+				_ = validation.Close()
+			}
+			if retainedIsPathHandle {
 				handle.SetAccess(delta.entry.Access)
 				if err := pathHandles.Add(handle); err != nil {
 					return nil, -1, err
 				}
+			} else {
+				_ = retained.Close()
 			}
 		}
 		if delta.class == GrantClassCommandStart {

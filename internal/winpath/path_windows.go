@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -113,22 +114,110 @@ func reservedDOSName(component string) bool {
 	return len(name) == 4 && (strings.HasPrefix(name, "COM") || strings.HasPrefix(name, "LPT")) && name[3] >= '1' && name[3] <= '9'
 }
 
-// EqualPath compares normalized path keys with CompareStringOrdinal's
-// case-insensitive semantics rather than locale-sensitive Unicode folding.
-func EqualPath(left, right string) bool {
+// Compare orders path keys with CompareStringOrdinal's case-insensitive UTF-16
+// semantics. It returns -1, 0, or 1.
+func Compare(left, right string) int {
 	left16, err := windows.UTF16FromString(left)
 	if err != nil {
-		return false
+		return strings.Compare(left, right)
 	}
 	right16, err := windows.UTF16FromString(right)
 	if err != nil {
-		return false
+		return strings.Compare(left, right)
 	}
 	result, _, _ := compareStringOrdinal.Call(
 		uintptr(unsafe.Pointer(&left16[0])), uintptr(len(left16)-1),
 		uintptr(unsafe.Pointer(&right16[0])), uintptr(len(right16)-1), 1,
 	)
-	return result == 2 // CSTR_EQUAL
+	switch result {
+	case 1: // CSTR_LESS_THAN
+		return -1
+	case 2: // CSTR_EQUAL
+		return 0
+	case 3: // CSTR_GREATER_THAN
+		return 1
+	default:
+		// CompareStringOrdinal is present on every supported Windows release.
+		// Fail closed for equality if the syscall nevertheless fails.
+		return strings.Compare(left, right)
+	}
+}
+
+// EqualPath reports ordinal case-insensitive equality.
+func EqualPath(left, right string) bool { return Compare(left, right) == 0 }
+
+// VolumeRoots enumerates every supported fixed local NTFS/ReFS drive root.
+func VolumeRoots() ([]string, error) {
+	candidates, err := logicalDriveRoots()
+	if err != nil {
+		return nil, err
+	}
+	var inspectErr error
+	roots := filterVolumeRoots(candidates, func(root string) bool {
+		object, err := Open(root)
+		if err != nil {
+			if errors.Is(err, ErrUnsupportedPath) {
+				return false
+			}
+			inspectErr = err
+			return false
+		}
+		defer object.Close()
+		return object.Kind == KindDirectory && object.ReparseTag == 0
+	})
+	if inspectErr != nil {
+		return nil, inspectErr
+	}
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("%w: no supported local volumes", ErrUnsupportedPath)
+	}
+	return roots, nil
+}
+
+func logicalDriveRoots() ([]string, error) {
+	size, err := windows.GetLogicalDriveStrings(0, nil)
+	if err != nil || size == 0 {
+		return nil, fmt.Errorf("enumerate logical drives: %w", err)
+	}
+	buffer := make([]uint16, size+1)
+	n, err := windows.GetLogicalDriveStrings(uint32(len(buffer)), &buffer[0])
+	if err != nil {
+		return nil, fmt.Errorf("read logical drives: %w", err)
+	}
+	var roots []string
+	start := 0
+	for i := 0; i < int(n); i++ {
+		if buffer[i] != 0 {
+			continue
+		}
+		if i > start {
+			roots = append(roots, windows.UTF16ToString(buffer[start:i]))
+		}
+		start = i + 1
+	}
+	return roots, nil
+}
+
+func filterVolumeRoots(candidates []string, supported func(string) bool) []string {
+	var roots []string
+	for _, candidate := range candidates {
+		root, err := Normalize(candidate)
+		if err != nil || len(root) != 3 || root[1:] != `:\` || !supported(root) {
+			continue
+		}
+		duplicate := false
+		for _, existing := range roots {
+			if EqualPath(existing, root) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			roots = append(roots, root)
+		}
+	}
+	slices.SortFunc(roots, Compare)
+	return roots
 }
 
 // Open validates path, rejects reparse-point ancestors, and captures complete

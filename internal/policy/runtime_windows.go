@@ -4,7 +4,10 @@ package policy
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/looprig/sandbox/internal/winpath"
 )
 
 const (
@@ -15,13 +18,9 @@ const (
 
 func runtimeBaselines() []string { return []string{WindowsRuntimeBaseline} }
 
-func hostRootPath(workspace string) string {
-	volume := filepath.VolumeName(filepath.Clean(workspace))
-	if volume == "" {
-		return pathKeySeparator
-	}
-	return volume + pathKeySeparator
-}
+func hostRootPaths() ([]string, error) { return winpath.VolumeRoots() }
+
+func sortHostRoots(roots []string) { slices.SortFunc(roots, winpath.Compare) }
 
 func pathKey(path string) string {
 	path = strings.ReplaceAll(path, "/", pathKeySeparator)

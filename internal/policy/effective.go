@@ -77,6 +77,10 @@ func Clone(p Effective) Effective {
 }
 
 func Compile(prof *profile.Profile) (Effective, error) {
+	return compileWithHostRoots(prof, hostRootPaths)
+}
+
+func compileWithHostRoots(prof *profile.Profile, roots func() ([]string, error)) (Effective, error) {
 	if err := prof.Validate(); err != nil {
 		return Effective{}, err
 	}
@@ -87,7 +91,14 @@ func Compile(prof *profile.Profile) (Effective, error) {
 		Home:      settings.Home,
 	}
 	if settings.Isolation == profile.Unconfined {
-		p.FS = []FSEntry{{Path: hostRootPath(settings.WorkspaceRoot), Access: ReadAccess | WriteAccess | ExecAccess}}
+		hostRoots, err := roots()
+		if err != nil {
+			return Effective{}, err
+		}
+		sortHostRoots(hostRoots)
+		for _, root := range hostRoots {
+			p.FS = append(p.FS, FSEntry{Path: root, Access: ReadAccess | WriteAccess | ExecAccess})
+		}
 		p.Net.Open = true
 		return p, nil
 	}
@@ -99,7 +110,14 @@ func Compile(prof *profile.Profile) (Effective, error) {
 	for _, root := range settings.AdditionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
 	}
-	appendRootAccess(&p.FS, hostRootPath(settings.WorkspaceRoot), settings.HostRead, settings.HostWrite)
+	hostRoots, err := roots()
+	if err != nil {
+		return Effective{}, err
+	}
+	sortHostRoots(hostRoots)
+	for _, root := range hostRoots {
+		appendRootAccess(&p.FS, root, settings.HostRead, settings.HostWrite)
+	}
 	if settings.Network == profile.Allow {
 		p.Net.Open = true
 	}

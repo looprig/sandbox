@@ -36,3 +36,9 @@ func TestWindowsPathWithinUsesOrdinalCaseInsensitiveBoundaries(t *testing.T) {
 		t.Fatal("component-prefix sibling was treated as within root")
 	}
 }
+
+func TestWindowsCanonicalPathLessUsesOrdinalUTF16Ordering(t *testing.T) {
+	if !canonicalPathLess("C:\\"+string(rune(0x10000)), "C:\\"+string(rune(0xe000))) {
+		t.Fatal("canonical path ordering is not Windows ordinal UTF-16 ordering")
+	}
+}

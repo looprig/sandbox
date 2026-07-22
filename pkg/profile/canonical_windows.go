@@ -25,7 +25,7 @@ func CanonicalRoot(path string) (string, error) {
 
 func canonicalPathEqual(left, right string) bool { return winpath.EqualPath(left, right) }
 func canonicalPathLess(left, right string) bool {
-	return strings.ToUpper(left) < strings.ToUpper(right)
+	return winpath.Compare(left, right) < 0
 }
 func canonicalPathWithin(path, root string) bool {
 	if winpath.EqualPath(path, root) {

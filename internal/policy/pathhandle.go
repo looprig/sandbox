@@ -135,3 +135,10 @@ func (handle *PathHandle) Target() string {
 
 // Exact reports whether the handle pins one file rather than a whole tree.
 func (handle *PathHandle) Exact() bool { return handle != nil && handle.exact }
+
+// SamePathHandleIdentity reports whether two independently opened handles pin
+// the same canonical target and complete platform identity.
+func SamePathHandleIdentity(left, right *PathHandle) bool {
+	return left != nil && right != nil && samePathHandleTarget(left.target, right.target) &&
+		left.identity == right.identity && left.exact == right.exact && left.isDir == right.isDir
+}

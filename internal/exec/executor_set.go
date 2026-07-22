@@ -318,6 +318,8 @@ func (e *Executor) revokeResources() {
 		e.grantKey[i] = 0
 	}
 	e.usedGrants = nil
+	_ = e.retainedGrantPaths.closeAll()
+	e.retainedGrantPaths = nil
 	proxy := e.proxy
 	e.grantMu.Unlock()
 	if proxy != nil {
