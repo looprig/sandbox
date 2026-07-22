@@ -651,12 +651,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	bits = e.composeRouteGuarantees(bits)
 	if bits != expectedGuarantees {
-		return nil, -1, errors.Join(ErrGrantGuaranteeMismatch, releaseSpec(spec))
+		return nil, -1, finishExecutionAndRelease(lease, spec, ErrGrantGuaranteeMismatch)
 	}
 	if len(proxyTargets) != 0 {
 		credential, err := e.proxy.Authorize(executionID, proxyTargets)
 		if err != nil {
-			return nil, -1, errors.Join(err, releaseSpec(spec))
+			return nil, -1, finishExecutionAndRelease(lease, spec, err)
 		}
 		proxyURL := e.proxy.URL(executionID, credential)
 		applyChildProxyEnv(pol.Env.Set, proxyURL)
@@ -676,7 +676,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	if denial != nil {
 		runErr = network.NewTargetDeniedError(code, runErr, denial)
 	}
-	return out, code, errors.Join(runErr, releaseSpec(spec))
+	return out, code, finishExecutionAndRelease(lease, spec, runErr)
+}
+
+func finishExecutionAndRelease(lease *executionLease, spec enforce.Spec, executionErr error) error {
+	lease.finish()
+	return errors.Join(executionErr, releaseSpec(spec))
 }
 
 func releaseSpec(spec enforce.Spec) error {

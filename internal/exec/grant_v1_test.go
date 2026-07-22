@@ -21,6 +21,7 @@ type captureBackend struct {
 	bits       uint64
 	compileErr error
 	release    func() error
+	cleanup    func()
 }
 
 type boundaryBackend struct {
@@ -51,7 +52,7 @@ func (b *captureBackend) Compile(pol policy.Effective) (enforce.Spec, CompileRep
 		return enforce.Spec{}, CompileReport{}, LevelNone, 0, b.compileErr
 	}
 	spec := enforce.Spec{
-		Wrap:    func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil },
+		Wrap:    func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, b.cleanup },
 		Release: b.release,
 	}
 	return spec, CompileReport{}, LevelNone, b.bits, nil
@@ -75,12 +76,30 @@ func TestGrantCompiledSpecReleasedAfterSpawn(t *testing.T) {
 		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
 	var releases atomic.Int32
+	var spawnCleaned atomic.Bool
+	var lifecycle *executorLifecycle
 	backend := &captureBackend{
 		bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
 		release: func() error {
-			releases.Add(1)
+			if releases.Add(1) != 1 {
+				return nil
+			}
+			if !spawnCleaned.Load() {
+				t.Error("grant spec released before spawn cleanup and process-tree wait completed")
+			}
+			leaseDone := make(chan struct{})
+			go func() {
+				lifecycle.wait()
+				close(leaseDone)
+			}()
+			select {
+			case <-leaseDone:
+			case <-time.After(100 * time.Millisecond):
+				t.Error("grant spec released while its execution lease was still active")
+			}
 			return nil
 		},
+		cleanup: func() { spawnCleaned.Store(true) },
 	}
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
 		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
@@ -91,6 +110,7 @@ func TestGrantCompiledSpecReleasedAfterSpawn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lifecycle = executor.lifecycle
 	if got := releases.Load(); got != 0 {
 		t.Fatalf("release count after base compile = %d, want 0", got)
 	}
