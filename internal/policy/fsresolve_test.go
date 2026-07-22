@@ -2,6 +2,7 @@ package policy
 
 import (
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -192,6 +193,27 @@ func TestResolveCanonicalizesTarget(t *testing.T) {
 	entries := []FSEntry{{"/work/ws", tRWX, 0, false, false}}
 	if got := ResolveFS(entries, "/work/ws/./src/../a.go"); got != tRWX {
 		t.Errorf("ResolveFS on noisy path = %s, want RWX", accessString(got))
+	}
+}
+
+func TestLiteralMatchesUnixPathKeysAreByteAndSeparatorSensitive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix path-key semantics")
+	}
+	tests := []struct {
+		name   string
+		entry  string
+		target string
+	}{
+		{name: "case variant", entry: "/work/Repo", target: "/work/repo/file"},
+		{name: "backslash is not separator", entry: "/work/repo", target: `/work/repo\\file`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if LiteralMatches(test.entry, test.target, false) {
+				t.Fatalf("LiteralMatches(%q, %q, false) = true, want false", test.entry, test.target)
+			}
+		})
 	}
 }
 

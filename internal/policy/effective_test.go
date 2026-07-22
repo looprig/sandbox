@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -154,6 +155,9 @@ func TestCompileEffectivePolicyLeavesTempOwnershipToExecutorSet(t *testing.T) {
 }
 
 func TestCompileEffectivePolicyUsesNarrowRuntimeClosure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix runtime closure")
+	}
 	workspace := t.TempDir()
 	profile := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
@@ -178,6 +182,24 @@ func TestCompileEffectivePolicyUsesNarrowRuntimeClosure(t *testing.T) {
 		if got := ResolveFS(policy.FS, test.path); got != test.want {
 			t.Errorf("runtime access for %q = %#x, want %#x", test.path, got, test.want)
 		}
+	}
+}
+
+func TestCompileEffectivePolicyHasNoNamedRuntimeBaselineOnUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix runtime vocabulary")
+	}
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	policy, err := Compile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(policy.RuntimeBaselines) != 0 {
+		t.Fatalf("runtime baselines = %q, want none", policy.RuntimeBaselines)
 	}
 }
 

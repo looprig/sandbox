@@ -20,10 +20,11 @@ import (
 // no entry controls a bit, that bit is denied.
 //
 // Contract: target must be an absolute, canonical, symlink-resolved path.
-// ResolveFS is purely lexical — it does no symlink, case-fold, or "." /".."
-// resolution beyond filepath.Clean — so resolving symlinks and case variants is
-// the caller's/backend's responsibility. Passing an unresolved path
-// could let a deny be bypassed via a symlink or a case variant on macOS.
+// ResolveFS is purely lexical — it does no symlink resolution and performs only
+// the platform path-key normalization used by literal matches plus
+// filepath.Clean. Windows keys fold case and separators; Unix keys remain byte
+// and separator sensitive. Passing an unresolved path could let a deny be
+// bypassed via a symlink or a case variant on macOS.
 func ResolveFS(entries []FSEntry, path string) FSAccess {
 	target := filepath.Clean(path)
 	var globDenied FSAccess
@@ -106,19 +107,21 @@ func denyMatches(entry FSEntry, target string) bool {
 
 // LiteralMatches reports whether target is entryPath or is nested under it at a
 // path boundary, so "/work/repo" matches "/work/repo" and "/work/repo/src" but
-// not "/work/repository". The root "/" matches everything.
+// not "/work/repository". A platform volume root matches everything on that
+// volume.
 func LiteralMatches(entryPath, target string, exact bool) bool {
-	ep := filepath.Clean(entryPath)
+	ep := pathKey(entryPath)
+	target = pathKey(target)
 	if exact {
 		return target == ep
 	}
-	if ep == "/" {
+	if pathKeyIsRoot(ep) {
 		return true
 	}
 	if target == ep {
 		return true
 	}
-	return strings.HasPrefix(target, ep+"/")
+	return strings.HasPrefix(target, ep+pathKeySeparator)
 }
 
 // entrySpecificity is the length of an entry's matched literal prefix: the
@@ -135,7 +138,7 @@ func entrySpecificity(entryPath string) int {
 		// unspecific; filepath.Clean("") would misleadingly report "." (len 1).
 		return 0
 	}
-	return len(filepath.Clean(prefix))
+	return len(pathKey(prefix))
 }
 
 // EntryPrecedence refines lexical specificity with scope shape. An exact path

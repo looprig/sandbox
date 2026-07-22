@@ -51,18 +51,20 @@ type Limits struct {
 }
 
 type Effective struct {
-	Workspace string
-	FS        []FSEntry
-	Net       NetPolicy
-	Env       EnvPolicy
-	Limits    Limits
-	Isolation profile.Isolation
-	Home      profile.Home
+	Workspace        string
+	FS               []FSEntry
+	RuntimeBaselines []string
+	Net              NetPolicy
+	Env              EnvPolicy
+	Limits           Limits
+	Isolation        profile.Isolation
+	Home             profile.Home
 }
 
 func Clone(p Effective) Effective {
 	clone := p
 	clone.FS = append([]FSEntry(nil), p.FS...)
+	clone.RuntimeBaselines = append([]string(nil), p.RuntimeBaselines...)
 	clone.Net.Ports = append([]uint16(nil), p.Net.Ports...)
 	clone.Env.Allow = append([]string(nil), p.Env.Allow...)
 	if p.Env.Set != nil {
@@ -73,10 +75,6 @@ func Clone(p Effective) Effective {
 	}
 	return clone
 }
-
-const (
-	NullDevicePath = "/dev/null"
-)
 
 func Compile(prof *profile.Profile) (Effective, error) {
 	if err := prof.Validate(); err != nil {
@@ -89,18 +87,19 @@ func Compile(prof *profile.Profile) (Effective, error) {
 		Home:      settings.Home,
 	}
 	if settings.Isolation == profile.Unconfined {
-		p.FS = []FSEntry{{Path: string(filepath.Separator), Access: ReadAccess | WriteAccess | ExecAccess}}
+		p.FS = []FSEntry{{Path: hostRootPath(settings.WorkspaceRoot), Access: ReadAccess | WriteAccess | ExecAccess}}
 		p.Net.Open = true
 		return p, nil
 	}
 
+	p.RuntimeBaselines = runtimeBaselines()
 	p.FS = append(p.FS, MinimalRuntimeEntries()...)
 	p.FS = append(p.FS, FSEntry{Path: NullDevicePath, Access: ReadAccess | WriteAccess, Exact: true})
 	appendRootAccess(&p.FS, settings.WorkspaceRoot, settings.WorkspaceRead, settings.WorkspaceWrite)
 	for _, root := range settings.AdditionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
 	}
-	appendRootAccess(&p.FS, string(filepath.Separator), settings.HostRead, settings.HostWrite)
+	appendRootAccess(&p.FS, hostRootPath(settings.WorkspaceRoot), settings.HostRead, settings.HostWrite)
 	if settings.Network == profile.Allow {
 		p.Net.Open = true
 	}
@@ -120,28 +119,6 @@ func appendRootAccess(entries *[]FSEntry, path string, read, write profile.Acces
 		denied |= WriteAccess
 	}
 	*entries = append(*entries, FSEntry{Path: path, Access: access, Denied: denied})
-}
-
-func MinimalRuntimeEntries() []FSEntry {
-	var entries []FSEntry
-	for _, path := range []string{
-		"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/libexec",
-		"/usr/lib/git-core", "/lib", "/lib64",
-	} {
-		entries = append(entries, FSEntry{Path: path, Access: ReadAccess | ExecAccess})
-	}
-	for _, path := range []string{
-		"/usr/lib", "/usr/lib64", "/System/Library", "/etc/ssl/certs", "/etc/pki",
-	} {
-		entries = append(entries, FSEntry{Path: path, Access: ReadAccess})
-	}
-	for _, path := range []string{
-		"/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/services",
-		"/etc/protocols", "/etc/localtime", "/etc/ld.so.cache", "/etc/ssl/cert.pem",
-	} {
-		entries = append(entries, FSEntry{Path: path, Access: ReadAccess, Exact: true})
-	}
-	return entries
 }
 
 func BaselineEnvAllowlist() []string {
