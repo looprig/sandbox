@@ -125,6 +125,7 @@ func TestConfigureExplicitHandleListNarrowsWideRegularStandardFiles(t *testing.T
 				t.Fatalf("%s was not replaced", stream)
 			}
 			assertHandleAccess(t, narrow, want)
+			assertHandleNonInheritable(t, narrow)
 		})
 	}
 }
@@ -232,6 +233,9 @@ func TestConfigureExplicitHandleListNarrowsSuppliedStandardFiles(t *testing.T) {
 	assertHandleAccess(t, narrowStdin, standardInputAccess)
 	assertHandleAccess(t, narrowStdout, standardOutputAccess)
 	assertHandleAccess(t, narrowStderr, standardOutputAccess)
+	assertHandleNonInheritable(t, narrowStdin)
+	assertHandleNonInheritable(t, narrowStdout)
+	assertHandleNonInheritable(t, narrowStderr)
 	stdinDuplicate := winapi.Handle(narrowStdin.Fd())
 	stdoutDuplicate := winapi.Handle(narrowStdout.Fd())
 	stderrDuplicate := winapi.Handle(narrowStderr.Fd())
@@ -381,6 +385,17 @@ func assertHandleAccess(t *testing.T, file *os.File, want uint32) {
 	}
 	if got != want {
 		t.Fatalf("handle access = %#x, want exact %#x", got, want)
+	}
+}
+
+func assertHandleNonInheritable(t *testing.T, file *os.File) {
+	t.Helper()
+	var flags uint32
+	if err := readHandleInformation(winapi.Handle(file.Fd()), &flags); err != nil {
+		t.Fatal(err)
+	}
+	if flags&winapi.HANDLE_FLAG_INHERIT != 0 {
+		t.Fatalf("owned standard handle %#x is inheritable before Start", file.Fd())
 	}
 }
 

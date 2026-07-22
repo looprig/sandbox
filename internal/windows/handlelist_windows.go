@@ -179,7 +179,10 @@ func narrowStandardHandles(cmd *exec.Cmd) (func(), error) {
 			return nil, fmt.Errorf("sandbox: configure Windows handle list: %s lacks required access %#x (granted %#x)", stream.name, missing, granted)
 		}
 		var duplicate winapi.Handle
-		if err := winapi.DuplicateHandle(winapi.CurrentProcess(), handle, winapi.CurrentProcess(), &duplicate, stream.access, true, 0); err != nil {
+		// Keep the parent-side wrapper non-inheritable. syscall.StartProcess
+		// creates its own inheritable ProcAttr.Files duplicate immediately before
+		// publishing that transient handle through HANDLE_LIST.
+		if err := winapi.DuplicateHandle(winapi.CurrentProcess(), handle, winapi.CurrentProcess(), &duplicate, stream.access, false, 0); err != nil {
 			closeReplacements()
 			return nil, fmt.Errorf("sandbox: configure Windows handle list: narrow %s: %w", stream.name, err)
 		}
