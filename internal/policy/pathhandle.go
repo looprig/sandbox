@@ -11,6 +11,7 @@ import (
 type PathHandle struct {
 	file   *os.File
 	close  func() error
+	native uintptr
 	target string
 	exact  bool
 	isDir  bool
@@ -27,12 +28,23 @@ func (handle *PathHandle) Close() error {
 	if handle.close != nil {
 		close := handle.close
 		handle.close = nil
+		handle.native = 0
 		return close()
 	}
 	if handle.file == nil {
 		return nil
 	}
 	return handle.file.Close()
+}
+
+// NativeHandle returns the borrowed platform handle while this PathHandle is
+// open. The caller must never close it. A zero result means that this platform
+// has no native handle or that ownership has already been released.
+func (handle *PathHandle) NativeHandle() uintptr {
+	if handle == nil {
+		return 0
+	}
+	return handle.native
 }
 
 func closeGrantPathHandles(handles []*PathHandle) {

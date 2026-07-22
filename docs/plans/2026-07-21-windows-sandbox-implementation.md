@@ -53,7 +53,12 @@ Work is on branch `feat/windows-sandbox`.
   remain outstanding: this managed host starts Codex from an already restricted
   source token, and the tests fail with that explicit prerequisite rather than
   skipping or claiming a pass.
-- Tasks 10-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
+- Task 10 is implemented at code level. Focused transactional ACL/journal tests,
+  vet, and Windows amd64/arm64 cross-builds pass. The destructive disposable
+  NTFS exact/tree/inheritance/carveout/reparse/hard-link matrix is executable
+  behind `SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST=1` but has not been run on this
+  developer workstation, as required by the repository execution rules.
+- Tasks 11-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
   Task 5 runtime-baseline result.
 
 Run these gates on the Windows handoff branch:

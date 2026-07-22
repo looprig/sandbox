@@ -146,6 +146,7 @@ func (mutation ACLMutation) Rollback() ACLRollbackMetadata {
 // returns a defensive copy so journal/apply code cannot accidentally alter it.
 type ACLPlan struct {
 	sid       SID
+	root      ACLObjectIdentity
 	mutations []ACLMutation
 	skipped   []ACLObjectIdentity
 	narrowing []string
@@ -153,6 +154,9 @@ type ACLPlan struct {
 }
 
 func (plan ACLPlan) SID() SID { return plan.sid }
+
+// RootIdentity returns the root object encoded by this plan.
+func (plan ACLPlan) RootIdentity() ACLObjectIdentity { return plan.root }
 
 func (plan ACLPlan) Mutations() []ACLMutation {
 	result := make([]ACLMutation, len(plan.mutations))
@@ -216,7 +220,7 @@ func buildExactACLPlan(request ACLPlanRequest) (ACLPlan, error) {
 	if request.Root.LinkCount > 1 {
 		return ACLPlan{}, fmt.Errorf("%w: exact ACL grant names a multi-link file", policy.ErrUnsupportedClass)
 	}
-	plan := ACLPlan{sid: request.SID}
+	plan := ACLPlan{sid: request.SID, root: request.Root}
 	for _, axis := range splitAccess(request.Access) {
 		plan.appendMutation(request.LeaseID, request.Root, ACEAllow, axis, false)
 	}
@@ -230,7 +234,7 @@ func buildTreeACLPlan(request ACLPlanRequest) (ACLPlan, error) {
 	if request.Root.Kind != ACLObjectDirectory {
 		return ACLPlan{}, fmt.Errorf("%w: tree ACL grant requires an existing directory", policy.ErrUnsupportedClass)
 	}
-	plan := ACLPlan{sid: request.SID}
+	plan := ACLPlan{sid: request.SID, root: request.Root}
 	entries := append([]ACLPlanEntry(nil), request.Entries...)
 	slices.SortFunc(entries, func(left, right ACLPlanEntry) int {
 		return compareACLIdentity(left.Object, right.Object)

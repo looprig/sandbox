@@ -33,7 +33,7 @@ func AcquirePathHandle(binding *PathBinding, target string, exact bool) (*PathHa
 	}
 	return &PathHandle{
 		target: object.DOSPath, exact: exact, isDir: object.Kind == winpath.KindDirectory,
-		identity: identity, close: object.Close,
+		identity: identity, native: uintptr(object.Handle), close: object.Close,
 	}, nil
 }
 
