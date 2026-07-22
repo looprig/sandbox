@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -109,7 +108,6 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 	}
 
 	roots := make([]RootAccess, 0, len(config.AdditionalRoots))
-	seen := make(map[string]RootAccess, len(config.AdditionalRoots))
 	for i, root := range config.AdditionalRoots {
 		if !validAccess(root.Read) || !validAccess(root.Write) {
 			return nil, fmt.Errorf("%w: additional root %d has unknown access", ErrInvalidProfile, i)
@@ -118,20 +116,25 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: additional root %d: %v", ErrInvalidProfile, i, err)
 		}
-		if path == workspace {
+		if canonicalPathEqual(path, workspace) {
 			return nil, fmt.Errorf("%w: additional root duplicates workspace", ErrInvalidProfile)
 		}
 		normalized := RootAccess{Path: path, Read: root.Read, Write: root.Write}
-		if prior, ok := seen[path]; ok {
-			if prior.Read != normalized.Read || prior.Write != normalized.Write {
-				return nil, fmt.Errorf("%w: contradictory additional root %q", ErrInvalidProfile, path)
+		duplicate := false
+		for _, prior := range roots {
+			if canonicalPathEqual(prior.Path, path) {
+				if prior.Read != normalized.Read || prior.Write != normalized.Write {
+					return nil, fmt.Errorf("%w: contradictory additional root %q", ErrInvalidProfile, path)
+				}
+				duplicate = true
+				break
 			}
-			continue
 		}
-		seen[path] = normalized
-		roots = append(roots, normalized)
+		if !duplicate {
+			roots = append(roots, normalized)
+		}
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].Path < roots[j].Path })
+	sort.Slice(roots, func(i, j int) bool { return canonicalPathLess(roots[i].Path, roots[j].Path) })
 
 	p := &Profile{
 		version:         currentAccessVersion,
@@ -156,29 +159,6 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		return nil, fmt.Errorf("%w: fingerprint: %v", ErrInvalidProfile, err)
 	}
 	return p, nil
-}
-
-// CanonicalRoot resolves path to an absolute, symlink-free, existing
-// directory. It is the canonicalization every configured root is held to.
-func CanonicalRoot(path string) (string, error) {
-	if path == "" {
-		return "", errors.New("path is empty")
-	}
-	if !filepath.IsAbs(path) {
-		return "", errors.New("path is not absolute")
-	}
-	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
-	if err != nil {
-		return "", fmt.Errorf("resolve symlinks: %w", err)
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", fmt.Errorf("stat: %w", err)
-	}
-	if !info.IsDir() {
-		return "", errors.New("path is not a directory")
-	}
-	return filepath.Clean(resolved), nil
 }
 
 func validAccess(access Access) bool { return access <= Allow }
@@ -268,11 +248,11 @@ func (p *Profile) filesystemAccess(write bool, scope string) (Access, error) {
 }
 
 func (p *Profile) isConfiguredRoot(path string) bool {
-	if path == p.workspaceRoot {
+	if canonicalPathEqual(path, p.workspaceRoot) {
 		return true
 	}
 	for _, root := range p.additionalRoots {
-		if root.Path == path {
+		if canonicalPathEqual(root.Path, path) {
 			return true
 		}
 	}
@@ -311,10 +291,7 @@ func (p *Profile) accessAtPath(write bool, path string) Access {
 
 // PathWithin reports whether path is root itself or lies beneath it.
 func PathWithin(path, root string) bool {
-	if root == string(filepath.Separator) {
-		return true
-	}
-	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+	return canonicalPathWithin(path, root)
 }
 
 // Fingerprint returns the deterministic digest of all normalized authority.

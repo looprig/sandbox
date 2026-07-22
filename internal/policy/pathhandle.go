@@ -10,6 +10,7 @@ import (
 // tree-directory grant between authentication and child confinement setup.
 type PathHandle struct {
 	file   *os.File
+	close  func() error
 	target string
 	exact  bool
 	isDir  bool
@@ -20,7 +21,15 @@ type PathHandle struct {
 }
 
 func (handle *PathHandle) Close() error {
-	if handle == nil || handle.file == nil {
+	if handle == nil {
+		return nil
+	}
+	if handle.close != nil {
+		close := handle.close
+		handle.close = nil
+		return close()
+	}
+	if handle.file == nil {
 		return nil
 	}
 	return handle.file.Close()
@@ -46,13 +55,13 @@ func (set *PathHandleSet) Add(handle *PathHandle) error {
 	if handle == nil {
 		return nil
 	}
-	if handle.file == nil || handle.target == "" || handle.identity == "" {
+	if (handle.file == nil && handle.close == nil) || handle.target == "" || handle.identity == "" {
 		_ = handle.Close()
 		set.Close()
 		return ErrTargetChanged
 	}
 	for _, existing := range set.handles {
-		if existing.target != handle.target {
+		if !samePathHandleTarget(existing.target, handle.target) {
 			continue
 		}
 		if existing.identity != handle.identity {

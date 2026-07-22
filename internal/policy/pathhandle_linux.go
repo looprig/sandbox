@@ -60,3 +60,5 @@ func AcquirePathHandle(binding *PathBinding, target string, exact bool) (*PathHa
 		file: file, target: target, exact: exact, isDir: info.IsDir(), identity: identity,
 	}, nil
 }
+
+func samePathHandleTarget(left, right string) bool { return left == right }

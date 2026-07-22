@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package policy
 
@@ -8,3 +8,5 @@ func AcquirePathHandle(binding *PathBinding, target string, _ bool) (*PathHandle
 	}
 	return nil, nil
 }
+
+func samePathHandleTarget(left, right string) bool { return left == right }
