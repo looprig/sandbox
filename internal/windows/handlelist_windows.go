@@ -15,6 +15,12 @@ import (
 
 const objectBasicInformation = 0
 
+const (
+	objectTypeInformation = 2
+	standardInputAccess   = winapi.FILE_READ_DATA | winapi.SYNCHRONIZE
+	standardOutputAccess  = winapi.FILE_WRITE_DATA | winapi.SYNCHRONIZE
+)
+
 var ntQueryObject = winapi.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryObject")
 
 type objectBasicInfo struct {
@@ -23,6 +29,12 @@ type objectBasicInfo struct {
 	HandleCount   uint32
 	PointerCount  uint32
 	Reserved      [10]uint32
+}
+
+type objectTypeUnicodeString struct {
+	Length        uint16
+	MaximumLength uint16
+	Buffer        *uint16
 }
 
 // ExplicitHandle describes a kernel handle deliberately shared with a child.
@@ -59,7 +71,8 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 	if len(cmd.SysProcAttr.AdditionalInheritedHandles) != 0 {
 		return nil, errors.New("sandbox: configure Windows handle list: ambient inherited handles are forbidden")
 	}
-	if err := validateStandardHandles(cmd); err != nil {
+	standardCleanup, err := narrowStandardHandles(cmd)
+	if err != nil {
 		return nil, err
 	}
 
@@ -71,6 +84,7 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 		}
 		duplicates = nil
 		cmd.SysProcAttr.AdditionalInheritedHandles = nil
+		standardCleanup()
 	}
 	defer func() {
 		if err != nil {
@@ -120,20 +134,30 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 	return closeDuplicates, nil
 }
 
-func validateStandardHandles(cmd *exec.Cmd) error {
+func narrowStandardHandles(cmd *exec.Cmd) (func(), error) {
 	// os/exec creates directional anonymous pipes for non-*os.File streams and
 	// opens NUL read-only for a nil stdin. A supplied *os.File bypasses that
-	// construction and is inherited directly, so inspect it before Start and
-	// reject any access beyond the standard stream's directional minimum.
+	// construction and is inherited directly, so classify its kernel object and
+	// replace it with an executor-owned least-access duplicate before Start.
 	streams := []struct {
-		name     string
-		value    any
-		allowed  uint32
-		required uint32
+		name   string
+		value  any
+		access uint32
 	}{
-		{name: "stdin", value: cmd.Stdin, allowed: winapi.FILE_GENERIC_READ, required: winapi.FILE_READ_DATA},
-		{name: "stdout", value: cmd.Stdout, allowed: winapi.FILE_GENERIC_WRITE, required: winapi.FILE_WRITE_DATA},
-		{name: "stderr", value: cmd.Stderr, allowed: winapi.FILE_GENERIC_WRITE, required: winapi.FILE_WRITE_DATA},
+		{name: "stdin", value: cmd.Stdin, access: standardInputAccess},
+		{name: "stdout", value: cmd.Stdout, access: standardOutputAccess},
+		{name: "stderr", value: cmd.Stderr, access: standardOutputAccess},
+	}
+	type replacement struct {
+		name string
+		file *os.File
+	}
+	replacements := make([]replacement, 0, len(streams))
+	closeReplacements := func() {
+		for _, replacement := range replacements {
+			_ = replacement.file.Close()
+		}
+		replacements = nil
 	}
 	for _, stream := range streams {
 		file, ok := stream.value.(*os.File)
@@ -141,18 +165,101 @@ func validateStandardHandles(cmd *exec.Cmd) error {
 			continue
 		}
 		handle := winapi.Handle(file.Fd())
-		if invalidExplicitHandle(handle) {
-			return fmt.Errorf("sandbox: configure Windows handle list: %s has an invalid or pseudo handle", stream.name)
+		if err := validateStandardHandleObject(stream.name, handle); err != nil {
+			closeReplacements()
+			return nil, err
 		}
 		granted, err := handleGrantedAccess(handle)
 		if err != nil {
-			return fmt.Errorf("sandbox: configure Windows handle list: inspect %s access: %w", stream.name, err)
+			closeReplacements()
+			return nil, fmt.Errorf("sandbox: configure Windows handle list: inspect %s access: %w", stream.name, err)
 		}
-		if granted&stream.required == 0 || granted&^stream.allowed != 0 {
-			return fmt.Errorf("sandbox: configure Windows handle list: %s access %#x exceeds directional mask %#x", stream.name, granted, stream.allowed)
+		if missing := stream.access &^ granted; missing != 0 {
+			closeReplacements()
+			return nil, fmt.Errorf("sandbox: configure Windows handle list: %s lacks required access %#x (granted %#x)", stream.name, missing, granted)
+		}
+		var duplicate winapi.Handle
+		if err := winapi.DuplicateHandle(winapi.CurrentProcess(), handle, winapi.CurrentProcess(), &duplicate, stream.access, true, 0); err != nil {
+			closeReplacements()
+			return nil, fmt.Errorf("sandbox: configure Windows handle list: narrow %s: %w", stream.name, err)
+		}
+		owned := os.NewFile(uintptr(duplicate), "sandbox-"+stream.name)
+		if owned == nil {
+			_ = winapi.CloseHandle(duplicate)
+			closeReplacements()
+			return nil, fmt.Errorf("sandbox: configure Windows handle list: wrap narrow %s", stream.name)
+		}
+		replacements = append(replacements, replacement{name: stream.name, file: owned})
+	}
+	for _, replacement := range replacements {
+		switch replacement.name {
+		case "stdin":
+			cmd.Stdin = replacement.file
+		case "stdout":
+			cmd.Stdout = replacement.file
+		case "stderr":
+			cmd.Stderr = replacement.file
 		}
 	}
-	return nil
+	return closeReplacements, nil
+}
+
+func validateStandardHandleObject(name string, handle winapi.Handle) error {
+	if invalidExplicitHandle(handle) {
+		return fmt.Errorf("sandbox: configure Windows handle list: %s has an invalid or pseudo handle", name)
+	}
+	typeName, err := handleObjectType(handle)
+	if err != nil {
+		return fmt.Errorf("sandbox: configure Windows handle list: inspect %s object type: %w", name, err)
+	}
+	if typeName != "File" {
+		return fmt.Errorf("sandbox: configure Windows handle list: %s object type %q is not stream-capable File", name, typeName)
+	}
+	fileType, err := winapi.GetFileType(handle)
+	if err != nil {
+		return fmt.Errorf("sandbox: configure Windows handle list: inspect %s file type: %w", name, err)
+	}
+	switch fileType &^ winapi.FILE_TYPE_REMOTE {
+	case winapi.FILE_TYPE_PIPE:
+		return nil
+	case winapi.FILE_TYPE_DISK:
+		var info winapi.ByHandleFileInformation
+		if err := winapi.GetFileInformationByHandle(handle, &info); err != nil {
+			return fmt.Errorf("sandbox: configure Windows handle list: inspect %s disk object: %w", name, err)
+		}
+		if info.FileAttributes&winapi.FILE_ATTRIBUTE_DIRECTORY != 0 {
+			return fmt.Errorf("sandbox: configure Windows handle list: %s directory handles are not supported", name)
+		}
+		return nil
+	case winapi.FILE_TYPE_CHAR:
+		var mode uint32
+		if err := winapi.GetConsoleMode(handle, &mode); err == nil {
+			return fmt.Errorf("sandbox: configure Windows handle list: %s console handles are not supported by least-access launch", name)
+		}
+		return fmt.Errorf("sandbox: configure Windows handle list: %s character devices are not supported", name)
+	default:
+		return fmt.Errorf("sandbox: configure Windows handle list: %s file type %#x is not supported", name, fileType)
+	}
+}
+
+func handleObjectType(handle winapi.Handle) (string, error) {
+	buffer := make([]byte, 4<<10)
+	var needed uint32
+	status, _, _ := ntQueryObject.Call(
+		uintptr(handle),
+		objectTypeInformation,
+		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(len(buffer)),
+		uintptr(unsafe.Pointer(&needed)),
+	)
+	if status != 0 {
+		return "", fmt.Errorf("NtQueryObject: NTSTATUS %#x", uint32(status))
+	}
+	name := (*objectTypeUnicodeString)(unsafe.Pointer(&buffer[0]))
+	if name.Buffer == nil || name.Length == 0 {
+		return "", errors.New("NtQueryObject returned an empty object type")
+	}
+	return winapi.UTF16ToString(unsafe.Slice(name.Buffer, int(name.Length/2))), nil
 }
 
 func handleGrantedAccess(handle winapi.Handle) (uint32, error) {

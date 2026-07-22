@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,7 +87,7 @@ func TestConfigureExplicitHandleListRejectsWiderAccess(t *testing.T) {
 	}
 }
 
-func TestConfigureExplicitHandleListRejectsWideStandardFiles(t *testing.T) {
+func TestConfigureExplicitHandleListNarrowsWideRegularStandardFiles(t *testing.T) {
 	file, err := os.OpenFile(filepath.Join(t.TempDir(), "stdio"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -104,10 +105,282 @@ func TestConfigureExplicitHandleListRejectsWideStandardFiles(t *testing.T) {
 			case "stderr":
 				cmd.Stderr = file
 			}
+			cleanup, err := ConfigureExplicitHandleList(cmd, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			var narrow *os.File
+			want := uint32(standardOutputAccess)
+			switch stream {
+			case "stdin":
+				narrow = cmd.Stdin.(*os.File)
+				want = standardInputAccess
+			case "stdout":
+				narrow = cmd.Stdout.(*os.File)
+			case "stderr":
+				narrow = cmd.Stderr.(*os.File)
+			}
+			if narrow == file {
+				t.Fatalf("%s was not replaced", stream)
+			}
+			assertHandleAccess(t, narrow, want)
+		})
+	}
+}
+
+func TestConfigureExplicitHandleListRejectsNonStreamKernelObjects(t *testing.T) {
+	tests := []struct {
+		name   string
+		create func(t *testing.T) winapi.Handle
+	}{
+		{name: "token", create: func(t *testing.T) winapi.Handle {
+			var token winapi.Token
+			if err := winapi.OpenProcessToken(winapi.CurrentProcess(), winapi.TOKEN_QUERY, &token); err != nil {
+				t.Fatal(err)
+			}
+			return winapi.Handle(token)
+		}},
+		{name: "job", create: func(t *testing.T) winapi.Handle {
+			job, err := winapi.CreateJobObject(nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return duplicateTestHandle(t, job, 1, func() { _ = winapi.CloseHandle(job) })
+		}},
+		{name: "event", create: func(t *testing.T) winapi.Handle {
+			event, err := winapi.CreateEvent(nil, 1, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return duplicateTestHandle(t, event, 1, func() { _ = winapi.CloseHandle(event) })
+		}},
+		{name: "directory", create: func(t *testing.T) winapi.Handle {
+			path, err := syscall.UTF16PtrFromString(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			directory, err := winapi.CreateFile(path, winapi.FILE_LIST_DIRECTORY, winapi.FILE_SHARE_READ|winapi.FILE_SHARE_WRITE|winapi.FILE_SHARE_DELETE, nil, winapi.OPEN_EXISTING, winapi.FILE_FLAG_BACKUP_SEMANTICS, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return directory
+		}},
+		{name: "device", create: func(t *testing.T) winapi.Handle {
+			path, err := syscall.UTF16PtrFromString("NUL")
+			if err != nil {
+				t.Fatal(err)
+			}
+			device, err := winapi.CreateFile(path, winapi.GENERIC_READ, winapi.FILE_SHARE_READ|winapi.FILE_SHARE_WRITE, nil, winapi.OPEN_EXISTING, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return device
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handle := tt.create(t)
+			file := os.NewFile(uintptr(handle), tt.name)
+			if file == nil {
+				t.Fatal("os.NewFile returned nil")
+			}
+			defer file.Close()
+			cmd := exec.Command("cmd.exe", "/c", "exit 0")
+			cmd.Stdin = file
 			if _, err := ConfigureExplicitHandleList(cmd, nil); err == nil {
-				t.Fatalf("ConfigureExplicitHandleList accepted read/write %s", stream)
+				t.Fatalf("ConfigureExplicitHandleList accepted %s as stdin", tt.name)
 			}
 		})
+	}
+}
+
+func TestConfigureExplicitHandleListNarrowsSuppliedStandardFiles(t *testing.T) {
+	stdin, stdinPeer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	defer stdinPeer.Close()
+	stdoutPeer, stdout, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdoutPeer.Close()
+	defer stdout.Close()
+
+	cmd := exec.Command("cmd.exe", "/c", "exit 0")
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stdout
+	cleanup, err := ConfigureExplicitHandleList(cmd, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowStdin, ok := cmd.Stdin.(*os.File)
+	if !ok || narrowStdin == stdin {
+		t.Fatal("stdin was not replaced with an owned narrow duplicate")
+	}
+	narrowStdout, ok := cmd.Stdout.(*os.File)
+	if !ok || narrowStdout == stdout {
+		t.Fatal("stdout was not replaced with an owned narrow duplicate")
+	}
+	narrowStderr, ok := cmd.Stderr.(*os.File)
+	if !ok || narrowStderr == stdout || narrowStderr == narrowStdout {
+		t.Fatal("stderr was not replaced with its own owned narrow duplicate")
+	}
+	assertHandleAccess(t, narrowStdin, standardInputAccess)
+	assertHandleAccess(t, narrowStdout, standardOutputAccess)
+	assertHandleAccess(t, narrowStderr, standardOutputAccess)
+	stdinDuplicate := winapi.Handle(narrowStdin.Fd())
+	stdoutDuplicate := winapi.Handle(narrowStdout.Fd())
+	stderrDuplicate := winapi.Handle(narrowStderr.Fd())
+	cleanup()
+	for name, handle := range map[string]winapi.Handle{
+		"stdin duplicate": stdinDuplicate, "stdout duplicate": stdoutDuplicate, "stderr duplicate": stderrDuplicate,
+	} {
+		if _, err := handleGrantedAccess(handle); err == nil {
+			t.Errorf("%s remains open after cleanup", name)
+		}
+	}
+	if _, err := handleGrantedAccess(winapi.Handle(stdin.Fd())); err != nil {
+		t.Errorf("cleanup closed caller stdin: %v", err)
+	}
+	if _, err := handleGrantedAccess(winapi.Handle(stdout.Fd())); err != nil {
+		t.Errorf("cleanup closed caller stdout: %v", err)
+	}
+}
+
+func TestSuppliedStandardFilesHaveExactChildAccess(t *testing.T) {
+	helper := buildHandleProbe(t)
+	t.Run("pipe", func(t *testing.T) {
+		stdin, stdinWriter, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stdin.Close()
+		defer stdinWriter.Close()
+		stdoutReader, stdout, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stdoutReader.Close()
+		defer stdout.Close()
+		stderrReader, stderr, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stderrReader.Close()
+		defer stderr.Close()
+
+		cmd := exec.Command(helper)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+		cleanup, err := ConfigureExplicitHandleList(cmd, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if _, err := stdinWriter.Write([]byte("stdio-ok")); err != nil {
+			t.Fatal(err)
+		}
+		_ = stdinWriter.Close()
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		cleanup()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		stdoutBytes, err := io.ReadAll(stdoutReader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderrBytes, err := io.ReadAll(stderrReader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertProbeStandardAuthority(t, stdoutBytes, stderrBytes)
+	})
+
+	t.Run("regular", func(t *testing.T) {
+		open := func(name string) *os.File {
+			file, err := os.OpenFile(filepath.Join(t.TempDir(), name), os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = file.Close() })
+			return file
+		}
+		stdin := open("stdin")
+		stdout := open("stdout")
+		stderr := open("stderr")
+		if _, err := stdin.WriteString("stdio-ok"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stdin.Seek(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(helper)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+		cleanup, err := ConfigureExplicitHandleList(cmd, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+		cleanup()
+		if _, err := stdout.Seek(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stderr.Seek(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		stdoutBytes, err := io.ReadAll(stdout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderrBytes, err := io.ReadAll(stderr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertProbeStandardAuthority(t, stdoutBytes, stderrBytes)
+	})
+}
+
+func assertProbeStandardAuthority(t *testing.T, stdout, stderr []byte) {
+	t.Helper()
+	var report probeReport
+	if err := json.Unmarshal(stdout, &report); err != nil {
+		t.Fatalf("decode handle probe: %v: %q", err, stdout)
+	}
+	if report.Stdin != "stdio-ok" {
+		t.Fatalf("probe stdin = %q, want stdio-ok", report.Stdin)
+	}
+	if got := string(stderr); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
+		t.Fatalf("probe stderr = %q, want stderr-ok", got)
+	}
+	assertStandardHandleAccess(t, report, standardInputAccess, standardOutputAccess)
+}
+
+func duplicateTestHandle(t *testing.T, source winapi.Handle, access uint32, closeSource func()) winapi.Handle {
+	t.Helper()
+	defer closeSource()
+	var duplicate winapi.Handle
+	if err := winapi.DuplicateHandle(winapi.CurrentProcess(), source, winapi.CurrentProcess(), &duplicate, access, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	return duplicate
+}
+
+func assertHandleAccess(t *testing.T, file *os.File, want uint32) {
+	t.Helper()
+	got, err := handleGrantedAccess(winapi.Handle(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("handle access = %#x, want exact %#x", got, want)
 	}
 }
 
@@ -188,7 +461,7 @@ func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	if !found {
 		t.Fatalf("declared duplicate %#x was not inherited", uintptr(duplicate))
 	}
-	assertStandardHandleAccess(t, report)
+	assertStandardHandleAccess(t, report, winapi.FILE_GENERIC_READ, winapi.FILE_GENERIC_WRITE)
 }
 
 func readHandleInformation(handle winapi.Handle, flags *uint32) error {
@@ -264,7 +537,7 @@ func runTwoStageHandleProbe(t *testing.T, helper string) {
 	if got := stderr.String(); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
 		t.Fatalf("target stderr = %q, want stderr-ok", got)
 	}
-	assertStandardHandleAccess(t, report)
+	assertStandardHandleAccess(t, report, standardInputAccess, standardOutputAccess)
 	for _, inherited := range report.Handles {
 		if inherited.Value == requestHandle {
 			t.Fatalf("target has runner request handle value %#x (type=%s access=%#x)", requestHandle, inherited.Type, inherited.Access)
@@ -313,7 +586,7 @@ func runHandleProbe(t *testing.T, helper string, canaries map[string]winapi.Hand
 	if got := stderr.String(); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
 		t.Fatalf("probe stderr = %q, want stderr-ok", got)
 	}
-	assertStandardHandleAccess(t, report)
+	assertStandardHandleAccess(t, report, winapi.FILE_GENERIC_READ, winapi.FILE_GENERIC_WRITE)
 	for name, canary := range canaries {
 		for _, inherited := range report.Handles {
 			if inherited.Value == uintptr(canary) {
@@ -323,12 +596,12 @@ func runHandleProbe(t *testing.T, helper string, canaries map[string]winapi.Hand
 	}
 }
 
-func assertStandardHandleAccess(t *testing.T, report probeReport) {
+func assertStandardHandleAccess(t *testing.T, report probeReport, inputAccess, outputAccess uint32) {
 	t.Helper()
 	want := map[string]uint32{
-		"stdin":  winapi.FILE_GENERIC_READ,
-		"stdout": winapi.FILE_GENERIC_WRITE,
-		"stderr": winapi.FILE_GENERIC_WRITE,
+		"stdin":  inputAccess,
+		"stdout": outputAccess,
+		"stderr": outputAccess,
 	}
 	for name, expected := range want {
 		value, ok := report.Standard[name]
