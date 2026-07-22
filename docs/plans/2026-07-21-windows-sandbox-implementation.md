@@ -21,6 +21,56 @@ HTTP proxy, and Windows Server/Windows 11 CI.
 
 **Normative design:** `docs/plans/2026-07-21-windows-sandbox-design.md`.
 
+## Implementation status and Windows handoff (2026-07-21)
+
+Work is on branch `feat/windows-sandbox`.
+
+- Phase 1 (Tasks 1-4) is implemented, independently reviewed for specification
+  compliance and code quality, and verified with the full host race suite plus
+  Windows amd64/arm64 cross-builds.
+- Phase 2 Tasks 5-8 are implemented at code level and cross-build for Windows
+  amd64/arm64. Portable and host-side race tests pass. No live Windows result is
+  claimed yet.
+- Task 5 still requires the exact-token runtime matrix on every supported
+  disposable Windows image. A failure requires bound trace evidence collected
+  by a separate elevated collector while the baseline test itself runs as a
+  standard user. No go/no-go result has been selected.
+- Tasks 6-8 still require live Windows path, handle-inheritance, and Job tests.
+- Phase 2 code passed aggregate specification review. Aggregate code-quality
+  review is not yet approved: the remaining Important finding is to quarantine
+  and retain a failed Job plus execution backing resources when completion-port
+  zero proof cannot be obtained, instead of releasing lifecycle resources after
+  the bounded error. Continue from `internal/exec/process_tree_windows.go` and
+  `internal/windows/job_windows.go`; add injected reaper/quarantine ownership
+  tests before implementation.
+- Tasks 9-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
+  Task 5 runtime-baseline result.
+
+Run these gates on the Windows handoff branch:
+
+```powershell
+# Standard-user exact-token gate. Required Python and every manifest-required
+# runtime must be installed; required-row skips/absence are not a pass.
+go test -count=1 -v ./spikes/windows -run TestRestrictedRuntimeBaseline
+
+# Path identity and namespace behavior. Exercise NTFS and ReFS plus enabled
+# 8.3, symlink, junction, hard-link, and root-swap controls without skips.
+go test -race -count=1 ./internal/winpath ./pkg/profile ./internal/policy
+
+# Explicit handle-list, least-authority stdio, and two-stage runner canaries.
+go test -race -count=1 ./internal/windows ./internal/exec -run 'Handle|Spawn|Standard'
+
+# Job configuration, breakaway, descendants, limits, UI, and cancellation.
+go test -race -count=1 ./internal/windows ./internal/exec -run 'Job|ProcessTree|ResourceLimit'
+```
+
+If Task 5 records a runtime failure, follow
+`docs/spikes/windows-restricted-runtime.md`: keep `go test` in the standard-user
+session, run ProcMon/another approved collector in a separate elevated session,
+bind the shared run nonce and captured PIDs, finalize the raw-trace hash, and
+validate the evidence without rerunning the baseline. ProcMon-only evidence is
+not sufficient for an NT Object Manager class it did not capture.
+
 ---
 
 ## Repository and execution rules
