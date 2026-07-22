@@ -97,6 +97,11 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 		t.Fatal("8.3 fixture did not produce a distinct short path; enable 8.3 names on the disposable volume")
 	}
 
+	// Positive control for the root-swap denial below: before compilation owns
+	// no-delete identity handles, the exact same populated workspace root must be
+	// renameable and restorable by this standard-user worker.
+	assertUnleasedRootRenameControl(t, workspace)
+
 	p := policy.Effective{
 		Workspace: workspace,
 		FS: []policy.FSEntry{
@@ -236,6 +241,49 @@ func globalRootAlias(t *testing.T, path string) string {
 	device := win.UTF16ToString(buffer[:n])
 	relative := strings.TrimPrefix(path, volume)
 	return `\\?\GLOBALROOT` + device + relative
+}
+
+func assertUnleasedRootRenameControl(t *testing.T, root string) {
+	t.Helper()
+	swapped := root + "-unleased-rename-control"
+	if err := os.Rename(root, swapped); err != nil {
+		t.Fatalf("unleased root-swap positive control cannot rename workspace: %v", err)
+	}
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = os.Rename(swapped, root)
+		}
+	})
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		_ = os.Rename(swapped, root)
+		restored = true
+		t.Fatalf("unleased root-swap positive control left original root visible: %v", err)
+	}
+	if info, err := os.Stat(swapped); err != nil || !info.IsDir() {
+		_ = os.Rename(swapped, root)
+		restored = true
+		t.Fatalf("unleased root-swap positive control did not move directory: info=%v err=%v", info, err)
+	}
+	if err := os.Rename(swapped, root); err != nil {
+		t.Fatalf("unleased root-swap positive control cannot restore workspace: %v", err)
+	}
+	restored = true
+}
+
+func TestUnleasedRootRenamePositiveControl(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "populated.marker")
+	if err := os.WriteFile(marker, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertUnleasedRootRenameControl(t, root)
+	if contents, err := os.ReadFile(marker); err != nil || string(contents) != "preserved" {
+		t.Fatalf("rename-and-restore did not preserve populated root: contents=%q err=%v", contents, err)
+	}
 }
 
 func TestRestrictedDisposableJournalRecoveryAndSIDNonReuse(t *testing.T) {
