@@ -17,7 +17,7 @@ type processTree struct {
 	pgid int
 }
 
-func newProcessTree(cmd *exec.Cmd) (*processTree, error) {
+func newProcessTree(cmd *exec.Cmd, _ processTreeOptions) (*processTree, error) {
 	if cmd == nil {
 		return nil, errors.New("sandbox: nil command process tree")
 	}

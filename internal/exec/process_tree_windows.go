@@ -9,52 +9,41 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
+	winjob "github.com/looprig/sandbox/internal/windows"
 	"golang.org/x/sys/windows"
 )
 
 var ntResumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
 
-type jobBasicAccounting struct {
-	TotalUserTime             int64
-	TotalKernelTime           int64
-	ThisPeriodTotalUserTime   int64
-	ThisPeriodTotalKernelTime int64
-	TotalPageFaultCount       uint32
-	TotalProcesses            uint32
-	ActiveProcesses           uint32
-	TotalTerminatedProcesses  uint32
-}
-
-// processTree owns one Windows Job Object. The child is created suspended,
-// assigned to the job, and only then resumed, so it has no opportunity to fork
-// outside the tree before job ownership is established.
+// processTree owns one Windows Job Object. The Job is fully configured before
+// the child is created suspended, assigned before resume, and retained until
+// every process in the Job has exited.
 type processTree struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
-	job      windows.Handle
+	job      *winjob.Job
 	assigned bool
 }
 
-func newProcessTree(cmd *exec.Cmd) (*processTree, error) {
+func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, error) {
 	if cmd == nil {
 		return nil, errors.New("sandbox: nil command process tree")
 	}
-	job, err := windows.CreateJobObject(nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("sandbox: create process job: %w", err)
+	limits := options.Limits
+	if limits.Disabled {
+		limits.MaxPIDs = 0
+		limits.MaxMemBytes = 0
+		limits.MaxCPUPct = 0
 	}
-	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(
-		job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&limits)),
-		uint32(unsafe.Sizeof(limits)),
-	); err != nil {
-		_ = windows.CloseHandle(job)
-		return nil, fmt.Errorf("sandbox: configure process job: %w", err)
+	job, err := winjob.NewJob(winjob.JobOptions{
+		Sandboxed:      options.Sandboxed,
+		MaxProcesses:   limits.MaxPIDs,
+		MaxMemoryBytes: limits.MaxMemBytes,
+		MaxCPUPct:      limits.MaxCPUPct,
+	})
+	if err != nil {
+		return nil, err
 	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -74,7 +63,7 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 	}
 	var setupErr error
 	err := cmd.Process.WithHandle(func(processHandle uintptr) {
-		if err := windows.AssignProcessToJobObject(tree.job, windows.Handle(processHandle)); err != nil {
+		if err := tree.job.Assign(windows.Handle(processHandle)); err != nil {
 			setupErr = fmt.Errorf("assign process to job: %w", err)
 			return
 		}
@@ -92,6 +81,8 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 	if setupErr == nil {
 		return nil
 	}
+	// The process is still suspended on every setup failure. Terminate it before
+	// returning, whether assignment succeeded or not.
 	_ = tree.terminate()
 	_ = cmd.Wait()
 	return fmt.Errorf("sandbox: start process tree: %w", setupErr)
@@ -106,11 +97,8 @@ func (tree *processTree) terminate() error {
 	job := tree.job
 	cmd := tree.cmd
 	tree.mu.Unlock()
-	if assigned && job != 0 {
-		if err := windows.TerminateJobObject(job, 1); err != nil {
-			return err
-		}
-		return nil
+	if assigned && job != nil {
+		return job.Terminate(1)
 	}
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -130,26 +118,19 @@ func (tree *processTree) terminateAndWait() error {
 	assigned := tree.assigned
 	job := tree.job
 	tree.mu.Unlock()
-	if !assigned || job == 0 {
+	if !assigned || job == nil {
 		return nil
 	}
 	for {
-		// Neither termination nor inspection failure proves that the job is
-		// empty. Retain the lease and job handle until zero active processes can
-		// be verified; the sleep prevents a transient OS failure from busy-looping.
+		// Neither termination nor inspection failure proves that the Job is
+		// empty. Retain the Job and execution lease until zero is read back.
 		_ = tree.terminate()
-		var accounting jobBasicAccounting
-		if err := windows.QueryInformationJobObject(
-			job,
-			windows.JobObjectBasicAccountingInformation,
-			uintptr(unsafe.Pointer(&accounting)),
-			uint32(unsafe.Sizeof(accounting)),
-			nil,
-		); err != nil {
+		active, err := job.ActiveProcesses()
+		if err != nil {
 			time.Sleep(time.Millisecond)
 			continue
 		}
-		if accounting.ActiveProcesses == 0 {
+		if active == 0 {
 			return nil
 		}
 		time.Sleep(time.Millisecond)
@@ -162,9 +143,9 @@ func (tree *processTree) close() {
 	}
 	tree.mu.Lock()
 	job := tree.job
-	tree.job = 0
+	tree.job = nil
 	tree.mu.Unlock()
-	if job != 0 {
-		_ = windows.CloseHandle(job)
+	if job != nil {
+		_ = job.Close()
 	}
 }

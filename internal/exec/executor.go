@@ -353,7 +353,10 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 			return nil, -1, err
 		}
 	}
-	tree, err := newProcessTree(cmd)
+	tree, err := newProcessTree(cmd, processTreeOptions{
+		Sandboxed: s.policy.Isolation != profile.Unconfined,
+		Limits:    s.policy.Limits,
+	})
 	if err != nil {
 		return nil, -1, err
 	}
