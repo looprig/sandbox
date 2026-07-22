@@ -465,7 +465,7 @@ type RestrictedACLCleaner struct{}
 
 func (RestrictedACLCleaner) RemoveRestrictedAllowACE(record RestrictedCleanupRecord) (bool, error) {
 	if record.Rollback.Role != ACERoleRestrictingAllow ||
-		record.Rollback.SID.kind != sidKindOneShot ||
+		!retirableRestrictedSID(record.Rollback.SID) ||
 		!recognizedRestrictingACE(record.Rollback.SID, record.Rollback.Role, record.ACE) ||
 		sha256.Sum256(record.ACE) != record.Rollback.ACEHash {
 		return false, errors.New("sandbox: untrusted restricted cleanup record")

@@ -20,14 +20,20 @@ func ValidateConfig(config Config) error {
 	}
 }
 
-// PlatformBackend is the compile-safe Windows selector seam. The real
-// restricted-token and elevated selectors are introduced in later phases; until
-// then it fails closed and makes no enforcement claim.
-func PlatformBackend(config Config) (enforce.Backend, error) {
+// PlatformBackend selects the Windows tier while keeping the caller-owned
+// restricted scratch root distinct from elevated installation state.
+func PlatformBackend(config Config, scratchRoot string) (enforce.Backend, error) {
 	if err := ValidateConfig(config); err != nil {
 		return nil, err
 	}
-	return nil, enforce.ErrUnavailable
+	switch config.Mode {
+	case Auto, RestrictedToken:
+		return newRestrictedBackend(config, scratchRoot), nil
+	case Elevated:
+		return nil, ErrSetupRequired
+	default:
+		panic("validated Windows mode became invalid")
+	}
 }
 
 func Inspect(context.Context, SetupConfig) (SetupStatus, error) {

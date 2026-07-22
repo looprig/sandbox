@@ -1,16 +1,24 @@
 package exec
 
 import (
-	"github.com/looprig/sandbox/internal/enforce"
-	"github.com/looprig/sandbox/internal/platform"
 	"os/exec"
+	"runtime"
 	"time"
 
+	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 )
 
 func newExecutorForEffectivePolicy(p policy.Effective, configs ...executorConfig) (*Executor, error) {
-	return newExecutorFromEffective(nil, p, mergeExecutorConfigs(configs...))
+	config := mergeExecutorConfigs(configs...)
+	// Direct construction is a unit-test seam and owns no stable scratch root.
+	// Production Windows construction always enters through ExecutorSet, which
+	// supplies that root before selecting the restricted backend.
+	if runtime.GOOS == "windows" && config.backend == nil && config.platform.ScratchRoot == "" {
+		config.backend = newTestPassthroughBackend()
+	}
+	return newExecutorFromEffective(nil, p, config)
 }
 
 func newTestExecutor(profile *Profile, configs ...executorConfig) (*Executor, error) {

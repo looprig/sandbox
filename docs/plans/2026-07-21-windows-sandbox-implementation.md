@@ -58,7 +58,13 @@ Work is on branch `feat/windows-sandbox`.
   NTFS exact/tree/inheritance/carveout/reparse/hard-link matrix is executable
   behind `SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST=1` but has not been run on this
   developer workstation, as required by the repository execution rules.
-- Tasks 11-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
+- Task 11 is implemented at code level. Focused backend/platform tests and vet
+  pass, and the affected packages cross-compile for Windows amd64/arm64. The
+  disposable restricted executor lifecycle test is gated with the same worker
+  prerequisite and has not been run here. Three local executor runtime tests
+  fail before backend construction because the managed host denies the required
+  parent-path identity walk; this is not recorded as a pass or skip.
+- Tasks 12-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
   Task 5 runtime-baseline result.
 
 Run these gates on the Windows handoff branch:

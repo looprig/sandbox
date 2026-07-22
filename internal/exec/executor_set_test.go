@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -86,6 +87,11 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	if access := policy.ResolveFS(alpha.policy.FS, alpha.tmp); access&(policy.ReadAccess|policy.WriteAccess) != policy.ReadAccess|policy.WriteAccess {
 		t.Fatalf("isolated TMPDIR access = %d, want read and write", access)
 	}
+	for name, root := range map[string]string{"HOME": alpha.home, "TMPDIR": alpha.tmp} {
+		if !slices.Contains(alpha.policy.ProjectionRoots, root) {
+			t.Errorf("owned %s %q is not marked as an ACL projection root", name, root)
+		}
+	}
 	if !containsEnv(alpha.env, "TMPDIR="+alpha.tmp) {
 		t.Fatalf("executor environment does not use owned TMPDIR %q", alpha.tmp)
 	}
@@ -144,15 +150,16 @@ func TestWindowsExecutorOptionsRejectedOnNonWindows(t *testing.T) {
 
 func TestWindowsOptionSnapshotIsPassedToExecutors(t *testing.T) {
 	want := windows.Config{Mode: windows.Elevated, StateRoot: `C:\ProgramData\Looprig`}
+	wantScratch := filepath.Clean(t.TempDir())
 	var config executorSetConfig
 	WithWindowsSandboxMode(want.Mode)(&config)
 	WithWindowsSandboxStateRoot(want.StateRoot)(&config)
 
-	snapshotWindowsOptions(&config)
+	snapshotWindowsOptions(&config, wantScratch)
 	config.windows = windows.Config{}
 
-	if got := config.executor.platform; got != (platform.Options{Windows: want}) {
-		t.Fatalf("executor platform options = %#v; want Windows %#v", got, want)
+	if got := config.executor.platform; got != (platform.Options{Windows: want, ScratchRoot: wantScratch}) {
+		t.Fatalf("executor platform options = %#v; want Windows %#v and scratch root %q", got, want, wantScratch)
 	}
 }
 

@@ -191,6 +191,35 @@ func TestRestrictedJournalRetiresSIDAtomicallyAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestRestrictedJournalRetiresExecutorSIDAcrossReopen(t *testing.T) {
+	root := t.TempDir()
+	sid, err := ExecutorSID("installation", "random-executor-identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := OpenRestrictedJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := first.RetireSID(sid); err != nil || !retired {
+		t.Fatalf("first executor retirement = (%v, %v), want (true, nil)", retired, err)
+	}
+	reopened, err := OpenRestrictedJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := reopened.RetireSID(sid); err != nil || retired {
+		t.Fatalf("reopened executor retirement = (%v, %v), want (false, nil)", retired, err)
+	}
+	installation, err := InstallationSID("installation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := reopened.RetireSID(installation); err == nil || retired {
+		t.Fatalf("installation SID retirement = (%v, %v), want (false, error)", retired, err)
+	}
+}
+
 type testPruner struct {
 	wanted SID
 	allow  func(SID, ACERole, []byte) bool

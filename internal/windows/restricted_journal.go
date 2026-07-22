@@ -203,13 +203,15 @@ func (j *RestrictedJournal) Sweep(cleaner RestrictedJournalCleaner) (RestrictedS
 	return report, nil
 }
 
-// RetireSID atomically and durably records a one-shot SID before issuance.
+// RetireSID atomically and durably records a transient executor or one-shot SID
+// before issuance. Installation SIDs are persistent names and are never valid
+// restricted-tier cleanup capabilities.
 func (j *RestrictedJournal) RetireSID(sid SID) (bool, error) {
 	if j == nil {
 		return false, errors.New("sandbox: nil restricted journal")
 	}
-	if sid.kind != sidKindOneShot || !sid.isPrivateCapability() {
-		return false, errors.New("sandbox: only module-issued one-shot SIDs may be retired")
+	if !retirableRestrictedSID(sid) {
+		return false, errors.New("sandbox: only module-issued transient restricted SIDs may be retired")
 	}
 	digest := sha256.Sum256([]byte(sid.String()))
 	path := filepath.Join(j.retiredDir, hex.EncodeToString(digest[:])+".sid")
@@ -231,7 +233,7 @@ func (j *RestrictedJournal) Prune(pruner RestrictedPruner) error {
 		return errors.New("sandbox: restricted journal pruner is required")
 	}
 	return pruner.PruneRestrictedACEs(func(sid SID, role ACERole, ace []byte) bool {
-		if role != ACERoleRestrictingAllow || sid.kind != sidKindOneShot || !sid.isPrivateCapability() || !recognizedRestrictingACE(sid, role, ace) {
+		if role != ACERoleRestrictingAllow || !retirableRestrictedSID(sid) || !recognizedRestrictingACE(sid, role, ace) {
 			return false
 		}
 		return j.isDurablyRetired(sid)
@@ -239,7 +241,7 @@ func (j *RestrictedJournal) Prune(pruner RestrictedPruner) error {
 }
 
 func (j *RestrictedJournal) isDurablyRetired(sid SID) bool {
-	if j == nil || sid.kind != sidKindOneShot || !sid.isPrivateCapability() {
+	if j == nil || !retirableRestrictedSID(sid) {
 		return false
 	}
 	digest := sha256.Sum256([]byte(sid.String()))
@@ -298,7 +300,7 @@ func validateRestrictedRecord(record RestrictedCleanupRecord) error {
 	if record.Rollback.Role != ACERoleRestrictingAllow && record.Rollback.Role != ACERoleRestrictingDeny {
 		return errors.New("sandbox: restricted journal accepts restricting ACEs only")
 	}
-	if record.Rollback.SID.kind != sidKindOneShot || !record.Rollback.SID.isPrivateCapability() || len(record.ACE) == 0 {
+	if !retirableRestrictedSID(record.Rollback.SID) || len(record.ACE) == 0 {
 		return errors.New("sandbox: invalid restricted cleanup ACE")
 	}
 	if !recognizedRestrictingACE(record.Rollback.SID, record.Rollback.Role, record.ACE) {
@@ -308,6 +310,10 @@ func validateRestrictedRecord(record RestrictedCleanupRecord) error {
 		return errors.New("sandbox: restricted cleanup ACE hash mismatch")
 	}
 	return nil
+}
+
+func retirableRestrictedSID(sid SID) bool {
+	return (sid.kind == sidKindExecutor || sid.kind == sidKindOneShot) && sid.isPrivateCapability()
 }
 
 func recognizedRestrictingACE(sid SID, role ACERole, ace []byte) bool {

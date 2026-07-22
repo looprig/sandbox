@@ -59,12 +59,20 @@ type Effective struct {
 	Limits           Limits
 	Isolation        profile.Isolation
 	Home             profile.Home
+	// ProjectionRoots contains only configured roots eligible for a Windows
+	// restricting-SID ACL projection. Host volumes and runtime baselines are absent.
+	ProjectionRoots []string
+	// RequiredGuarantees is the immutable public-profile requirement snapshot.
+	// Backends use it only for typed mechanism selection errors; achieved bits
+	// remain authoritative and are checked independently by the executor.
+	RequiredGuarantees uint64
 }
 
 func Clone(p Effective) Effective {
 	clone := p
 	clone.FS = append([]FSEntry(nil), p.FS...)
 	clone.RuntimeBaselines = append([]string(nil), p.RuntimeBaselines...)
+	clone.ProjectionRoots = append([]string(nil), p.ProjectionRoots...)
 	clone.Net.Ports = append([]uint16(nil), p.Net.Ports...)
 	clone.Env.Allow = append([]string(nil), p.Env.Allow...)
 	if p.Env.Set != nil {
@@ -86,9 +94,10 @@ func compileWithHostRoots(prof *profile.Profile, roots func() ([]string, error))
 	}
 	settings := prof.Settings()
 	p := Effective{
-		Workspace: settings.WorkspaceRoot,
-		Isolation: settings.Isolation,
-		Home:      settings.Home,
+		Workspace:          settings.WorkspaceRoot,
+		Isolation:          settings.Isolation,
+		Home:               settings.Home,
+		RequiredGuarantees: settings.RequiredGuarantees,
 	}
 	if settings.Isolation == profile.Unconfined {
 		hostRoots, err := roots()
@@ -107,8 +116,10 @@ func compileWithHostRoots(prof *profile.Profile, roots func() ([]string, error))
 	p.FS = append(p.FS, MinimalRuntimeEntries()...)
 	p.FS = append(p.FS, FSEntry{Path: NullDevicePath, Access: ReadAccess | WriteAccess, Exact: true})
 	appendRootAccess(&p.FS, settings.WorkspaceRoot, settings.WorkspaceRead, settings.WorkspaceWrite)
+	p.ProjectionRoots = append(p.ProjectionRoots, settings.WorkspaceRoot)
 	for _, root := range settings.AdditionalRoots {
 		appendRootAccess(&p.FS, root.Path, root.Read, root.Write)
+		p.ProjectionRoots = append(p.ProjectionRoots, root.Path)
 	}
 	hostRoots, err := roots()
 	if err != nil {

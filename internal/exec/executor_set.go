@@ -98,7 +98,6 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	if err := windows.ValidateConfig(config.windows); err != nil {
 		return nil, err
 	}
-	snapshotWindowsOptions(&config)
 	if config.scratchRoot == "" {
 		return nil, errors.New("sandbox: executor set scratch root is required")
 	}
@@ -117,6 +116,7 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: executor set scratch root: %w", err)
 	}
+	snapshotWindowsOptions(&config, scratch)
 	owned, err := os.MkdirTemp(scratch, "sandbox-executors-")
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: create executor set root: %w", err)
@@ -138,8 +138,11 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	}, nil
 }
 
-func snapshotWindowsOptions(config *executorSetConfig) {
-	config.executor.platform = platform.Options{Windows: config.windows}
+func snapshotWindowsOptions(config *executorSetConfig, scratchRoot string) {
+	config.executor.platform = platform.Options{
+		Windows:     config.windows,
+		ScratchRoot: scratchRoot,
+	}
 }
 
 // For memoizes an executor with a distinct grant key and child HOME per key.
@@ -209,8 +212,10 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	pol.Env.Set["TMPDIR"] = tmp
 	if ownedHome {
 		pol.FS = append(pol.FS, policy.FSEntry{Path: home, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
+		pol.ProjectionRoots = append(pol.ProjectionRoots, home)
 	}
 	pol.FS = append(pol.FS, policy.FSEntry{Path: tmp, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
+	pol.ProjectionRoots = append(pol.ProjectionRoots, tmp)
 	var proxy *network.Proxy
 	if set.route != nil {
 		proxy, err = network.NewProxy(*set.route)
