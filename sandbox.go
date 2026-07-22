@@ -6,6 +6,7 @@ import (
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/exec"
+	"github.com/looprig/sandbox/internal/windows"
 	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
@@ -127,6 +128,53 @@ func NewEgressRouteResolver(routes []EgressRoute, selector func(context.Context,
 // available on this host, so a Sandboxed profile cannot be honoured.
 var ErrSandboxUnavailable = enforce.ErrUnavailable
 
+// Windows sandbox selection and elevated setup vocabulary.
+type (
+	WindowsSandboxMode      = windows.SandboxMode
+	WindowsSetupConfig      = windows.SetupConfig
+	WindowsSetupProblemCode = windows.WindowsSetupProblemCode
+	WindowsSetupProblem     = windows.SetupProblem
+	WindowsSetupStatus      = windows.SetupStatus
+)
+
+const (
+	WindowsAuto            = windows.Auto
+	WindowsRestrictedToken = windows.RestrictedToken
+	WindowsElevated        = windows.Elevated
+
+	WindowsSetupProblemUnknown               = windows.SetupProblemUnknown
+	WindowsSetupProblemManifestMissing       = windows.SetupProblemManifestMissing
+	WindowsSetupProblemOwnerMismatch         = windows.SetupProblemOwnerMismatch
+	WindowsSetupProblemHostBinaryStale       = windows.SetupProblemHostBinaryStale
+	WindowsSetupProblemServiceUnavailable    = windows.SetupProblemServiceUnavailable
+	WindowsSetupProblemAccountMissing        = windows.SetupProblemAccountMissing
+	WindowsSetupProblemCredentialUnavailable = windows.SetupProblemCredentialUnavailable
+	WindowsSetupProblemFirewallOverridden    = windows.SetupProblemFirewallOverridden
+	WindowsSetupProblemFirewallRuleChanged   = windows.SetupProblemFirewallRuleChanged
+	WindowsSetupProblemPortInUse             = windows.SetupProblemPortInUse
+	WindowsSetupProblemRuntimeBaselineGap    = windows.SetupProblemRuntimeBaselineGap
+	WindowsSetupProblemLeaseRecoveryPending  = windows.SetupProblemLeaseRecoveryPending
+	WindowsSetupProblemProtocolMismatch      = windows.SetupProblemProtocolMismatch
+)
+
+var (
+	ErrWindowsSetupRequired     = windows.ErrSetupRequired
+	ErrWindowsSetupStale        = windows.ErrSetupStale
+	ErrWindowsElevationRequired = windows.ErrElevationRequired
+)
+
+func InspectWindowsSandbox(ctx context.Context, config WindowsSetupConfig) (WindowsSetupStatus, error) {
+	return windows.Inspect(ctx, config)
+}
+
+func SetupWindowsSandbox(ctx context.Context, config WindowsSetupConfig) error {
+	return windows.Setup(ctx, config)
+}
+
+func RemoveWindowsSandbox(ctx context.Context, config WindowsSetupConfig) error {
+	return windows.Remove(ctx, config)
+}
+
 // Executor ownership. The executor and the single-spawn grant tokens it mints
 // and verifies live in internal/exec; these are the names consumers use.
 type (
@@ -154,6 +202,16 @@ func WithGrantTTL(duration time.Duration) ExecutorSetOption { return exec.WithGr
 
 // WithEgressRoute configures the explicit route used by target-scoped grants.
 func WithEgressRoute(route EgressRoute) ExecutorSetOption { return exec.WithEgressRoute(route) }
+
+// WithWindowsSandboxMode selects the Windows confinement tier.
+func WithWindowsSandboxMode(mode WindowsSandboxMode) ExecutorSetOption {
+	return exec.WithWindowsSandboxMode(mode)
+}
+
+// WithWindowsSandboxStateRoot selects the Windows elevated installation root.
+func WithWindowsSandboxStateRoot(path string) ExecutorSetOption {
+	return exec.WithWindowsSandboxStateRoot(path)
+}
 
 // Executor lifecycle sentinels.
 var (

@@ -3,7 +3,6 @@ package exec
 import (
 	"errors"
 	"fmt"
-	"github.com/looprig/sandbox/internal/policy"
 	"net"
 	"os"
 	"strconv"
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/internal/windows"
 	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 )
@@ -26,6 +27,7 @@ type executorSetConfig struct {
 	executor    executorConfig
 	grantTTLSet bool
 	route       *EgressRoute
+	windows     windows.Config
 }
 
 // ExecutorSetOption configures executor ownership and resource limits.
@@ -55,6 +57,16 @@ func WithEgressRoute(route EgressRoute) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.route = &route }
 }
 
+// WithWindowsSandboxMode selects the Windows confinement tier.
+func WithWindowsSandboxMode(mode windows.SandboxMode) ExecutorSetOption {
+	return func(config *executorSetConfig) { config.windows.Mode = mode }
+}
+
+// WithWindowsSandboxStateRoot selects the Windows elevated installation root.
+func WithWindowsSandboxStateRoot(path string) ExecutorSetOption {
+	return func(config *executorSetConfig) { config.windows.StateRoot = path }
+}
+
 // ExecutorSet owns per-key executors, their grant keys, and isolated HOME dirs.
 type ExecutorSet struct {
 	mu        sync.Mutex
@@ -81,6 +93,9 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 		if option != nil {
 			option(&config)
 		}
+	}
+	if err := windows.ValidateConfig(config.windows); err != nil {
+		return nil, err
 	}
 	if config.scratchRoot == "" {
 		return nil, errors.New("sandbox: executor set scratch root is required")

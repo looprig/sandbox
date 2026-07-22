@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -19,6 +20,13 @@ import (
 // the exported surface, exactly as a consumer does.
 
 func TestFacadeExportsTheConsumedSurface(t *testing.T) {
+	var (
+		_ sandbox.WindowsSandboxMode    = sandbox.WindowsAuto
+		_ sandbox.ExecutorSetOption     = sandbox.WithWindowsSandboxMode(sandbox.WindowsRestrictedToken)
+		_ sandbox.ExecutorSetOption     = sandbox.WithWindowsSandboxStateRoot(`C:\ProgramData\Looprig`)
+		_ []sandbox.WindowsSetupProblem = sandbox.WindowsSetupStatus{}.Problems
+	)
+
 	// Authority enums and their values.
 	var (
 		_ sandbox.Access    = sandbox.Deny
@@ -146,6 +154,22 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 	}
 }
 
+func TestFacadeWindowsSetupUnavailableOnNonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("non-Windows contract")
+	}
+	config := sandbox.WindowsSetupConfig{}
+	if _, err := sandbox.InspectWindowsSandbox(context.Background(), config); !errors.Is(err, sandbox.ErrSandboxUnavailable) {
+		t.Fatalf("InspectWindowsSandbox error = %v, want ErrSandboxUnavailable", err)
+	}
+	if err := sandbox.SetupWindowsSandbox(context.Background(), config); !errors.Is(err, sandbox.ErrSandboxUnavailable) {
+		t.Fatalf("SetupWindowsSandbox error = %v, want ErrSandboxUnavailable", err)
+	}
+	if err := sandbox.RemoveWindowsSandbox(context.Background(), config); !errors.Is(err, sandbox.ErrSandboxUnavailable) {
+		t.Fatalf("RemoveWindowsSandbox error = %v, want ErrSandboxUnavailable", err)
+	}
+}
+
 // TestFacadeExportsTheConsumedSentinels pins the error values consumers match
 // with errors.Is. A sentinel that silently becomes a different value is the
 // failure mode this catches: it would compile everywhere and match nowhere.
@@ -153,6 +177,9 @@ func TestFacadeExportsTheConsumedSentinels(t *testing.T) {
 	for name, err := range map[string]error{
 		"ErrInvalidProfile":             sandbox.ErrInvalidProfile,
 		"ErrSandboxUnavailable":         sandbox.ErrSandboxUnavailable,
+		"ErrWindowsSetupRequired":       sandbox.ErrWindowsSetupRequired,
+		"ErrWindowsSetupStale":          sandbox.ErrWindowsSetupStale,
+		"ErrWindowsElevationRequired":   sandbox.ErrWindowsElevationRequired,
 		"ErrExecutorClosed":             sandbox.ErrExecutorClosed,
 		"ErrExecutorSetClosed":          sandbox.ErrExecutorSetClosed,
 		"ErrExecutorLimit":              sandbox.ErrExecutorLimit,
@@ -180,6 +207,12 @@ func TestFacadeExportsTheConsumedSentinels(t *testing.T) {
 		if !errors.Is(err, err) {
 			t.Errorf("%s does not match itself under errors.Is", name)
 		}
+	}
+	if !errors.Is(sandbox.ErrWindowsSetupRequired, sandbox.ErrSandboxUnavailable) {
+		t.Error("ErrWindowsSetupRequired does not unwrap to ErrSandboxUnavailable")
+	}
+	if !errors.Is(sandbox.ErrWindowsSetupStale, sandbox.ErrSandboxUnavailable) {
+		t.Error("ErrWindowsSetupStale does not unwrap to ErrSandboxUnavailable")
 	}
 
 	// The grant enforcement classes are a shipped wire contract: these exact

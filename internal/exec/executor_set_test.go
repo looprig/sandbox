@@ -5,9 +5,11 @@ import (
 	"errors"
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/internal/windows"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,6 +110,35 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	if _, err := set.For("after-close"); !errors.Is(err, ErrExecutorSetClosed) {
 		t.Fatalf("For after close error = %v, want ErrExecutorSetClosed", err)
 	}
+}
+
+func TestWindowsExecutorOptionsRejectedOnNonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("non-Windows contract")
+	}
+	profile := mustProfile(t, ProfileConfig{WorkspaceRoot: t.TempDir()})
+	for name, option := range map[string]ExecutorSetOption{
+		"restricted mode": WithWindowsSandboxMode(windows.RestrictedToken),
+		"elevated mode":   WithWindowsSandboxMode(windows.Elevated),
+		"state root":      WithWindowsSandboxStateRoot(`C:\ProgramData\Looprig`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), option); err == nil {
+				t.Fatal("NewExecutorSet with non-default Windows option succeeded")
+			}
+		})
+	}
+
+	set, err := NewExecutorSet(profile,
+		WithScratchRoot(t.TempDir()),
+		WithMaxExecutors(1),
+		WithWindowsSandboxMode(windows.Auto),
+		WithWindowsSandboxStateRoot(""),
+	)
+	if err != nil {
+		t.Fatalf("NewExecutorSet with default Windows options: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
 }
 
 func TestExecutorSetCloseReleasesCompiledSpecOnce(t *testing.T) {
