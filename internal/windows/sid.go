@@ -4,12 +4,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf16"
 )
 
 // These domains are part of the persisted SID ABI. Changing one strands ACEs
@@ -32,7 +34,7 @@ const (
 	sidKindOneShot
 )
 
-// SID is a module-issued private Windows capability SID. Its representation
+// SID is a module-issued private Windows trustee SID. Its representation
 // and role are intentionally closed so callers cannot convert arbitrary text
 // into a principal accepted by the token or ACL boundary.
 type SID struct {
@@ -47,7 +49,7 @@ func InstallationSID(installationID string) (SID, error) {
 	if installationID == "" {
 		return SID{}, errors.New("sandbox: empty Windows installation identity")
 	}
-	return deriveCapabilitySID(sidKindInstallation, installationSIDDomain, installationID), nil
+	return deriveModuleTrusteeSID(sidKindInstallation, installationSIDDomain, installationID), nil
 }
 
 // ExecutorSID deterministically names one executor within an installation.
@@ -55,16 +57,20 @@ func ExecutorSID(installationID, executorID string) (SID, error) {
 	if installationID == "" || executorID == "" {
 		return SID{}, errors.New("sandbox: empty Windows executor identity")
 	}
-	return deriveCapabilitySID(sidKindExecutor, executorSIDDomain, installationID, executorID), nil
+	return deriveModuleTrusteeSID(sidKindExecutor, executorSIDDomain, installationID, executorID), nil
 }
 
-func deriveCapabilitySID(kind sidKind, domain string, fields ...string) SID {
+func deriveModuleTrusteeSID(kind sidKind, domain string, fields ...string) SID {
+	return moduleTrusteeSID(kind, moduleTrusteeName(domain, fields...))
+}
+
+func moduleTrusteeName(domain string, fields ...string) string {
 	hash := sha256.New()
 	writeHashField(hash, []byte(domain))
 	for _, field := range fields {
 		writeHashField(hash, []byte(field))
 	}
-	return capabilitySID(kind, hash.Sum(nil))
+	return "looprig.windows.trustee/" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func writeHashField(writer io.Writer, value []byte) {
@@ -74,16 +80,22 @@ func writeHashField(writer io.Writer, value []byte) {
 	_, _ = writer.Write(value)
 }
 
-func capabilitySID(kind sidKind, digest []byte) SID {
+func moduleTrusteeSID(kind sidKind, name string) SID {
+	// This is the documented DeriveCapabilitySidsFromName group-SID algorithm:
+	// SHA-256 of the uppercased UTF-16LE capability name under the NT-authority
+	// S-1-5-32 namespace. Unlike the paired S-1-15 capability SID, Windows
+	// accepts this group SID in CreateRestrictedToken's restricting list.
+	encodedName := utf16.Encode([]rune(strings.ToUpper(name)))
+	hash := sha256.New()
+	var codeUnit [2]byte
+	for _, value := range encodedName {
+		binary.LittleEndian.PutUint16(codeUnit[:], value)
+		_, _ = hash.Write(codeUnit[:])
+	}
+	digest := hash.Sum(nil)
 	var builder strings.Builder
-	// CreateRestrictedToken rejects synthetic S-1-15 capability-authority SIDs
-	// that were not derived by Windows, even though ConvertStringSidToSid and
-	// IsValidSid accept their structure. A private NT-authority SID with four
-	// digest subauthorities is accepted both as an ACL principal and as a
-	// restricting SID. The 128-bit suffix keeps collision resistance while
-	// staying in the conventional S-1-5-21 token-compatible shape.
-	builder.WriteString("S-1-5-21")
-	for offset := 0; offset < 16; offset += 4 {
+	builder.WriteString("S-1-5-32")
+	for offset := 0; offset < sha256.Size; offset += 4 {
 		builder.WriteByte('-')
 		builder.WriteString(strconv.FormatUint(uint64(binary.LittleEndian.Uint32(digest[offset:offset+4])), 10))
 	}
@@ -127,7 +139,7 @@ func (generator *OneShotSIDGenerator) Next() (SID, error) {
 	if _, err := io.ReadFull(generator.source, entropy); err != nil {
 		return SID{}, fmt.Errorf("generate one-shot Windows SID: %w", err)
 	}
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, string(entropy))
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, string(entropy))
 	retired, err := generator.store.RetireSID(sid)
 	if err != nil {
 		return SID{}, fmt.Errorf("retire one-shot Windows SID: %w", err)
@@ -140,14 +152,14 @@ func (generator *OneShotSIDGenerator) Next() (SID, error) {
 
 func (sid SID) binary() []byte {
 	parts := strings.Split(sid.text, "-")
-	if len(parts) != 8 || parts[0] != "S" || parts[1] != "1" || parts[2] != "5" || parts[3] != "21" {
+	if len(parts) != 12 || parts[0] != "S" || parts[1] != "1" || parts[2] != "5" || parts[3] != "32" {
 		return nil
 	}
-	result := make([]byte, 8+5*4)
+	result := make([]byte, 8+9*4)
 	result[0] = 1
-	result[1] = 5
+	result[1] = 9
 	result[7] = 5
-	binary.LittleEndian.PutUint32(result[8:12], 21)
+	binary.LittleEndian.PutUint32(result[8:12], 32)
 	for index, part := range parts[4:] {
 		value, err := strconv.ParseUint(part, 10, 32)
 		if err != nil {
@@ -158,15 +170,15 @@ func (sid SID) binary() []byte {
 	return result
 }
 
-func (sid SID) isPrivateCapability() bool {
+func (sid SID) isModuleTrustee() bool {
 	switch sid.kind {
 	case sidKindInstallation, sidKindExecutor, sidKindOneShot:
-		return len(sid.binary()) == 8+5*4
+		return len(sid.binary()) == 8+9*4
 	default:
 		return false
 	}
 }
 
-func (sid SID) isRestrictedTierCapability() bool {
-	return (sid.kind == sidKindExecutor || sid.kind == sidKindOneShot) && sid.isPrivateCapability()
+func (sid SID) isRestrictedTierTrustee() bool {
+	return (sid.kind == sidKindExecutor || sid.kind == sidKindOneShot) && sid.isModuleTrustee()
 }

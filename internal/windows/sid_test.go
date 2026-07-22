@@ -44,18 +44,18 @@ func TestSIDNamespacesAreDeterministicAndSeparated(t *testing.T) {
 	if installation != again {
 		t.Fatalf("installation SID is not deterministic: %q != %q", installation, again)
 	}
-	const wantInstallation = "S-1-5-21-2604559594-2853295540-4076106329-3836222237"
+	const wantInstallation = "S-1-5-32-906244842-2273296446-3503414478-3616732795-3278140985-13462797-1442982838-532462144"
 	if installation.String() != wantInstallation {
 		t.Fatalf("installation SID ABI changed: %q, want %q", installation, wantInstallation)
 	}
 	if installation == executor {
 		t.Fatalf("domain-separated SIDs collided: %q", installation)
 	}
-	if got := installation.String(); len(got) < len("S-1-5-21-") || got[:len("S-1-5-21-")] != "S-1-5-21-" {
+	if got := installation.String(); len(got) < len("S-1-5-32-") || got[:len("S-1-5-32-")] != "S-1-5-32-" {
 		t.Fatalf("installation SID = %q, want token-compatible private namespace", got)
 	}
-	if !installation.isPrivateCapability() || (SID{text: "S-1-5-12", kind: sidKindExecutor}).isPrivateCapability() {
-		t.Fatal("private capability validation accepted the wrong SID shape")
+	if !installation.isModuleTrustee() || (SID{text: "S-1-5-12", kind: sidKindExecutor}).isModuleTrustee() {
+		t.Fatal("module trustee validation accepted the wrong SID shape")
 	}
 	if _, err := InstallationSID(""); err == nil {
 		t.Fatal("empty installation identity accepted")
@@ -154,11 +154,11 @@ func TestSIDBinaryRoundTripsStableShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := sid.binary()
-	if len(binary) != 8+5*4 || binary[0] != 1 || binary[1] != 5 {
+	if len(binary) != 8+9*4 || binary[0] != 1 || binary[1] != 9 {
 		t.Fatalf("binary SID shape = %x", binary)
 	}
-	if got := binary[8:12]; !bytes.Equal(got, []byte{21, 0, 0, 0}) {
-		t.Fatalf("private namespace subauthority = %x, want 21", got)
+	if got := binary[8:12]; !bytes.Equal(got, []byte{32, 0, 0, 0}) {
+		t.Fatalf("private namespace subauthority = %x, want 32", got)
 	}
 	binary[0] = 0
 	if sid.binary()[0] != 1 {

@@ -89,6 +89,81 @@ func TestRestrictedTokenCallUsesExactFlagsAndLists(t *testing.T) {
 	}
 }
 
+func TestModuleTrusteeMatchesWindowsDerivation(t *testing.T) {
+	const installationID = "windows-derivation-installation"
+	const executorID = "windows-derivation-executor"
+	want, err := ExecutorSID(installationID, executorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := xwindows.UTF16PtrFromString(moduleTrusteeName(executorSIDDomain, installationID, executorID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := xwindows.NewLazySystemDLL("kernelbase.dll").NewProc("DeriveCapabilitySidsFromName")
+	var groupArray, capabilityArray **xwindows.SID
+	var groupCount, capabilityCount uint32
+	result, _, callErr := proc.Call(
+		uintptr(unsafe.Pointer(name)),
+		uintptr(unsafe.Pointer(&groupArray)), uintptr(unsafe.Pointer(&groupCount)),
+		uintptr(unsafe.Pointer(&capabilityArray)), uintptr(unsafe.Pointer(&capabilityCount)),
+	)
+	if result == 0 {
+		t.Fatalf("DeriveCapabilitySidsFromName: %v", callErr)
+	}
+	defer func() {
+		for _, array := range []struct {
+			ptr   **xwindows.SID
+			count uint32
+		}{{groupArray, groupCount}, {capabilityArray, capabilityCount}} {
+			if array.ptr == nil {
+				continue
+			}
+			for _, sid := range unsafe.Slice(array.ptr, int(array.count)) {
+				_, _ = xwindows.LocalFree(xwindows.Handle(uintptr(unsafe.Pointer(sid))))
+			}
+			_, _ = xwindows.LocalFree(xwindows.Handle(uintptr(unsafe.Pointer(array.ptr))))
+		}
+	}()
+	if groupCount != 1 || capabilityCount != 1 || groupArray == nil || capabilityArray == nil {
+		t.Fatalf("derived group/capability counts = %d/%d, want 1/1", groupCount, capabilityCount)
+	}
+	groupSID := unsafe.Slice(groupArray, int(groupCount))[0]
+	capabilitySID := unsafe.Slice(capabilityArray, int(capabilityCount))[0]
+	if got := groupSID.String(); got != want.String() {
+		t.Fatalf("Windows-derived group SID = %s, module trustee = %s", got, want)
+	}
+	if capabilitySID.String() == want.String() {
+		t.Fatal("selected NT-authority group SID unexpectedly equals AppAuthority capability SID")
+	}
+	var source xwindows.Token
+	if err := xwindows.OpenProcessToken(xwindows.CurrentProcess(), xwindows.TOKEN_DUPLICATE|xwindows.TOKEN_QUERY, &source); err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	token, err := CreateRestrictedToken(source, []SID{want})
+	if err != nil {
+		t.Fatalf("create token with Windows-derived module trustee: %v", err)
+	}
+	defer token.Close()
+	assertOnlyRestrictingSIDs(t, token, groupSID)
+}
+
+func TestRestrictingSIDCollisionChecksIncludeTokenUser(t *testing.T) {
+	user := mustTestSID(t, "S-1-5-21-101-202-303-404")
+	other := mustTestSID(t, "S-1-5-32-1-2-3-4-5-6-7-8")
+	if err := ensureRestrictingSIDsAreNew(user, nil, []*xwindows.SID{user}); err == nil {
+		t.Fatal("exact TokenUser collision accepted")
+	}
+	groups := []xwindows.SIDAndAttributes{{Sid: other}}
+	if err := ensureRestrictingSIDsAreNew(user, groups, []*xwindows.SID{other}); err == nil {
+		t.Fatal("exact TokenGroups collision accepted")
+	}
+	if err := ensureRestrictingSIDsAreNew(user, groups, []*xwindows.SID{mustTestSID(t, "S-1-5-32-8-7-6-5-4-3-2-1")}); err != nil {
+		t.Fatalf("fresh restricting SID rejected: %v", err)
+	}
+}
+
 func TestDangerousGroupSIDListIsPinned(t *testing.T) {
 	want := []string{
 		"S-1-5-32-544", "S-1-5-32-547", "S-1-5-32-548", "S-1-5-32-549",
@@ -140,12 +215,12 @@ func TestCreateRestrictedTokenRejectsInvalidInput(t *testing.T) {
 	installation, _ := InstallationSID("test-installation")
 	if token, err := CreateRestrictedToken(source, []SID{installation}); err == nil {
 		token.Close()
-		t.Fatal("installation capability SID accepted as an execution restriction")
+		t.Fatal("installation trustee SID accepted as an execution restriction")
 	}
 	for _, invalid := range []SID{
 		{text: "S-1-5-12", kind: sidKindExecutor},
 		{text: "S-1-15-2-1", kind: sidKindExecutor},
-		{text: "S-1-5-21-314159-265358-979323", kind: sidKindExecutor},
+		{text: "S-1-5-32-1-2-3-4-5-6-7", kind: sidKindExecutor},
 		{text: "S-1-15-3-1-2-3-4-5-6-7-8", kind: sidKindExecutor},
 		{text: "S-1-15-3-1024-1-2-3-4-5-6-7", kind: sidKindExecutor},
 		{text: "S-1-15-3-1024-1-2-3-4-5-6-7-not-a-word", kind: sidKindExecutor},
@@ -154,7 +229,7 @@ func TestCreateRestrictedTokenRejectsInvalidInput(t *testing.T) {
 		t.Run(invalid.String(), func(t *testing.T) {
 			if token, err := CreateRestrictedToken(source, []SID{invalid}); err == nil {
 				token.Close()
-				t.Fatalf("non-module capability SID %q accepted", invalid)
+				t.Fatalf("non-module trustee SID %q accepted", invalid)
 			}
 		})
 	}

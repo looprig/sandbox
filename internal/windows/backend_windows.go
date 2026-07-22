@@ -73,7 +73,7 @@ func (backend *restrictedBackend) Compile(p policy.Effective) (enforce.Spec, pro
 	if err != nil {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, err
 	}
-	if !lease.sid.isRestrictedTierCapability() || lease.release == nil {
+	if !lease.sid.isRestrictedTierTrustee() || lease.release == nil {
 		if lease.release != nil {
 			err = errors.Join(err, lease.release())
 		}
@@ -295,6 +295,9 @@ func prepareRestrictedLease(_ Config, runtime *RestrictedRuntime, p policy.Effec
 	if err != nil {
 		return restrictedPreparedLease{}, err
 	}
+	if err := ensureModuleTrusteesAbsentFromCurrentToken([]SID{sid}); err != nil {
+		return restrictedPreparedLease{}, fmt.Errorf("validate executor trustee before ACL projection: %w", err)
+	}
 	resources := &restrictedLeaseResources{}
 	defer func() {
 		if err != nil {
@@ -505,7 +508,7 @@ func configureRestrictedSpawn(cmd *exec.Cmd, sids []SID) (func(), error) {
 		return nil, errors.New("sandbox: invalid restricted Windows spawn")
 	}
 	for _, sid := range sids {
-		if !sid.isRestrictedTierCapability() {
+		if !sid.isRestrictedTierTrustee() {
 			return nil, errors.New("sandbox: invalid restricted Windows spawn SID")
 		}
 	}

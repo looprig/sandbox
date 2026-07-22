@@ -48,6 +48,7 @@ type reportedHandle struct {
 	Value  uintptr `json:"value"`
 	Type   string  `json:"type"`
 	Access uint32  `json:"access"`
+	Object uintptr `json:"object,omitempty"`
 }
 
 type report struct {
@@ -61,15 +62,37 @@ func main() {
 		runRunner()
 		return
 	}
-	runTarget()
+	requestedObjects, err := requestedObjectHandles(os.Args[1:])
+	if err != nil {
+		fatal(err)
+	}
+	runTarget(requestedObjects)
 }
 
-func runTarget() {
+func requestedObjectHandles(args []string) (map[uintptr]struct{}, error) {
+	if len(args) == 0 || args[0] == "target" {
+		return nil, nil
+	}
+	if args[0] != "objects" {
+		return nil, fmt.Errorf("unknown mode %q", args[0])
+	}
+	requested := make(map[uintptr]struct{}, len(args)-1)
+	for _, value := range args[1:] {
+		handle, err := strconv.ParseUint(value, 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse requested handle %q: %w", value, err)
+		}
+		requested[uintptr(handle)] = struct{}{}
+	}
+	return requested, nil
+}
+
+func runTarget(requestedObjects map[uintptr]struct{}) {
 	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fatal(err)
 	}
-	handles, err := enumerateHandles()
+	handles, err := enumerateHandles(requestedObjects)
 	if err != nil {
 		fatal(err)
 	}
@@ -125,7 +148,7 @@ func runRunner() {
 	}
 }
 
-func enumerateHandles() ([]reportedHandle, error) {
+func enumerateHandles(requestedObjects map[uintptr]struct{}) ([]reportedHandle, error) {
 	buffer := make([]byte, 64<<10)
 	for {
 		var needed uint32
@@ -160,11 +183,15 @@ func enumerateHandles() ([]reportedHandle, error) {
 		if entry.UniqueProcessID != pid {
 			continue
 		}
-		result = append(result, reportedHandle{
+		reported := reportedHandle{
 			Value:  entry.HandleValue,
 			Type:   objectType(windows.Handle(entry.HandleValue)),
 			Access: entry.GrantedAccess,
-		})
+		}
+		if _, requested := requestedObjects[entry.HandleValue]; requested {
+			reported.Object = entry.Object
+		}
+		result = append(result, reported)
 	}
 	return result, nil
 }

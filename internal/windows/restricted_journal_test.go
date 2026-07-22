@@ -10,7 +10,7 @@ import (
 )
 
 func restrictedTestSID(label string) SID {
-	return deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, label)
+	return deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, label)
 }
 
 func restrictedTestRecord(t *testing.T, label string) RestrictedCleanupRecord {

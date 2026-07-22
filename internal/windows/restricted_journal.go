@@ -313,7 +313,7 @@ func validateRestrictedRecord(record RestrictedCleanupRecord) error {
 }
 
 func retirableRestrictedSID(sid SID) bool {
-	return (sid.kind == sidKindExecutor || sid.kind == sidKindOneShot) && sid.isPrivateCapability()
+	return (sid.kind == sidKindExecutor || sid.kind == sidKindOneShot) && sid.isModuleTrustee()
 }
 
 func recognizedRestrictingACE(sid SID, role ACERole, ace []byte) bool {

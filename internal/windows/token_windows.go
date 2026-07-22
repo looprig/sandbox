@@ -88,7 +88,11 @@ func CreateRestrictedToken(source xwindows.Token, restrictingSIDs []SID) (xwindo
 	if err != nil {
 		return 0, fmt.Errorf("windows sandbox: read source privileges: %w", err)
 	}
-	if err := ensureRestrictingSIDsAreNew(sourceGroups.AllGroups(), parsedRestrictingSIDs); err != nil {
+	sourceUser, err := source.GetTokenUser()
+	if err != nil {
+		return 0, fmt.Errorf("windows sandbox: read source user: %w", err)
+	}
+	if err := ensureRestrictingSIDsAreNew(sourceUser.User.Sid, sourceGroups.AllGroups(), parsedRestrictingSIDs); err != nil {
 		return 0, err
 	}
 
@@ -164,8 +168,8 @@ func dangerousGroupSIDs() ([]*xwindows.SID, error) {
 func parseRestrictingSIDs(sids []SID) ([]*xwindows.SID, error) {
 	parsed := make([]*xwindows.SID, len(sids))
 	for index, sid := range sids {
-		if !sid.isRestrictedTierCapability() {
-			return nil, fmt.Errorf("windows sandbox: restricting SID %d is not an executor or one-shot capability SID", index)
+		if !sid.isRestrictedTierTrustee() {
+			return nil, fmt.Errorf("windows sandbox: restricting SID %d is not an executor or one-shot module trustee SID", index)
 		}
 		windowsSID, err := xwindows.StringToSid(sid.String())
 		if err != nil || !windowsSID.IsValid() {
@@ -181,13 +185,41 @@ func parseRestrictingSIDs(sids []SID) ([]*xwindows.SID, error) {
 	return parsed, nil
 }
 
-func ensureRestrictingSIDsAreNew(groups []xwindows.SIDAndAttributes, sids []*xwindows.SID) error {
+func ensureRestrictingSIDsAreNew(user *xwindows.SID, groups []xwindows.SIDAndAttributes, sids []*xwindows.SID) error {
 	for _, sid := range sids {
+		if user != nil && xwindows.EqualSid(user, sid) {
+			return fmt.Errorf("windows sandbox: restricting SID %s is already the token user", sid)
+		}
 		if sidInGroups(groups, sid) {
 			return fmt.Errorf("windows sandbox: restricting SID %s is already a normal token group", sid)
 		}
 	}
 	return nil
+}
+
+// ensureModuleTrusteesAbsentFromCurrentToken prevents ACL projection from
+// granting authority to a principal already carried by the host token. It must
+// run before any ACE is applied; CreateRestrictedToken repeats the check at
+// spawn time to cover a changed source token as well.
+func ensureModuleTrusteesAbsentFromCurrentToken(sids []SID) error {
+	parsed, err := parseRestrictingSIDs(sids)
+	if err != nil {
+		return err
+	}
+	var source xwindows.Token
+	if err := xwindows.OpenProcessToken(xwindows.CurrentProcess(), xwindows.TOKEN_QUERY, &source); err != nil {
+		return fmt.Errorf("windows sandbox: open source token for trustee collision check: %w", err)
+	}
+	defer source.Close()
+	user, err := source.GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("windows sandbox: read source user for trustee collision check: %w", err)
+	}
+	groups, err := source.GetTokenGroups()
+	if err != nil {
+		return fmt.Errorf("windows sandbox: read source groups for trustee collision check: %w", err)
+	}
+	return ensureRestrictingSIDsAreNew(user.User.Sid, groups.AllGroups(), parsed)
 }
 
 func validateRestrictedToken(token xwindows.Token, sourceIntegrity *xwindows.SID, disabledGroups []xwindows.SIDAndAttributes, sourcePrivileges []xwindows.LUIDAndAttributes, restrictingSIDs []*xwindows.SID) error {

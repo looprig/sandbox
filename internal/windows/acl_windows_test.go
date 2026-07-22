@@ -99,7 +99,7 @@ func cloneMutationRecord(record ACLMutationRecord) ACLMutationRecord {
 
 func exactProjectionFixture(t *testing.T, access ACLAccess, initial [][]byte, recorder ACLMutationRecorder) (ACLPlan, *fakeACLObject, *ACLProjection) {
 	t.Helper()
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "acl-windows-transaction-test")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "acl-windows-transaction-test")
 	identity := testIdentity(42, ACLObjectFile, 1)
 	plan, err := BuildACLPlan(ACLPlanRequest{
 		LeaseID: testLeaseID(), SID: sid, Scope: ACLScopeExact, Access: access, Root: identity,
@@ -227,7 +227,7 @@ func TestACLProjectionRollbackRemovesOnlyOccurrenceAboveBaseline(t *testing.T) {
 }
 
 func TestACLProjectionRollbackPermanentlyRefusesConcurrentIdenticalDeny(t *testing.T) {
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "identical-deny-collision")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "identical-deny-collision")
 	identity := testIdentity(63, ACLObjectFile, 2)
 	deny := ACLACE{Type: ACEDeny, Access: ACLWrite}
 	deny.Bytes = encodeACE(sid, identity.Kind, deny)
@@ -267,7 +267,7 @@ func TestACLProjectionRollbackPermanentlyRefusesConcurrentIdenticalDeny(t *testi
 }
 
 func TestACLTreeProjectionRollsBackWhenWriteSharingCannotRelax(t *testing.T) {
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "relax-failure")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "relax-failure")
 	identity := testIdentity(64, ACLObjectDirectory, 1)
 	plan, err := BuildACLPlan(ACLPlanRequest{
 		LeaseID: testLeaseID(), SID: sid, Scope: ACLScopeTree, Access: ACLWrite, Root: identity,
@@ -291,7 +291,7 @@ func TestACLTreeProjectionRollsBackWhenWriteSharingCannotRelax(t *testing.T) {
 }
 
 func TestACLTreeProjectionCommitsValidatedSharingReplacementSet(t *testing.T) {
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "relax-success")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "relax-success")
 	identity := testIdentity(65, ACLObjectDirectory, 1)
 	plan, err := BuildACLPlan(ACLPlanRequest{
 		LeaseID: testLeaseID(), SID: sid, Scope: ACLScopeTree, Access: ACLWrite, Root: identity,
@@ -374,7 +374,7 @@ func TestACLProjectionRequiresExactRetainedHandleSet(t *testing.T) {
 }
 
 func TestACLProjectionRefusesDenyRemovalWhileMatchingAllowRemains(t *testing.T) {
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "deny-cleanup-safety")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "deny-cleanup-safety")
 	identity := testIdentity(77, ACLObjectFile, 2)
 	deny := ACLACE{Type: ACEDeny, Access: ACLWrite}
 	deny.Bytes = encodeACE(sid, identity.Kind, deny)
@@ -402,7 +402,7 @@ func TestACLProjectionRefusesDenyRemovalWhileMatchingAllowRemains(t *testing.T) 
 }
 
 func TestACLProjectionTreeRollbackRemovesAllowBeforeHardlinkDeny(t *testing.T) {
-	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "tree-rollback-order")
+	sid := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "tree-rollback-order")
 	rootIdentity := testIdentity(81, ACLObjectDirectory, 1)
 	hardlinkIdentity := testIdentity(82, ACLObjectFile, 2)
 	plan, err := BuildACLPlan(ACLPlanRequest{
