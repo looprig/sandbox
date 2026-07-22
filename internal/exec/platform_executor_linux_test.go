@@ -97,7 +97,7 @@ func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 // WIRED LIVE (platform.Backend no longer returns null on linux).
 func TestPlatformBackendLiveOnThisHost(t *testing.T) {
 	requireLandlockV4(t)
-	b, err := platform.Backend()
+	b, err := platform.Backend(platform.Options{})
 	if err != nil {
 		t.Fatalf("platform.Backend: %v", err)
 	}

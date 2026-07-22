@@ -2,6 +2,7 @@ package exec
 
 import (
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/platform"
 	"os/exec"
 	"time"
 
@@ -31,6 +32,9 @@ func mergeExecutorConfigs(configs ...executorConfig) executorConfig {
 		}
 		if config.backend != nil {
 			merged.backend = config.backend
+		}
+		if config.platform != (platform.Options{}) {
+			merged.platform = config.platform
 		}
 		if config.lifecycle != nil {
 			merged.lifecycle = config.lifecycle

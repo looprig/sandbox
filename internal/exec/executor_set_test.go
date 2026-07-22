@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/internal/windows"
 	"os"
@@ -139,6 +140,20 @@ func TestWindowsExecutorOptionsRejectedOnNonWindows(t *testing.T) {
 		t.Fatalf("NewExecutorSet with default Windows options: %v", err)
 	}
 	t.Cleanup(func() { _ = set.Close() })
+}
+
+func TestWindowsOptionSnapshotIsPassedToExecutors(t *testing.T) {
+	want := windows.Config{Mode: windows.Elevated, StateRoot: `C:\ProgramData\Looprig`}
+	var config executorSetConfig
+	WithWindowsSandboxMode(want.Mode)(&config)
+	WithWindowsSandboxStateRoot(want.StateRoot)(&config)
+
+	snapshotWindowsOptions(&config)
+	config.windows = windows.Config{}
+
+	if got := config.executor.platform; got != (platform.Options{Windows: want}) {
+		t.Fatalf("executor platform options = %#v; want Windows %#v", got, want)
+	}
 }
 
 func TestExecutorSetCloseReleasesCompiledSpecOnce(t *testing.T) {

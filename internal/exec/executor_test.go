@@ -3,12 +3,16 @@ package exec
 import (
 	"context"
 	"errors"
-	"github.com/looprig/sandbox/internal/enforce"
-	"github.com/looprig/sandbox/internal/policy"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/platform"
+	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/internal/windows"
 )
 
 // TestNewExecutorNullBackendGuarantees pins the null-backend posture: no OS
@@ -373,5 +377,28 @@ func TestNewExecutorRejectsMissingRequiredGuarantees(t *testing.T) {
 	backend := &captureBackend{bits: GuaranteeEnvScrub}
 	if _, err := newTestExecutor(profile, withBackend(backend)); !errors.Is(err, enforce.ErrUnavailable) {
 		t.Fatalf("NewExecutor error = %v, want enforce.ErrUnavailable", err)
+	}
+}
+
+func TestPlatformUnconfinedProfileExplicitlyUsesNullBackend(t *testing.T) {
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot:  t.TempDir(),
+		WorkspaceRead:  Allow,
+		WorkspaceWrite: Allow,
+		HostRead:       Allow,
+		HostWrite:      Allow,
+		Network:        Allow,
+		Command:        Allow,
+		Isolation:      Unconfined,
+		AckUnconfined:  true,
+	})
+	executor, err := newTestExecutor(profile, executorConfig{
+		platform: platform.Options{Windows: windows.Config{Mode: windows.Elevated}},
+	})
+	if err != nil {
+		t.Fatalf("newExecutor: %v", err)
+	}
+	if reflect.TypeOf(executor.backend) != reflect.TypeOf(enforce.NewNull()) {
+		t.Fatalf("backend = %T; want explicit %T", executor.backend, enforce.NewNull())
 	}
 }

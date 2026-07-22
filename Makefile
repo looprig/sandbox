@@ -1,4 +1,4 @@
-.PHONY: test test-os test-linux-build fmt fmt-check vet staticcheck lint vuln secure fuzz
+.PHONY: test test-os test-linux-build test-windows-build fmt fmt-check vet staticcheck lint vuln secure fuzz
 
 GO ?= go
 GOOS := $(shell go env GOOS)
@@ -34,6 +34,12 @@ endif
 test-linux-build:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /dev/null ./...
 	@echo "linux/amd64 test binaries build OK"
+
+# Cross-compile every package's tests independently for both supported Windows
+# architectures. The helper owns a temporary output directory and leaves no
+# .exe files in the repository.
+test-windows-build:
+	@GO="$(GO)" ./scripts/test-windows-build.sh
 
 # Format the whole module in place.
 fmt:

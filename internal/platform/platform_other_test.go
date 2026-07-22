@@ -1,16 +1,25 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package platform
 
 import (
 	"errors"
-	"github.com/looprig/sandbox/internal/enforce"
 	"testing"
+
+	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/windows"
 )
 
 func TestUnsupportedPlatformHasNoSandboxBackend(t *testing.T) {
-	backend, err := Backend()
-	if enforce.Backend != nil || !errors.Is(err, enforce.ErrUnavailable) {
+	backend, err := Backend(Options{})
+	if backend != nil || !errors.Is(err, enforce.ErrUnavailable) {
 		t.Fatalf("Backend = %T, %v; want nil, enforce.ErrUnavailable", backend, err)
+	}
+}
+
+func TestPlatformRejectsWindowsOptionsOnUnsupportedNonWindows(t *testing.T) {
+	backend, err := Backend(Options{Windows: windows.Config{Mode: windows.Elevated}})
+	if backend != nil || err == nil {
+		t.Fatalf("Backend(non-zero Windows options) = %T, %v; want nil, error", backend, err)
 	}
 }

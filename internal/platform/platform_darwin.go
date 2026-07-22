@@ -5,6 +5,7 @@ package platform
 import (
 	"github.com/looprig/sandbox/internal/darwin"
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/windows"
 )
 
 // Backend selects the OS enforcement backend on darwin: Seatbelt via
@@ -17,4 +18,9 @@ import (
 // would silently drop all OS enforcement). A test may still pin the null enforce.Backend
 // through the unexported withBackend seam to keep executor UNIT tests
 // backend-independent.
-func Backend() (enforce.Backend, error) { return darwin.NewBackend(), nil }
+func Backend(options Options) (enforce.Backend, error) {
+	if err := windows.ValidateConfig(options.Windows); err != nil {
+		return nil, err
+	}
+	return darwin.NewBackend(), nil
+}

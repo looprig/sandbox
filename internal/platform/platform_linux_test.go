@@ -8,7 +8,23 @@ import (
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/linux"
+	"github.com/looprig/sandbox/internal/windows"
 )
+
+func TestPlatformZeroWindowsOptionsLeaveLinuxSelectionUnchanged(t *testing.T) {
+	want, wantErr := linux.PlatformBackend()
+	got, gotErr := Backend(Options{})
+	if !errors.Is(gotErr, wantErr) || (got == nil) != (want == nil) {
+		t.Fatalf("Backend(Options{}) = %T, %v; linux.PlatformBackend() = %T, %v", got, gotErr, want, wantErr)
+	}
+}
+
+func TestPlatformRejectsWindowsOptionsOnLinux(t *testing.T) {
+	backend, err := Backend(Options{Windows: windows.Config{Mode: windows.RestrictedToken}})
+	if backend != nil || err == nil {
+		t.Fatalf("Backend(non-zero Windows options) = %T, %v; want nil, error", backend, err)
+	}
+}
 
 // TestSelectLinuxBackend covers the rung × Init-called matrix that Backend
 // uses: a re-exec rung (1/2) needs Init() and yields the linux.Backend, else

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/internal/windows"
 	"github.com/looprig/sandbox/pkg/network"
@@ -97,6 +98,7 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	if err := windows.ValidateConfig(config.windows); err != nil {
 		return nil, err
 	}
+	snapshotWindowsOptions(&config)
 	if config.scratchRoot == "" {
 		return nil, errors.New("sandbox: executor set scratch root is required")
 	}
@@ -134,6 +136,10 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 		lifecycle: newExecutorLifecycle(),
 		closeDone: make(chan struct{}),
 	}, nil
+}
+
+func snapshotWindowsOptions(config *executorSetConfig) {
+	config.executor.platform = platform.Options{Windows: config.windows}
 }
 
 // For memoizes an executor with a distinct grant key and child HOME per key.

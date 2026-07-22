@@ -63,6 +63,7 @@ type executorConfig struct {
 	grantTTL  time.Duration
 	clock     func() time.Time // nil means default time.Now
 	backend   enforce.Backend  // nil means select via platformBackend (test seam)
+	platform  platform.Options
 	lifecycle *executorLifecycle
 }
 
@@ -129,7 +130,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	if prof != nil {
 		settings = prof.Settings()
 	}
-	// Backend selection: platform.Backend() for production; a test may pin one via
+	// Backend selection: platform.Backend(config.platform) for production; a test may pin one via
 	// the unexported withBackend seam so executor UNIT tests stay backend-independent.
 	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
 	// backend selected without Init() having been called), which fails construction
@@ -140,7 +141,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 			b = enforce.NewNull()
 		} else {
 			var berr error
-			b, berr = platform.Backend()
+			b, berr = platform.Backend(config.platform)
 			if berr != nil {
 				return nil, berr
 			}
