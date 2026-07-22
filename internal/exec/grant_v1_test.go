@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,6 +20,7 @@ type captureBackend struct {
 	policies   []policy.Effective
 	bits       uint64
 	compileErr error
+	release    func() error
 }
 
 type boundaryBackend struct {
@@ -48,7 +50,10 @@ func (b *captureBackend) Compile(pol policy.Effective) (enforce.Spec, CompileRep
 	if b.compileErr != nil {
 		return enforce.Spec{}, CompileReport{}, LevelNone, 0, b.compileErr
 	}
-	spec := enforce.Spec{Wrap: func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil }}
+	spec := enforce.Spec{
+		Wrap:    func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, nil },
+		Release: b.release,
+	}
 	return spec, CompileReport{}, LevelNone, b.bits, nil
 }
 
@@ -56,6 +61,53 @@ func (b *captureBackend) lastPolicy() policy.Effective {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return policy.Clone(b.policies[len(b.policies)-1])
+}
+
+func TestGrantCompiledSpecReleasedAfterSpawn(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	target := filepath.Join(workspace, "generated.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	var releases atomic.Int32
+	backend := &captureBackend{
+		bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		release: func() error {
+			releases.Add(1)
+			return nil
+		},
+	}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := set.For("release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := releases.Load(); got != 0 {
+		t.Fatalf("release count after base compile = %d, want 0", got)
+	}
+	token := issueTestGrant(t, executor, now, "exec-release", "true", workspace,
+		"filesystem.write", target, "filesystem.path.write.v1", target)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-release", workspace, "true", []string{token}); err != nil {
+		t.Fatalf("RunCommandWithGrants: %v", err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release count after grant spawn = %d, want transient spec released once while base spec remains owned", got)
+	}
+	if err := set.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := releases.Load(); got != 2 {
+		t.Fatalf("release count after set close = %d, want transient and base specs released once each", got)
+	}
 }
 
 func TestGrantVersionAndCommandStart(t *testing.T) {

@@ -129,7 +129,7 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 		bits |= profile.GuaranteeResourceLimits
 	}
 
-	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, cnet, cg, nil, handles)}
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, cnet, cg, nil, handles), Release: nil}
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the Rung-2 Seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
@@ -209,7 +209,7 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 	r1 := &rung1Plan{mount: mvp, nft: nft}
 	// cnet is empty: Rung 1 does NOT use the Landlock TCP-port net (nftables covers
 	// egress), so linuxWrap sets NetConfined=false and injects no RES_OPTIONS.
-	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, CompiledNet{}, cg, r1, handles)}
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, CompiledNet{}, cg, r1, handles), Release: nil}
 	report := rung1CompileReport(p, mvp, nft)
 	report.Entries = append(report.Entries, CgroupCompileReport(cg))
 	return spec, report, profile.LevelFull, bits, nil

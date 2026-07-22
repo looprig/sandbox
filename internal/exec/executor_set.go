@@ -263,10 +263,14 @@ func (set *ExecutorSet) Close() error {
 		executor.markClosed()
 	}
 	set.lifecycle.wait()
+	var releaseErr error
+	for _, executor := range executors {
+		releaseErr = errors.Join(releaseErr, executor.releaseCompiledSpec())
+	}
 	for _, executor := range executors {
 		executor.revokeResources()
 	}
-	err := os.RemoveAll(set.ownedRoot)
+	err := errors.Join(releaseErr, os.RemoveAll(set.ownedRoot))
 
 	set.mu.Lock()
 	set.closeErr = err

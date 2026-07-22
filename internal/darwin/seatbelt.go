@@ -458,6 +458,7 @@ func (seatbeltBackend) Compile(p policy.Effective) (enforce.Spec, profile.Compil
 			wrapped = append(wrapped, innerArgv...)
 			return wrapped, nil, nil
 		},
+		Release: nil,
 	}
 	return spec, report, level, bits, nil
 }

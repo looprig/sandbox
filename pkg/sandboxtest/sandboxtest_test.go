@@ -10,12 +10,37 @@ package sandboxtest_test
 // backend needs an unexported seam an external consumer cannot reach.
 
 import (
+	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/looprig/sandbox"
 	"github.com/looprig/sandbox/pkg/sandboxtest"
 )
+
+type conservativeSUT struct {
+	workspace string
+}
+
+func (sut conservativeSUT) RunCommand(_ context.Context, _ string, command string) ([]byte, int, error) {
+	if command == "env" {
+		return []byte(strings.Join(os.Environ(), "\n")), 0, nil
+	}
+	path := strings.TrimSuffix(strings.TrimPrefix(command, ": > '"), "'")
+	rel, err := filepath.Rel(sut.workspace, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, 1, nil
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		return nil, 1, nil
+	}
+	return nil, 0, nil
+}
+
+func (conservativeSUT) Level() uint8          { return sandboxtest.LevelNone }
+func (conservativeSUT) GuaranteeBits() uint64 { return 0 }
 
 // TestMain dispatches any re-exec'd stage-2 child before running the suite: the
 // live Linux backend re-execs this test binary as /proc/self/exe, and
@@ -51,5 +76,11 @@ func TestSuiteAgainstLivePlatformBackend(t *testing.T) {
 			t.Fatalf("ExecutorSet.For(live): %v", err)
 		}
 		return e
+	})
+}
+
+func TestSuiteAcceptsUnclaimedWriteDenial(t *testing.T) {
+	sandboxtest.RunSuite(t, "unclaimed-write-denial", func(_ *testing.T, workspace string) sandboxtest.SUT {
+		return conservativeSUT{workspace: workspace}
 	})
 }

@@ -2,9 +2,10 @@ package enforce
 
 import (
 	"errors"
+	"os/exec"
+
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
-	"os/exec"
 )
 
 var ErrUnavailable = errors.New("sandbox: OS confinement unavailable")
@@ -18,18 +19,16 @@ var ErrUnavailable = errors.New("sandbox: OS confinement unavailable")
 // exit-code/error convention — so that behaviour stays identical across
 // backends and only the enforcement transform varies.
 
-// Spec is a backend's compiled per-spawn transform (SPEC §7: "enforcement
-// is a stateless per-spawn transform"). It holds nothing long-lived and is
-// reused across every RunCommand/RunArgv on an executor; the PER-SPAWN state
-// lives in the fresh closures its wrap func returns, not on the spec.
+// Spec is a backend's compiled spawn transform. It may own immutable enforcement
+// resources for its lifetime; Release idempotently relinquishes those resources.
+// Mutable per-spawn state lives only in the fresh closures Wrap returns.
 type Spec struct {
 	// wrap turns a target spawn — the working directory and the inner argv to run
 	// under confinement — into the actual argv the executor execs, plus a fresh
 	// per-spawn configure hook and cleanup func.
 	//
-	// The executor supplies innerArgv already shell-normalized: RunCommand passes
-	// []string{"/bin/sh", "-c", command} (running a shell command is /bin/sh -c on
-	// every backend), RunArgv passes the caller's argv verbatim. A backend then:
+	// The executor supplies innerArgv already shell-normalized for the current
+	// platform; RunArgv passes the caller's argv verbatim. A backend then:
 	//   - null: returns innerArgv unchanged (finalArgv == innerArgv).
 	//   - seatbelt: prepends "sandbox-exec -p <profile> --" to innerArgv.
 	//   - linux: returns ["/proc/self/exe", <stage-2 sentinel>] and a configure
@@ -45,6 +44,10 @@ type Spec struct {
 	// error fails before Start. If cleanup is non-nil, the executor calls it after
 	// configure or spawn completes.
 	Wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
+
+	// Release relinquishes immutable resources owned by the compiled spec. It may
+	// be nil when the spec owns none and must be safe to call idempotently.
+	Release func() error
 }
 
 // backend compiles a policy.Effective into a reusable Spec plus the achieved isolation
@@ -58,9 +61,3 @@ type Spec struct {
 type Backend interface {
 	Compile(p policy.Effective) (spec Spec, report profile.CompileReport, level uint8, guaranteeBits uint64, err error)
 }
-
-// ShellArgv is the universal shell-normalization: running a command STRING means
-// executing /bin/sh -c <command> under confinement, on every backend. The enforce.Backend
-// wraps this inner argv (sandbox-exec prefix, stage-2 re-exec, or nothing); the
-// executor owns the shell form so the backends only ever wrap an argv.
-func ShellArgv(command string) []string { return []string{"/bin/sh", "-c", command} }

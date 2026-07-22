@@ -67,7 +67,7 @@ type executorConfig struct {
 }
 
 // Executor compiles a policy.Effective once via the platform backend and then runs
-// commands under the resulting stateless per-spawn transform (SPEC §6, §7). It
+// commands under the resulting reusable spawn transform (SPEC §6, §7). It
 // holds the compiled policy, the chosen backend, its enforce.Spec, the compilation
 // report, the achieved level and guarantee bits, and the assembled child
 // environment — everything a spawn needs, precomputed at construction.
@@ -99,6 +99,8 @@ type Executor struct {
 	usedGrants       map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
 	closed           bool
 	lifecycle        *executorLifecycle
+	specReleaseOnce  sync.Once
+	specReleaseErr   error
 }
 
 // snapshot is the compiled state a single spawn needs.
@@ -151,13 +153,14 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	if prof != nil {
 		missing := settings.RequiredGuarantees &^ bits
 		if missing != 0 {
-			return nil, fmt.Errorf("%w: backend missing required guarantees %#x", enforce.ErrUnavailable, missing)
+			compileErr := fmt.Errorf("%w: backend missing required guarantees %#x", enforce.ErrUnavailable, missing)
+			return nil, errors.Join(compileErr, releaseSpec(spec))
 		}
 	}
 
 	key, err := newGrantKey()
 	if err != nil {
-		return nil, fmt.Errorf("sandbox: grant key: %w", err)
+		return nil, errors.Join(fmt.Errorf("sandbox: grant key: %w", err), releaseSpec(spec))
 	}
 
 	lifecycle := config.lifecycle
@@ -648,12 +651,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	bits = e.composeRouteGuarantees(bits)
 	if bits != expectedGuarantees {
-		return nil, -1, ErrGrantGuaranteeMismatch
+		return nil, -1, errors.Join(ErrGrantGuaranteeMismatch, releaseSpec(spec))
 	}
 	if len(proxyTargets) != 0 {
 		credential, err := e.proxy.Authorize(executionID, proxyTargets)
 		if err != nil {
-			return nil, -1, err
+			return nil, -1, errors.Join(err, releaseSpec(spec))
 		}
 		proxyURL := e.proxy.URL(executionID, credential)
 		applyChildProxyEnv(pol.Env.Set, proxyURL)
@@ -671,9 +674,26 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	e.grantMu.Lock()
 	if denial != nil {
-		return out, code, network.NewTargetDeniedError(code, runErr, denial)
+		runErr = network.NewTargetDeniedError(code, runErr, denial)
 	}
-	return out, code, runErr
+	return out, code, errors.Join(runErr, releaseSpec(spec))
+}
+
+func releaseSpec(spec enforce.Spec) error {
+	if spec.Release == nil {
+		return nil
+	}
+	return spec.Release()
+}
+
+func (e *Executor) releaseCompiledSpec() error {
+	if e == nil {
+		return nil
+	}
+	e.specReleaseOnce.Do(func() {
+		e.specReleaseErr = releaseSpec(e.spec)
+	})
+	return e.specReleaseErr
 }
 
 // pruneUsedGrantsLocked removes entries only after their signed validity

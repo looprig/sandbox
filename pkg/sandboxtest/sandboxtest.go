@@ -14,13 +14,10 @@
 // a rung-1 executor (LevelFull), and Seatbelt — each is held
 // only to the guarantees it actually claims:
 //
-//  1. Write boundary — Guarantees.WriteBoundary ⟺ writes are actually confined.
-//     A write inside a policy-writable root succeeds; a write to a path OUTSIDE
-//     every writable root is denied IFF the executor claims WriteBoundary. A
-//     no-op backend that honestly reports WriteBoundary=false is conformant
-//     precisely because it does NOT claim confinement it cannot deliver. The
-//     security-critical direction — claiming the bit while writes leak — is the
-//     fail-open this catches.
+//  1. Write boundary — a write inside a policy-writable root succeeds. When the
+//     executor claims WriteBoundary, every covered write outside every writable
+//     root is denied. An executor that withholds the bit may still deny writes;
+//     absent claims never require permissive behavior.
 //  2. Env scrub — a secret planted in the parent environment is absent from a
 //     spawned child whenever the executor claims EnvScrub. This is the harness
 //     secret-leak boundary and holds independently of any OS mechanism.
@@ -163,12 +160,10 @@ func RunSuite(t *testing.T, name string, newSUT Factory) {
 	})
 }
 
-// checkWriteBoundary asserts the WriteBoundary contract: a write inside a
-// writable root always succeeds, and a write outside every writable root is
-// denied exactly when the executor claims WriteBoundary. The biconditional is the
-// point — a backend may honestly report WriteBoundary=false (no confinement), but
-// claiming it while an outside write lands is the fail-open the auto-approval
-// interlock must never see.
+// checkWriteBoundary asserts the one-way WriteBoundary contract: a write inside
+// a writable root always succeeds, and every covered write outside writable
+// roots is denied when the executor claims WriteBoundary. Withholding the bit
+// does not require a backend to permit the outside write.
 func checkWriteBoundary(t *testing.T, newSUT Factory) {
 	ws := t.TempDir()
 	e := newSUT(t, ws)
@@ -194,21 +189,18 @@ func checkWriteBoundary(t *testing.T, newSUT Factory) {
 		t.Errorf("write INSIDE workspace denied (exit %d), want permitted — a writable root must be writable", code)
 	}
 
-	// Negative half: attempt a write outside every writable root, then reconcile
-	// the observed confinement with the claimed guarantee.
+	// Negative half: attempt a write outside every writable root and require
+	// denial only when the executor claims the guarantee.
 	outside := filepath.Join(home, ".lrsandboxtest-writeboundary-DONOTEXIST")
 	t.Cleanup(func() { _ = os.Remove(outside) })
 	outsideCode := runWrite(t, e, ctx, ws, outside)
-	confined := outsideCode != 0
 	_, statErr := os.Stat(outside)
 	created := statErr == nil
 
 	claimsWriteBoundary := e.GuaranteeBits()&GuaranteeWriteBoundary != 0
 
-	// The load-bearing biconditional.
-	if claimsWriteBoundary != confined {
-		t.Errorf("WriteBoundary contract violated: Guarantees claims WriteBoundary=%v but the out-of-policy write was %s (exit %d) — the bit and the mechanism must agree",
-			claimsWriteBoundary, confinedWord(confined), outsideCode)
+	if claimsWriteBoundary && outsideCode == 0 {
+		t.Errorf("FAIL-OPEN: WriteBoundary claimed but the out-of-policy write was permitted (exit %d)", outsideCode)
 	}
 	// Security-critical corollary: a claimed boundary must not have left a file.
 	if claimsWriteBoundary && created {
@@ -342,12 +334,4 @@ func isUnder(path, root string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// confinedWord renders the confinement outcome for an error message.
-func confinedWord(confined bool) string {
-	if confined {
-		return "denied"
-	}
-	return "permitted"
 }

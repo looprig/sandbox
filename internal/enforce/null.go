@@ -23,11 +23,12 @@ func (nullBackend) Compile(p policy.Effective) (Spec, profile.CompileReport, uin
 	}
 	spec := Spec{
 		// Pure passthrough: run the inner argv exactly as given (the executor has
-		// already shell-normalized a RunCommand to /bin/sh -c command). No spawn
+		// already shell-normalized a RunCommand for the platform). No spawn
 		// attributes, no per-spawn resources — configure and cleanup are nil.
 		Wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 			return innerArgv, nil, nil
 		},
+		Release: nil,
 	}
 	var bits uint64
 	if !p.Env.Inherit {

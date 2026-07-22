@@ -110,6 +110,42 @@ func TestExecutorSetValidationOwnershipAndCleanup(t *testing.T) {
 	}
 }
 
+func TestExecutorSetCloseReleasesCompiledSpecOnce(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	var releases atomic.Int32
+	backend := &captureBackend{
+		bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		release: func() error {
+			releases.Add(1)
+			return nil
+		},
+	}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(backend)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := set.For("executor"); err != nil {
+		t.Fatal(err)
+	}
+	if got := releases.Load(); got != 0 {
+		t.Fatalf("release count before close = %d, want 0", got)
+	}
+	if err := set.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := set.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release count after two closes = %d, want 1", got)
+	}
+}
+
 func TestExecutorSetConcurrentMemoization(t *testing.T) {
 	profile := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: t.TempDir(), WorkspaceRead: Allow, WorkspaceWrite: Allow,
@@ -171,6 +207,27 @@ func TestExecutorSetPartialConstructionCleanup(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("partial construction left %d entries in owned root", len(entries))
+	}
+
+	var releases atomic.Int32
+	releasable := &captureBackend{
+		bits: GuaranteeEnvScrub,
+		release: func() error {
+			releases.Add(1)
+			return nil
+		},
+	}
+	setWithCompiledSpec, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(releasable)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = setWithCompiledSpec.Close() })
+	if _, err := setWithCompiledSpec.For("missing-guarantees"); !errors.Is(err, enforce.ErrUnavailable) {
+		t.Fatalf("For with missing backend guarantees error = %v, want enforce.ErrUnavailable", err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release count after compiled-spec construction failure = %d, want 1", got)
 	}
 }
 
