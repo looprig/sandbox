@@ -113,22 +113,22 @@ func (tree *processTree) terminate() error {
 	return err
 }
 
-func (tree *processTree) terminateAndWait() error {
+func (tree *processTree) terminateAndWait() (error, error) {
 	if tree == nil {
-		return nil
+		return nil, nil
 	}
 	tree.mu.Lock()
 	assigned := tree.assigned
 	job := tree.job
 	tree.mu.Unlock()
 	if !assigned || job == nil {
-		return nil
+		return nil, nil
 	}
 	terminateErr := tree.terminate()
 	waitCtx, cancel := context.WithTimeout(context.Background(), jobCompletionWaitTimeout)
 	defer cancel()
 	waitErr := job.WaitActiveProcessesZero(waitCtx)
-	return errors.Join(terminateErr, waitErr)
+	return terminateErr, waitErr
 }
 
 func (tree *processTree) close() {

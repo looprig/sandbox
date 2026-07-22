@@ -284,7 +284,9 @@ func (set *ExecutorSet) Close() error {
 		executor.markClosed()
 	}
 	set.lifecycle.wait()
+	set.lifecycle.waitCleanup()
 	var releaseErr error
+	releaseErr = errors.Join(releaseErr, set.lifecycle.delayedCleanupError())
 	for _, executor := range executors {
 		releaseErr = errors.Join(releaseErr, executor.releaseCompiledSpec())
 	}

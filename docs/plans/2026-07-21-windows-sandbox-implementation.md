@@ -21,28 +21,32 @@ HTTP proxy, and Windows Server/Windows 11 CI.
 
 **Normative design:** `docs/plans/2026-07-21-windows-sandbox-design.md`.
 
-## Implementation status and Windows handoff (2026-07-21)
+## Implementation status and Windows handoff (2026-07-22)
 
 Work is on branch `feat/windows-sandbox`.
 
 - Phase 1 (Tasks 1-4) is implemented, independently reviewed for specification
   compliance and code quality, and verified with the full host race suite plus
   Windows amd64/arm64 cross-builds.
-- Phase 2 Tasks 5-8 are implemented at code level and cross-build for Windows
-  amd64/arm64. Portable and host-side race tests pass. No live Windows result is
-  claimed yet.
+- Phase 2 Tasks 5-8 are implemented at code level, independently approved for
+  static specification compliance and code quality, and cross-build for Windows
+  amd64/arm64. The focused Job quarantine tests and live Job cancellation/
+  breakaway tests pass on the current Windows host. No complete live Windows
+  phase result is claimed yet.
 - Task 5 still requires the exact-token runtime matrix on every supported
   disposable Windows image. A failure requires bound trace evidence collected
   by a separate elevated collector while the baseline test itself runs as a
   standard user. No go/no-go result has been selected.
-- Tasks 6-8 still require live Windows path, handle-inheritance, and Job tests.
-- Phase 2 code passed aggregate specification review. Aggregate code-quality
-  review is not yet approved: the remaining Important finding is to quarantine
-  and retain a failed Job plus execution backing resources when completion-port
-  zero proof cannot be obtained, instead of releasing lifecycle resources after
-  the bounded error. Continue from `internal/exec/process_tree_windows.go` and
-  `internal/windows/job_windows.go`; add injected reaper/quarantine ownership
-  tests before implementation.
+- Tasks 6-8 still require the complete disposable-worker live Windows path,
+  handle-inheritance, and Job matrices. The current managed host cannot run the
+  path suites because its sandbox denies parent-path identity walks, and its Go
+  toolchain has no C compiler for `-race`.
+- A failed completion-port zero proof now transfers the Job, command backing,
+  spawn cleanup, lifecycle barriers, transient compiled spec, and proxy authority
+  to an injected quarantine/reaper. Release occurs only after a later exact zero
+  proof; delayed cleanup errors are returned by `ExecutorSet.Close`. Focused core
+  and real `Executor.run` integration regressions cover retention, release order,
+  early setup errors, proxy observation, and set-close blocking.
 - Tasks 9-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
   Task 5 runtime-baseline result.
 

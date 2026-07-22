@@ -60,11 +60,13 @@ const spawnWaitGrace = time.Second
 // Public ownership configuration belongs to ExecutorSetOption; there is no
 // direct-executor option surface.
 type executorConfig struct {
-	grantTTL  time.Duration
-	clock     func() time.Time // nil means default time.Now
-	backend   enforce.Backend  // nil means select via platformBackend (test seam)
-	platform  platform.Options
-	lifecycle *executorLifecycle
+	grantTTL    time.Duration
+	clock       func() time.Time // nil means default time.Now
+	backend     enforce.Backend  // nil means select via platformBackend (test seam)
+	platform    platform.Options
+	lifecycle   *executorLifecycle
+	quarantine  quarantineSink
+	processTree processTreeFactory
 }
 
 // Executor compiles a policy.Effective once via the platform backend and then runs
@@ -105,6 +107,8 @@ type Executor struct {
 	grantExpiryWG       sync.WaitGroup
 	closed              bool
 	lifecycle           *executorLifecycle
+	quarantine          quarantineSink
+	processTree         processTreeFactory
 	specReleaseOnce     sync.Once
 	specReleaseErr      error
 }
@@ -173,6 +177,16 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	if lifecycle == nil {
 		lifecycle = newExecutorLifecycle()
 	}
+	quarantine := config.quarantine
+	if quarantine == nil {
+		quarantine = newAsyncQuarantineReaper()
+	}
+	processTree := config.processTree
+	if processTree == nil {
+		processTree = func(cmd *exec.Cmd, options processTreeOptions) (processTreeBoundary, error) {
+			return newProcessTree(cmd, options)
+		}
+	}
 	return &Executor{
 		profile:             prof,
 		settings:            settings,
@@ -191,6 +205,8 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		retainedGrantPaths:  make(retainedGrantPaths),
 		grantExpiryRealtime: config.clock == nil,
 		lifecycle:           lifecycle,
+		quarantine:          quarantine,
+		processTree:         processTree,
 	}, nil
 }
 
@@ -228,7 +244,12 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if err != nil {
 		return nil, -1, err
 	}
-	defer lease.finish()
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred {
+			lease.finish()
+		}
+	}()
 	if err := e.commandAccess(); err != nil {
 		return nil, -1, err
 	}
@@ -240,10 +261,12 @@ func (e *Executor) RunCommand(ctx context.Context, dir, command string) ([]byte,
 	if err != nil {
 		return nil, -1, err
 	}
+	var releases []func() error
 	if executionID != "" {
-		defer e.proxy.Release(executionID)
+		releases = append(releases, func() error { e.proxy.Release(executionID); return nil })
 	}
-	return e.run(lease, dir, enforce.ShellArgv(command), s)
+	leaseTransferred = true
+	return e.run(lease, dir, enforce.ShellArgv(command), s, nil, releases...)
 }
 
 // resolve returns the immutable compiled snapshot for one spawn.
@@ -274,7 +297,12 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 	if err != nil {
 		return nil, -1, err
 	}
-	defer lease.finish()
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred {
+			lease.finish()
+		}
+	}()
 	if err := e.commandAccess(); err != nil {
 		return nil, -1, err
 	}
@@ -286,10 +314,12 @@ func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]by
 	if err != nil {
 		return nil, -1, err
 	}
+	var releases []func() error
 	if executionID != "" {
-		defer e.proxy.Release(executionID)
+		releases = append(releases, func() error { e.proxy.Release(executionID); return nil })
 	}
-	return e.run(lease, dir, argv, s)
+	leaseTransferred = true
+	return e.run(lease, dir, argv, s, nil, releases...)
 }
 
 func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
@@ -321,7 +351,19 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 // (output, exit, err) convention. The caller supplies one immutable snapshot for
 // the whole spawn, and each wrap call yields its own closures, so concurrent
 // spawns never share per-spawn state.
-func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot) ([]byte, int, error) {
+func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot, observe func(), afterZero ...func() error) (out []byte, code int, runErr error) {
+	spawn := newQuarantinedSpawn(nil, nil, lease)
+	spawn.observe = observe
+	spawn.afterExecution = append(spawn.afterExecution, afterZero...)
+	releaseOnReturn := true
+	defer func() {
+		if releaseOnReturn {
+			if releaseErr := spawn.release(false, false, nil); releaseErr != nil {
+				runErr = errors.Join(runErr, releaseErr)
+				code = -1
+			}
+		}
+	}()
 	// Fail closed if the spawn spec never compiled: resolve already guards this,
 	// but a nil transform must never reach a spawn (defense in depth).
 	if s.spec.Wrap == nil {
@@ -333,7 +375,7 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 
 	argv, configure, cleanup := s.spec.Wrap(dir, innerArgv)
 	if cleanup != nil {
-		defer cleanup()
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { cleanup(); return nil })
 	}
 	if len(argv) == 0 {
 		return nil, -1, errors.New("sandbox: backend produced an empty argv")
@@ -360,14 +402,15 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 			return nil, -1, err
 		}
 	}
-	tree, err := newProcessTree(cmd, processTreeOptions{
+	tree, err := e.processTree(cmd, processTreeOptions{
 		Sandboxed: s.policy.Isolation != profile.Unconfined,
 		Limits:    s.policy.Limits,
 	})
 	if err != nil {
 		return nil, -1, err
 	}
-	defer tree.close()
+	spawn.prover = tree
+	spawn.cmd = cmd
 
 	var output bytes.Buffer
 	cmd.Stdout = &output
@@ -376,16 +419,29 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	if err != nil {
 		return nil, -1, err
 	}
-	defer handleCleanup()
+	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
 	err = lease.start(cmd, tree)
 	if err == nil {
 		err = cmd.Wait()
 	}
-	treeErr := tree.terminateAndWait()
+	terminateErr, proofErr := tree.terminateAndWait()
+	if proofErr != nil {
+		releaseOnReturn = false
+		spawn.transferTo(e.quarantine)
+		return output.Bytes(), -1, errors.Join(terminateErr, proofErr)
+	}
+	// Snapshot cancellation before releasing the execution lease: finish cancels
+	// lease.ctx as part of normal teardown and must not be mistaken for a caller
+	// cancellation or ExecutorSet close.
+	executionCtxErr := lease.ctx.Err()
+	callerCtxErr := lease.caller.Err()
+	releaseErr := spawn.release(true, false, terminateErr)
+	releaseOnReturn = false
+	treeErr := releaseErr
 	if treeErr != nil {
 		err = treeErr
 	}
-	out := output.Bytes()
+	out = output.Bytes()
 	if treeErr != nil {
 		return out, -1, treeErr
 	}
@@ -394,9 +450,9 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	// ExitError with code -1), which would otherwise be reported as a nil-error
 	// non-zero run. Check the context first so a deadline/cancel is a visible
 	// error, symmetric with cancel-before-start.
-	if lease.ctx.Err() != nil {
-		if lease.caller.Err() != nil {
-			return out, -1, lease.caller.Err()
+	if executionCtxErr != nil {
+		if callerCtxErr != nil {
+			return out, -1, callerCtxErr
 		}
 		return out, -1, ErrExecutorClosed
 	}
@@ -595,7 +651,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	if err != nil {
 		return nil, -1, err
 	}
-	defer lease.finish()
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred {
+			lease.finish()
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, -1, err
 	}
@@ -763,17 +824,25 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	s := snapshot{spec: spec, env: assembleEnv(pol), policy: pol}
 	e.grantMu.Unlock()
-	out, code, runErr := e.run(lease, canonicalCWD, enforce.ShellArgv(command), s)
 	var denial error
+	releases := []func() error{func() error { return releaseSpec(spec) }}
 	if len(proxyTargets) != 0 {
-		denial = e.proxy.Denial(executionID)
-		e.proxy.Release(executionID)
+		releases = append(releases, func() error {
+			e.proxy.Release(executionID)
+			return nil
+		})
 	}
+	var observe func()
+	if len(proxyTargets) != 0 {
+		observe = func() { denial = e.proxy.Denial(executionID) }
+	}
+	leaseTransferred = true
+	out, code, runErr := e.run(lease, canonicalCWD, enforce.ShellArgv(command), s, observe, releases...)
 	e.grantMu.Lock()
 	if denial != nil {
 		runErr = network.NewTargetDeniedError(code, runErr, denial)
 	}
-	return out, code, finishExecutionAndRelease(lease, spec, runErr)
+	return out, code, runErr
 }
 
 func finishExecutionAndRelease(lease *executionLease, spec enforce.Spec, executionErr error) error {

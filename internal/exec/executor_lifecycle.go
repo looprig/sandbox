@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"sync"
 )
@@ -10,11 +11,14 @@ import (
 // mutex is the spawn/close linearization point: Start either completes before
 // close begins, or observes closing and fails without spawning.
 type executorLifecycle struct {
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
-	active sync.WaitGroup
-	closed bool
+	mu         sync.Mutex
+	ctx        context.Context
+	cancel     context.CancelFunc
+	active     sync.WaitGroup
+	cleanup    sync.WaitGroup
+	closed     bool
+	errMu      sync.Mutex
+	cleanupErr error
 }
 
 func newExecutorLifecycle() *executorLifecycle {
@@ -23,12 +27,13 @@ func newExecutorLifecycle() *executorLifecycle {
 }
 
 type executionLease struct {
-	lifecycle *executorLifecycle
-	caller    context.Context
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stopClose func() bool
-	once      sync.Once
+	lifecycle     *executorLifecycle
+	caller        context.Context
+	ctx           context.Context
+	cancel        context.CancelFunc
+	stopClose     func() bool
+	executionOnce sync.Once
+	cleanupOnce   sync.Once
 }
 
 func (e *Executor) beginExecution(caller context.Context) (*executionLease, error) {
@@ -45,6 +50,7 @@ func (e *Executor) beginExecution(caller context.Context) (*executionLease, erro
 		return nil, ErrExecutorClosed
 	}
 	lifecycle.active.Add(1)
+	lifecycle.cleanup.Add(1)
 	lifecycle.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(caller)
@@ -58,7 +64,7 @@ func (e *Executor) beginExecution(caller context.Context) (*executionLease, erro
 	return lease, nil
 }
 
-func (lease *executionLease) start(cmd *exec.Cmd, tree *processTree) error {
+func (lease *executionLease) start(cmd *exec.Cmd, tree processTreeBoundary) error {
 	if lease == nil || lease.lifecycle == nil {
 		return ErrExecutorClosed
 	}
@@ -74,17 +80,30 @@ func (lease *executionLease) start(cmd *exec.Cmd, tree *processTree) error {
 	return tree.start(cmd)
 }
 
-func (lease *executionLease) finish() {
+func (lease *executionLease) finishExecution() {
 	if lease == nil {
 		return
 	}
-	lease.once.Do(func() {
+	lease.executionOnce.Do(func() {
 		if lease.stopClose != nil {
 			lease.stopClose()
 		}
 		lease.cancel()
 		lease.lifecycle.active.Done()
 	})
+}
+
+func (lease *executionLease) finishCleanup() {
+	if lease == nil || lease.lifecycle == nil {
+		return
+	}
+	lease.cleanupOnce.Do(func() { lease.lifecycle.cleanup.Done() })
+}
+
+// finish releases both barriers for paths that never transfer spawn ownership.
+func (lease *executionLease) finish() {
+	lease.finishExecution()
+	lease.finishCleanup()
 }
 
 func (lifecycle *executorLifecycle) beginClose() {
@@ -103,4 +122,28 @@ func (lifecycle *executorLifecycle) wait() {
 	if lifecycle != nil {
 		lifecycle.active.Wait()
 	}
+}
+
+func (lifecycle *executorLifecycle) waitCleanup() {
+	if lifecycle != nil {
+		lifecycle.cleanup.Wait()
+	}
+}
+
+func (lifecycle *executorLifecycle) recordCleanupError(err error) {
+	if lifecycle == nil || err == nil {
+		return
+	}
+	lifecycle.errMu.Lock()
+	lifecycle.cleanupErr = errors.Join(lifecycle.cleanupErr, err)
+	lifecycle.errMu.Unlock()
+}
+
+func (lifecycle *executorLifecycle) delayedCleanupError() error {
+	if lifecycle == nil {
+		return nil
+	}
+	lifecycle.errMu.Lock()
+	defer lifecycle.errMu.Unlock()
+	return lifecycle.cleanupErr
 }

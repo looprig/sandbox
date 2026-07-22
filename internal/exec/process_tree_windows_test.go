@@ -3,6 +3,8 @@
 package exec
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,7 +53,7 @@ func TestProcessTreeCancellationAndJobClosePreventDelayedGrandchild(t *testing.T
 			marker := filepath.Join(dir, "grandchild-marker")
 			ready := filepath.Join(dir, "ready")
 			breakaway := filepath.Join(dir, "breakaway-marker")
-			cmd := exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$")
+			cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestProcessTreeHelper$")
 			cmd.Env = append(os.Environ(),
 				processTreeHelperMode+"=parent",
 				processTreeMarker+"="+marker,
@@ -72,8 +74,8 @@ func TestProcessTreeCancellationAndJobClosePreventDelayedGrandchild(t *testing.T
 			}
 			_ = cmd.Wait()
 			if tc.name == "cancellation" {
-				if err := tree.terminateAndWait(); err != nil {
-					t.Fatal(err)
+				if terminateErr, proofErr := tree.terminateAndWait(); terminateErr != nil || proofErr != nil {
+					t.Fatal(errors.Join(terminateErr, proofErr))
 				}
 			}
 			time.Sleep(750 * time.Millisecond)

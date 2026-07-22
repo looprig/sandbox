@@ -39,6 +39,12 @@ func mergeExecutorConfigs(configs ...executorConfig) executorConfig {
 		if config.lifecycle != nil {
 			merged.lifecycle = config.lifecycle
 		}
+		if config.quarantine != nil {
+			merged.quarantine = config.quarantine
+		}
+		if config.processTree != nil {
+			merged.processTree = config.processTree
+		}
 	}
 	return merged
 }

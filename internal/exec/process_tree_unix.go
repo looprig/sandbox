@@ -59,9 +59,9 @@ func (tree *processTree) terminate() error {
 	return err
 }
 
-func (tree *processTree) terminateAndWait() error {
+func (tree *processTree) terminateAndWait() (error, error) {
 	if tree == nil || tree.pgid <= 0 {
-		return nil
+		return nil, nil
 	}
 	for {
 		reapProcessGroup(tree.pgid)
@@ -73,7 +73,7 @@ func (tree *processTree) terminateAndWait() error {
 			continue
 		}
 		if !active {
-			return nil
+			return nil, nil
 		}
 		// Cancellation may already have delivered SIGKILL while the group is in
 		// the exit transition. Darwin can report EPERM for a redundant kill during

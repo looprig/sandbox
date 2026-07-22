@@ -16,6 +16,6 @@ type processTree struct{}
 func newProcessTree(*exec.Cmd, processTreeOptions) (*processTree, error) {
 	return nil, enforce.ErrUnavailable
 }
-func (*processTree) start(*exec.Cmd) error   { return enforce.ErrUnavailable }
-func (*processTree) terminateAndWait() error { return nil }
-func (*processTree) close()                  {}
+func (*processTree) start(*exec.Cmd) error            { return enforce.ErrUnavailable }
+func (*processTree) terminateAndWait() (error, error) { return nil, nil }
+func (*processTree) close()                           {}
