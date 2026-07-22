@@ -34,7 +34,7 @@ func CanonicalPath(path string) (string, error) {
 		if errors.Is(openErr, winpath.ErrReparsePoint) {
 			return "", ErrUnsupportedClass
 		}
-		if !errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) {
+		if !isWindowsPathNotFound(openErr) {
 			return "", openErr
 		}
 		parent := filepath.Dir(ancestor)
@@ -53,7 +53,7 @@ func CapturePathBinding(path string) (PathBinding, error) {
 	}
 	object, err := winpath.Open(canonical)
 	if err != nil {
-		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+		if isWindowsPathNotFound(err) {
 			return PathBinding{}, ErrUnsupportedClass
 		}
 		return PathBinding{}, err
@@ -67,6 +67,13 @@ func CapturePathBinding(path string) (PathBinding, error) {
 		ExistingPath:  object.DOSPath,
 		Identity:      windowsObjectIdentity(object),
 	}, nil
+}
+
+func isWindowsPathNotFound(err error) bool {
+	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
+		errors.Is(err, windows.ERROR_PATH_NOT_FOUND) ||
+		errors.Is(err, windows.STATUS_OBJECT_NAME_NOT_FOUND) ||
+		errors.Is(err, windows.STATUS_OBJECT_PATH_NOT_FOUND)
 }
 
 func RevalidatePathBinding(binding *PathBinding, target string) error {

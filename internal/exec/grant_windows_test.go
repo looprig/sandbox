@@ -5,6 +5,8 @@ package exec
 import (
 	"context"
 	"errors"
+	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -133,6 +135,68 @@ func TestWindowsIssueGrantValidatesBeforeProbingNonexistentExactTarget(t *testin
 			}
 			if executor != nil && len(executor.retainedGrantPaths) != 0 {
 				t.Fatalf("rejected exact grant retained handles: %d", len(executor.retainedGrantPaths))
+			}
+		})
+	}
+}
+
+func TestWindowsIssueGrantCanonicalRejectionPrecedesAvailabilityProbe(t *testing.T) {
+	now := time.Date(2026, 7, 21, 19, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		HostRead: Allow, HostWrite: Gated, Network: Deny, Command: Allow,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		target func(*testing.T) string
+	}{
+		{
+			name: "intermediate reparse",
+			target: func(t *testing.T) string {
+				outside := t.TempDir()
+				link := filepath.Join(workspace, "intermediate-link")
+				if err := os.Symlink(outside, link); err != nil {
+					if output, junctionErr := osexec.Command("cmd.exe", "/D", "/C", "mklink", "/J", link, outside).CombinedOutput(); junctionErr != nil {
+						t.Skipf("symbolic-link and junction fixtures unavailable: symlink=%v junction=%v (%s)", err, junctionErr, output)
+					}
+				}
+				return filepath.Join(link, "missing.txt")
+			},
+		},
+		{
+			name: "remote-like UNC spelling",
+			target: func(*testing.T) string {
+				// winpath rejects UNC syntax lexically; no SMB connection is made.
+				return `\\offline.invalid\share\missing.txt`
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := test.target(t)
+			probed := false
+			probe := func(grantDelta) error {
+				probed = true
+				return errors.New("unexpected availability probe")
+			}
+			_, err := executor.issueGrant(context.Background(), "canonical-order", "true", workspace,
+				"filesystem.write", target, GrantClassFilesystemPathWrite, target,
+				now.Add(time.Minute).UnixMilli(), probe)
+			if !errors.Is(err, ErrGrantMalformed) {
+				t.Fatalf("IssueGrant(canonical rejection) error = %v, want ErrGrantMalformed", err)
+			}
+			if probed {
+				t.Fatal("availability probe ran before canonical target rejection")
 			}
 		})
 	}

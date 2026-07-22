@@ -525,6 +525,14 @@ func (e *Executor) GrantVersion() uint16 {
 
 // IssueGrant mints a single-use, executor-bound capability grant.
 func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, kind, scope, class, target string, expiryUnixMilli int64) (string, error) {
+	return e.issueGrant(ctx, executionID, command, cwd, kind, scope, class, target, expiryUnixMilli, validateGrantTargetAvailability)
+}
+
+type grantTargetAvailabilityFunc func(grantDelta) error
+
+// issueGrant accepts the platform availability check as a narrow test seam so
+// ordering tests can prove that no target probe precedes canonical validation.
+func (e *Executor) issueGrant(ctx context.Context, executionID, command, cwd, kind, scope, class, target string, expiryUnixMilli int64, checkAvailability grantTargetAvailabilityFunc) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -545,7 +553,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if err != nil {
 		return "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
 	}
-	rawDelta, _, err := validateGrantClass(kind, authorizedScope, class, authorizedTarget)
+	_, _, err = validateGrantClass(kind, authorizedScope, class, authorizedTarget)
 	if err != nil {
 		return "", err
 	}
@@ -558,10 +566,6 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if err := e.authorizeGrantScope(kind, authorizedScope); err != nil {
 		return "", err
 	}
-	if err := validateGrantTargetAvailability(rawDelta); err != nil {
-		return "", err
-	}
-
 	scope, target, err = normalizeGrantScopeTarget(authorizedScope, class, authorizedTarget)
 	if err != nil {
 		return "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
@@ -573,6 +577,12 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	// Resolution may change path spelling or reveal a reparse target. Re-check
 	// the canonical scope so lexical authorization can never widen authority.
 	if err := e.authorizeGrantScope(kind, scope); err != nil {
+		return "", err
+	}
+	if checkAvailability == nil {
+		return "", ErrGrantUnsupported
+	}
+	if err := checkAvailability(delta); err != nil {
 		return "", err
 	}
 	e.grantMu.Lock()
