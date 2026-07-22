@@ -39,6 +39,7 @@ test-linux-build:
 # architectures. The helper owns a temporary output directory and leaves no
 # .exe files in the repository.
 test-windows-build:
+	@./scripts/test-windows-build_test.sh
 	@GO="$(GO)" ./scripts/test-windows-build.sh
 
 # Format the whole module in place.
