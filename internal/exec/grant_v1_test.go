@@ -16,12 +16,15 @@ import (
 )
 
 type captureBackend struct {
-	mu         sync.Mutex
-	policies   []policy.Effective
-	bits       uint64
-	compileErr error
-	release    func() error
-	cleanup    func()
+	mu                  sync.Mutex
+	policies            []policy.Effective
+	bits                uint64
+	compileErr          error
+	compileErrAfter     int
+	compileErrorRelease func() error
+	release             func() error
+	releaseForCompile   func(int) func() error
+	cleanup             func()
 }
 
 type boundaryBackend struct {
@@ -47,15 +50,64 @@ func (b *boundaryBackend) Compile(pol policy.Effective) (enforce.Spec, CompileRe
 func (b *captureBackend) Compile(pol policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
 	b.mu.Lock()
 	b.policies = append(b.policies, policy.Clone(pol))
+	compileNumber := len(b.policies)
 	b.mu.Unlock()
-	if b.compileErr != nil {
-		return enforce.Spec{}, CompileReport{}, LevelNone, 0, b.compileErr
+	if b.compileErr != nil && (b.compileErrAfter == 0 || compileNumber >= b.compileErrAfter) {
+		return enforce.Spec{Release: b.compileErrorRelease}, CompileReport{}, LevelNone, 0, b.compileErr
+	}
+	release := b.release
+	if b.releaseForCompile != nil {
+		release = b.releaseForCompile(compileNumber)
 	}
 	spec := enforce.Spec{
 		Wrap:    func(_ string, argv []string) ([]string, func(*exec.Cmd) error, func()) { return argv, nil, b.cleanup },
-		Release: b.release,
+		Release: release,
 	}
 	return spec, CompileReport{}, LevelNone, b.bits, nil
+}
+
+func TestGrantPartialCompileSpecReleasedAndErrorsPreserved(t *testing.T) {
+	now := time.Date(2026, 7, 21, 13, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	target := filepath.Join(workspace, "generated.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Gated,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	compileErr := errors.New("transient compile failed")
+	releaseErr := errors.New("transient partial release failed")
+	var releases atomic.Int32
+	backend := &captureBackend{
+		bits:            GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		compileErr:      compileErr,
+		compileErrAfter: 2,
+		compileErrorRelease: func() error {
+			releases.Add(1)
+			return releaseErr
+		},
+	}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("partial-compile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestGrant(t, executor, now, "exec-partial", "true", workspace,
+		"filesystem.write", target, "filesystem.path.write.v1", target)
+	_, _, err = executor.RunCommandWithGrants(context.Background(), "exec-partial", workspace, "true", []string{token})
+	if !errors.Is(err, compileErr) || !errors.Is(err, releaseErr) {
+		t.Fatalf("RunCommandWithGrants error = %v, want compile and release errors", err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("partial grant spec release count = %d, want 1", got)
+	}
 }
 
 func (b *captureBackend) lastPolicy() policy.Effective {

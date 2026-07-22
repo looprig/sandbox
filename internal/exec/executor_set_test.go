@@ -192,6 +192,54 @@ func TestExecutorSetCloseReleasesCompiledSpecOnce(t *testing.T) {
 	}
 }
 
+func TestExecutorSetConcurrentClosePreservesEveryBaseReleaseError(t *testing.T) {
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: t.TempDir(), WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	releaseErrs := []error{errors.New("release one"), errors.New("release two")}
+	var releases [2]atomic.Int32
+	backend := &captureBackend{
+		bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		releaseForCompile: func(compileNumber int) func() error {
+			index := compileNumber - 1
+			return func() error {
+				releases[index].Add(1)
+				return releaseErrs[index]
+			}
+		},
+	}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(2),
+		withExecutorSetConfig(withBackend(backend)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"one", "two"} {
+		if _, err := set.For(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const closers = 8
+	results := make(chan error, closers)
+	for range closers {
+		go func() { results <- set.Close() }()
+	}
+	for range closers {
+		err := <-results
+		for _, releaseErr := range releaseErrs {
+			if !errors.Is(err, releaseErr) {
+				t.Errorf("Close error = %v, want errors.Is(_, %v)", err, releaseErr)
+			}
+		}
+	}
+	for index := range releases {
+		if got := releases[index].Load(); got != 1 {
+			t.Errorf("base spec %d release count = %d, want 1", index+1, got)
+		}
+	}
+}
+
 func TestExecutorSetConcurrentMemoization(t *testing.T) {
 	profile := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: t.TempDir(), WorkspaceRead: Allow, WorkspaceWrite: Allow,
@@ -237,15 +285,27 @@ func TestExecutorSetConcurrentMemoization(t *testing.T) {
 
 func TestExecutorSetPartialConstructionCleanup(t *testing.T) {
 	profile := mustProfile(t, ProfileConfig{WorkspaceRoot: t.TempDir()})
-	backend := &captureBackend{compileErr: errors.New("compile failed")}
+	compileErr := errors.New("compile failed")
+	releaseErr := errors.New("partial release failed")
+	var partialReleases atomic.Int32
+	backend := &captureBackend{
+		compileErr: compileErr,
+		compileErrorRelease: func() error {
+			partialReleases.Add(1)
+			return releaseErr
+		},
+	}
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
 		withExecutorSetConfig(withBackend(backend)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = set.Close() })
-	if _, err := set.For("broken"); err == nil {
-		t.Fatal("For with failing backend succeeded")
+	if _, err := set.For("broken"); !errors.Is(err, compileErr) || !errors.Is(err, releaseErr) {
+		t.Fatalf("For with failing backend error = %v, want compile and release errors", err)
+	}
+	if got := partialReleases.Load(); got != 1 {
+		t.Fatalf("partial base spec release count = %d, want 1", got)
 	}
 	entries, err := os.ReadDir(set.ownedRoot)
 	if err != nil {

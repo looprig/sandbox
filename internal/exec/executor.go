@@ -149,7 +149,7 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	}
 	spec, report, level, bits, err := b.Compile(p)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, releaseSpec(spec))
 	}
 	if prof != nil {
 		missing := settings.RequiredGuarantees &^ bits
@@ -648,7 +648,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, pol, pathHandles.Sorted())
 	if err != nil {
-		return nil, -1, err
+		return nil, -1, finishExecutionAndRelease(lease, spec, err)
 	}
 	bits = e.composeRouteGuarantees(bits)
 	if bits != expectedGuarantees {
