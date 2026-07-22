@@ -171,9 +171,24 @@ each registry object attach its canonical hive path and
 `(Get-Acl -LiteralPath <registry-provider-path>).Sddl`. Record the exact
 Process Monitor command line in the JSON.
 
-Create trace evidence conforming to the v2 JSON schema. Each failed case must
+Create trace evidence conforming to the v3 JSON schema. Each failed case must
 repeat the exact runtime record from `runtime-final.json`, set `complete:true`,
-include the captured PID and the same nonce, and attach every denial. Validate
+and bind the caller PID, attempt ID, and same nonce. Failure evidence is
+phase-specific; never invent a child PID, executable hash, or denial:
+
+- `inventory_absent` records every verified lookup/canonical candidate and its
+  absence result. It requires caller binding and forbids child PID, executable
+  hash, collector event, Win32 spawn error, or denial records.
+- `pre_spawn` records caller PID, nonce/attempt ID, requested canonical
+  executable, identity/hash when actually available, Win32 error, and collector
+  events keyed to the caller/attempt. Child PID is zero and optional security
+  fields remain empty when the object could not be opened.
+- `post_spawn` requires the real child PID, executable identity/hash, caller and
+  child collector events, exit/diagnostic, and denial records when the trace
+  actually contains access denials.
+
+This permits honest narrowed-target or blocked selections for absence and
+pre-spawn failures while `exact_token_gate_passed` remains false. Validate
 without rerunning the baseline:
 
 ```powershell

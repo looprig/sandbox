@@ -1,1 +1,46 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://looprig.dev/schemas/windows-runtime-trace-v2.json","type":"object","additionalProperties":false,"required":["schema_version","run","cases"],"properties":{"schema_version":{"const":2},"run":{"$ref":"#/$defs/run"},"cases":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["runtime","complete","captured_pids","captured_nonce","denials"],"properties":{"runtime":{"$ref":"#/$defs/runtime"},"complete":{"const":true},"captured_pids":{"type":"array","minItems":1,"items":{"type":"integer","minimum":1}},"captured_nonce":{"type":"string","minLength":1},"denials":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"required":["operation","requested_access","object_path","object_identity","owner","dacl"],"properties":{"operation":{"type":"string","minLength":1},"requested_access":{"type":"string","minLength":1},"object_path":{"type":"string","minLength":1},"object_identity":{"type":"string","minLength":1},"owner":{"type":"string","minLength":1},"dacl":{"type":"string","minLength":1}}}}}}}},"$defs":{"runtime":{"type":"object","additionalProperties":false,"required":["name","executable_path","object_identity","executable_sha256","pid","status","exit_code","diagnostic"],"properties":{"name":{"type":"string","minLength":1},"executable_path":{"type":"string","minLength":1},"object_identity":{"type":"string","minLength":1},"executable_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"pid":{"type":"integer"},"status":{"type":"string","minLength":1},"exit_code":{"type":"integer"},"diagnostic":{"type":"string"}}},"run":{"type":"object","additionalProperties":false,"required":["schema_version","run_nonce","source_revision","platform","token_inventory_sha256","runtime_manifest_sha256","matrix_sha256","exact_token_gate_passed","runtimes","collector","raw_trace_path","raw_trace_sha256"],"properties":{"schema_version":{"const":2},"run_nonce":{"type":"string","minLength":1},"source_revision":{"type":"string","minLength":1},"platform":{"type":"object"},"token_inventory_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"runtime_manifest_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"matrix_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"exact_token_gate_passed":{"const":false},"runtimes":{"type":"array","items":{"$ref":"#/$defs/runtime"}},"collector":{"type":"object"},"raw_trace_path":{"type":"string","minLength":1},"raw_trace_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}}
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://looprig.dev/schemas/windows-runtime-trace-v3.json",
+  "type":"object",
+  "required":["schema_version","run","cases"],
+  "properties":{
+    "schema_version":{"const":3},
+    "run":{"$ref":"#/$defs/run"},
+    "cases":{"type":"array","items":{"$ref":"#/$defs/case"}}
+  },
+  "$defs":{
+    "runtime":{
+      "type":"object",
+      "required":["name","executable_path","object_identity","executable_sha256","pid","status","exit_code","diagnostic","failure_kind","caller_pid","attempt_id"],
+      "properties":{
+        "name":{"type":"string","minLength":1}, "executable_path":{"type":"string"}, "object_identity":{"type":"string"},
+        "executable_sha256":{"type":"string"}, "pid":{"type":"integer","minimum":0}, "status":{"const":"FAIL"},
+        "exit_code":{"type":"integer"}, "diagnostic":{"type":"string","minLength":1},
+        "failure_kind":{"enum":["inventory_absent","pre_spawn","post_spawn"]},
+        "caller_pid":{"type":"integer","minimum":1}, "attempt_id":{"type":"string","minLength":1},
+        "lookup_evidence":{"type":"array","items":{"type":"string","minLength":1}}, "win32_error":{"type":"string"}
+      },
+      "allOf":[
+        {"if":{"properties":{"failure_kind":{"const":"inventory_absent"}}},"then":{"properties":{"pid":{"const":0},"executable_sha256":{"maxLength":0},"win32_error":{"maxLength":0},"lookup_evidence":{"minItems":1}}}},
+        {"if":{"properties":{"failure_kind":{"const":"pre_spawn"}}},"then":{"properties":{"pid":{"const":0},"executable_path":{"minLength":1},"win32_error":{"minLength":1}}}},
+        {"if":{"properties":{"failure_kind":{"const":"post_spawn"}}},"then":{"properties":{"pid":{"minimum":1},"executable_path":{"minLength":1},"object_identity":{"minLength":1},"executable_sha256":{"pattern":"^[0-9a-f]{64}$"}}}}
+      ]
+    },
+    "case":{
+      "type":"object",
+      "required":["runtime","complete","captured_pids","captured_nonce","captured_attempt_id","events","denials"],
+      "properties":{
+        "runtime":{"$ref":"#/$defs/runtime"}, "complete":{"const":true},
+        "captured_pids":{"type":"array","minItems":1,"items":{"type":"integer","minimum":1}},
+        "captured_nonce":{"type":"string","minLength":1}, "captured_attempt_id":{"type":"string","minLength":1},
+        "events":{"type":"array","items":{"type":"object","required":["operation","result","path"],"properties":{"operation":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"path":{"type":"string","minLength":1}}}},
+        "denials":{"type":"array","items":{"type":"object","required":["operation","requested_access","object_path","object_identity","owner","dacl"]}}
+      },
+      "allOf":[
+        {"if":{"properties":{"runtime":{"properties":{"failure_kind":{"const":"inventory_absent"}}}}},"then":{"properties":{"events":{"maxItems":0},"denials":{"maxItems":0}}}},
+        {"if":{"properties":{"runtime":{"properties":{"failure_kind":{"enum":["pre_spawn","post_spawn"]}}}}},"then":{"properties":{"events":{"minItems":1}}}}
+      ]
+    },
+    "run":{"type":"object","required":["schema_version","run_nonce","source_revision","platform","token_inventory_sha256","runtime_manifest_sha256","matrix_sha256","exact_token_gate_passed","runtimes","collector","raw_trace_path","raw_trace_sha256"],"properties":{"schema_version":{"const":3},"run_nonce":{"type":"string","minLength":1},"source_revision":{"type":"string","minLength":1},"platform":{"type":"object"},"token_inventory_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"runtime_manifest_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"matrix_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"exact_token_gate_passed":{"const":false},"runtimes":{"type":"array"},"collector":{"type":"object"},"raw_trace_path":{"type":"string","minLength":1},"raw_trace_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}
+  }
+}

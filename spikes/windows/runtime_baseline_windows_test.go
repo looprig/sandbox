@@ -5,6 +5,7 @@ package windows_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -40,6 +41,7 @@ type runtimeCase struct {
 	creationFlags  uint32
 	required       bool
 	expectedOutput string
+	lookupEvidence []string
 }
 
 type runtimeResult struct {
@@ -56,6 +58,11 @@ type runtimeResult struct {
 	Output           string   `json:"output,omitempty"`
 	PID              int      `json:"pid,omitempty"`
 	ExecutableSHA256 string   `json:"executable_sha256"`
+	FailureKind      string   `json:"failure_kind,omitempty"`
+	CallerPID        int      `json:"caller_pid,omitempty"`
+	AttemptID        string   `json:"attempt_id,omitempty"`
+	LookupEvidence   []string `json:"lookup_evidence,omitempty"`
+	Win32Error       string   `json:"win32_error,omitempty"`
 }
 
 type limitedBuffer struct {
@@ -161,9 +168,9 @@ func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText st
 	if err != nil {
 		t.Fatalf("source revision: %v", err)
 	}
-	manifest := baseline.RunManifest{SchemaVersion: 2, RunNonce: nonce, SourceRevision: strings.TrimSpace(string(revision)), Platform: platform, TokenInventorySHA256: baseline.SHA256Hex([]byte(tokenText)), RuntimeManifestSHA256: baseline.RuntimeManifestDigest(), MatrixSHA256: baseline.SHA256Hex(matrix), ExactTokenGatePassed: passed}
+	manifest := baseline.RunManifest{SchemaVersion: 3, RunNonce: nonce, SourceRevision: strings.TrimSpace(string(revision)), Platform: platform, TokenInventorySHA256: baseline.SHA256Hex([]byte(tokenText)), RuntimeManifestSHA256: baseline.RuntimeManifestDigest(), MatrixSHA256: baseline.SHA256Hex(matrix), ExactTokenGatePassed: passed}
 	for _, result := range results {
-		manifest.Runtimes = append(manifest.Runtimes, baseline.RuntimeExecution{Name: result.Name, ExecutablePath: result.Path, ObjectIdentity: result.ObjectIdentity, ExecutableSHA256: result.ExecutableSHA256, PID: result.PID, Status: result.Status, ExitCode: result.ExitCode, Diagnostic: result.Error})
+		manifest.Runtimes = append(manifest.Runtimes, baseline.RuntimeExecution{Name: result.Name, ExecutablePath: result.Path, ObjectIdentity: result.ObjectIdentity, ExecutableSHA256: result.ExecutableSHA256, PID: result.PID, Status: result.Status, ExitCode: result.ExitCode, Diagnostic: result.Error, FailureKind: result.FailureKind, CallerPID: result.CallerPID, AttemptID: result.AttemptID, LookupEvidence: result.LookupEvidence, Win32Error: result.Win32Error})
 	}
 	return manifest
 }
@@ -399,8 +406,10 @@ func resolveRuntimeSpec(t *testing.T, spec baseline.RuntimeSpec, system32, probe
 		for _, candidate := range spec.Candidates {
 			path, err := exec.LookPath(candidate)
 			if err != nil {
+				testCase.lookupEvidence = append(testCase.lookupEvidence, candidate+": "+err.Error())
 				continue
 			}
+			testCase.lookupEvidence = append(testCase.lookupEvidence, candidate+": "+path)
 			testCase.path, err = filepath.Abs(path)
 			if err != nil {
 				t.Fatalf("absolute runtime path for %s: %v", candidate, err)
@@ -424,6 +433,9 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 		RequestedAccess: "FILE_EXECUTE|FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE (process image and loader startup)",
 		Status:          "FAIL",
 		ExitCode:        -1,
+		CallerPID:       os.Getpid(),
+		AttemptID:       os.Getenv("LOOPRIG_RUNTIME_RUN_NONCE") + "/" + testCase.name,
+		LookupEvidence:  append([]string(nil), testCase.lookupEvidence...),
 	}
 	result.ObjectIdentity, result.Owner, result.DACL = objectSecurity(testCase.path)
 	if contents, err := os.ReadFile(testCase.path); err == nil {
@@ -432,6 +444,15 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 
 	if _, err := os.Stat(testCase.path); err != nil {
 		result.Error = err.Error()
+		if len(result.LookupEvidence) == 0 {
+			result.LookupEvidence = []string{testCase.path + ": " + err.Error()}
+		}
+		if os.IsNotExist(err) {
+			result.FailureKind = baseline.FailureInventoryAbsent
+		} else {
+			result.FailureKind = baseline.FailurePreSpawn
+			result.Win32Error = win32Error(err)
+		}
 		return result
 	}
 	ctx := context.Background()
@@ -452,19 +473,35 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 		result.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	if timedOut {
+		result.FailureKind = baseline.FailurePostSpawn
 		result.Error = "external watchdog terminated process after " + runtimeTimeout.String()
 		return result
 	}
 	if err != nil {
 		result.Error = err.Error()
+		if result.PID > 0 {
+			result.FailureKind = baseline.FailurePostSpawn
+		} else {
+			result.FailureKind = baseline.FailurePreSpawn
+			result.Win32Error = win32Error(err)
+		}
 		return result
 	}
 	if testCase.expectedOutput != "" && result.Output != testCase.expectedOutput {
 		result.Error = fmt.Sprintf("observable startup order = %q, want %q", result.Output, testCase.expectedOutput)
+		result.FailureKind = baseline.FailurePostSpawn
 		return result
 	}
 	result.Status = "PASS"
 	return result
+}
+
+func win32Error(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return fmt.Sprintf("%d (%s)", uintptr(errno), errno.Error())
+	}
+	return err.Error()
 }
 
 func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, timedOut bool) {

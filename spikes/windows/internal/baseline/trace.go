@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 )
 
 //go:embed trace-evidence.schema.json
@@ -20,15 +21,26 @@ type RunPlatform struct {
 }
 
 type RuntimeExecution struct {
-	Name             string `json:"name"`
-	ExecutablePath   string `json:"executable_path"`
-	ObjectIdentity   string `json:"object_identity"`
-	ExecutableSHA256 string `json:"executable_sha256"`
-	PID              int    `json:"pid"`
-	Status           string `json:"status"`
-	ExitCode         int    `json:"exit_code"`
-	Diagnostic       string `json:"diagnostic"`
+	Name             string   `json:"name"`
+	ExecutablePath   string   `json:"executable_path"`
+	ObjectIdentity   string   `json:"object_identity"`
+	ExecutableSHA256 string   `json:"executable_sha256"`
+	PID              int      `json:"pid"`
+	Status           string   `json:"status"`
+	ExitCode         int      `json:"exit_code"`
+	Diagnostic       string   `json:"diagnostic"`
+	FailureKind      string   `json:"failure_kind,omitempty"`
+	CallerPID        int      `json:"caller_pid,omitempty"`
+	AttemptID        string   `json:"attempt_id,omitempty"`
+	LookupEvidence   []string `json:"lookup_evidence,omitempty"`
+	Win32Error       string   `json:"win32_error,omitempty"`
 }
+
+const (
+	FailureInventoryAbsent = "inventory_absent"
+	FailurePreSpawn        = "pre_spawn"
+	FailurePostSpawn       = "post_spawn"
+)
 
 type TraceCollector struct {
 	Name    string `json:"name"`
@@ -61,11 +73,19 @@ type TraceDenial struct {
 }
 
 type TraceCase struct {
-	Runtime       RuntimeExecution `json:"runtime"`
-	Complete      bool             `json:"complete"`
-	CapturedPIDs  []int            `json:"captured_pids"`
-	CapturedNonce string           `json:"captured_nonce"`
-	Denials       []TraceDenial    `json:"denials"`
+	Runtime           RuntimeExecution `json:"runtime"`
+	Complete          bool             `json:"complete"`
+	CapturedPIDs      []int            `json:"captured_pids"`
+	CapturedNonce     string           `json:"captured_nonce"`
+	CapturedAttemptID string           `json:"captured_attempt_id"`
+	Events            []TraceEvent     `json:"events,omitempty"`
+	Denials           []TraceDenial    `json:"denials"`
+}
+
+type TraceEvent struct {
+	Operation string `json:"operation"`
+	Result    string `json:"result"`
+	Path      string `json:"path"`
 }
 
 type TraceEvidence struct {
@@ -124,8 +144,8 @@ func FinalizeRunManifest(invocation RunManifest, collector TraceCollector, rawTr
 }
 
 func ValidateFailureTrace(manifest RunManifest, evidence TraceEvidence) error {
-	if manifest.SchemaVersion != 2 || evidence.SchemaVersion != 2 || evidence.Run.SchemaVersion != 2 {
-		return fmt.Errorf("run/trace schema version must be 2")
+	if manifest.SchemaVersion != 3 || evidence.SchemaVersion != 3 || evidence.Run.SchemaVersion != 3 {
+		return fmt.Errorf("run/trace schema version must be 3")
 	}
 	if manifest.ExactTokenGatePassed || evidence.Run.ExactTokenGatePassed {
 		return fmt.Errorf("failure evidence cannot claim exact-token PASS")
@@ -162,14 +182,14 @@ func ValidateFailureTrace(manifest RunManifest, evidence TraceEvidence) error {
 	}
 	for name, runtime := range failed {
 		traceCase, ok := cases[name]
-		if !ok || !traceCase.Complete || len(traceCase.Denials) == 0 {
-			return fmt.Errorf("failed runtime %q lacks complete trace-backed denials", name)
+		if !ok {
+			return fmt.Errorf("failed runtime %q lacks trace case", name)
 		}
-		if traceCase.CapturedNonce != manifest.RunNonce || !containsPID(traceCase.CapturedPIDs, runtime.PID) {
-			return fmt.Errorf("failed runtime %q trace lacks bound nonce/PID", name)
-		}
-		if traceCase.Runtime != runtime {
+		if !reflect.DeepEqual(traceCase.Runtime, runtime) {
 			return fmt.Errorf("failed runtime %q path/identity/hash/PID/exit/diagnostic mismatch", name)
+		}
+		if err := validateTraceCase(manifest.RunNonce, runtime, traceCase); err != nil {
+			return fmt.Errorf("failed runtime %q: %w", name, err)
 		}
 		for index, denial := range traceCase.Denials {
 			if denial.Operation == "" || denial.RequestedAccess == "" || denial.ObjectPath == "" || denial.ObjectIdentity == "" || denial.Owner == "" || denial.DACL == "" {
@@ -199,8 +219,36 @@ func compareRunBinding(want, got RunManifest) error {
 		return fmt.Errorf("runtime count binding mismatch")
 	}
 	for index := range want.Runtimes {
-		if want.Runtimes[index] != got.Runtimes[index] {
+		if !reflect.DeepEqual(want.Runtimes[index], got.Runtimes[index]) {
 			return fmt.Errorf("runtime %d binding mismatch", index)
+		}
+	}
+	return nil
+}
+
+func validateTraceCase(nonce string, runtime RuntimeExecution, traceCase TraceCase) error {
+	if !traceCase.Complete || traceCase.CapturedNonce != nonce || traceCase.CapturedAttemptID != runtime.AttemptID || !containsPID(traceCase.CapturedPIDs, runtime.CallerPID) {
+		return fmt.Errorf("trace lacks complete caller nonce/attempt/PID binding")
+	}
+	switch runtime.FailureKind {
+	case FailureInventoryAbsent:
+		if runtime.PID != 0 || runtime.ExecutableSHA256 != "" || runtime.Win32Error != "" || len(runtime.LookupEvidence) == 0 || len(traceCase.Events) != 0 || len(traceCase.Denials) != 0 {
+			return fmt.Errorf("inventory_absent requires lookup evidence and forbids child/hash/Win32/collector denial fabrication")
+		}
+	case FailurePreSpawn:
+		if runtime.PID != 0 || runtime.Win32Error == "" || runtime.ExecutablePath == "" || len(traceCase.Events) == 0 {
+			return fmt.Errorf("pre_spawn requires candidate/Win32 error/caller-keyed collector events and no child PID")
+		}
+	case FailurePostSpawn:
+		if runtime.PID <= 0 || runtime.ExecutableSHA256 == "" || runtime.ObjectIdentity == "" || !containsPID(traceCase.CapturedPIDs, runtime.PID) || len(traceCase.Events) == 0 {
+			return fmt.Errorf("post_spawn requires child PID/executable hash/identity and child-keyed events")
+		}
+	default:
+		return fmt.Errorf("unknown failure kind %q", runtime.FailureKind)
+	}
+	for _, event := range traceCase.Events {
+		if event.Operation == "" || event.Result == "" || event.Path == "" {
+			return fmt.Errorf("collector event is incomplete")
 		}
 	}
 	return nil
