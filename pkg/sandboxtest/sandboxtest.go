@@ -18,15 +18,21 @@
 //     executor claims WriteBoundary, every covered write outside every writable
 //     root is denied. An executor that withholds the bit may still deny writes;
 //     absent claims never require permissive behavior.
-//  2. Env scrub — a secret planted in the parent environment is absent from a
+//  2. Read boundary — a read inside the workspace succeeds. When ReadBoundary
+//     is claimed, a host-readable file outside the workspace is denied.
+//  3. Env scrub — a secret planted in the parent environment is absent from a
 //     spawned child whenever the executor claims EnvScrub. This is the harness
 //     secret-leak boundary and holds independently of any OS mechanism.
-//  3. Self-consistency — the reported guarantees and Level are internally
+//  4. Self-consistency — the reported guarantees and Level are internally
 //     coherent and fail-secure: LevelNone claims no OS-enforcement bit beyond
 //     EnvScrub; address-scoped networking implies a network boundary; a write
 //     boundary implies at least a degraded level; LevelFull implies a write
 //     boundary. An incoherent posture (a set bit with no honest backing) is the
 //     signal the auto-approval interlock must never trust.
+//
+// Scenario-specific process, network, and resource behavior is reusable through
+// [CheckClaimedImplications]. Platform suites provide the setup callbacks; this
+// package owns strict bit gating and positive-control validation.
 //
 // # Dependency posture
 //
@@ -91,6 +97,78 @@ type SUT interface {
 	GuaranteeBits() uint64
 }
 
+// ArgvSUT is the optional shell-free execution surface used by platform probe
+// helpers whenever the operation has a direct executable form. Executor
+// implementations should expose it; the smaller SUT remains supported so
+// downstream conformance adapters are not forced to emulate argv execution.
+type ArgvSUT interface {
+	RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error)
+}
+
+// ImplicationResult is the outcome of one end-to-end guarantee probe. A useful
+// negative probe always includes an unconfined positive control, preventing a
+// missing tool or unreachable target from masquerading as enforcement.
+type ImplicationResult struct {
+	PositiveControl bool
+	GuaranteeHeld   bool
+	Detail          string
+}
+
+// ImplicationProbe exercises one property against sut. Implementations own any
+// scenario-specific setup (nested processes, listeners, or requested limits)
+// and must clean it up before returning.
+type ImplicationProbe func(context.Context, SUT) (ImplicationResult, error)
+
+// ImplicationProbes supplies the scenario-dependent behavioral checks that a
+// generic executor surface cannot construct by itself. This dependency-inverted
+// seam lets platform suites reuse the claim gating and positive-control rules.
+type ImplicationProbes struct {
+	Read     ImplicationProbe
+	Process  ImplicationProbe
+	Network  ImplicationProbe
+	Resource ImplicationProbe
+}
+
+// CheckClaimedImplications runs exactly the probes whose guarantee bits are
+// claimed. A claimed guarantee without a probe is a conformance failure; an
+// unclaimed guarantee never executes its probe and imposes no permissiveness
+// requirement.
+func CheckClaimedImplications(t *testing.T, sut SUT, probes ImplicationProbes) {
+	t.Helper()
+	checks := []struct {
+		name  string
+		bit   uint64
+		probe ImplicationProbe
+	}{
+		{name: "read", bit: GuaranteeReadBoundary, probe: probes.Read},
+		{name: "process", bit: GuaranteeProcessBoundary, probe: probes.Process},
+		{name: "network", bit: GuaranteeNetworkBoundary, probe: probes.Network},
+		{name: "resource", bit: GuaranteeResourceLimits, probe: probes.Resource},
+	}
+	bits := sut.GuaranteeBits()
+	for _, check := range checks {
+		check := check
+		if bits&check.bit == 0 {
+			continue
+		}
+		t.Run(check.name+"-implication", func(t *testing.T) {
+			if check.probe == nil {
+				t.Fatalf("%s guarantee claimed without a conformance probe", check.name)
+			}
+			result, err := check.probe(context.Background(), sut)
+			if err != nil {
+				t.Fatalf("%s implication probe: %v", check.name, err)
+			}
+			if !result.PositiveControl {
+				t.Fatalf("%s implication probe has no successful positive control: %s", check.name, result.Detail)
+			}
+			if !result.GuaranteeHeld {
+				t.Errorf("FAIL-OPEN: %s guarantee claimed but probe bypassed it: %s", check.name, result.Detail)
+			}
+		})
+	}
+}
+
 // Factory builds a fresh, WRITE-CONFINING executor for the given workspace. The
 // contract the suite relies on: the workspace
 // is a writable root, the process's $HOME is NOT writable, and the environment is
@@ -149,6 +227,7 @@ func RunSuite(t *testing.T, name string, newSUT Factory) {
 		run  func(t *testing.T, newSUT Factory)
 	}{
 		{"write-boundary", checkWriteBoundary},
+		{"read-boundary", checkReadBoundary},
 		{"env-scrub", checkEnvScrub},
 		{"self-consistency", checkSelfConsistency},
 	}
@@ -158,6 +237,50 @@ func RunSuite(t *testing.T, name string, newSUT Factory) {
 			t.Run(c.name, func(t *testing.T) { c.run(t, newSUT) })
 		}
 	})
+}
+
+// checkReadBoundary proves workspace reads work for every backend. When a read
+// boundary is claimed, it additionally requires denial of a host-readable file
+// outside the workspace.
+func checkReadBoundary(t *testing.T, newSUT Factory) {
+	ws := t.TempDir()
+	inside := filepath.Join(ws, "inside-read.txt")
+	if err := os.WriteFile(inside, []byte("inside-read-control"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := newSUT(t, ws)
+	if out, code, err := runRead(context.Background(), e, ws, inside); err != nil || code != 0 || !strings.Contains(string(out), "inside-read-control") {
+		t.Fatalf("read INSIDE workspace failed: exit=%d err=%v out=%q", code, err, out)
+	}
+	if e.GuaranteeBits()&GuaranteeReadBoundary == 0 {
+		return
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil || isUnder(home, ws) {
+		t.Fatalf("ReadBoundary claimed without a usable outside positive-control root: home=%q err=%v", home, err)
+	}
+	outside, err := os.CreateTemp(home, ".lrsandboxtest-readboundary-")
+	if err != nil {
+		t.Fatalf("create outside read positive control: %v", err)
+	}
+	outsidePath := outside.Name()
+	t.Cleanup(func() { _ = os.Remove(outsidePath) })
+	if _, err := outside.WriteString("outside-read-control"); err != nil {
+		_ = outside.Close()
+		t.Fatalf("write outside read positive control: %v", err)
+	}
+	if err := outside.Close(); err != nil {
+		t.Fatalf("close outside read positive control: %v", err)
+	}
+	if data, err := os.ReadFile(outsidePath); err != nil || string(data) != "outside-read-control" {
+		t.Fatalf("outside read positive control failed: data=%q err=%v", data, err)
+	}
+	if out, code, err := runRead(context.Background(), e, ws, outsidePath); err != nil {
+		t.Fatalf("outside read probe spawn: %v (out=%q)", err, out)
+	} else if code == 0 {
+		t.Errorf("FAIL-OPEN: ReadBoundary claimed but outside read succeeded: %q", out)
+	}
 }
 
 // checkWriteBoundary asserts the one-way WriteBoundary contract: a write inside
@@ -218,7 +341,7 @@ func checkEnvScrub(t *testing.T, newSUT Factory) {
 	ws := t.TempDir()
 	e := newSUT(t, ws)
 
-	out, code, err := e.RunCommand(context.Background(), ws, "env")
+	out, code, err := runEnvironment(context.Background(), e, ws)
 	if err != nil {
 		t.Fatalf("RunCommand(env): %v (out=%q)", err, out)
 	}
@@ -308,17 +431,12 @@ func checkSelfConsistency(t *testing.T, newSUT Factory) {
 // failure (non-nil error) fails the test — that is not a policy signal.
 func runWrite(t *testing.T, e SUT, ctx context.Context, dir, path string) int {
 	t.Helper()
-	_, code, err := e.RunCommand(ctx, dir, ": > "+shQuote(path))
+	_, code, err := platformWrite(ctx, e, dir, path)
 	if err != nil {
 		t.Fatalf("RunCommand(write %s): unexpected spawn error %v", path, err)
 	}
 	return code
 }
-
-// shQuote single-quotes a filesystem path for safe embedding in a /bin/sh
-// command. Test paths (temp dirs, home) never contain single quotes, so wrapping
-// in single quotes fully neutralizes spaces and shell metacharacters.
-func shQuote(p string) string { return "'" + p + "'" }
 
 // isUnder reports whether path is equal to or nested within root, comparing
 // cleaned absolute-style paths so a suffix match (e.g. "/tmpfoo" under "/tmp")

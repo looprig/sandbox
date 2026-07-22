@@ -64,7 +64,11 @@ Work is on branch `feat/windows-sandbox`.
   prerequisite and has not been run here. Three local executor runtime tests
   fail before backend construction because the managed host denies the required
   parent-path identity walk; this is not recorded as a pass or skip.
-- Tasks 12-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
+- Task 12 is implemented at code level. Shell-aware conformance and non-live
+  focused tests pass; the Windows adversarial, broker, descendant, and acceptance
+  suites plus their helper cross-compile for amd64/arm64. Their disposable-worker
+  gates have not been enabled on this developer workstation and remain unrun.
+- Tasks 13-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
   Task 5 runtime-baseline result.
 
 Run these gates on the Windows handoff branch:
