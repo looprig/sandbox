@@ -19,6 +19,7 @@ func TestWindowsRestrictedSelectionRunsThroughExecutorLifecycle(t *testing.T) {
 	if os.Getenv("SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST") != "1" {
 		t.Skip("restricted ACL integration is restricted to a disposable Windows worker")
 	}
+	requireWindowsDisposableStandardSourceToken(t)
 	workspace := t.TempDir()
 	scratch := t.TempDir()
 	marker := filepath.Join(scratch, "caller-owned.marker")

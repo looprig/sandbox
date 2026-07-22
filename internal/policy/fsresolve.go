@@ -164,7 +164,11 @@ func EntryPrecedence(entry FSEntry) int {
 // fail-closed direction — denyMatches treats nil as a match (over-deny), while
 // entryMatches treats nil as a non-match (under-grant on the allow side).
 func GlobRegexp(glob string) *regexp.Regexp {
-	re, err := regexp.Compile(GlobToRegexp(glob))
+	tokens, err := parseGlob(glob)
+	if err != nil {
+		return nil
+	}
+	re, err := regexp.Compile(globRegexpSource(tokens))
 	if err != nil {
 		return nil
 	}
@@ -174,66 +178,16 @@ func GlobRegexp(glob string) *regexp.Regexp {
 // GlobToRegexp translates a glob into an anchored regexp source string.
 // filepath.Match has no "**", so the translation is done by hand: "**" -> ".*",
 // "*" and "?" stay within the current platform's path separator, bracket
-// expressions are carried through (with a leading "!" negation rewritten to
-// regexp "^"), and every other byte is escaped via regexp.QuoteMeta so
-// metacharacters such as "." match literally.
+// expressions are emitted from the canonical rune representation (with a
+// leading "!" negation rewritten to regexp "^"), and every literal rune is
+// escaped via regexp.QuoteMeta so metacharacters such as "." match literally.
 func GlobToRegexp(glob string) string {
-	glob = globPathKey(glob)
-	var b strings.Builder
-	b.WriteByte('^')
-	for i := 0; i < len(glob); {
-		switch c := glob[i]; c {
-		case '*':
-			if i+1 < len(glob) && glob[i+1] == '*' {
-				b.WriteString(".*") // cross-directory
-				i += 2
-			} else {
-				b.WriteString("[^" + regexp.QuoteMeta(pathKeySeparator) + "]*") // within a single segment
-				i++
-			}
-		case '?':
-			b.WriteString("[^" + regexp.QuoteMeta(pathKeySeparator) + "]")
-			i++
-		case '[':
-			if class, next, ok := scanClass(glob, i); ok {
-				b.WriteString(class)
-				i = next
-			} else {
-				// Unterminated "[": treat it as a literal character.
-				b.WriteString(regexp.QuoteMeta("["))
-				i++
-			}
-		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
-			i++
-		}
+	tokens, err := parseGlob(glob)
+	if err != nil {
+		// Preserve the public helper's contract as a regexp source. GlobRegexp
+		// performs canonical validation before compiling, so consumers which
+		// need a verdict must use it rather than compiling this sentinel.
+		return "(?!)"
 	}
-	b.WriteByte('$')
-	return b.String()
-}
-
-// scanClass reads a bracket expression starting at glob[start] == '['. On
-// success it returns the regexp-equivalent class, the index just past the
-// closing ']', and true. A leading "!" (glob negation) becomes regexp "^"; a "]"
-// immediately after the opener (optionally after the negation) is a literal
-// member per glob rules. It returns ok == false if there is no closing bracket.
-func scanClass(glob string, start int) (class string, next int, ok bool) {
-	j := start + 1
-	if j < len(glob) && (glob[j] == '!' || glob[j] == '^') {
-		j++
-	}
-	if j < len(glob) && glob[j] == ']' { // literal ']' as first member
-		j++
-	}
-	for j < len(glob) && glob[j] != ']' {
-		j++
-	}
-	if j >= len(glob) {
-		return "", 0, false
-	}
-	body := glob[start+1 : j]
-	if strings.HasPrefix(body, "!") {
-		body = "^" + body[1:]
-	}
-	return "[" + body + "]", j + 1, true
+	return globRegexpSource(tokens)
 }

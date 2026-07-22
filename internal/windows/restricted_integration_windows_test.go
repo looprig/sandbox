@@ -32,15 +32,8 @@ func requireRestrictedDisposableWorker(t *testing.T) {
 		t.Fatalf("inspect disposable-worker token: %v", err)
 	}
 	defer token.Close()
-	restricted, err := token.IsRestricted()
-	if err != nil {
-		t.Fatalf("inspect disposable-worker restriction state: %v", err)
-	}
-	if restricted {
-		t.Fatal("disposable restricted gate requires a non-restricted source token")
-	}
-	if token.IsElevated() {
-		t.Fatal("disposable restricted gate must run in a standard-user token, not an elevated token")
+	if err := ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("validate disposable-worker source token: %v", err)
 	}
 }
 

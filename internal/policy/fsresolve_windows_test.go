@@ -2,7 +2,11 @@
 
 package policy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestLiteralMatchesWindowsPathKeysIgnoreCaseAndSeparatorSpelling(t *testing.T) {
 	tests := []struct {
@@ -73,5 +77,55 @@ func TestWindowsGlobClassesAndQuestionMarksIgnoreCaseButNotSeparators(t *testing
 		if got := ResolveFS(entries, target); got != DenyAccess {
 			t.Fatalf("ResolveFS(%q) = %v, want deny", target, got)
 		}
+	}
+}
+
+func TestWindowsGlobCanonicalParserParity(t *testing.T) {
+	tests := []struct {
+		pattern string
+		target  string
+		want    bool
+	}{
+		{pattern: `C:\café\[à-ÿ].TXT`, target: `c:/CAFÉ/É.txt`, want: true},
+		{pattern: `C:\δ\file[.txt`, target: `c:/Δ/FILE[.TXT`, want: true},
+		{pattern: `C:/Mix/**/?.TXT`, target: `c:\mIX\one/two\λ.txt`, want: true},
+		{pattern: `C:/Mix/*/?.TXT`, target: `c:\mIX\one/two\λ.txt`, want: false},
+	}
+	for _, test := range tests {
+		got, valid := globMatches(test.pattern, test.target)
+		if !valid {
+			t.Fatalf("globMatches(%q, %q) unexpectedly invalid", test.pattern, test.target)
+		}
+		if got != test.want {
+			t.Errorf("globMatches(%q, %q) = %t, want %t", test.pattern, test.target, got, test.want)
+		}
+	}
+	for _, malformed := range []string{`C:\[ω-α].txt`, `C:\[z-a].txt`} {
+		if matched, valid := globMatches(malformed, `C:\x.txt`); matched || valid {
+			t.Errorf("globMatches(%q) = (%t, %t), want malformed fail-closed signal", malformed, matched, valid)
+		}
+	}
+}
+
+func TestWindowsGlobLongAdversarialInputIsBounded(t *testing.T) {
+	const n = 700
+	pattern := `C:\` + strings.Repeat(`*a`, n) + `b`
+	target := `c:\` + strings.Repeat(`a`, n) + `c`
+	started := time.Now()
+	matched, valid := globMatches(pattern, target)
+	if !valid || matched {
+		t.Fatalf("globMatches(long adversarial input) = (%t, %t), want (false, true)", matched, valid)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("globMatches(long adversarial input) took %v; DP complexity regressed", elapsed)
+	}
+}
+
+func BenchmarkWindowsGlobLongAdversarial(b *testing.B) {
+	const n = 300
+	pattern := `C:\` + strings.Repeat(`*a`, n) + `b`
+	target := `c:\` + strings.Repeat(`a`, n) + `c`
+	for i := 0; i < b.N; i++ {
+		globMatches(pattern, target)
 	}
 }

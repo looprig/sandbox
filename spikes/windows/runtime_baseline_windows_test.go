@@ -19,6 +19,7 @@ import (
 	"time"
 	"unsafe"
 
+	sandboxwindows "github.com/looprig/sandbox/internal/windows"
 	"github.com/looprig/sandbox/spikes/windows/internal/baseline"
 	"golang.org/x/sys/windows"
 )
@@ -100,6 +101,7 @@ func (b *limitedBuffer) String() string {
 
 func TestRestrictedRuntimeBaseline(t *testing.T) {
 	startedUTC := time.Now().UTC()
+	requireDisposableStandardSourceToken(t)
 	if testing.Short() {
 		t.Fatal("restricted runtime baseline is a live gate; -short is not a passing result")
 	}
@@ -133,6 +135,18 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 		t.Fatalf("exact Restricted Code token runtime failures: %s; exact_token_gate_passed=false failure_selection_evidence_complete=false; finalize and validate evidence from this same nonce/PID invocation without rerunning", strings.Join(failures, ", "))
 	}
 	t.Log("exact_token_gate_passed=true failure_selection_evidence_complete=false")
+}
+
+func requireDisposableStandardSourceToken(t *testing.T) {
+	t.Helper()
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
+		t.Fatalf("inspect disposable-worker source token: %v", err)
+	}
+	defer token.Close()
+	if err := sandboxwindows.ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("validate disposable-worker source token: %v", err)
+	}
 }
 
 func TestFinalizeRestrictedRuntimeRunManifest(t *testing.T) {

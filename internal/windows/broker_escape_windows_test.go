@@ -205,15 +205,8 @@ func requireDisposableStandardSourceToken(t *testing.T) {
 		t.Fatalf("inspect disposable-worker source token: %v", err)
 	}
 	defer token.Close()
-	restricted, err := token.IsRestricted()
-	if err != nil {
-		t.Fatalf("inspect disposable-worker restriction state: %v", err)
-	}
-	if restricted {
-		t.Fatal("disposable broker suite requires a non-restricted source token")
-	}
-	if token.IsElevated() {
-		t.Fatal("disposable broker suite requires a standard-user, non-elevated source token")
+	if err := sandboxwindows.ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("validate disposable-worker source token: %v", err)
 	}
 }
 

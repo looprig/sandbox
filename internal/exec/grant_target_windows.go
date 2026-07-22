@@ -6,22 +6,36 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
+// prepareGrantRequestForAuthorization performs only lexical Windows path
+// normalization. In particular, it must not open the target or walk any of its
+// ancestors: the caller has not authorized that resource access yet.
+func prepareGrantRequestForAuthorization(scope, class, target string) (string, string, error) {
+	if !strings.HasPrefix(class, "filesystem.") || strings.Contains(class, ".host.") {
+		return scope, target, nil
+	}
+	cleanTarget := filepath.Clean(target)
+	if strings.Contains(class, ".tree.") {
+		if !strings.HasPrefix(scope, "tree:") {
+			return scope, cleanTarget, nil
+		}
+		return "tree:" + filepath.Clean(strings.TrimPrefix(scope, "tree:")), cleanTarget, nil
+	}
+	return filepath.Clean(scope), cleanTarget, nil
+}
+
 // validateGrantTargetAvailability closes the Windows exact-object semantic gap
-// before canonicalization. Exact ACL grants require an existing object whose
-// identity can be retained; tree grants and non-Windows exact grants have
-// different creation semantics and are handled by their normal binders.
-func validateGrantTargetAvailability(scope, class, target string) error {
-	if class != GrantClassFilesystemPathRead && class != GrantClassFilesystemPathWrite {
+// after request validation and profile authorization. Exact ACL grants require
+// an existing object whose identity can be retained; tree grants and
+// non-Windows exact grants have different creation semantics and are handled by
+// their normal binders.
+func validateGrantTargetAvailability(delta grantDelta) error {
+	if delta.entry == nil || !delta.entry.Exact {
 		return nil
 	}
-	// Preserve malformed-input precedence for relative, unclean, or mismatched
-	// scope/target requests; validateGrantClass diagnoses those below.
-	if !filepath.IsAbs(target) || filepath.Clean(target) != target || scope != target {
-		return nil
-	}
-	if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(delta.entry.Path); errors.Is(err, os.ErrNotExist) {
 		return ErrGrantUnsupported
 	}
 	return nil

@@ -247,6 +247,34 @@ func TestResolveMalformedGlob(t *testing.T) {
 	}
 }
 
+func TestGlobRegexpUnicodeAndUnmatchedBracket(t *testing.T) {
+	tests := []struct {
+		pattern string
+		target  string
+		want    bool
+	}{
+		{pattern: `/data/café.txt`, target: `/data/café.txt`, want: true},
+		{pattern: `/data/[α-ω].txt`, target: `/data/λ.txt`, want: true},
+		{pattern: `/data/[α-ω].txt`, target: `/data/A.txt`, want: false},
+		{pattern: `/data/name[.txt`, target: `/data/name[.txt`, want: true},
+		{pattern: `/data/name[.txt`, target: `/data/nameX.txt`, want: false},
+	}
+	for _, test := range tests {
+		re := GlobRegexp(test.pattern)
+		if re == nil {
+			t.Fatalf("GlobRegexp(%q) unexpectedly rejected", test.pattern)
+		}
+		if got := re.MatchString(globPathKey(test.target)); got != test.want {
+			t.Errorf("GlobRegexp(%q).MatchString(%q) = %t, want %t", test.pattern, test.target, got, test.want)
+		}
+	}
+	for _, malformed := range []string{`/data/[z-a].txt`, `/data/[ω-α].txt`} {
+		if GlobRegexp(malformed) != nil {
+			t.Errorf("GlobRegexp(%q) accepted reversed class", malformed)
+		}
+	}
+}
+
 // TestResolveGlobBranches exercises the "?" single-char and "[...]"/"[!...]"
 // bracket-class glob branches, plus the allow-glob specificity ranking against a
 // literal (tie-union and longer-prefix win).

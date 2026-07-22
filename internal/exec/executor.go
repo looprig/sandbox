@@ -534,18 +534,18 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if !validGrantText(executionID) || !validGrantText(command) {
 		return "", ErrGrantMalformed
 	}
-	if err := validateGrantTargetAvailability(scope, class, target); err != nil {
-		return "", err
-	}
 	canonicalCWD, err := canonicalWorkingDirectory(cwd)
 	if err != nil {
 		return "", fmt.Errorf("%w: cwd: %v", ErrGrantMalformed, err)
 	}
-	scope, target, err = normalizeGrantScopeTarget(scope, class, target)
+	// Validate and authorize the lexical request before resolving or probing its
+	// target. Canonicalization is a resource operation on Windows, so doing it
+	// earlier would disclose target availability to an unauthorized caller.
+	authorizedScope, authorizedTarget, err := prepareGrantRequestForAuthorization(scope, class, target)
 	if err != nil {
 		return "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
 	}
-	delta, requiredBits, err := validateGrantClass(kind, scope, class, target)
+	rawDelta, _, err := validateGrantClass(kind, authorizedScope, class, authorizedTarget)
 	if err != nil {
 		return "", err
 	}
@@ -555,15 +555,25 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 	if class == GrantClassNetworkProxyTarget && e.proxy == nil {
 		return "", ErrGrantUnsupported
 	}
-	access, err := e.profile.AccessFor(kind, scope)
+	if err := e.authorizeGrantScope(kind, authorizedScope); err != nil {
+		return "", err
+	}
+	if err := validateGrantTargetAvailability(rawDelta); err != nil {
+		return "", err
+	}
+
+	scope, target, err = normalizeGrantScopeTarget(authorizedScope, class, authorizedTarget)
+	if err != nil {
+		return "", fmt.Errorf("%w: target: %v", ErrGrantMalformed, err)
+	}
+	delta, requiredBits, err := validateGrantClass(kind, scope, class, target)
 	if err != nil {
 		return "", err
 	}
-	if Access(access) == Deny {
-		return "", ErrGrantDenied
-	}
-	if Access(access) != Gated {
-		return "", ErrGrantUnsupported
+	// Resolution may change path spelling or reveal a reparse target. Re-check
+	// the canonical scope so lexical authorization can never widen authority.
+	if err := e.authorizeGrantScope(kind, scope); err != nil {
+		return "", err
 	}
 	e.grantMu.Lock()
 	defer e.grantMu.Unlock()
@@ -630,6 +640,24 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 		e.rescheduleRetainedGrantExpiryLocked()
 	}
 	return token, nil
+}
+
+// authorizeGrantScope maps one validated request scope to grant semantics.
+// Keeping this decision separate from target resolution makes the ordering
+// explicit and ensures every canonicalized scope is authorized again.
+func (e *Executor) authorizeGrantScope(kind, scope string) error {
+	access, err := e.profile.AccessFor(kind, scope)
+	if err != nil {
+		return err
+	}
+	switch Access(access) {
+	case Deny:
+		return ErrGrantDenied
+	case Gated:
+		return nil
+	default:
+		return ErrGrantUnsupported
+	}
 }
 
 // RunCommandWithGrants verifies all grants, compiles their least-authority

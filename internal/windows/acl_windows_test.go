@@ -543,6 +543,7 @@ func TestACLProjectionDisposableExactAndReadback(t *testing.T) {
 	if os.Getenv("SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST") != "1" {
 		t.Skip("destructive ACL integration is restricted to a disposable Windows worker")
 	}
+	requireACLDisposableStandardSourceToken(t)
 	root := t.TempDir()
 	path := filepath.Join(root, "exact.txt")
 	if err := os.WriteFile(path, []byte("positive control"), 0o600); err != nil {
@@ -601,6 +602,7 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	if os.Getenv("SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST") != "1" {
 		t.Skip("destructive ACL integration is restricted to a disposable Windows worker")
 	}
+	requireACLDisposableStandardSourceToken(t)
 	scratch := t.TempDir()
 	root := filepath.Join(t.TempDir(), "tree")
 	ordinaryDir := filepath.Join(root, "ordinary")
@@ -769,5 +771,17 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	}
 	if err := os.WriteFile(concurrentChild, []byte("namespace restored after rollback"), 0o600); err != nil {
 		t.Fatalf("retained namespace blockade survived projection close: %v", err)
+	}
+}
+
+func requireACLDisposableStandardSourceToken(t *testing.T) {
+	t.Helper()
+	var token win.Token
+	if err := win.OpenProcessToken(win.CurrentProcess(), win.TOKEN_QUERY, &token); err != nil {
+		t.Fatalf("inspect disposable-worker source token: %v", err)
+	}
+	defer token.Close()
+	if err := ValidateDisposableStandardUserToken(token); err != nil {
+		t.Fatalf("validate disposable-worker source token: %v", err)
 	}
 }

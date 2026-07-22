@@ -34,106 +34,70 @@ func globPathKey(path string) string { return strings.ReplaceAll(path, "/", path
 // as literal Windows paths; wildcard matching therefore cannot disagree with
 // ACL planning merely because a path's case differs from the policy spelling.
 func globMatches(glob, target string) (bool, bool) {
-	pattern := []rune(globPathKey(glob))
+	pattern, err := parseGlob(glob)
 	value := []rune(globPathKey(target))
-	// Reuse the canonical compiler as the syntax validator so malformed ranges
-	// retain ResolveFS's fail-closed allow/deny behavior.
-	if GlobRegexp(glob) == nil {
+	if err != nil {
 		return false, false
 	}
-	type state struct{ pattern, value int }
-	memo := make(map[state]bool)
-	seen := make(map[state]bool)
-	var match func(int, int) (bool, bool)
-	match = func(pi, vi int) (bool, bool) {
-		key := state{pi, vi}
-		if seen[key] {
-			return memo[key], true
+
+	// CompareStringOrdinal is an OS call. Cache each distinct rune pair so a
+	// repeated literal (the adversarial and common filename case) pays for the
+	// exact Windows comparison once without substituting linguistic folding.
+	type runePair struct{ left, right rune }
+	comparisons := make(map[runePair]int)
+	compare := func(left, right rune) int {
+		pair := runePair{left, right}
+		if result, ok := comparisons[pair]; ok {
+			return result
 		}
-		seen[key] = true
-		if pi == len(pattern) {
-			memo[key] = vi == len(value)
-			return memo[key], true
-		}
-		switch pattern[pi] {
-		case '*':
-			crossesSeparators := pi+1 < len(pattern) && pattern[pi+1] == '*'
-			next := pi + 1
-			if crossesSeparators {
-				next++
-			}
-			for end := vi; end <= len(value); end++ {
-				if end > vi && !crossesSeparators && value[end-1] == '\\' {
-					break
-				}
-				if ok, valid := match(next, end); !valid {
-					return false, false
-				} else if ok {
-					memo[key] = true
-					return true, true
-				}
-			}
-			return false, true
-		case '?':
-			if vi < len(value) && value[vi] != '\\' {
-				memo[key], _ = match(pi+1, vi+1)
-			}
-			return memo[key], true
-		case '[':
-			end, classMatch, valid := windowsGlobClass(pattern, pi, value, vi)
-			if !valid {
-				return false, false
-			}
-			if classMatch {
-				memo[key], _ = match(end, vi+1)
-			}
-			return memo[key], true
-		default:
-			if vi < len(value) && winpath.Compare(string(pattern[pi]), string(value[vi])) == 0 {
-				memo[key], _ = match(pi+1, vi+1)
-			}
-			return memo[key], true
-		}
+		result := winpath.Compare(string(left), string(right))
+		comparisons[pair] = result
+		return result
 	}
-	return match(0, 0)
+
+	// Rolling-row DP implements star as either zero characters (next[vi]) or
+	// one character while remaining on the star (current[vi+1]). Iterating the
+	// target right-to-left makes both dependencies available, giving O(m*n)
+	// work and O(n) state without recursive stacks or hash-map state overhead.
+	next := make([]bool, len(value)+1)
+	current := make([]bool, len(value)+1)
+	next[len(value)] = true
+	for pi := len(pattern) - 1; pi >= 0; pi-- {
+		token := pattern[pi]
+		for vi := len(value); vi >= 0; vi-- {
+			switch token.kind {
+			case globStar, globTreeStar:
+				current[vi] = next[vi]
+				if !current[vi] && vi < len(value) && (token.kind == globTreeStar || value[vi] != '\\') {
+					current[vi] = current[vi+1]
+				}
+			case globQuestion:
+				current[vi] = vi < len(value) && value[vi] != '\\' && next[vi+1]
+			case globClass:
+				current[vi] = windowsGlobClass(token, value, vi, compare) && next[vi+1]
+			case globLiteral:
+				current[vi] = vi < len(value) && compare(token.literal, value[vi]) == 0 && next[vi+1]
+			}
+		}
+		next, current = current, next
+	}
+	return next[0], true
 }
 
-func windowsGlobClass(pattern []rune, start int, value []rune, valueIndex int) (int, bool, bool) {
-	i := start + 1
-	negated := false
-	if i < len(pattern) && (pattern[i] == '!' || pattern[i] == '^') {
-		negated = true
-		i++
-	}
-	classStart := i
-	if i < len(pattern) && pattern[i] == ']' {
-		i++
-	}
-	for i < len(pattern) && pattern[i] != ']' {
-		i++
-	}
-	if i == len(pattern) {
-		return 0, false, false
-	}
+func windowsGlobClass(class globToken, value []rune, valueIndex int, compare func(rune, rune) int) bool {
 	if valueIndex >= len(value) || value[valueIndex] == '\\' {
-		return i + 1, false, true
+		return false
 	}
-	candidate := string(value[valueIndex])
+	candidate := value[valueIndex]
 	matched := false
-	for j := classStart; j < i; {
-		if j+2 < i && pattern[j+1] == '-' {
-			matched = matched || winpath.Compare(string(pattern[j]), candidate) <= 0 &&
-				winpath.Compare(candidate, string(pattern[j+2])) <= 0
-			j += 3
-			continue
-		}
-		matched = matched || winpath.Compare(string(pattern[j]), candidate) == 0
-		j++
+	for _, part := range class.parts {
+		matched = matched || compare(part.first, candidate) <= 0 &&
+			compare(candidate, part.last) <= 0
 	}
-	if negated {
+	if class.negated {
 		matched = !matched
 	}
-	return i + 1, matched, true
+	return matched
 }
 
 func pathKeyIsRoot(key string) bool {
