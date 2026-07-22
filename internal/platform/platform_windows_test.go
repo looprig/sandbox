@@ -13,30 +13,30 @@ import (
 
 func TestPlatformForwardsEveryWindowsMode(t *testing.T) {
 	tests := []struct {
-		name        string
-		config      windows.Config
-		scratchRoot string
+		name    string
+		config  windows.Config
+		runtime *windows.RestrictedRuntime
 	}{
-		{name: "auto", config: windows.Config{Mode: windows.Auto}, scratchRoot: `C:\scratch\auto`},
-		{name: "restricted token", config: windows.Config{Mode: windows.RestrictedToken}, scratchRoot: `C:\scratch\restricted`},
-		{name: "elevated", config: windows.Config{Mode: windows.Elevated, StateRoot: `C:\ProgramData\Looprig`}, scratchRoot: `C:\scratch\elevated`},
+		{name: "auto", config: windows.Config{Mode: windows.Auto}, runtime: windows.NewRestrictedRuntime(`C:\scratch\auto`)},
+		{name: "restricted token", config: windows.Config{Mode: windows.RestrictedToken}, runtime: windows.NewRestrictedRuntime(`C:\scratch\restricted`)},
+		{name: "elevated", config: windows.Config{Mode: windows.Elevated, StateRoot: `C:\ProgramData\Looprig`}, runtime: windows.NewRestrictedRuntime(`C:\scratch\elevated`)},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var got windows.Config
-			var gotScratchRoot string
+			var gotRuntime *windows.RestrictedRuntime
 			calls := 0
 			original := windowsPlatformBackend
-			windowsPlatformBackend = func(config windows.Config, scratchRoot string) (enforce.Backend, error) {
+			windowsPlatformBackend = func(config windows.Config, runtime *windows.RestrictedRuntime) (enforce.Backend, error) {
 				calls++
 				got = config
-				gotScratchRoot = scratchRoot
+				gotRuntime = runtime
 				return enforce.NewNull(), nil
 			}
 			t.Cleanup(func() { windowsPlatformBackend = original })
 
-			backend, err := Backend(Options{Windows: test.config, ScratchRoot: test.scratchRoot})
+			backend, err := Backend(Options{Windows: test.config, WindowsRestrictedRuntime: test.runtime})
 			if err != nil {
 				t.Fatalf("Backend: %v", err)
 			}
@@ -49,8 +49,8 @@ func TestPlatformForwardsEveryWindowsMode(t *testing.T) {
 			if !reflect.DeepEqual(got, test.config) {
 				t.Fatalf("forwarded config = %#v; want %#v", got, test.config)
 			}
-			if gotScratchRoot != test.scratchRoot {
-				t.Fatalf("forwarded scratch root = %q; want %q", gotScratchRoot, test.scratchRoot)
+			if gotRuntime != test.runtime {
+				t.Fatalf("forwarded restricted runtime = %p; want %p", gotRuntime, test.runtime)
 			}
 		})
 	}
@@ -59,7 +59,7 @@ func TestPlatformForwardsEveryWindowsMode(t *testing.T) {
 func TestPlatformReturnsWindowsSelectorErrorUnchanged(t *testing.T) {
 	want := errors.New("selector failed")
 	original := windowsPlatformBackend
-	windowsPlatformBackend = func(windows.Config, string) (enforce.Backend, error) {
+	windowsPlatformBackend = func(windows.Config, *windows.RestrictedRuntime) (enforce.Backend, error) {
 		return nil, want
 	}
 	t.Cleanup(func() { windowsPlatformBackend = original })

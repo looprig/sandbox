@@ -6,8 +6,8 @@ import "github.com/looprig/sandbox/internal/windows"
 // remains exclusively owned by profile.Settings.
 type Options struct {
 	Windows windows.Config
-	// ScratchRoot is the caller-owned stable root for backend crash-recovery
-	// state. It is deliberately separate from the elevated installation's
+	// WindowsRestrictedRuntime is shared by every backend selected for one
+	// ExecutorSet. It is deliberately separate from the elevated installation's
 	// Windows.StateRoot.
-	ScratchRoot string
+	WindowsRestrictedRuntime *windows.RestrictedRuntime
 }

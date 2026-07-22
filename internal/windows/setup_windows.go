@@ -20,15 +20,15 @@ func ValidateConfig(config Config) error {
 	}
 }
 
-// PlatformBackend selects the Windows tier while keeping the caller-owned
-// restricted scratch root distinct from elevated installation state.
-func PlatformBackend(config Config, scratchRoot string) (enforce.Backend, error) {
+// PlatformBackend selects the Windows tier while keeping ExecutorSet-scoped
+// restricted recovery coordination distinct from elevated installation state.
+func PlatformBackend(config Config, runtime *RestrictedRuntime) (enforce.Backend, error) {
 	if err := ValidateConfig(config); err != nil {
 		return nil, err
 	}
 	switch config.Mode {
 	case Auto, RestrictedToken:
-		return newRestrictedBackend(config, scratchRoot), nil
+		return newRestrictedBackend(config, runtime), nil
 	case Elevated:
 		return nil, ErrSetupRequired
 	default:

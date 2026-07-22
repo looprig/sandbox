@@ -47,6 +47,11 @@ Work is on branch `feat/windows-sandbox`.
   proof; delayed cleanup errors are returned by `ExecutorSet.Close`. Focused core
   and real `Executor.run` integration regressions cover retention, release order,
   early setup errors, proxy observation, and set-close blocking.
+- `TestProcessTreeCancellationAndJobClosePreventDelayedGrandchild` is the
+  shared Phase 2 parent-crash/host-close evidence: closing the host-owned Job
+  prevents a delayed ordinary grandchild marker, alongside the cancellation
+  case. Task 12 reuses that reviewed lifecycle proof rather than simulating a
+  weaker non-production parent.
 - Task 9 is implemented and independently approved for static specification
   compliance and code quality. Focused SID/ACL-plan tests, vet, and Windows
   amd64/arm64 cross-builds pass. The live restricted-token conformance tests

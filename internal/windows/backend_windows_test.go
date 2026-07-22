@@ -23,7 +23,7 @@ func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
 	configureCalls := 0
 	releaseCalls := 0
 	backend := &restrictedBackend{config: Config{Mode: RestrictedToken}, deps: restrictedCompileDependencies{
-		prepare: func(_ Config, _ string, got policy.Effective) (restrictedPreparedLease, error) {
+		prepare: func(_ Config, _ *RestrictedRuntime, got policy.Effective) (restrictedPreparedLease, error) {
 			prepareCalls++
 			got.FS = append(got.FS, policy.FSEntry{Path: `C:\mutated`})
 			return restrictedPreparedLease{sid: executor, release: func() error { releaseCalls++; return nil }}, nil
@@ -91,7 +91,7 @@ func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
 
 func TestWindowsAutoFailsWithTypedSetupErrorForExactRequiredBits(t *testing.T) {
 	backend := &restrictedBackend{config: Config{Mode: Auto}, deps: restrictedCompileDependencies{
-		prepare: func(Config, string, policy.Effective) (restrictedPreparedLease, error) {
+		prepare: func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error) {
 			t.Fatal("Auto contacted restricted preparation despite missing guarantees")
 			return restrictedPreparedLease{}, nil
 		},
@@ -117,7 +117,7 @@ func TestWindowsAutoFailsWithTypedSetupErrorForExactRequiredBits(t *testing.T) {
 func TestExplicitRestrictedMissingGuaranteesDoesNotPrepare(t *testing.T) {
 	prepareCalls := 0
 	backend := &restrictedBackend{config: Config{Mode: RestrictedToken}, deps: restrictedCompileDependencies{
-		prepare: func(Config, string, policy.Effective) (restrictedPreparedLease, error) {
+		prepare: func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error) {
 			prepareCalls++
 			return restrictedPreparedLease{}, nil
 		},
@@ -146,7 +146,7 @@ func TestRestrictedProjectionRootsExcludeHostVolume(t *testing.T) {
 func TestRestrictedCompileReleasesMalformedPreparedLease(t *testing.T) {
 	releases := 0
 	backend := &restrictedBackend{config: Config{Mode: RestrictedToken}, deps: restrictedCompileDependencies{
-		prepare: func(Config, string, policy.Effective) (restrictedPreparedLease, error) {
+		prepare: func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error) {
 			return restrictedPreparedLease{release: func() error { releases++; return nil }}, nil
 		},
 		configure: func(*exec.Cmd, []SID) (func(), error) { return nil, nil },
@@ -167,7 +167,7 @@ func TestRestrictedGrantCompileReusesBaseLeaseAndTransientReleaseKeepsItActive(t
 	baseReleases := 0
 	var configured []SID
 	backend := &restrictedBackend{config: Config{Mode: RestrictedToken}, deps: restrictedCompileDependencies{
-		prepare: func(Config, string, policy.Effective) (restrictedPreparedLease, error) {
+		prepare: func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error) {
 			return restrictedPreparedLease{sid: base, journal: &RestrictedJournal{}, release: func() error { baseReleases++; return nil }}, nil
 		},
 		configure: func(_ *exec.Cmd, sids []SID) (func(), error) {

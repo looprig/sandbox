@@ -121,6 +121,7 @@ func NewACLTreeProjection(plan ACLPlan, tree *RetainedACLTree, recorder ACLMutat
 	if err != nil {
 		return nil, err
 	}
+	projection.relaxTreeSharing = true
 	tree.objects = nil
 	return projection, nil
 }

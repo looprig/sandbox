@@ -113,7 +113,7 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 		Isolation:          profile.Sandboxed,
 		RequiredGuarantees: profile.GuaranteeEnvScrub,
 	}
-	backend := newRestrictedBackend(Config{Mode: RestrictedToken}, stateRoot)
+	backend := newRestrictedBackend(Config{Mode: RestrictedToken}, NewRestrictedRuntime(stateRoot))
 	spec, report, level, bits, err := backend.Compile(p)
 	if err != nil {
 		t.Fatalf("compile production restricted backend: %v", err)
@@ -143,6 +143,25 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 	if control, err := exec.Command(helper, "read", outsideReadable).CombinedOutput(); err != nil || string(control) != "outside-readable" {
 		t.Fatalf("unconfined outside-read positive control = %q, %v", control, err)
 	}
+	// NUL is the ordinary Win32 null-device baseline. Keep it separate from
+	// actual raw/device namespace probes so a DOS alias is never presented as
+	// evidence that raw namespaces were denied.
+	assertUnconfinedWriteControl(t, helper, "NUL")
+	if output, err := runRestrictedProbe(context.Background(), spec, helper, "write", "NUL", "restricted-null-baseline"); err != nil {
+		t.Fatalf("restricted runtime-baseline NUL became unusable: %v: %s", err, output)
+	}
+	deviceTarget := filepath.Join(deniedLong, "device-namespace.txt")
+	deviceAlias := globalRootAlias(t, deviceTarget)
+	t.Run("raw-device-namespace", func(t *testing.T) {
+		assertUnconfinedWriteControl(t, helper, deviceAlias)
+		output, err := runRestrictedProbe(context.Background(), spec, helper, "write", deviceAlias, "restricted")
+		if err == nil {
+			t.Fatalf("restricted GLOBALROOT device-namespace write unexpectedly succeeded: %s", output)
+		}
+		if data, readErr := os.ReadFile(deviceTarget); readErr == nil && string(data) == "restricted" {
+			t.Fatal("restricted device-namespace marker was written despite failing process")
+		}
+	})
 	if output, err := runRestrictedProbe(context.Background(), spec, helper, "read", outsideReadable); err != nil || string(output) != "outside-readable" {
 		t.Fatalf("WRITE_RESTRICTED unexpectedly acted as a read boundary: %q, %v", output, err)
 	}
@@ -162,7 +181,6 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 		{"extended", `\\?\` + filepath.Join(deniedLong, "extended.txt")},
 		{"8dot3", filepath.Join(shortDenied, "short.txt")},
 		{"ads", adsCarrier + ":sandbox-stream"},
-		{"device", "NUL"},
 	}
 	for _, test := range denials {
 		t.Run(test.name, func(t *testing.T) {
@@ -171,10 +189,8 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 			if err == nil {
 				t.Fatalf("restricted write unexpectedly succeeded: %s", output)
 			}
-			if test.path != "NUL" {
-				if data, readErr := os.ReadFile(test.path); readErr == nil && string(data) == "restricted" {
-					t.Fatal("denied marker was written despite failing process")
-				}
+			if data, readErr := os.ReadFile(test.path); readErr == nil && string(data) == "restricted" {
+				t.Fatal("denied marker was written despite failing process")
 			}
 		})
 	}
@@ -200,6 +216,26 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 			t.Fatal("compiled root was replaceable while its ACL lease was active")
 		}
 	})
+}
+
+func globalRootAlias(t *testing.T, path string) string {
+	t.Helper()
+	volume := filepath.VolumeName(path)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Fatalf("GLOBALROOT fixture lacks a DOS drive volume: %q", path)
+	}
+	name, err := win.UTF16PtrFromString(volume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]uint16, 1024)
+	n, err := win.QueryDosDevice(name, &buffer[0], uint32(len(buffer)))
+	if err != nil || n == 0 {
+		t.Fatalf("QueryDosDevice(%q): n=%d err=%v", volume, n, err)
+	}
+	device := win.UTF16ToString(buffer[:n])
+	relative := strings.TrimPrefix(path, volume)
+	return `\\?\GLOBALROOT` + device + relative
 }
 
 func TestRestrictedDisposableJournalRecoveryAndSIDNonReuse(t *testing.T) {

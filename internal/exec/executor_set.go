@@ -23,12 +23,13 @@ var (
 )
 
 type executorSetConfig struct {
-	scratchRoot string
-	max         int
-	executor    executorConfig
-	grantTTLSet bool
-	route       *EgressRoute
-	windows     windows.Config
+	scratchRoot           string
+	max                   int
+	executor              executorConfig
+	grantTTLSet           bool
+	route                 *EgressRoute
+	windows               windows.Config
+	windowsRuntimeRelease func()
 }
 
 // ExecutorSetOption configures executor ownership and resource limits.
@@ -70,18 +71,19 @@ func WithWindowsSandboxStateRoot(path string) ExecutorSetOption {
 
 // ExecutorSet owns per-key executors, their grant keys, and isolated HOME dirs.
 type ExecutorSet struct {
-	mu        sync.Mutex
-	profile   *Profile
-	settings  profile.Settings
-	ownedRoot string
-	max       int
-	executor  executorConfig
-	route     *EgressRoute
-	executors map[string]*Executor
-	lifecycle *executorLifecycle
-	closed    bool
-	closeErr  error
-	closeDone chan struct{}
+	mu                    sync.Mutex
+	profile               *Profile
+	settings              profile.Settings
+	ownedRoot             string
+	max                   int
+	executor              executorConfig
+	route                 *EgressRoute
+	executors             map[string]*Executor
+	lifecycle             *executorLifecycle
+	closed                bool
+	closeErr              error
+	closeDone             chan struct{}
+	windowsRuntimeRelease func()
 }
 
 // NewExecutorSet creates one owner-only child beneath a required scratch root.
@@ -119,6 +121,7 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	snapshotWindowsOptions(&config, scratch)
 	owned, err := os.MkdirTemp(scratch, "sandbox-executors-")
 	if err != nil {
+		config.windowsRuntimeRelease()
 		return nil, fmt.Errorf("sandbox: create executor set root: %w", err)
 	}
 	// #nosec G302 -- 0700 is correct for a DIRECTORY: G302 assumes a regular
@@ -126,23 +129,30 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	// non-traversable and unusable. 0700 is already owner-only.
 	if err := os.Chmod(owned, 0o700); err != nil {
 		_ = os.RemoveAll(owned)
+		config.windowsRuntimeRelease()
 		return nil, fmt.Errorf("sandbox: secure executor set root: %w", err)
 	}
 	return &ExecutorSet{
 		profile: prof, settings: prof.Settings(), ownedRoot: owned, max: config.max,
-		executor:  config.executor,
-		route:     config.route,
-		executors: make(map[string]*Executor),
-		lifecycle: newExecutorLifecycle(),
-		closeDone: make(chan struct{}),
+		executor:              config.executor,
+		route:                 config.route,
+		executors:             make(map[string]*Executor),
+		lifecycle:             newExecutorLifecycle(),
+		closeDone:             make(chan struct{}),
+		windowsRuntimeRelease: config.windowsRuntimeRelease,
 	}, nil
 }
 
 func snapshotWindowsOptions(config *executorSetConfig, scratchRoot string) {
-	config.executor.platform = platform.Options{
-		Windows:     config.windows,
-		ScratchRoot: scratchRoot,
+	if config.windowsRuntimeRelease != nil {
+		config.windowsRuntimeRelease()
 	}
+	runtime, release := windows.AcquireRestrictedRuntime(scratchRoot)
+	config.executor.platform = platform.Options{
+		Windows:                  config.windows,
+		WindowsRestrictedRuntime: runtime,
+	}
+	config.windowsRuntimeRelease = release
 }
 
 // For memoizes an executor with a distinct grant key and child HOME per key.
@@ -297,6 +307,9 @@ func (set *ExecutorSet) Close() error {
 	}
 	for _, executor := range executors {
 		executor.revokeResources()
+	}
+	if set.windowsRuntimeRelease != nil {
+		set.windowsRuntimeRelease()
 	}
 	err := errors.Join(releaseErr, os.RemoveAll(set.ownedRoot))
 

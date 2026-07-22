@@ -29,22 +29,22 @@ type restrictedPreparedLease struct {
 }
 
 type restrictedCompileDependencies struct {
-	prepare   func(Config, string, policy.Effective) (restrictedPreparedLease, error)
+	prepare   func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error)
 	configure func(*exec.Cmd, []SID) (func(), error)
 }
 
 type restrictedBackend struct {
-	config      Config
-	scratchRoot string
-	deps        restrictedCompileDependencies
-	mu          sync.Mutex
-	baseSID     SID
-	journal     *RestrictedJournal
-	baseActive  bool
+	config     Config
+	runtime    *RestrictedRuntime
+	deps       restrictedCompileDependencies
+	mu         sync.Mutex
+	baseSID    SID
+	journal    *RestrictedJournal
+	baseActive bool
 }
 
-func newRestrictedBackend(config Config, scratchRoot string) enforce.Backend {
-	return &restrictedBackend{config: config, scratchRoot: scratchRoot, deps: restrictedCompileDependencies{
+func newRestrictedBackend(config Config, runtime *RestrictedRuntime) enforce.Backend {
+	return &restrictedBackend{config: config, runtime: runtime, deps: restrictedCompileDependencies{
 		prepare:   prepareRestrictedLease,
 		configure: configureRestrictedSpawn,
 	}}
@@ -69,7 +69,7 @@ func (backend *restrictedBackend) Compile(p policy.Effective) (enforce.Spec, pro
 	if err := validateRestrictedGrantClasses(p); err != nil {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, err
 	}
-	lease, err := backend.deps.prepare(backend.config, backend.scratchRoot, policy.Clone(p))
+	lease, err := backend.deps.prepare(backend.config, backend.runtime, policy.Clone(p))
 	if err != nil {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, err
 	}
@@ -282,14 +282,14 @@ func (resources *restrictedLeaseResources) close() error {
 	return result
 }
 
-func prepareRestrictedLease(_ Config, scratchRoot string, p policy.Effective) (_ restrictedPreparedLease, err error) {
-	stateRoot, err := restrictedStateRoot(scratchRoot)
-	if err != nil {
-		return restrictedPreparedLease{}, err
-	}
-	journal, _, err := OpenRestrictedJournalAndSweep(stateRoot, RestrictedACLCleaner{})
+func prepareRestrictedLease(_ Config, runtime *RestrictedRuntime, p policy.Effective) (_ restrictedPreparedLease, err error) {
+	journal, err := runtime.restrictedJournal()
 	if err != nil {
 		return restrictedPreparedLease{}, fmt.Errorf("sweep restricted ACL journal: %w", err)
+	}
+	stateRoot, err := restrictedStateRoot(runtime.scratchRoot)
+	if err != nil {
+		return restrictedPreparedLease{}, err
 	}
 	sid, err := newRetiredExecutorSID(rand.Reader, journal, stateRoot)
 	if err != nil {

@@ -11,5 +11,5 @@ var windowsPlatformBackend = windows.PlatformBackend
 
 // Backend delegates Windows mechanism selection to the package that owns it.
 func Backend(options Options) (enforce.Backend, error) {
-	return windowsPlatformBackend(options.Windows, options.ScratchRoot)
+	return windowsPlatformBackend(options.Windows, options.WindowsRestrictedRuntime)
 }

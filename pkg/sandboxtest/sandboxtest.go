@@ -123,10 +123,12 @@ type ImplicationProbe func(context.Context, SUT) (ImplicationResult, error)
 // generic executor surface cannot construct by itself. This dependency-inverted
 // seam lets platform suites reuse the claim gating and positive-control rules.
 type ImplicationProbes struct {
-	Read     ImplicationProbe
-	Process  ImplicationProbe
-	Network  ImplicationProbe
-	Resource ImplicationProbe
+	Read           ImplicationProbe
+	Process        ImplicationProbe
+	Network        ImplicationProbe
+	AddressNetwork ImplicationProbe
+	TargetNetwork  ImplicationProbe
+	Resource       ImplicationProbe
 }
 
 // CheckClaimedImplications runs exactly the probes whose guarantee bits are
@@ -143,6 +145,8 @@ func CheckClaimedImplications(t *testing.T, sut SUT, probes ImplicationProbes) {
 		{name: "read", bit: GuaranteeReadBoundary, probe: probes.Read},
 		{name: "process", bit: GuaranteeProcessBoundary, probe: probes.Process},
 		{name: "network", bit: GuaranteeNetworkBoundary, probe: probes.Network},
+		{name: "address-network", bit: GuaranteeAddressNetwork, probe: probes.AddressNetwork},
+		{name: "target-network", bit: GuaranteeTargetNetwork, probe: probes.TargetNetwork},
 		{name: "resource", bit: GuaranteeResourceLimits, probe: probes.Resource},
 	}
 	bits := sut.GuaranteeBits()

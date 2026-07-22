@@ -15,7 +15,7 @@ func newExecutorForEffectivePolicy(p policy.Effective, configs ...executorConfig
 	// Direct construction is a unit-test seam and owns no stable scratch root.
 	// Production Windows construction always enters through ExecutorSet, which
 	// supplies that root before selecting the restricted backend.
-	if runtime.GOOS == "windows" && config.backend == nil && config.platform.ScratchRoot == "" {
+	if runtime.GOOS == "windows" && config.backend == nil && config.platform.WindowsRestrictedRuntime == nil {
 		config.backend = newTestPassthroughBackend()
 	}
 	return newExecutorFromEffective(nil, p, config)

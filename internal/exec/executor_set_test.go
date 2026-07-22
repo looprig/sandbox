@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"github.com/looprig/sandbox/internal/enforce"
-	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/internal/windows"
 	"os"
@@ -156,10 +155,12 @@ func TestWindowsOptionSnapshotIsPassedToExecutors(t *testing.T) {
 	WithWindowsSandboxStateRoot(want.StateRoot)(&config)
 
 	snapshotWindowsOptions(&config, wantScratch)
+	t.Cleanup(config.windowsRuntimeRelease)
 	config.windows = windows.Config{}
 
-	if got := config.executor.platform; got != (platform.Options{Windows: want, ScratchRoot: wantScratch}) {
-		t.Fatalf("executor platform options = %#v; want Windows %#v and scratch root %q", got, want, wantScratch)
+	got := config.executor.platform
+	if got.Windows != want || got.WindowsRestrictedRuntime == nil {
+		t.Fatalf("executor platform options = %#v; want Windows %#v and a restricted runtime", got, want)
 	}
 }
 

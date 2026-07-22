@@ -116,6 +116,8 @@ func TestClaimedImplicationChecksAreStrictlyBitGated(t *testing.T) {
 	const claimed = sandboxtest.GuaranteeReadBoundary |
 		sandboxtest.GuaranteeProcessBoundary |
 		sandboxtest.GuaranteeNetworkBoundary |
+		sandboxtest.GuaranteeAddressNetwork |
+		sandboxtest.GuaranteeTargetNetwork |
 		sandboxtest.GuaranteeResourceLimits
 	sut := conservativeSUT{bits: claimed}
 	calls := make(map[string]int)
@@ -126,9 +128,10 @@ func TestClaimedImplicationChecksAreStrictlyBitGated(t *testing.T) {
 		}
 	}
 	sandboxtest.CheckClaimedImplications(t, sut, sandboxtest.ImplicationProbes{
-		Read: probe("read"), Process: probe("process"), Network: probe("network"), Resource: probe("resource"),
+		Read: probe("read"), Process: probe("process"), Network: probe("network"),
+		AddressNetwork: probe("address-network"), TargetNetwork: probe("target-network"), Resource: probe("resource"),
 	})
-	for _, name := range []string{"read", "process", "network", "resource"} {
+	for _, name := range []string{"read", "process", "network", "address-network", "target-network", "resource"} {
 		if calls[name] != 1 {
 			t.Errorf("%s probe calls = %d; want 1", name, calls[name])
 		}

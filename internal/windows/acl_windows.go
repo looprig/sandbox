@@ -22,8 +22,9 @@ const (
 )
 
 var (
-	kernel32DLL    = win.NewLazySystemDLL("kernel32.dll")
-	procReOpenFile = kernel32DLL.NewProc("ReOpenFile")
+	kernel32DLL              = win.NewLazySystemDLL("kernel32.dll")
+	procReOpenFile           = kernel32DLL.NewProc("ReOpenFile")
+	errACLIdenticalCollision = errors.New("sandbox: byte-identical ACL mutation collision")
 )
 
 // ACLMutationRecord is the cleanup-only fact persisted before one DACL write.
@@ -118,17 +119,22 @@ func aclMutationSignature(record ACLMutationRecord) string {
 // for its lifetime and reopens each by handle (never by name) with READ_CONTROL
 // and WRITE_DAC authority.
 type ACLProjection struct {
-	plan     ACLPlan
-	objects  map[aclIdentityKey]aclProjectionObject
-	owners   map[aclIdentityKey][]byte
-	recorder ACLMutationRecorder
-	applied  []appliedACLMutation
+	plan             ACLPlan
+	objects          map[aclIdentityKey]aclProjectionObject
+	owners           map[aclIdentityKey][]byte
+	recorder         ACLMutationRecorder
+	applied          []appliedACLMutation
+	relaxTreeSharing bool
 }
 
 type aclProjectionObject interface {
 	snapshot() (aclObjectSnapshot, error)
 	setDACL([][]byte) error
 	close() error
+}
+
+type aclTreeSharingPreparer interface {
+	prepareWriteShared() (aclProjectionObject, error)
 }
 
 type aclObjectSnapshot struct {
@@ -143,9 +149,10 @@ type boundACLObject struct {
 }
 
 type appliedACLMutation struct {
-	record ACLMutationRecord
-	object aclProjectionObject
-	owner  []byte
+	record              ACLMutationRecord
+	object              aclProjectionObject
+	owner               []byte
+	terminalRollbackErr error
 }
 
 type aclIdentityKey struct {
@@ -272,6 +279,11 @@ func (projection *ACLProjection) Apply() error {
 	if err := projection.validatePlanReadback(); err != nil {
 		return projection.failApply(err)
 	}
+	if projection.relaxTreeSharing {
+		if err := projection.relaxRetainedTreeSharing(); err != nil {
+			return projection.failApply(err)
+		}
+	}
 	return nil
 }
 
@@ -286,6 +298,55 @@ func (projection *ACLProjection) validatePlanReadback() error {
 				return errors.New("sandbox: required projected ACE missing from DACL read-back")
 			}
 		}
+	}
+	return nil
+}
+
+// relaxRetainedTreeSharing prepares every replacement while the original
+// read-sharing-only set still freezes data writes and namespace changes. Only
+// after all replacements have been identity/owner validated are they installed
+// as one logical set. Delete sharing remains omitted for the lease lifetime.
+func (projection *ACLProjection) relaxRetainedTreeSharing() error {
+	replacements := make(map[aclIdentityKey]aclProjectionObject, len(projection.objects))
+	expected := make(map[aclIdentityKey]ACLObjectIdentity, len(projection.objects))
+	for _, target := range projection.plan.ValidationTargets() {
+		expected[identityKey(target.Object)] = target.Object
+	}
+	closeReplacements := func() {
+		for _, object := range replacements {
+			_ = object.close()
+		}
+	}
+	for key, object := range projection.objects {
+		preparer, ok := object.(aclTreeSharingPreparer)
+		if !ok {
+			closeReplacements()
+			return errors.New("sandbox: retained ACL tree object cannot relax write sharing")
+		}
+		replacement, err := preparer.prepareWriteShared()
+		if err != nil {
+			closeReplacements()
+			return fmt.Errorf("relax retained ACL tree sharing: %w", err)
+		}
+		snapshot, err := replacement.snapshot()
+		if err != nil || snapshot.identity != expected[key] || !bytes.Equal(snapshot.owner, projection.owners[key]) {
+			_ = replacement.close()
+			closeReplacements()
+			return errors.Join(fmt.Errorf("%w: relaxed ACL tree handle changed", policy.ErrTargetChanged), err)
+		}
+		replacements[key] = replacement
+	}
+	old := projection.objects
+	projection.objects = replacements
+	for index := range projection.applied {
+		projection.applied[index].object = replacements[identityKey(projection.applied[index].record.Object)]
+	}
+	var closeErr error
+	for _, object := range old {
+		closeErr = errors.Join(closeErr, object.close())
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close frozen ACL tree handles: %w", closeErr)
 	}
 	return nil
 }
@@ -305,6 +366,11 @@ func (projection *ACLProjection) Rollback() error {
 	remaining := make([]appliedACLMutation, 0, len(projection.applied))
 	for index := len(projection.applied) - 1; index >= 0; index-- {
 		applied := projection.applied[index]
+		if applied.terminalRollbackErr != nil {
+			result = errors.Join(result, applied.terminalRollbackErr)
+			remaining = append(remaining, applied)
+			continue
+		}
 		snapshot, err := applied.object.snapshot()
 		if err == nil && (snapshot.identity != applied.record.Object || !bytes.Equal(snapshot.owner, applied.owner)) {
 			err = fmt.Errorf("%w: refusing ACL rollback after identity or owner change", policy.ErrTargetChanged)
@@ -332,6 +398,9 @@ func (projection *ACLProjection) Rollback() error {
 			err = projection.recorder.AfterACLRollback(applied.record)
 		}
 		if err != nil {
+			if errors.Is(err, errACLIdenticalCollision) {
+				applied.terminalRollbackErr = err
+			}
 			result = errors.Join(result, err)
 			remaining = append(remaining, applied)
 			continue
@@ -397,8 +466,12 @@ func insertCanonicalACE(aces [][]byte, inserted []byte) [][]byte {
 }
 
 func removeLeaseACEOccurrence(aces [][]byte, target []byte, baseline int) ([][]byte, error) {
-	if countIdenticalACE(aces, target) <= baseline {
+	count := countIdenticalACE(aces, target)
+	if count <= baseline {
 		return cloneACEs(aces), nil
+	}
+	if count != baseline+1 {
+		return cloneACEs(aces), fmt.Errorf("%w: observed %d occurrences above baseline %d", errACLIdenticalCollision, count, baseline)
 	}
 	result := cloneACEs(aces)
 	for index := len(result) - 1; index >= 0; index-- {
@@ -454,6 +527,27 @@ func reopenWin32ACLObject(handle win.Handle, target string) (*win32ACLObject, er
 		return nil, fmt.Errorf("reopen retained handle for ACL access: %w", callErr)
 	}
 	return &win32ACLObject{handle: win.Handle(reopened), target: target}, nil
+}
+
+func (object *win32ACLObject) prepareWriteShared() (aclProjectionObject, error) {
+	if object == nil || object.handle == 0 || object.handle == win.InvalidHandle {
+		return nil, errors.New("sandbox: invalid retained ACL tree handle")
+	}
+	snapshot, err := object.snapshot()
+	if err != nil {
+		return nil, err
+	}
+	desired := uintptr(win.READ_CONTROL | win.WRITE_DAC | win.FILE_READ_ATTRIBUTES)
+	if snapshot.identity.Kind == ACLObjectDirectory {
+		desired |= win.FILE_LIST_DIRECTORY
+	}
+	reopened, _, callErr := procReOpenFile.Call(uintptr(object.handle), desired,
+		win.FILE_SHARE_READ|win.FILE_SHARE_WRITE,
+		win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
+	if reopened == uintptr(win.InvalidHandle) {
+		return nil, fmt.Errorf("reopen retained ACL tree with write sharing: %w", callErr)
+	}
+	return &win32ACLObject{handle: win.Handle(reopened), target: object.target}, nil
 }
 
 // RestrictedACLCleaner is the allow-only crash-recovery half of restricted ACL

@@ -24,6 +24,8 @@ type fakeACLObject struct {
 	snapshotCalls  int
 	failSnapshotAt int
 	afterSet       func(*fakeACLObject)
+	relaxErr       error
+	relaxed        *fakeACLObject
 	closed         bool
 }
 
@@ -55,6 +57,20 @@ func (object *fakeACLObject) setDACL(aces [][]byte) error {
 }
 
 func (object *fakeACLObject) close() error { object.closed = true; return nil }
+
+func (object *fakeACLObject) prepareWriteShared() (aclProjectionObject, error) {
+	if object.relaxErr != nil {
+		return nil, object.relaxErr
+	}
+	if object.relaxed == nil {
+		object.relaxed = &fakeACLObject{snapshotValue: aclObjectSnapshot{
+			identity: object.snapshotValue.identity,
+			owner:    append([]byte(nil), object.snapshotValue.owner...),
+			aces:     cloneACEs(object.snapshotValue.aces),
+		}, failSetAt: -1, failSnapshotAt: -1}
+	}
+	return object.relaxed, nil
+}
 
 type recordingACLJournal struct {
 	prepared  []ACLMutationRecord
@@ -207,6 +223,103 @@ func TestACLProjectionRollbackRemovesOnlyOccurrenceAboveBaseline(t *testing.T) {
 	}
 	if countIdenticalACE(object.snapshotValue.aces, identical) != 1 {
 		t.Fatalf("rollback did not preserve baseline identical ACE: %x", object.snapshotValue.aces)
+	}
+}
+
+func TestACLProjectionRollbackPermanentlyRefusesConcurrentIdenticalDeny(t *testing.T) {
+	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "identical-deny-collision")
+	identity := testIdentity(63, ACLObjectFile, 2)
+	deny := ACLACE{Type: ACEDeny, Access: ACLWrite}
+	deny.Bytes = encodeACE(sid, identity.Kind, deny)
+	object := &fakeACLObject{snapshotValue: aclObjectSnapshot{
+		identity: identity, owner: []byte("owner"), aces: [][]byte{deny.Bytes, deny.Bytes},
+	}, failSetAt: -1, failSnapshotAt: -1}
+	projection := &ACLProjection{applied: []appliedACLMutation{{
+		record: ACLMutationRecord{
+			Object: identity, ACE: append([]byte(nil), deny.Bytes...), BaselineIdentical: 0,
+			Rollback: ACLRollbackMetadata{LeaseID: testLeaseID(), Role: ACERoleRestrictingDeny, SID: sid},
+		},
+		object: object, owner: []byte("owner"),
+	}}}
+	if err := projection.Rollback(); !errors.Is(err, errACLIdenticalCollision) {
+		t.Fatalf("first rollback error = %v, want permanent identical collision", err)
+	}
+	if object.setCalls != 0 || countIdenticalACE(object.snapshotValue.aces, deny.Bytes) != 2 {
+		t.Fatalf("collision rollback mutated DACL: calls=%d aces=%x", object.setCalls, object.snapshotValue.aces)
+	}
+	// Even if the concurrent owner later removes one occurrence, the lease can
+	// no longer distinguish whose ACE remains and must never retry removal.
+	object.snapshotValue.aces = object.snapshotValue.aces[:1]
+	for attempt := 0; attempt < 2; attempt++ {
+		var err error
+		if attempt == 0 {
+			err = projection.Rollback()
+		} else {
+			err = projection.Close()
+		}
+		if !errors.Is(err, errACLIdenticalCollision) {
+			t.Fatalf("retry %d error = %v, want permanent identical collision", attempt, err)
+		}
+		if object.setCalls != 0 || countIdenticalACE(object.snapshotValue.aces, deny.Bytes) != 1 {
+			t.Fatalf("retry %d removed another occurrence: calls=%d aces=%x", attempt, object.setCalls, object.snapshotValue.aces)
+		}
+	}
+}
+
+func TestACLTreeProjectionRollsBackWhenWriteSharingCannotRelax(t *testing.T) {
+	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "relax-failure")
+	identity := testIdentity(64, ACLObjectDirectory, 1)
+	plan, err := BuildACLPlan(ACLPlanRequest{
+		LeaseID: testLeaseID(), SID: sid, Scope: ACLScopeTree, Access: ACLWrite, Root: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := &fakeACLObject{snapshotValue: aclObjectSnapshot{identity: identity, owner: []byte("owner")},
+		failSetAt: -1, failSnapshotAt: -1, relaxErr: errors.New("injected sharing relaxation failure")}
+	projection, err := newACLProjection(plan, map[aclIdentityKey]aclProjectionObject{identityKey(identity): object}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection.relaxTreeSharing = true
+	if err := projection.Apply(); err == nil || !strings.Contains(err.Error(), "sharing relaxation failure") {
+		t.Fatalf("Apply error = %v, want sharing relaxation failure", err)
+	}
+	if len(object.snapshotValue.aces) != 0 || len(projection.applied) != 0 {
+		t.Fatalf("relaxation failure was not rolled back: aces=%x applied=%d", object.snapshotValue.aces, len(projection.applied))
+	}
+}
+
+func TestACLTreeProjectionCommitsValidatedSharingReplacementSet(t *testing.T) {
+	sid := deriveCapabilitySID(sidKindOneShot, oneShotSIDDomain, "relax-success")
+	identity := testIdentity(65, ACLObjectDirectory, 1)
+	plan, err := BuildACLPlan(ACLPlanRequest{
+		LeaseID: testLeaseID(), SID: sid, Scope: ACLScopeTree, Access: ACLWrite, Root: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := &fakeACLObject{snapshotValue: aclObjectSnapshot{identity: identity, owner: []byte("owner")},
+		failSetAt: -1, failSnapshotAt: -1}
+	projection, err := newACLProjection(plan, map[aclIdentityKey]aclProjectionObject{identityKey(identity): object}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection.relaxTreeSharing = true
+	if err := projection.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if !object.closed || object.relaxed == nil || projection.objects[identityKey(identity)] != object.relaxed {
+		t.Fatal("validated replacement set was not committed and frozen handle closed")
+	}
+	if len(projection.applied) != 1 || projection.applied[0].object != object.relaxed {
+		t.Fatal("rollback ownership did not transfer to relaxed handle")
+	}
+	if err := projection.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if len(object.relaxed.snapshotValue.aces) != 0 {
+		t.Fatalf("rollback through replacement left ACEs: %x", object.relaxed.snapshotValue.aces)
 	}
 }
 
@@ -522,6 +635,19 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	}
 	if err := projection.Apply(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(ordinaryFile, []byte("write allowed after full readback"), 0o600); err != nil {
+		t.Fatalf("relaxed retained tree still blocks ordinary writes after Apply: %v", err)
+	}
+	if err := os.WriteFile(concurrentChild, []byte("create allowed after full readback"), 0o600); err != nil {
+		t.Fatalf("relaxed retained root still blocks child creation after Apply: %v", err)
+	}
+	if err := os.Remove(ordinaryFile); err == nil {
+		t.Fatal("relaxed retained file allowed delete sharing")
+	}
+	if err := os.Rename(root, root+"-swapped"); err == nil {
+		_ = os.Rename(root+"-swapped", root)
+		t.Fatal("relaxed retained root allowed root swap")
 	}
 	// Apply performs the authoritative full-plan DACL read-back. Repeat it here
 	// so this live matrix explicitly observes inheritance and carveout denies.
