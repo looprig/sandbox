@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -62,11 +64,14 @@ func TestWindowsCompareUsesOrdinalUTF16Ordering(t *testing.T) {
 	}
 }
 
-func TestWindowsSupportedVolumeRootsFiltersDeduplicatesAndOrders(t *testing.T) {
-	got := filterVolumeRoots([]string{`D:\`, `z:\`, `c:\`, `C:\`}, func(root string) bool {
-		return !EqualPath(root, `Z:\`)
+func TestWindowsVolumeMountRootsIncludeDirectoryOnlyVolumesAndDedupeIdentity(t *testing.T) {
+	got := selectVolumeMountRoots([]enumeratedVolume{
+		{identity: "volume-b", paths: []string{`C:\mounts\data\`}},
+		{identity: "volume-a", paths: []string{`C:\mounts\system\`, `D:\`}},
+		{identity: "volume-a", paths: []string{`d:\`}},
+		{identity: "volume-c", paths: []string{`Z:\`, `z:\`}},
 	})
-	want := []string{`C:\`, `D:\`}
+	want := []string{`C:\mounts\data`, `D:\`, `Z:\`}
 	if len(got) != len(want) {
 		t.Fatalf("roots = %q, want %q", got, want)
 	}
@@ -153,7 +158,7 @@ func shortPathName(path string) (string, error) {
 	return windows.UTF16ToString(buffer[:n]), nil
 }
 
-func TestWindowsOpenDoesNotFollowLeafReparsePoint(t *testing.T) {
+func TestWindowsOpenRejectsLeafReparsePoint(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
 	link := filepath.Join(root, "link.txt")
@@ -163,17 +168,122 @@ func TestWindowsOpenDoesNotFollowLeafReparsePoint(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("creating symlink requires Windows developer mode or privilege: %v", err)
 	}
-	object, err := Open(link)
+	if _, err := Open(link); !errors.Is(err, ErrUnsupportedPath) {
+		t.Fatalf("Open symlink error = %v, want ErrUnsupportedPath", err)
+	}
+}
+
+func TestWindowsComponentWalkRetainsParentsAndUsesRelativeNames(t *testing.T) {
+	var roots []string
+	var relatives []string
+	var closed []windows.Handle
+	handles, err := walkPathComponents(`C:\one\two\leaf`, windows.FILE_SHARE_READ,
+		func(root string, _ uint32) (windows.Handle, error) {
+			roots = append(roots, root)
+			return 1, nil
+		},
+		func(parent windows.Handle, name string, directory bool, _ uint32) (windows.Handle, error) {
+			relatives = append(relatives, name)
+			if want := windows.Handle(len(relatives)); parent != want {
+				t.Fatalf("relative parent = %d, want %d", parent, want)
+			}
+			if directory != (name != "leaf") {
+				t.Fatalf("relative %q directory = %t", name, directory)
+			}
+			return parent + 1, nil
+		},
+		func(windows.Handle) (bool, error) { return false, nil },
+		func(handle windows.Handle) error { closed = append(closed, handle); return nil },
+	)
 	if err != nil {
-		t.Fatalf("Open symlink: %v", err)
+		t.Fatal(err)
 	}
-	defer object.Close()
-	if object.ReparseTag != windows.IO_REPARSE_TAG_SYMLINK {
-		t.Fatalf("reparse tag = %#x, want symlink %#x", object.ReparseTag, windows.IO_REPARSE_TAG_SYMLINK)
+	if got, want := roots, []string{`C:\`}; !slices.Equal(got, want) {
+		t.Fatalf("roots = %q, want %q", got, want)
 	}
-	if object.Kind != KindReparsePoint {
-		t.Fatalf("kind = %v, want KindReparsePoint", object.Kind)
+	if got, want := relatives, []string{"one", "two", "leaf"}; !slices.Equal(got, want) {
+		t.Fatalf("relative opens = %q, want %q", got, want)
 	}
+	if len(handles) != 4 || len(closed) != 0 {
+		t.Fatalf("handles=%v closed=%v, want retained chain", handles, closed)
+	}
+}
+
+func TestWindowsComponentWalkClosesChainWhenReparseAppears(t *testing.T) {
+	var closed []windows.Handle
+	_, err := walkPathComponents(`C:\one\junction\leaf`, windows.FILE_SHARE_READ,
+		func(string, uint32) (windows.Handle, error) { return 1, nil },
+		func(parent windows.Handle, _ string, _ bool, _ uint32) (windows.Handle, error) {
+			return parent + 1, nil
+		},
+		func(handle windows.Handle) (bool, error) { return handle == 3, nil },
+		func(handle windows.Handle) error { closed = append(closed, handle); return nil },
+	)
+	if !errors.Is(err, ErrUnsupportedPath) {
+		t.Fatalf("walk error = %v, want ErrUnsupportedPath", err)
+	}
+	if got, want := closed, []windows.Handle{3, 2, 1}; !slices.Equal(got, want) {
+		t.Fatalf("closed handles = %v, want %v", got, want)
+	}
+}
+
+func TestWindowsOpenNeverEscapesDuringConcurrentSymlinkSwap(t *testing.T) {
+	parent := t.TempDir()
+	safe := filepath.Join(parent, "slot")
+	held := filepath.Join(parent, "held")
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(safe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(safe, "leaf"), []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "leaf"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(parent, "probe-link")
+	if err := os.Symlink(outside, probe); err != nil {
+		t.Skipf("directory symlink privilege unavailable: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if os.Rename(safe, held) == nil {
+				if os.Symlink(outside, safe) == nil {
+					_ = os.Remove(safe)
+				}
+				_ = os.Rename(held, safe)
+			}
+		}
+	}()
+	for range 500 {
+		object, err := Open(filepath.Join(safe, "leaf"))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(object.DOSPath), `\outside\`) {
+			object.Close()
+			close(stop)
+			<-done
+			t.Fatalf("walk escaped requested namespace: %q", object.DOSPath)
+		}
+		_ = object.Close()
+	}
+	close(stop)
+	<-done
 }
 
 func TestWindowsOpenPinnedBlocksRootSwapUntilClose(t *testing.T) {
