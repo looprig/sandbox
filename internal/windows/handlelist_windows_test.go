@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -85,6 +86,31 @@ func TestConfigureExplicitHandleListRejectsWiderAccess(t *testing.T) {
 	}
 }
 
+func TestConfigureExplicitHandleListRejectsWideStandardFiles(t *testing.T) {
+	file, err := os.OpenFile(filepath.Join(t.TempDir(), "stdio"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	for _, stream := range []string{"stdin", "stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			cmd := exec.Command("cmd.exe", "/c", "exit 0")
+			switch stream {
+			case "stdin":
+				cmd.Stdin = file
+			case "stdout":
+				cmd.Stdout = file
+			case "stderr":
+				cmd.Stderr = file
+			}
+			if _, err := ConfigureExplicitHandleList(cmd, nil); err == nil {
+				t.Fatalf("ConfigureExplicitHandleList accepted read/write %s", stream)
+			}
+		})
+	}
+}
+
 func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	helper := buildHandleProbe(t)
 	r, w, err := os.Pipe()
@@ -94,6 +120,7 @@ func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	source := winapi.Handle(r.Fd())
+	makeNonInheritable(t, source)
 
 	var sourceFlags uint32
 	if err := readHandleInformation(source, &sourceFlags); err != nil {
@@ -161,6 +188,7 @@ func TestHandleListDuplicatesOnlyDeclaredMinimumAccess(t *testing.T) {
 	if !found {
 		t.Fatalf("declared duplicate %#x was not inherited", uintptr(duplicate))
 	}
+	assertStandardHandleAccess(t, report)
 }
 
 func readHandleInformation(handle winapi.Handle, flags *uint32) error {
@@ -172,8 +200,9 @@ func readHandleInformation(handle winapi.Handle, flags *uint32) error {
 }
 
 type probeReport struct {
-	Stdin   string `json:"stdin"`
-	Handles []struct {
+	Stdin    string             `json:"stdin"`
+	Standard map[string]uintptr `json:"standard"`
+	Handles  []struct {
 		Value  uintptr `json:"value"`
 		Type   string  `json:"type"`
 		Access uint32  `json:"access"`
@@ -188,19 +217,59 @@ func TestInheritedHandleCanariesAreExcluded(t *testing.T) {
 
 func TestHandleListRunnerRequestIsExcludedFromTarget(t *testing.T) {
 	helper := buildHandleProbe(t)
+	runTwoStageHandleProbe(t, helper)
+}
+
+func runTwoStageHandleProbe(t *testing.T, helper string) {
+	t.Helper()
 	requestRead, requestWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer requestRead.Close()
-	defer requestWrite.Close()
-	makeInheritable(t, winapi.Handle(requestRead.Fd()))
+	makeNonInheritable(t, winapi.Handle(requestRead.Fd()))
 
-	// This models the runner retaining a sealed request read handle while it
-	// launches the actual target. The target gets only standard streams.
-	runHandleProbe(t, helper, map[string]winapi.Handle{
-		"sealed-request-read": winapi.Handle(requestRead.Fd()),
-	})
+	cmd := exec.Command(helper, "runner", "pending")
+	cmd.Stdin = strings.NewReader("stdio-ok")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cleanup, err := ConfigureExplicitHandleList(cmd, []ExplicitHandle{{
+		Handle: winapi.Handle(requestRead.Fd()),
+		Access: winapi.FILE_READ_DATA,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	requestHandle := uintptr(cmd.SysProcAttr.AdditionalInheritedHandles[0])
+	cmd.Args[2] = strconv.FormatUint(uint64(requestHandle), 16)
+	if _, err := requestWrite.Write([]byte{0x7f}); err != nil {
+		t.Fatal(err)
+	}
+	if err := requestWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run two-stage handle probe: %v: %s", err, stderr.String())
+	}
+
+	var report probeReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode target report: %v: %q", err, stdout.String())
+	}
+	if report.Stdin != "stdio-ok" {
+		t.Fatalf("target stdin = %q, want stdio-ok", report.Stdin)
+	}
+	if got := stderr.String(); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
+		t.Fatalf("target stderr = %q, want stderr-ok", got)
+	}
+	assertStandardHandleAccess(t, report)
+	for _, inherited := range report.Handles {
+		if inherited.Value == requestHandle {
+			t.Fatalf("target has runner request handle value %#x (type=%s access=%#x)", requestHandle, inherited.Type, inherited.Access)
+		}
+	}
 }
 
 func buildHandleProbe(t *testing.T) string {
@@ -244,11 +313,41 @@ func runHandleProbe(t *testing.T, helper string, canaries map[string]winapi.Hand
 	if got := stderr.String(); got != "stderr-ok\r\n" && got != "stderr-ok\n" {
 		t.Fatalf("probe stderr = %q, want stderr-ok", got)
 	}
+	assertStandardHandleAccess(t, report)
 	for name, canary := range canaries {
 		for _, inherited := range report.Handles {
 			if inherited.Value == uintptr(canary) {
 				t.Errorf("target inherited %s canary handle %#x (type=%s access=%#x)", name, uintptr(canary), inherited.Type, inherited.Access)
 			}
+		}
+	}
+}
+
+func assertStandardHandleAccess(t *testing.T, report probeReport) {
+	t.Helper()
+	want := map[string]uint32{
+		"stdin":  winapi.FILE_GENERIC_READ,
+		"stdout": winapi.FILE_GENERIC_WRITE,
+		"stderr": winapi.FILE_GENERIC_WRITE,
+	}
+	for name, expected := range want {
+		value, ok := report.Standard[name]
+		if !ok {
+			t.Errorf("target did not report %s handle", name)
+			continue
+		}
+		found := false
+		for _, handle := range report.Handles {
+			if handle.Value == value {
+				found = true
+				if handle.Access != expected {
+					t.Errorf("target %s access = %#x, want exact %#x", name, handle.Access, expected)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Errorf("target %s handle %#x absent from enumeration", name, value)
 		}
 	}
 }
@@ -321,5 +420,12 @@ func makeInheritable(t *testing.T, handle winapi.Handle) {
 	t.Helper()
 	if err := winapi.SetHandleInformation(handle, winapi.HANDLE_FLAG_INHERIT, winapi.HANDLE_FLAG_INHERIT); err != nil {
 		t.Fatalf("make handle %#x inheritable: %v", uintptr(handle), err)
+	}
+}
+
+func makeNonInheritable(t *testing.T, handle winapi.Handle) {
+	t.Helper()
+	if err := winapi.SetHandleInformation(handle, winapi.HANDLE_FLAG_INHERIT, 0); err != nil {
+		t.Fatalf("make handle %#x non-inheritable: %v", uintptr(handle), err)
 	}
 }

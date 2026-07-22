@@ -5,6 +5,7 @@ package windows
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -57,6 +58,9 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 	}
 	if len(cmd.SysProcAttr.AdditionalInheritedHandles) != 0 {
 		return nil, errors.New("sandbox: configure Windows handle list: ambient inherited handles are forbidden")
+	}
+	if err := validateStandardHandles(cmd); err != nil {
+		return nil, err
 	}
 
 	seen := make(map[winapi.Handle]struct{}, len(declared))
@@ -114,6 +118,41 @@ func ConfigureExplicitHandleList(cmd *exec.Cmd, declared []ExplicitHandle) (clea
 		cmd.SysProcAttr.AdditionalInheritedHandles[i] = syscall.Handle(handle)
 	}
 	return closeDuplicates, nil
+}
+
+func validateStandardHandles(cmd *exec.Cmd) error {
+	// os/exec creates directional anonymous pipes for non-*os.File streams and
+	// opens NUL read-only for a nil stdin. A supplied *os.File bypasses that
+	// construction and is inherited directly, so inspect it before Start and
+	// reject any access beyond the standard stream's directional minimum.
+	streams := []struct {
+		name     string
+		value    any
+		allowed  uint32
+		required uint32
+	}{
+		{name: "stdin", value: cmd.Stdin, allowed: winapi.FILE_GENERIC_READ, required: winapi.FILE_READ_DATA},
+		{name: "stdout", value: cmd.Stdout, allowed: winapi.FILE_GENERIC_WRITE, required: winapi.FILE_WRITE_DATA},
+		{name: "stderr", value: cmd.Stderr, allowed: winapi.FILE_GENERIC_WRITE, required: winapi.FILE_WRITE_DATA},
+	}
+	for _, stream := range streams {
+		file, ok := stream.value.(*os.File)
+		if !ok || file == nil {
+			continue
+		}
+		handle := winapi.Handle(file.Fd())
+		if invalidExplicitHandle(handle) {
+			return fmt.Errorf("sandbox: configure Windows handle list: %s has an invalid or pseudo handle", stream.name)
+		}
+		granted, err := handleGrantedAccess(handle)
+		if err != nil {
+			return fmt.Errorf("sandbox: configure Windows handle list: inspect %s access: %w", stream.name, err)
+		}
+		if granted&stream.required == 0 || granted&^stream.allowed != 0 {
+			return fmt.Errorf("sandbox: configure Windows handle list: %s access %#x exceeds directional mask %#x", stream.name, granted, stream.allowed)
+		}
+	}
+	return nil
 }
 
 func handleGrantedAccess(handle winapi.Handle) (uint32, error) {

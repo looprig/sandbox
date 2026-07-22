@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strconv"
 	"unsafe"
 
+	winlaunch "github.com/looprig/sandbox/internal/windows"
 	"golang.org/x/sys/windows"
 )
 
@@ -48,11 +51,20 @@ type reportedHandle struct {
 }
 
 type report struct {
-	Stdin   string           `json:"stdin"`
-	Handles []reportedHandle `json:"handles"`
+	Stdin    string             `json:"stdin"`
+	Standard map[string]uintptr `json:"standard"`
+	Handles  []reportedHandle   `json:"handles"`
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "runner" {
+		runRunner()
+		return
+	}
+	runTarget()
+}
+
+func runTarget() {
 	stdin, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fatal(err)
@@ -61,11 +73,55 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(report{Stdin: string(stdin), Handles: handles}); err != nil {
+	if err := json.NewEncoder(os.Stdout).Encode(report{
+		Stdin: string(stdin),
+		Standard: map[string]uintptr{
+			"stdin":  os.Stdin.Fd(),
+			"stdout": os.Stdout.Fd(),
+			"stderr": os.Stderr.Fd(),
+		},
+		Handles: handles,
+	}); err != nil {
 		fatal(err)
 	}
 	if _, err := fmt.Fprintln(os.Stderr, "stderr-ok"); err != nil {
 		fatal(err)
+	}
+}
+
+func runRunner() {
+	if len(os.Args) != 3 {
+		fatal(fmt.Errorf("runner requires request handle"))
+	}
+	value, err := strconv.ParseUint(os.Args[2], 16, 64)
+	if err != nil {
+		fatal(fmt.Errorf("parse request handle: %w", err))
+	}
+	requestHandle := windows.Handle(uintptr(value))
+	request := os.NewFile(uintptr(requestHandle), "sealed-request")
+	if request == nil {
+		fatal(fmt.Errorf("open inherited request handle"))
+	}
+	defer request.Close()
+	marker := []byte{0}
+	if _, err := io.ReadFull(request, marker); err != nil || marker[0] != 0x7f {
+		fatal(fmt.Errorf("read inherited request marker: value=%#x err=%v", marker[0], err))
+	}
+	if err := windows.SetHandleInformation(requestHandle, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
+		fatal(fmt.Errorf("clear request inheritance: %w", err))
+	}
+
+	cmd := exec.Command(os.Args[0], "target")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cleanup, err := winlaunch.ConfigureExplicitHandleList(cmd, nil)
+	if err != nil {
+		fatal(err)
+	}
+	defer cleanup()
+	if err := cmd.Run(); err != nil {
+		fatal(fmt.Errorf("run target: %w", err))
 	}
 }
 
