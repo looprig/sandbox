@@ -362,6 +362,11 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
+	handleCleanup, err := configureChildHandleList(cmd)
+	if err != nil {
+		return nil, -1, err
+	}
+	defer handleCleanup()
 	err = lease.start(cmd, tree)
 	if err == nil {
 		err = cmd.Wait()
