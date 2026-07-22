@@ -146,6 +146,28 @@ func Compare(left, right string) int {
 // EqualPath reports ordinal case-insensitive equality.
 func EqualPath(left, right string) bool { return Compare(left, right) == 0 }
 
+// HasPrefix reports whether value begins with prefix under ordinal
+// case-insensitive UTF-16 comparison.
+func HasPrefix(value, prefix string) bool {
+	value16, err := windows.UTF16FromString(value)
+	if err != nil {
+		return false
+	}
+	prefix16, err := windows.UTF16FromString(prefix)
+	if err != nil || len(value16) < len(prefix16) {
+		return false
+	}
+	prefixUnits := len(prefix16) - 1
+	if len(value16)-1 < prefixUnits {
+		return false
+	}
+	result, _, _ := compareStringOrdinal.Call(
+		uintptr(unsafe.Pointer(&value16[0])), uintptr(prefixUnits),
+		uintptr(unsafe.Pointer(&prefix16[0])), uintptr(prefixUnits), 1,
+	)
+	return result == 2
+}
+
 // VolumeRoots enumerates every supported fixed local NTFS/ReFS drive root.
 func VolumeRoots() ([]string, error) {
 	candidates, err := logicalDriveRoots()

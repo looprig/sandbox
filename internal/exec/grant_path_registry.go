@@ -39,7 +39,7 @@ func (paths retainedGrantPaths) add(id [32]byte, entry retainedGrantPath) error 
 	return nil
 }
 
-func (paths retainedGrantPaths) take(id [32]byte, binding *policy.PathBinding, target string, exact bool, expiryUnixMilli int64) (retainedPathHandle, error) {
+func (paths retainedGrantPaths) borrow(id [32]byte, binding *policy.PathBinding, target string, exact bool, expiryUnixMilli int64) (retainedPathHandle, error) {
 	entry, exists := paths[id]
 	if !exists {
 		return nil, ErrGrantReplay
@@ -47,12 +47,23 @@ func (paths retainedGrantPaths) take(id [32]byte, binding *policy.PathBinding, t
 	if binding == nil || entry.target != target || entry.exact != exact || entry.expiryUnixMilli != expiryUnixMilli ||
 		entry.binding.CanonicalPath != binding.CanonicalPath || entry.binding.ExistingPath != binding.ExistingPath ||
 		entry.binding.Identity != binding.Identity {
-		delete(paths, id)
-		_ = entry.handle.Close()
 		return nil, ErrGrantTargetChanged
 	}
-	delete(paths, id)
 	return entry.handle, nil
+}
+
+func (paths retainedGrantPaths) commit(ids [][32]byte) ([]retainedPathHandle, error) {
+	for _, id := range ids {
+		if _, exists := paths[id]; !exists {
+			return nil, ErrGrantReplay
+		}
+	}
+	handles := make([]retainedPathHandle, 0, len(ids))
+	for _, id := range ids {
+		handles = append(handles, paths[id].handle)
+		delete(paths, id)
+	}
+	return handles, nil
 }
 
 func (paths retainedGrantPaths) prune(nowUnixMilli int64) {

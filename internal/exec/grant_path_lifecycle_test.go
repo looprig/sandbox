@@ -94,6 +94,41 @@ func TestRetainedGrantPathConcurrentConsumptionFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRetainedGrantPathSurvivesLaterInvalidToken(t *testing.T) {
+	now := time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	target := filepath.Join(workspace, "target.txt")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := executor.IssueGrant(context.Background(), "retry", "true", workspace,
+		"filesystem.read", target, GrantClassFilesystemPathRead, target, now.Add(time.Minute).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := grantID(token)
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "retry", workspace, "true", []string{token, "invalid"}); !errors.Is(err, ErrGrantMalformed) {
+		t.Fatalf("mixed batch error = %v, want ErrGrantMalformed", err)
+	}
+	if _, ok := executor.retainedGrantPaths[id]; !ok {
+		t.Fatal("valid grant handle was consumed by failed batch")
+	}
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "retry", workspace, "true", []string{token}); err != nil {
+		t.Fatalf("retry valid grant: %v", err)
+	}
+}
+
 func TestRetainedGrantPathExpiresAndClosesWithExecutor(t *testing.T) {
 	now := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())

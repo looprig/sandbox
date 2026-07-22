@@ -26,3 +26,18 @@ func TestLiteralMatchesWindowsPathKeysIgnoreCaseAndSeparatorSpelling(t *testing.
 		})
 	}
 }
+
+func TestWindowsLiteralComparisonUsesOrdinalUnicodeSemantics(t *testing.T) {
+	if !literalPathEqual(`C:\Straße`, `c:\STRAẞE`) {
+		t.Fatal("ordinal case-insensitive equality rejected sharp-s case pair")
+	}
+	if !literalPathHasComponentPrefix(`c:\STRAẞE\child`, `C:\Straße`) {
+		t.Fatal("ordinal component prefix rejected sharp-s case pair")
+	}
+	if literalPathHasComponentPrefix(`C:\Straße-other`, `c:\STRAẞE`) {
+		t.Fatal("ordinal prefix crossed a component boundary")
+	}
+	if !literalVolumeEqual(`c:`, `C:`) || literalVolumeEqual(`C:`, `D:`) {
+		t.Fatal("ordinal volume comparison contract violated")
+	}
+}

@@ -24,15 +24,23 @@ func sortHostRoots(roots []string) { slices.SortFunc(roots, winpath.Compare) }
 
 func pathKey(path string) string {
 	path = strings.ReplaceAll(path, "/", pathKeySeparator)
-	return strings.ToUpper(filepath.Clean(path))
+	return filepath.Clean(path)
 }
 
 func pathKeyIsRoot(key string) bool {
 	volume := filepath.VolumeName(key)
-	return volume != "" && key == strings.ToUpper(volume)+pathKeySeparator
+	return volume != "" && literalPathEqual(key, volume+pathKeySeparator)
 }
 
-func pathKeyVolume(key string) string { return strings.ToUpper(filepath.VolumeName(key)) }
+func pathKeyVolume(key string) string { return filepath.VolumeName(key) }
+
+func literalPathEqual(left, right string) bool { return winpath.Compare(left, right) == 0 }
+
+func literalPathHasComponentPrefix(target, entry string) bool {
+	return winpath.HasPrefix(target, strings.TrimSuffix(entry, pathKeySeparator)+pathKeySeparator)
+}
+
+func literalVolumeEqual(left, right string) bool { return winpath.Compare(left, right) == 0 }
 
 // MinimalRuntimeEntries is intentionally empty on Windows. The operating-system
 // runtime closure is represented by WindowsRuntimeBaseline and audited by the

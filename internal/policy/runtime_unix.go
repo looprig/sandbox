@@ -5,6 +5,7 @@ package policy
 import (
 	"path/filepath"
 	"slices"
+	"strings"
 )
 
 const (
@@ -23,6 +24,14 @@ func pathKey(path string) string { return filepath.Clean(path) }
 func pathKeyIsRoot(key string) bool { return key == pathKeySeparator }
 
 func pathKeyVolume(string) string { return "" }
+
+func literalPathEqual(left, right string) bool { return left == right }
+
+func literalPathHasComponentPrefix(target, entry string) bool {
+	return strings.HasPrefix(target, entry+pathKeySeparator)
+}
+
+func literalVolumeEqual(left, right string) bool { return left == right }
 
 func MinimalRuntimeEntries() []FSEntry {
 	var entries []FSEntry

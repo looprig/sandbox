@@ -306,7 +306,9 @@ func (e *Executor) markClosed() {
 	}
 	e.grantMu.Lock()
 	e.closed = true
+	e.stopRetainedGrantExpiryLocked()
 	e.grantMu.Unlock()
+	e.grantExpiryWG.Wait()
 }
 
 func (e *Executor) revokeResources() {
@@ -314,6 +316,8 @@ func (e *Executor) revokeResources() {
 		return
 	}
 	e.grantMu.Lock()
+	e.closed = true
+	e.stopRetainedGrantExpiryLocked()
 	for i := range e.grantKey {
 		e.grantKey[i] = 0
 	}
@@ -322,6 +326,7 @@ func (e *Executor) revokeResources() {
 	e.retainedGrantPaths = nil
 	proxy := e.proxy
 	e.grantMu.Unlock()
+	e.grantExpiryWG.Wait()
 	if proxy != nil {
 		_ = proxy.Close()
 	}

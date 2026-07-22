@@ -16,7 +16,7 @@ func TestWindowsRetainedGrantRegistryAcceptsInjectedHandleWithoutLiveObject(t *t
 	if err := paths.add(id, retainedGrantPath{binding: binding, target: binding.CanonicalPath, exact: true, expiryUnixMilli: 42, handle: handle}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := paths.take(id, &binding, binding.CanonicalPath, true, 42)
+	got, err := paths.borrow(id, &binding, binding.CanonicalPath, true, 42)
 	if err != nil || got != handle {
 		t.Fatalf("take injected Windows handle = (%T, %v)", got, err)
 	}

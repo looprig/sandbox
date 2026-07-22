@@ -113,19 +113,19 @@ func LiteralMatches(entryPath, target string, exact bool) bool {
 	ep := pathKey(entryPath)
 	target = pathKey(target)
 	if exact {
-		return target == ep
+		return literalPathEqual(target, ep)
 	}
 	if pathKeyIsRoot(ep) {
 		return rootMatchesVolume(pathKeyVolume(ep), pathKeyVolume(target))
 	}
-	if target == ep {
+	if literalPathEqual(target, ep) {
 		return true
 	}
-	return strings.HasPrefix(target, ep+pathKeySeparator)
+	return literalPathHasComponentPrefix(target, ep)
 }
 
 func rootMatchesVolume(entryVolume, targetVolume string) bool {
-	return entryVolume == "" || entryVolume == targetVolume
+	return entryVolume == "" || literalVolumeEqual(entryVolume, targetVolume)
 }
 
 // entrySpecificity is the length of an entry's matched literal prefix: the

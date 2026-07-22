@@ -89,20 +89,24 @@ type Executor struct {
 	// Grant wiring (SPEC §9.2). The HMAC key is per-executor and never serialized.
 	// Tokens also bind the immutable profile, route identity, and guarantee bits.
 	// usedGrants provides one-shot replay protection; Close revokes the key.
-	grantKey           []byte
-	clock              func() time.Time
-	grantTTL           time.Duration
-	routeFingerprint   string
-	proxy              *network.Proxy
-	home               string
-	tmp                string
-	grantMu            sync.Mutex
-	usedGrants         map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
-	retainedGrantPaths retainedGrantPaths
-	closed             bool
-	lifecycle          *executorLifecycle
-	specReleaseOnce    sync.Once
-	specReleaseErr     error
+	grantKey            []byte
+	clock               func() time.Time
+	grantTTL            time.Duration
+	routeFingerprint    string
+	proxy               *network.Proxy
+	home                string
+	tmp                 string
+	grantMu             sync.Mutex
+	usedGrants          map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	retainedGrantPaths  retainedGrantPaths
+	grantExpiryTimer    *time.Timer
+	grantExpiryGen      uint64
+	grantExpiryRealtime bool
+	grantExpiryWG       sync.WaitGroup
+	closed              bool
+	lifecycle           *executorLifecycle
+	specReleaseOnce     sync.Once
+	specReleaseErr      error
 }
 
 // snapshot is the compiled state a single spawn needs.
@@ -170,22 +174,23 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		lifecycle = newExecutorLifecycle()
 	}
 	return &Executor{
-		profile:            prof,
-		settings:           settings,
-		policy:             p,
-		backend:            b,
-		spec:               spec,
-		report:             report,
-		level:              level,
-		guaranteeBits:      bits,
-		env:                assembleEnv(p),
-		grantKey:           key,
-		clock:              clockOrDefault(config.clock),
-		grantTTL:           ttlOrDefault(config.grantTTL),
-		routeFingerprint:   defaultRouteIdentity,
-		usedGrants:         make(map[[32]byte]int64),
-		retainedGrantPaths: make(retainedGrantPaths),
-		lifecycle:          lifecycle,
+		profile:             prof,
+		settings:            settings,
+		policy:              p,
+		backend:             b,
+		spec:                spec,
+		report:              report,
+		level:               level,
+		guaranteeBits:       bits,
+		env:                 assembleEnv(p),
+		grantKey:            key,
+		clock:               clockOrDefault(config.clock),
+		grantTTL:            ttlOrDefault(config.grantTTL),
+		routeFingerprint:    defaultRouteIdentity,
+		usedGrants:          make(map[[32]byte]int64),
+		retainedGrantPaths:  make(retainedGrantPaths),
+		grantExpiryRealtime: config.clock == nil,
+		lifecycle:           lifecycle,
 	}, nil
 }
 
@@ -563,6 +568,7 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 		}); err != nil {
 			return "", err
 		}
+		e.rescheduleRetainedGrantExpiryLocked()
 	}
 	return token, nil
 }
@@ -574,6 +580,15 @@ func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, c
 }
 
 type grantPathAcquirer func(*policy.PathBinding, string, bool) (*policy.PathHandle, error)
+
+type pendingGrantPath struct {
+	id              [32]byte
+	binding         *policy.PathBinding
+	target          string
+	exact           bool
+	access          policy.FSAccess
+	expiryUnixMilli int64
+}
 
 func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string, acquire grantPathAcquirer) ([]byte, int, error) {
 	lease, err := e.beginExecution(ctx)
@@ -603,10 +618,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
 	e.retainedGrantPaths.prune(now.UnixMilli())
+	e.rescheduleRetainedGrantExpiryLocked()
 	seen := make(map[[32]byte]int64, len(grants))
 	commandGrant := e.settings.Command == Allow
 	expectedGuarantees := e.guaranteeBits
 	var proxyTargets []NetworkTarget
+	var pendingPaths []pendingGrantPath
 	var pathHandles policy.PathHandleSet
 	defer pathHandles.Close()
 	for _, token := range grants {
@@ -634,37 +651,11 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			return nil, -1, ErrGrantGuaranteeMismatch
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
-			validation, err := acquire(payload.PathBinding, delta.entry.Path, delta.entry.Exact)
-			if err != nil {
-				return nil, -1, err
-			}
-			retained, err := e.retainedGrantPaths.take(id, payload.PathBinding, delta.entry.Path, delta.entry.Exact, payload.ExpiryUnixMilli)
-			if err != nil {
-				if validation != nil {
-					_ = validation.Close()
-				}
-				return nil, -1, err
-			}
-			handle, retainedIsPathHandle := retained.(*policy.PathHandle)
-			if retainedIsPathHandle != (validation != nil) ||
-				(retainedIsPathHandle && !policy.SamePathHandleIdentity(handle, validation)) {
-				if validation != nil {
-					_ = validation.Close()
-				}
-				_ = retained.Close()
-				return nil, -1, ErrGrantTargetChanged
-			}
-			if validation != nil {
-				_ = validation.Close()
-			}
-			if retainedIsPathHandle {
-				handle.SetAccess(delta.entry.Access)
-				if err := pathHandles.Add(handle); err != nil {
-					return nil, -1, err
-				}
-			} else {
-				_ = retained.Close()
-			}
+			pendingPaths = append(pendingPaths, pendingGrantPath{
+				id: id, binding: payload.PathBinding, target: delta.entry.Path,
+				exact: delta.entry.Exact, access: delta.entry.Access,
+				expiryUnixMilli: payload.ExpiryUnixMilli,
+			})
 		}
 		if delta.class == GrantClassCommandStart {
 			if payload.Target != command {
@@ -711,6 +702,30 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		}
 		pol.Net = policy.NetPolicy{ProxyPort: uint16(port)}
 	}
+	for _, pending := range pendingPaths {
+		retained, err := e.retainedGrantPaths.borrow(pending.id, pending.binding, pending.target, pending.exact, pending.expiryUnixMilli)
+		if err != nil {
+			return nil, -1, err
+		}
+		validation, err := acquire(pending.binding, pending.target, pending.exact)
+		if err != nil {
+			return nil, -1, err
+		}
+		retainedHandle, retainedIsPathHandle := retained.(*policy.PathHandle)
+		if retainedIsPathHandle != (validation != nil) ||
+			(retainedIsPathHandle && !policy.SamePathHandleIdentity(retainedHandle, validation)) {
+			if validation != nil {
+				_ = validation.Close()
+			}
+			return nil, -1, ErrGrantTargetChanged
+		}
+		if validation != nil {
+			validation.SetAccess(pending.access)
+			if err := pathHandles.Add(validation); err != nil {
+				return nil, -1, err
+			}
+		}
+	}
 	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, pol, pathHandles.Sorted())
 	if err != nil {
 		return nil, -1, finishExecutionAndRelease(lease, spec, err)
@@ -727,8 +742,24 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		proxyURL := e.proxy.URL(executionID, credential)
 		applyChildProxyEnv(pol.Env.Set, proxyURL)
 	}
+	pathIDs := make([][32]byte, len(pendingPaths))
+	for i := range pendingPaths {
+		pathIDs[i] = pendingPaths[i].id
+	}
+	retainedHandles, err := e.retainedGrantPaths.commit(pathIDs)
+	if err != nil {
+		return nil, -1, finishExecutionAndRelease(lease, spec, err)
+	}
+	var retainedCloseErr error
+	for _, handle := range retainedHandles {
+		retainedCloseErr = errors.Join(retainedCloseErr, handle.Close())
+	}
 	for id, expiryUnixMilli := range seen {
 		e.usedGrants[id] = expiryUnixMilli
+	}
+	e.rescheduleRetainedGrantExpiryLocked()
+	if retainedCloseErr != nil {
+		return nil, -1, finishExecutionAndRelease(lease, spec, retainedCloseErr)
 	}
 	s := snapshot{spec: spec, env: assembleEnv(pol), policy: pol}
 	e.grantMu.Unlock()
@@ -775,6 +806,64 @@ func (e *Executor) pruneUsedGrantsLocked(nowUnixMilli int64) {
 		if expiryUnixMilli < nowUnixMilli {
 			delete(e.usedGrants, id)
 		}
+	}
+}
+
+func (e *Executor) rescheduleRetainedGrantExpiryLocked() {
+	e.grantExpiryGen++
+	if e.grantExpiryTimer != nil {
+		if e.grantExpiryTimer.Stop() {
+			e.grantExpiryWG.Done()
+		}
+		e.grantExpiryTimer = nil
+	}
+	if e.closed || !e.grantExpiryRealtime || len(e.retainedGrantPaths) == 0 {
+		return
+	}
+	nearest := int64(0)
+	for _, entry := range e.retainedGrantPaths {
+		if nearest == 0 || entry.expiryUnixMilli < nearest {
+			nearest = entry.expiryUnixMilli
+		}
+	}
+	now := time.Now()
+	if e.clock != nil {
+		now = e.clock()
+	}
+	delay := time.Duration(nearest-now.UnixMilli()+1) * time.Millisecond
+	if delay < 0 {
+		delay = 0
+	}
+	generation := e.grantExpiryGen
+	e.grantExpiryWG.Add(1)
+	e.grantExpiryTimer = time.AfterFunc(delay, func() {
+		defer e.grantExpiryWG.Done()
+		e.expireRetainedGrantPaths(generation)
+	})
+}
+
+func (e *Executor) expireRetainedGrantPaths(generation uint64) {
+	e.grantMu.Lock()
+	defer e.grantMu.Unlock()
+	if e.closed || generation != e.grantExpiryGen {
+		return
+	}
+	e.grantExpiryTimer = nil
+	now := time.Now()
+	if e.clock != nil {
+		now = e.clock()
+	}
+	e.retainedGrantPaths.prune(now.UnixMilli())
+	e.rescheduleRetainedGrantExpiryLocked()
+}
+
+func (e *Executor) stopRetainedGrantExpiryLocked() {
+	e.grantExpiryGen++
+	if e.grantExpiryTimer != nil {
+		if e.grantExpiryTimer.Stop() {
+			e.grantExpiryWG.Done()
+		}
+		e.grantExpiryTimer = nil
 	}
 }
 
