@@ -47,7 +47,13 @@ Work is on branch `feat/windows-sandbox`.
   proof; delayed cleanup errors are returned by `ExecutorSet.Close`. Focused core
   and real `Executor.run` integration regressions cover retention, release order,
   early setup errors, proxy observation, and set-close blocking.
-- Tasks 9-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
+- Task 9 is implemented and independently approved for static specification
+  compliance and code quality. Focused SID/ACL-plan tests, vet, and Windows
+  amd64/arm64 cross-builds pass. The live restricted-token conformance tests
+  remain outstanding: this managed host starts Codex from an already restricted
+  source token, and the tests fail with that explicit prerequisite rather than
+  skipping or claiming a pass.
+- Tasks 10-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
   Task 5 runtime-baseline result.
 
 Run these gates on the Windows handoff branch:
