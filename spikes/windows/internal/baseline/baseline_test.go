@@ -76,12 +76,12 @@ func TestFailedRuntimeRequiresCompleteTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := RuntimeExecution{Name: "windows-powershell", ExecutablePath: `C:\Windows\powershell.exe`, ObjectIdentity: "volume=1 file=2", ExecutableSHA256: SHA256Hex([]byte("exe")), PID: 42, Status: "FAIL", ExitCode: 5, Diagnostic: "access denied", FailureKind: FailurePostSpawn, CallerPID: 10, AttemptID: "caller-nonce-123/windows-powershell"}
-	manifest := RunManifest{SchemaVersion: 3, RunNonce: "caller-nonce-123", SourceRevision: "0123456789abcdef", Platform: RunPlatform{WindowsBuild: "10.0.26100", Architecture: "amd64", Filesystem: "NTFS:00000001"}, TokenInventorySHA256: SHA256Hex([]byte("token")), RuntimeManifestSHA256: RuntimeManifestDigest(), MatrixSHA256: SHA256Hex([]byte("matrix")), Runtimes: []RuntimeExecution{runtime}}
+	manifest := RunManifest{SchemaVersion: 3, RunNonce: "caller-nonce-123", SourceRevision: "0123456789abcdef", Platform: RunPlatform{WindowsBuild: "10.0.26100", Architecture: "amd64", Filesystem: "NTFS:00000001"}, TokenInventorySHA256: SHA256Hex([]byte("token")), RuntimeManifestSHA256: RuntimeManifestDigest(), MatrixSHA256: SHA256Hex([]byte("matrix")), Runtimes: []RuntimeExecution{runtime}, StartedUTC: "2026-07-22T12:00:00Z", FinishedUTC: "2026-07-22T12:00:02Z"}
 	manifest, err := FinalizeRunManifest(manifest, TraceCollector{Name: "Microsoft Sysinternals Process Monitor", Version: "4.01", Command: "procmon64.exe /BackingFile baseline.pml"}, rawPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	trace := TraceEvidence{SchemaVersion: 3, Run: manifest, Cases: []TraceCase{{Runtime: runtime, Complete: true, CapturedPIDs: []int{10, 42}, CapturedNonce: manifest.RunNonce, CapturedAttemptID: runtime.AttemptID, Events: []TraceEvent{{Operation: "CreateFile", Result: "ACCESS DENIED", Path: `C:\Windows\System32\example.dll`}}, Denials: []TraceDenial{{Operation: "CreateFile", RequestedAccess: "Read Data/List Directory, Execute/Traverse", ObjectPath: `C:\Windows\System32\example.dll`, ObjectIdentity: "volume=00000001 file=0000000000000002", Owner: "S-1-5-18", DACL: "D:(A;;GR;;;RC)"}}}}}
+	trace := TraceEvidence{SchemaVersion: 3, Run: manifest, Cases: []TraceCase{{Runtime: runtime, Complete: true, CapturedPIDs: []int{10, 42}, CapturedNonce: manifest.RunNonce, CapturedAttemptID: runtime.AttemptID, Events: []TraceEvent{{PID: 42, EventID: "e1", Sequence: 1, TimestampUTC: "2026-07-22T12:00:01Z", RunNonce: manifest.RunNonce, AttemptID: runtime.AttemptID, Operation: "CreateFile", Result: "ACCESS DENIED", Path: `C:\Windows\System32\example.dll`}}, Denials: []TraceDenial{{EventID: "e1", PID: 42, Operation: "CreateFile", RequestedAccess: "Read Data/List Directory, Execute/Traverse", ObjectPath: `C:\Windows\System32\example.dll`, ObjectIdentity: "volume=00000001 file=0000000000000002", Owner: "S-1-5-18", DACL: "D:(A;;GR;;;RC)"}}}}}
 	if err := ValidateFailureTrace(manifest, trace); err != nil {
 		t.Fatalf("complete trace rejected: %v", err)
 	}

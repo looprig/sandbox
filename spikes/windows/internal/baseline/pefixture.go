@@ -5,7 +5,7 @@ import (
 	"debug/pe"
 	"encoding/binary"
 	"fmt"
-	"io"
+	"math"
 )
 
 const (
@@ -312,7 +312,11 @@ func InspectTLSFixture(file *pe.File) (TLSFixtureInfo, error) {
 	if callbackArrayVA < optional.ImageBase {
 		return TLSFixtureInfo{}, fmt.Errorf("invalid TLS callback array VA %#x", callbackArrayVA)
 	}
-	callbackData, err := readRVA(file, uint32(callbackArrayVA-optional.ImageBase), 16)
+	callbackArrayRVA64 := callbackArrayVA - optional.ImageBase
+	if callbackArrayRVA64 > math.MaxUint32 {
+		return TLSFixtureInfo{}, fmt.Errorf("TLS callback array VA overflows RVA")
+	}
+	callbackData, err := readRVA(file, uint32(callbackArrayRVA64), 16)
 	if err != nil {
 		return TLSFixtureInfo{}, fmt.Errorf("read TLS callback array: %w", err)
 	}
@@ -323,21 +327,25 @@ func InspectTLSFixture(file *pe.File) (TLSFixtureInfo, error) {
 	if binary.LittleEndian.Uint64(callbackData[8:]) != 0 {
 		return TLSFixtureInfo{}, fmt.Errorf("TLS callback array is not null terminated")
 	}
-	if callbackVA < optional.ImageBase {
+	if callbackVA < optional.ImageBase || callbackVA-optional.ImageBase > math.MaxUint32 {
 		return TLSFixtureInfo{}, fmt.Errorf("invalid TLS callback VA %#x", callbackVA)
 	}
 	if _, err := readRVA(file, uint32(callbackVA-optional.ImageBase), 1); err != nil {
 		return TLSFixtureInfo{}, fmt.Errorf("TLS callback does not point into the image: %w", err)
 	}
-	all, err := io.ReadAll(io.NewSectionReader(file.Sections[1], 0, int64(file.Sections[1].Size)))
+	info := TLSFixtureInfo{Machine: file.Machine, EntryPointRVA: optional.AddressOfEntryPoint, CallbackVA: callbackVA}
+	callbackBytes, err := readRVA(file, peRDataRVA+peCallbackMsgOff, uint32(len(callbackMarker)))
 	if err != nil {
 		return TLSFixtureInfo{}, err
 	}
-	info := TLSFixtureInfo{Machine: file.Machine, EntryPointRVA: optional.AddressOfEntryPoint, CallbackVA: callbackVA}
-	if bytes.Contains(all, []byte(callbackMarker)) {
+	mainBytes, err := readRVA(file, peRDataRVA+peMainMsgOff, uint32(len(mainMarker)))
+	if err != nil {
+		return TLSFixtureInfo{}, err
+	}
+	if bytes.Equal(callbackBytes, []byte(callbackMarker)) {
 		info.CallbackMarker = callbackMarker
 	}
-	if bytes.Contains(all, []byte(mainMarker)) {
+	if bytes.Equal(mainBytes, []byte(mainMarker)) {
 		info.MainMarker = mainMarker
 	}
 	return info, nil
@@ -345,14 +353,20 @@ func InspectTLSFixture(file *pe.File) (TLSFixtureInfo, error) {
 
 func readRVA(file *pe.File, rva, size uint32) ([]byte, error) {
 	for _, section := range file.Sections {
-		if rva < section.VirtualAddress || rva+size > section.VirtualAddress+section.Size {
+		if rva < section.VirtualAddress {
+			continue
+		}
+		off := rva - section.VirtualAddress
+		if off > section.Size || size > section.Size-off {
 			continue
 		}
 		data, err := section.Data()
 		if err != nil {
 			return nil, err
 		}
-		off := rva - section.VirtualAddress
+		if uint64(off)+uint64(size) > uint64(len(data)) {
+			return nil, fmt.Errorf("RVA %#x exceeds raw section data", rva)
+		}
 		return data[off : off+size], nil
 	}
 	return nil, fmt.Errorf("RVA %#x size %#x is outside sections", rva, size)

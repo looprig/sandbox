@@ -9,7 +9,7 @@ func TestFailurePhaseRules(t *testing.T) {
 		trace   TraceCase
 	}{
 		{name: "inventory_absent", runtime: RuntimeExecution{Name: "python", FailureKind: FailureInventoryAbsent, CallerPID: 10, AttemptID: "n/python", LookupEvidence: []string{"python.exe: not found"}, Status: "FAIL", Diagnostic: "not found"}, trace: TraceCase{Complete: true, CapturedNonce: "n", CapturedAttemptID: "n/python", CapturedPIDs: []int{10}}},
-		{name: "pre_spawn", runtime: RuntimeExecution{Name: "powershell", FailureKind: FailurePreSpawn, CallerPID: 10, AttemptID: "n/powershell", ExecutablePath: `C:\powershell.exe`, ObjectIdentity: "unavailable", Win32Error: "ERROR_ACCESS_DENIED", Status: "FAIL", Diagnostic: "CreateProcess: access denied"}, trace: TraceCase{Complete: true, CapturedNonce: "n", CapturedAttemptID: "n/powershell", CapturedPIDs: []int{10}, Events: []TraceEvent{{Operation: "Process Create", Result: "ACCESS DENIED", Path: `C:\powershell.exe`}}}},
+		{name: "pre_spawn", runtime: RuntimeExecution{Name: "powershell", FailureKind: FailurePreSpawn, CallerPID: 10, AttemptID: "n/powershell", ExecutablePath: `C:\powershell.exe`, ObjectIdentity: "unavailable", Win32Error: "ERROR_ACCESS_DENIED", Status: "FAIL", Diagnostic: "CreateProcess: access denied"}, trace: TraceCase{Complete: true, CapturedNonce: "n", CapturedAttemptID: "n/powershell", CapturedPIDs: []int{10}, Events: []TraceEvent{{PID: 10, EventID: "e1", Sequence: 1, TimestampUTC: "2026-07-22T12:00:01Z", RunNonce: "n", AttemptID: "n/powershell", Operation: "Process Create", Result: "ACCESS DENIED", Path: `C:\powershell.exe`}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			test.trace.Runtime = test.runtime

@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"time"
 )
 
 //go:embed trace-evidence.schema.json
@@ -61,9 +64,13 @@ type RunManifest struct {
 	Collector             TraceCollector     `json:"collector"`
 	RawTracePath          string             `json:"raw_trace_path"`
 	RawTraceSHA256        string             `json:"raw_trace_sha256"`
+	StartedUTC            string             `json:"started_utc"`
+	FinishedUTC           string             `json:"finished_utc"`
 }
 
 type TraceDenial struct {
+	EventID         string `json:"event_id"`
+	PID             int    `json:"pid"`
 	Operation       string `json:"operation"`
 	RequestedAccess string `json:"requested_access"`
 	ObjectPath      string `json:"object_path"`
@@ -83,9 +90,15 @@ type TraceCase struct {
 }
 
 type TraceEvent struct {
-	Operation string `json:"operation"`
-	Result    string `json:"result"`
-	Path      string `json:"path"`
+	PID          int    `json:"pid"`
+	EventID      string `json:"event_id"`
+	Sequence     uint64 `json:"sequence"`
+	TimestampUTC string `json:"timestamp_utc"`
+	RunNonce     string `json:"run_nonce"`
+	AttemptID    string `json:"attempt_id"`
+	Operation    string `json:"operation"`
+	Result       string `json:"result"`
+	Path         string `json:"path"`
 }
 
 type TraceEvidence struct {
@@ -122,8 +135,16 @@ func loadJSON(path string, target any) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if err := json.Unmarshal(contents, target); err != nil {
+	if err := rejectDuplicateKeys(contents); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(contents)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("decode %s: trailing JSON", path)
 	}
 	return nil
 }
@@ -188,7 +209,7 @@ func ValidateFailureTrace(manifest RunManifest, evidence TraceEvidence) error {
 		if !reflect.DeepEqual(traceCase.Runtime, runtime) {
 			return fmt.Errorf("failed runtime %q path/identity/hash/PID/exit/diagnostic mismatch", name)
 		}
-		if err := validateTraceCase(manifest.RunNonce, runtime, traceCase); err != nil {
+		if err := validateTraceCaseWindow(manifest.RunNonce, manifest.StartedUTC, manifest.FinishedUTC, runtime, traceCase); err != nil {
 			return fmt.Errorf("failed runtime %q: %w", name, err)
 		}
 		for index, denial := range traceCase.Denials {
@@ -209,6 +230,7 @@ func compareRunBinding(want, got RunManifest) error {
 		{"collector name", want.Collector.Name, got.Collector.Name}, {"collector version", want.Collector.Version, got.Collector.Version},
 		{"collector command", want.Collector.Command, got.Collector.Command}, {"raw trace path", want.RawTracePath, got.RawTracePath},
 		{"raw trace hash", want.RawTraceSHA256, got.RawTraceSHA256},
+		{"started UTC", want.StartedUTC, got.StartedUTC}, {"finished UTC", want.FinishedUTC, got.FinishedUTC},
 	}
 	for _, check := range checks {
 		if check.want == "" || check.want != check.got {
@@ -227,6 +249,10 @@ func compareRunBinding(want, got RunManifest) error {
 }
 
 func validateTraceCase(nonce string, runtime RuntimeExecution, traceCase TraceCase) error {
+	return validateTraceCaseWindow(nonce, "", "", runtime, traceCase)
+}
+
+func validateTraceCaseWindow(nonce, startedText, finishedText string, runtime RuntimeExecution, traceCase TraceCase) error {
 	if !traceCase.Complete || traceCase.CapturedNonce != nonce || traceCase.CapturedAttemptID != runtime.AttemptID || !containsPID(traceCase.CapturedPIDs, runtime.CallerPID) {
 		return fmt.Errorf("trace lacks complete caller nonce/attempt/PID binding")
 	}
@@ -246,10 +272,93 @@ func validateTraceCase(nonce string, runtime RuntimeExecution, traceCase TraceCa
 	default:
 		return fmt.Errorf("unknown failure kind %q", runtime.FailureKind)
 	}
+	allowed := map[int]bool{runtime.CallerPID: true}
+	if runtime.PID > 0 {
+		allowed[runtime.PID] = true
+	}
+	seen := map[string]bool{}
+	seenSequence := map[uint64]bool{}
+	var started, finished time.Time
+	if startedText != "" {
+		var err error
+		started, err = time.Parse(time.RFC3339Nano, startedText)
+		if err != nil {
+			return fmt.Errorf("invalid run start")
+		}
+		finished, err = time.Parse(time.RFC3339Nano, finishedText)
+		if err != nil || finished.Before(started) {
+			return fmt.Errorf("invalid run finish")
+		}
+	}
 	for _, event := range traceCase.Events {
 		if event.Operation == "" || event.Result == "" || event.Path == "" {
 			return fmt.Errorf("collector event is incomplete")
 		}
+		if event.EventID == "" || event.Sequence == 0 || event.TimestampUTC == "" || event.RunNonce != nonce || event.AttemptID != runtime.AttemptID || !allowed[event.PID] || seen[event.EventID] || seenSequence[event.Sequence] {
+			return fmt.Errorf("collector event provenance is invalid")
+		}
+		seen[event.EventID] = true
+		seenSequence[event.Sequence] = true
+		stamp, err := time.Parse(time.RFC3339Nano, event.TimestampUTC)
+		if err != nil || (!started.IsZero() && (stamp.Before(started) || stamp.After(finished))) {
+			return fmt.Errorf("collector event timestamp is stale/out of window")
+		}
+	}
+	for _, denial := range traceCase.Denials {
+		if !seen[denial.EventID] || !allowed[denial.PID] {
+			return fmt.Errorf("denial is not bound to an accepted event/PID")
+		}
+	}
+	return nil
+}
+
+func rejectDuplicateKeys(data []byte) error {
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	var parse func() error
+	parse = func() error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		d, ok := tok.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch d {
+		case '{':
+			seen := map[string]bool{}
+			for dec.More() {
+				kTok, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				k := kTok.(string)
+				if seen[k] {
+					return fmt.Errorf("duplicate JSON key %q", k)
+				}
+				seen[k] = true
+				if err := parse(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		case '[':
+			for dec.More() {
+				if err := parse(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		}
+		return nil
+	}
+	if err := parse(); err != nil {
+		return err
+	}
+	if dec.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("trailing JSON")
 	}
 	return nil
 }

@@ -99,6 +99,7 @@ func (b *limitedBuffer) String() string {
 }
 
 func TestRestrictedRuntimeBaseline(t *testing.T) {
+	startedUTC := time.Now().UTC()
 	if testing.Short() {
 		t.Fatal("restricted runtime baseline is a live gate; -short is not a passing result")
 	}
@@ -126,7 +127,7 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 			failures = append(failures, result.Name)
 		}
 	}
-	manifest := createRunManifest(t, platform, tokenText, encoded, results, len(failures) == 0)
+	manifest := createRunManifest(t, platform, tokenText, encoded, results, len(failures) == 0, startedUTC, time.Now().UTC())
 	writeInvocationManifest(t, manifest)
 	if len(failures) != 0 {
 		t.Fatalf("exact Restricted Code token runtime failures: %s; exact_token_gate_passed=false failure_selection_evidence_complete=false; finalize and validate evidence from this same nonce/PID invocation without rerunning", strings.Join(failures, ", "))
@@ -156,7 +157,7 @@ func TestValidateRestrictedRuntimeTraceEvidence(t *testing.T) {
 	t.Log("exact_token_gate_passed=false failure_selection_evidence_complete=true")
 }
 
-func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText string, matrix []byte, results []runtimeResult, passed bool) baseline.RunManifest {
+func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText string, matrix []byte, results []runtimeResult, passed bool, started, finished time.Time) baseline.RunManifest {
 	t.Helper()
 	nonce := os.Getenv("LOOPRIG_RUNTIME_RUN_NONCE")
 	if os.Getenv("LOOPRIG_RUNTIME_RUN_MANIFEST_OUT") != "" && nonce == "" {
@@ -168,7 +169,7 @@ func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText st
 	if err != nil {
 		t.Fatalf("source revision: %v", err)
 	}
-	manifest := baseline.RunManifest{SchemaVersion: 3, RunNonce: nonce, SourceRevision: strings.TrimSpace(string(revision)), Platform: platform, TokenInventorySHA256: baseline.SHA256Hex([]byte(tokenText)), RuntimeManifestSHA256: baseline.RuntimeManifestDigest(), MatrixSHA256: baseline.SHA256Hex(matrix), ExactTokenGatePassed: passed}
+	manifest := baseline.RunManifest{SchemaVersion: 3, RunNonce: nonce, SourceRevision: strings.TrimSpace(string(revision)), Platform: platform, TokenInventorySHA256: baseline.SHA256Hex([]byte(tokenText)), RuntimeManifestSHA256: baseline.RuntimeManifestDigest(), MatrixSHA256: baseline.SHA256Hex(matrix), ExactTokenGatePassed: passed, StartedUTC: started.Format(time.RFC3339Nano), FinishedUTC: finished.Format(time.RFC3339Nano)}
 	for _, result := range results {
 		manifest.Runtimes = append(manifest.Runtimes, baseline.RuntimeExecution{Name: result.Name, ExecutablePath: result.Path, ObjectIdentity: result.ObjectIdentity, ExecutableSHA256: result.ExecutableSHA256, PID: result.PID, Status: result.Status, ExitCode: result.ExitCode, Diagnostic: result.Error, FailureKind: result.FailureKind, CallerPID: result.CallerPID, AttemptID: result.AttemptID, LookupEvidence: result.LookupEvidence, Win32Error: result.Win32Error})
 	}

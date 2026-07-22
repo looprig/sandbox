@@ -187,6 +187,19 @@ phase-specific; never invent a child PID, executable hash, or denial:
   child collector events, exit/diagnostic, and denial records when the trace
   actually contains access denials.
 
+Every collector event carries its real PID, stable collector event ID and
+sequence, UTC timestamp, run nonce, and attempt ID. The validator rejects
+events outside the manifest's standard-user invocation start/finish window,
+events from any PID other than the bound caller or child, stale nonce/attempt,
+missing identity/time, and duplicate event IDs. Each denial references an
+accepted event ID and the same permitted PID. Runtime-name-only association is
+not evidence.
+
+JSON loading is fail-closed: the v3 schema declares
+`additionalProperties:false` for every object, and the typed loader rejects
+unknown fields, duplicate keys at any nesting depth, and trailing JSON before
+provenance validation.
+
 This permits honest narrowed-target or blocked selections for absence and
 pre-spawn failures while `exact_token_gate_passed` remains false. Validate
 without rerunning the baseline:
