@@ -3,6 +3,7 @@
 package exec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -15,6 +16,8 @@ import (
 )
 
 var ntResumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
+
+const jobCompletionWaitTimeout = 30 * time.Second
 
 // processTree owns one Windows Job Object. The Job is fully configured before
 // the child is created suspended, assigned before resume, and retained until
@@ -121,20 +124,11 @@ func (tree *processTree) terminateAndWait() error {
 	if !assigned || job == nil {
 		return nil
 	}
-	for {
-		// Neither termination nor inspection failure proves that the Job is
-		// empty. Retain the Job and execution lease until zero is read back.
-		_ = tree.terminate()
-		active, err := job.ActiveProcesses()
-		if err != nil {
-			time.Sleep(time.Millisecond)
-			continue
-		}
-		if active == 0 {
-			return nil
-		}
-		time.Sleep(time.Millisecond)
-	}
+	terminateErr := tree.terminate()
+	waitCtx, cancel := context.WithTimeout(context.Background(), jobCompletionWaitTimeout)
+	defer cancel()
+	waitErr := job.WaitActiveProcessesZero(waitCtx)
+	return errors.Join(terminateErr, waitErr)
 }
 
 func (tree *processTree) close() {

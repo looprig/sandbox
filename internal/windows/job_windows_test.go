@@ -3,7 +3,10 @@
 package windows
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 	"unsafe"
 
 	winapi "golang.org/x/sys/windows"
@@ -119,5 +122,28 @@ func TestJobUnconfinedHasNoSandboxUIRestrictions(t *testing.T) {
 	}
 	if ui.UIRestrictionsClass != 0 {
 		t.Errorf("unconfined UI restrictions = %#x, want 0", ui.UIRestrictionsClass)
+	}
+}
+
+func TestJobCompletionWaitCloseRaceTerminates(t *testing.T) {
+	job, err := NewJob(JobOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- job.WaitActiveProcessesZero(ctx) }()
+	time.Sleep(10 * time.Millisecond)
+	if err := job.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrJobCompletionWait) {
+			t.Fatalf("wait error = %v, want completion wait failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("completion wait deadlocked with Job close")
 	}
 }

@@ -3,9 +3,11 @@
 package windows
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 	"unsafe"
 
 	winapi "golang.org/x/sys/windows"
@@ -50,10 +52,18 @@ type jobBasicAccountingInformation struct {
 	TotalTerminatedProcesses  uint32
 }
 
+type jobAssociateCompletionPort struct {
+	CompletionKey  uintptr
+	CompletionPort winapi.Handle
+}
+
 // Job owns one configured Windows Job Object.
 type Job struct {
 	mu                      sync.Mutex
+	completionMu            sync.Mutex
 	handle                  winapi.Handle
+	completionPort          winapi.Handle
+	completionKey           uintptr
 	resourceLimitsInstalled bool
 }
 
@@ -67,12 +77,24 @@ func NewJob(options JobOptions) (_ *Job, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: create Windows Job: %w", err)
 	}
-	job := &Job{handle: handle}
+	job := &Job{handle: handle, completionKey: 1}
 	defer func() {
 		if err != nil {
 			_ = job.Close()
 		}
 	}()
+	completionPort, err := winapi.CreateIoCompletionPort(winapi.InvalidHandle, 0, 0, 1)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: create Windows Job completion port: %w", err)
+	}
+	job.completionPort = completionPort
+	association := jobAssociateCompletionPort{
+		CompletionKey:  job.completionKey,
+		CompletionPort: completionPort,
+	}
+	if _, err := winapi.SetInformationJobObject(handle, winapi.JobObjectAssociateCompletionPortInformation, uintptr(unsafe.Pointer(&association)), uint32(unsafe.Sizeof(association))); err != nil {
+		return nil, fmt.Errorf("sandbox: associate Windows Job completion port: %w", err)
+	}
 
 	limits := winapi.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limits.BasicLimitInformation.LimitFlags = winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -229,16 +251,77 @@ func (job *Job) ActiveProcesses() (uint32, error) {
 	return accounting.ActiveProcesses, nil
 }
 
+// WaitActiveProcessesZero consumes Job completion notifications until the OS
+// reports JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO. The completion port is associated
+// before any process can be assigned to this Job, so an early notification
+// remains queued until this method reads it.
+func (job *Job) WaitActiveProcessesZero(ctx context.Context) error {
+	if job == nil {
+		return fmt.Errorf("%w: nil Job", ErrJobCompletionWait)
+	}
+	job.mu.Lock()
+	key := job.completionKey
+	job.mu.Unlock()
+	return waitForJobActiveProcessZero(ctx, key, job.nextCompletion, jobCompletionWaitOptions{})
+}
+
+func (job *Job) nextCompletion(timeout time.Duration) jobCompletionEvent {
+	job.completionMu.Lock()
+	defer job.completionMu.Unlock()
+	job.mu.Lock()
+	port := job.completionPort
+	job.mu.Unlock()
+	if port == 0 {
+		return jobCompletionEvent{err: errJobCompletionPortClosed}
+	}
+	milliseconds := timeout.Milliseconds()
+	if milliseconds < 1 {
+		milliseconds = 1
+	}
+	if milliseconds > int64(^uint32(0)-1) {
+		milliseconds = int64(^uint32(0) - 1)
+	}
+	var message uint32
+	var key uintptr
+	var overlapped *winapi.Overlapped
+	if err := winapi.GetQueuedCompletionStatus(port, &message, &key, &overlapped, uint32(milliseconds)); err != nil {
+		switch {
+		case errors.Is(err, winapi.WAIT_TIMEOUT):
+			return jobCompletionEvent{err: errJobCompletionPollTimeout}
+		case errors.Is(err, winapi.ERROR_ABANDONED_WAIT_0):
+			return jobCompletionEvent{err: errJobCompletionPortClosed}
+		default:
+			return jobCompletionEvent{err: err}
+		}
+	}
+	return jobCompletionEvent{message: message, key: key}
+}
+
 func (job *Job) Close() error {
 	if job == nil {
 		return nil
 	}
 	job.mu.Lock()
-	defer job.mu.Unlock()
-	if job.handle == 0 {
+	handle := job.handle
+	completionPort := job.completionPort
+	job.handle = 0
+	job.completionPort = 0
+	job.mu.Unlock()
+	if handle == 0 && completionPort == 0 {
 		return nil
 	}
-	err := winapi.CloseHandle(job.handle)
-	job.handle = 0
+	// Wait for any bounded GetQueuedCompletionStatus call to leave the port
+	// before closing its handle. New reads already observe completionPort == 0.
+	job.completionMu.Lock()
+	defer job.completionMu.Unlock()
+	// Close the Job first so kill-on-close remains authoritative until the last
+	// possible moment. A concurrent waiter then reports a terminal close error.
+	var err error
+	if handle != 0 {
+		err = errors.Join(err, winapi.CloseHandle(handle))
+	}
+	if completionPort != 0 {
+		err = errors.Join(err, winapi.CloseHandle(completionPort))
+	}
 	return err
 }
