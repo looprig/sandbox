@@ -81,7 +81,7 @@ func TestFailedRuntimeRequiresCompleteTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	trace := TraceEvidence{SchemaVersion: 3, Run: manifest, Cases: []TraceCase{{Runtime: runtime, Complete: true, CapturedPIDs: []int{10, 42}, CapturedNonce: manifest.RunNonce, CapturedAttemptID: runtime.AttemptID, Events: []TraceEvent{{PID: 42, EventID: "e1", Sequence: 1, TimestampUTC: "2026-07-22T12:00:01Z", RunNonce: manifest.RunNonce, AttemptID: runtime.AttemptID, Operation: "CreateFile", Result: "ACCESS DENIED", Path: `C:\Windows\System32\example.dll`}}, Denials: []TraceDenial{{EventID: "e1", PID: 42, Operation: "CreateFile", RequestedAccess: "Read Data/List Directory, Execute/Traverse", ObjectPath: `C:\Windows\System32\example.dll`, ObjectIdentity: "volume=00000001 file=0000000000000002", Owner: "S-1-5-18", DACL: "D:(A;;GR;;;RC)"}}}}}
+	trace := TraceEvidence{SchemaVersion: 3, Run: manifest, Cases: []TraceCase{{Runtime: runtime, Complete: true, CapturedPIDs: []int{10, 42}, CapturedNonce: manifest.RunNonce, CapturedAttemptID: runtime.AttemptID, Events: []TraceEvent{{PID: 42, EventID: "e1", Sequence: 1, TimestampUTC: "2026-07-22T12:00:01Z", RunNonce: manifest.RunNonce, AttemptID: runtime.AttemptID, Operation: "CreateFile", Result: "ACCESS DENIED", Path: `C:\Windows\System32\example.dll`, RequestedAccess: "Read Data/List Directory, Execute/Traverse"}}, Denials: []TraceDenial{{EventID: "e1", PID: 42, Operation: "CreateFile", RequestedAccess: "Read Data/List Directory, Execute/Traverse", ObjectPath: `C:\Windows\System32\example.dll`, ObjectIdentity: "volume=00000001 file=0000000000000002", Owner: "S-1-5-18", DACL: "D:(A;;GR;;;RC)"}}}}}
 	if err := ValidateFailureTrace(manifest, trace); err != nil {
 		t.Fatalf("complete trace rejected: %v", err)
 	}

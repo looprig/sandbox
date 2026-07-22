@@ -34,6 +34,8 @@ Timeout cleanup has an independent two-second reap watchdog. It records the
 `TerminateJobObject` result, closes the kill-on-close Job as escalation, kills
 the root process, and reports whether `Wait` completed plus every cleanup error.
 Neither timeout nor setup-failure cleanup waits without a bound.
+If the second watchdog cannot reap the process, a terminal fatal boundary stops
+the gate before another runtime row or selection evidence can run.
 
 The explicit manifest supports `windows-11` and `windows-server`. The live
 evidence record for each image must add:
@@ -204,8 +206,10 @@ sequence, UTC timestamp, run nonce, and attempt ID. The validator rejects
 events outside the manifest's standard-user invocation start/finish window,
 events from any PID other than the bound caller or child, stale nonce/attempt,
 missing identity/time, and duplicate event IDs. Each denial references an
-accepted event ID and the same permitted PID. Runtime-name-only association is
-not evidence.
+accepted denial-class event (`ACCESS DENIED` or `PRIVILEGE NOT HELD`) and must
+match its PID, normalized operation/object path, and requested access. A success
+or unrelated harmless event cannot anchor a denial. Runtime-name-only
+association is not evidence.
 
 JSON loading is fail-closed: the v3 schema declares
 `additionalProperties:false` for every object, and the typed loader rejects

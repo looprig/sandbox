@@ -90,15 +90,16 @@ type TraceCase struct {
 }
 
 type TraceEvent struct {
-	PID          int    `json:"pid"`
-	EventID      string `json:"event_id"`
-	Sequence     uint64 `json:"sequence"`
-	TimestampUTC string `json:"timestamp_utc"`
-	RunNonce     string `json:"run_nonce"`
-	AttemptID    string `json:"attempt_id"`
-	Operation    string `json:"operation"`
-	Result       string `json:"result"`
-	Path         string `json:"path"`
+	PID             int    `json:"pid"`
+	EventID         string `json:"event_id"`
+	Sequence        uint64 `json:"sequence"`
+	TimestampUTC    string `json:"timestamp_utc"`
+	RunNonce        string `json:"run_nonce"`
+	AttemptID       string `json:"attempt_id"`
+	Operation       string `json:"operation"`
+	Result          string `json:"result"`
+	Path            string `json:"path"`
+	RequestedAccess string `json:"requested_access"`
 }
 
 type TraceEvidence struct {
@@ -291,7 +292,7 @@ func validateTraceCaseWindow(nonce, startedText, finishedText string, runtime Ru
 		}
 	}
 	for _, event := range traceCase.Events {
-		if event.Operation == "" || event.Result == "" || event.Path == "" {
+		if event.Operation == "" || event.Result == "" || event.Path == "" || event.RequestedAccess == "" {
 			return fmt.Errorf("collector event is incomplete")
 		}
 		if event.EventID == "" || event.Sequence == 0 || event.TimestampUTC == "" || event.RunNonce != nonce || event.AttemptID != runtime.AttemptID || !allowed[event.PID] || seen[event.EventID] || seenSequence[event.Sequence] {
@@ -305,9 +306,32 @@ func validateTraceCaseWindow(nonce, startedText, finishedText string, runtime Ru
 		}
 	}
 	for _, denial := range traceCase.Denials {
-		if !seen[denial.EventID] || !allowed[denial.PID] {
-			return fmt.Errorf("denial is not bound to an accepted event/PID")
+		if err := validateDenialBinding(eventsByID(traceCase.Events), denial); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func eventsByID(events []TraceEvent) map[string]TraceEvent {
+	result := map[string]TraceEvent{}
+	for _, e := range events {
+		result[e.EventID] = e
+	}
+	return result
+}
+func validateDenialBinding(events map[string]TraceEvent, denial TraceDenial) error {
+	event, ok := events[denial.EventID]
+	if !ok {
+		return fmt.Errorf("denial event is missing")
+	}
+	result := strings.ToUpper(strings.TrimSpace(event.Result))
+	if result != "ACCESS DENIED" && result != "PRIVILEGE NOT HELD" {
+		return fmt.Errorf("denial anchored to non-denial result")
+	}
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(s, "/", `\`))) }
+	if denial.PID != event.PID || norm(denial.Operation) != norm(event.Operation) || norm(denial.ObjectPath) != norm(event.Path) || norm(denial.RequestedAccess) != norm(event.RequestedAccess) {
+		return fmt.Errorf("denial/event semantic mismatch")
 	}
 	return nil
 }

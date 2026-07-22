@@ -337,11 +337,11 @@ func newExactRestrictedToken(t *testing.T) windows.Token {
 		t.Fatal("CreateRestrictedToken returned a token Windows does not identify as restricted")
 	}
 	assertExactRestrictingList(t, token, restrictedCode)
-	assertExactTokenShape(t, base, token)
+	assertExactTokenShape(t, base, token, disable)
 	return token
 }
 
-func assertExactTokenShape(t *testing.T, source, restricted windows.Token) {
+func assertExactTokenShape(t *testing.T, source, restricted windows.Token, disabled []windows.SIDAndAttributes) {
 	t.Helper()
 	for _, token := range []windows.Token{source, restricted} {
 		info := tokenInfo(t, token, windows.TokenType)
@@ -356,8 +356,14 @@ func assertExactTokenShape(t *testing.T, source, restricted windows.Token) {
 	if !windows.EqualSid(sourceIntegrity, restrictedIntegrity) {
 		t.Fatal("CreateRestrictedToken changed integrity")
 	}
-	sourceGroups, _ := source.GetTokenGroups()
-	restrictedGroups, _ := restricted.GetTokenGroups()
+	sourceGroups, err := source.GetTokenGroups()
+	if err != nil {
+		t.Fatalf("source groups: %v", err)
+	}
+	restrictedGroups, err := restricted.GetTokenGroups()
+	if err != nil {
+		t.Fatalf("restricted groups: %v", err)
+	}
 	groupAttrs := map[string]uint32{}
 	for _, g := range restrictedGroups.AllGroups() {
 		groupAttrs[g.Sid.String()] = g.Attributes
@@ -365,6 +371,11 @@ func assertExactTokenShape(t *testing.T, source, restricted windows.Token) {
 	for _, g := range sourceGroups.AllGroups() {
 		if g.Attributes&windows.SE_GROUP_ENABLED != 0 && groupAttrs[g.Sid.String()]&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
 			t.Fatalf("enabled source group %s was not made deny-only", g.Sid)
+		}
+	}
+	for _, expected := range disabled {
+		if groupAttrs[expected.Sid.String()]&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+			t.Fatalf("disable-list group %s was not deny-only", expected.Sid)
 		}
 	}
 	sourcePrivInfo := tokenInfo(t, source, windows.TokenPrivileges)
@@ -608,6 +619,7 @@ func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, tim
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
 		cleanup := baseline.CleanupWithWatchdog(done, time.After(2*time.Second), func() error { return windows.TerminateJobObject(job, 1) }, closeJob, cmd.Process.Kill)
+		baseline.EnforceCleanupCompleted(cleanup, func(message string) { panic(message) })
 		return fmt.Errorf("%w; cleanup=%s", runErr, cleanupDiagnostic(cleanup)), false
 	}
 
@@ -620,6 +632,7 @@ func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, tim
 		return err, false
 	case <-timer.C:
 		cleanup := baseline.CleanupWithWatchdog(done, time.After(2*time.Second), func() error { return windows.TerminateJobObject(job, 1) }, closeJob, cmd.Process.Kill)
+		baseline.EnforceCleanupCompleted(cleanup, func(message string) { panic(message) })
 		return fmt.Errorf("%w; cleanup=%s", context.DeadlineExceeded, cleanupDiagnostic(cleanup)), true
 	}
 }
