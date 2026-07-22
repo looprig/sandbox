@@ -10,16 +10,18 @@ func TestLiteralMatchesWindowsPathKeysIgnoreCaseAndSeparatorSpelling(t *testing.
 		entry  string
 		target string
 		exact  bool
+		want   bool
 	}{
-		{name: "case insensitive tree", entry: `C:\Work\Repo`, target: `c:\work\repo\src\main.go`},
-		{name: "slash and backslash equivalent", entry: `C:\work\repo`, target: `c:/work/repo/src/main.go`},
-		{name: "case insensitive exact", entry: `C:\Work\Repo`, target: `c:/work/repo`, exact: true},
-		{name: "drive root", entry: `C:\`, target: `c:/work/repo`},
+		{name: "case insensitive tree", entry: `C:\Work\Repo`, target: `c:\work\repo\src\main.go`, want: true},
+		{name: "slash and backslash equivalent", entry: `C:\work\repo`, target: `c:/work/repo/src/main.go`, want: true},
+		{name: "case insensitive exact", entry: `C:\Work\Repo`, target: `c:/work/repo`, exact: true, want: true},
+		{name: "same drive root", entry: `C:\`, target: `c:/work/repo`, want: true},
+		{name: "different drive root", entry: `C:\`, target: `D:\secret`, want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if !LiteralMatches(test.entry, test.target, test.exact) {
-				t.Fatalf("LiteralMatches(%q, %q, %t) = false, want true", test.entry, test.target, test.exact)
+			if got := LiteralMatches(test.entry, test.target, test.exact); got != test.want {
+				t.Fatalf("LiteralMatches(%q, %q, %t) = %t, want %t", test.entry, test.target, test.exact, got, test.want)
 			}
 		})
 	}

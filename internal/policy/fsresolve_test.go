@@ -217,6 +217,15 @@ func TestLiteralMatchesUnixPathKeysAreByteAndSeparatorSensitive(t *testing.T) {
 	}
 }
 
+func TestVolumeRootMatchingKeysDoNotCrossVolumes(t *testing.T) {
+	if !rootMatchesVolume("C:", "C:") {
+		t.Fatal("same-volume root did not match")
+	}
+	if rootMatchesVolume("C:", "D:") {
+		t.Fatal("cross-volume root matched")
+	}
+}
+
 // TestResolveMalformedGlob pins the fail-closed contract for uncompilable glob
 // patterns. "/data/[z-a].secret" contains a bracket metacharacter (so it is
 // treated as a glob) but translates to an invalid regexp character-class range,

@@ -33,6 +33,8 @@ func pathKeyIsRoot(key string) bool {
 	return volume != "" && key == strings.ToUpper(volume)+pathKeySeparator
 }
 
+func pathKeyVolume(key string) string { return strings.ToUpper(filepath.VolumeName(key)) }
+
 // MinimalRuntimeEntries is intentionally empty on Windows. The operating-system
 // runtime closure is represented by WindowsRuntimeBaseline and audited by the
 // Windows backend; policy compilation must not enumerate or alter WRP objects.

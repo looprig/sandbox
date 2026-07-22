@@ -17,6 +17,8 @@ func pathKey(path string) string { return filepath.Clean(path) }
 
 func pathKeyIsRoot(key string) bool { return key == pathKeySeparator }
 
+func pathKeyVolume(string) string { return "" }
+
 func MinimalRuntimeEntries() []FSEntry {
 	var entries []FSEntry
 	for _, path := range []string{
