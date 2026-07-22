@@ -30,6 +30,11 @@ complete verbose log as CI evidence. If a worker-level timeout is available,
 set it above the harness's per-process 20-second watchdog so the harness can
 terminate and report a stuck target first.
 
+Timeout cleanup has an independent two-second reap watchdog. It records the
+`TerminateJobObject` result, closes the kill-on-close Job as escalation, kills
+the root process, and reports whether `Wait` completed plus every cleanup error.
+Neither timeout nor setup-failure cleanup waits without a bound.
+
 The explicit manifest supports `windows-11` and `windows-server`. The live
 evidence record for each image must add:
 
@@ -66,6 +71,13 @@ The test does not lower integrity and does not add `ALL APPLICATION PACKAGES`,
 an installation SID, an executor SID, or a grant SID. This is deliberately the
 narrow runtime-only feasibility token, not the eventual complete elevated
 execution token.
+
+The harness asserts the shape rather than merely logging it: source and result
+are primary tokens, integrity is unchanged, every enabled source group is
+deny-only in the result, every enabled privilege except Windows'
+`SeChangeNotifyPrivilege` traversal exception is disabled/removed, and an
+attempt to re-enable a removed privilege remains ineffective. No executor,
+grant, installation, or Task 9 SID is added.
 
 ## Required runtime contract
 

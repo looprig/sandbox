@@ -337,7 +337,71 @@ func newExactRestrictedToken(t *testing.T) windows.Token {
 		t.Fatal("CreateRestrictedToken returned a token Windows does not identify as restricted")
 	}
 	assertExactRestrictingList(t, token, restrictedCode)
+	assertExactTokenShape(t, base, token)
 	return token
+}
+
+func assertExactTokenShape(t *testing.T, source, restricted windows.Token) {
+	t.Helper()
+	for _, token := range []windows.Token{source, restricted} {
+		info := tokenInfo(t, token, windows.TokenType)
+		if *(*uint32)(unsafe.Pointer(&info[0])) != windows.TokenPrimary {
+			t.Fatal("runtime baseline token is not primary")
+		}
+	}
+	sourceIntegrityInfo := tokenInfo(t, source, windows.TokenIntegrityLevel)
+	restrictedIntegrityInfo := tokenInfo(t, restricted, windows.TokenIntegrityLevel)
+	sourceIntegrity := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&sourceIntegrityInfo[0])).Label.Sid
+	restrictedIntegrity := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&restrictedIntegrityInfo[0])).Label.Sid
+	if !windows.EqualSid(sourceIntegrity, restrictedIntegrity) {
+		t.Fatal("CreateRestrictedToken changed integrity")
+	}
+	sourceGroups, _ := source.GetTokenGroups()
+	restrictedGroups, _ := restricted.GetTokenGroups()
+	groupAttrs := map[string]uint32{}
+	for _, g := range restrictedGroups.AllGroups() {
+		groupAttrs[g.Sid.String()] = g.Attributes
+	}
+	for _, g := range sourceGroups.AllGroups() {
+		if g.Attributes&windows.SE_GROUP_ENABLED != 0 && groupAttrs[g.Sid.String()]&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+			t.Fatalf("enabled source group %s was not made deny-only", g.Sid)
+		}
+	}
+	sourcePrivInfo := tokenInfo(t, source, windows.TokenPrivileges)
+	restrictedPrivInfo := tokenInfo(t, restricted, windows.TokenPrivileges)
+	sourcePriv := (*windows.Tokenprivileges)(unsafe.Pointer(&sourcePrivInfo[0])).AllPrivileges()
+	restrictedPriv := (*windows.Tokenprivileges)(unsafe.Pointer(&restrictedPrivInfo[0])).AllPrivileges()
+	attrs := map[string]uint32{}
+	key := func(l windows.LUID) string { return fmt.Sprintf("%08x:%08x", uint32(l.HighPart), l.LowPart) }
+	for _, p := range restrictedPriv {
+		attrs[key(p.Luid)] = p.Attributes
+	}
+	var change windows.LUID
+	_ = windows.LookupPrivilegeValue(nil, windows.StringToUTF16Ptr("SeChangeNotifyPrivilege"), &change)
+	var removed *windows.LUID
+	for _, p := range sourcePriv {
+		if p.Attributes&windows.SE_PRIVILEGE_ENABLED != 0 && key(p.Luid) != key(change) && attrs[key(p.Luid)]&windows.SE_PRIVILEGE_ENABLED != 0 {
+			t.Fatalf("privilege %s remained enabled", key(p.Luid))
+		}
+		if key(p.Luid) != key(change) && attrs[key(p.Luid)]&windows.SE_PRIVILEGE_ENABLED == 0 && removed == nil {
+			copy := p.Luid
+			removed = &copy
+		}
+	}
+	if removed == nil {
+		t.Fatal("source token exposed no privilege to prove DISABLE_MAX_PRIVILEGE removal")
+	}
+	if removed != nil {
+		state := windows.Tokenprivileges{PrivilegeCount: 1, Privileges: [1]windows.LUIDAndAttributes{{Luid: *removed, Attributes: windows.SE_PRIVILEGE_ENABLED}}}
+		_ = windows.AdjustTokenPrivileges(restricted, false, &state, uint32(unsafe.Sizeof(state)), nil, nil)
+		afterInfo := tokenInfo(t, restricted, windows.TokenPrivileges)
+		after := (*windows.Tokenprivileges)(unsafe.Pointer(&afterInfo[0])).AllPrivileges()
+		for _, p := range after {
+			if key(p.Luid) == key(*removed) && p.Attributes&windows.SE_PRIVILEGE_ENABLED != 0 {
+				t.Fatal("removed privilege could be re-enabled")
+			}
+		}
+	}
 }
 
 func assertExactRestrictingList(t *testing.T, token windows.Token, want *windows.SID) {
@@ -475,7 +539,7 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 	}
 	if timedOut {
 		result.FailureKind = baseline.FailurePostSpawn
-		result.Error = "external watchdog terminated process after " + runtimeTimeout.String()
+		result.Error = "external watchdog after " + runtimeTimeout.String() + ": " + err.Error()
 		return result
 	}
 	if err != nil {
@@ -510,7 +574,15 @@ func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, tim
 	if err != nil {
 		return fmt.Errorf("CreateJobObject: %w", err), false
 	}
-	defer windows.CloseHandle(job)
+	jobOpen := true
+	closeJob := func() error {
+		if !jobOpen {
+			return nil
+		}
+		jobOpen = false
+		return windows.CloseHandle(job)
+	}
+	defer closeJob()
 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
@@ -533,10 +605,10 @@ func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, tim
 		runErr = fmt.Errorf("access restricted process handle: %w", setupErr)
 	}
 	if runErr != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return runErr, false
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		cleanup := baseline.CleanupWithWatchdog(done, time.After(2*time.Second), func() error { return windows.TerminateJobObject(job, 1) }, closeJob, cmd.Process.Kill)
+		return fmt.Errorf("%w; cleanup=%s", runErr, cleanupDiagnostic(cleanup)), false
 	}
 
 	done := make(chan error, 1)
@@ -547,10 +619,13 @@ func runInRestrictedJob(cmd *exec.Cmd, timeout time.Duration) (runErr error, tim
 	case err := <-done:
 		return err, false
 	case <-timer.C:
-		_ = windows.TerminateJobObject(job, 1)
-		<-done
-		return context.DeadlineExceeded, true
+		cleanup := baseline.CleanupWithWatchdog(done, time.After(2*time.Second), func() error { return windows.TerminateJobObject(job, 1) }, closeJob, cmd.Process.Kill)
+		return fmt.Errorf("%w; cleanup=%s", context.DeadlineExceeded, cleanupDiagnostic(cleanup)), true
 	}
+}
+
+func cleanupDiagnostic(result baseline.CleanupResult) string {
+	return fmt.Sprintf("completed=%v wait=%v terminate_job=%v close_job=%v kill=%v", result.Completed, result.WaitError, result.TerminateError, result.CloseJobError, result.KillError)
 }
 
 func objectSecurity(path string) (identity, owner, dacl string) {
