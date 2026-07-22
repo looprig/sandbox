@@ -11,6 +11,7 @@ import (
 	osexec "os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -300,14 +301,19 @@ func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	canaries := make(map[string]win.Handle)
+	canaries := make(map[string]windows.HandleObjectIdentity)
 	add := func(name string, handle win.Handle, close func() error) {
 		t.Helper()
 		if err := win.SetHandleInformation(handle, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT); err != nil {
 			_ = close()
 			t.Fatalf("make %s canary inheritable: %v", name, err)
 		}
-		canaries[name] = handle
+		identity, err := windows.CaptureHandleObjectIdentity(handle)
+		if err != nil {
+			_ = close()
+			t.Fatalf("capture %s canary identity: %v", name, err)
+		}
+		canaries[name] = identity
 		t.Cleanup(func() { _ = close() })
 	}
 	openDirectory := func(name, path string) {
@@ -333,7 +339,8 @@ func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
 	}
 	add("representative-live-lease-object", win.Handle(leaseFile.Fd()), leaseFile.Close)
 	if err := filepath.WalkDir(journalRoot, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() || canaries["restricted-journal-file"] != 0 {
+		_, journalFileFound := canaries["restricted-journal-file"]
+		if walkErr != nil || entry.IsDir() || journalFileFound {
 			return nil
 		}
 		file, openErr := os.Open(path)
@@ -345,7 +352,7 @@ func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("find actual restricted journal file canary: %v", err)
 	}
-	if canaries["restricted-journal-file"] == 0 {
+	if _, ok := canaries["restricted-journal-file"]; !ok {
 		t.Fatal("production restricted construction created no durable journal file canary")
 	}
 	job, err := win.CreateJobObject(nil, nil)
@@ -366,14 +373,28 @@ func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	output, code, err := executor.RunArgv(ctx, workspace, []string{helper})
+	requested := make([]uintptr, 0, len(canaries))
+	for _, canary := range canaries {
+		requested = append(requested, canary.Value())
+	}
+	sort.Slice(requested, func(i, j int) bool { return requested[i] < requested[j] })
+	argv := make([]string, 1, len(requested)+2)
+	argv[0] = helper
+	argv = append(argv, "objects")
+	for _, value := range requested {
+		argv = append(argv, strconv.FormatUint(uint64(value), 16))
+	}
+	output, code, err := executor.RunArgv(ctx, workspace, argv)
 	if err != nil || code != 0 {
 		t.Fatalf("production restricted handle probe: code=%d err=%v output=%q", code, err, output)
 	}
 	var report struct {
 		Standard map[string]uintptr `json:"standard"`
 		Handles  []struct {
-			Value uintptr `json:"value"`
+			Value  uintptr `json:"value"`
+			Type   string  `json:"type"`
+			Access uint32  `json:"access"`
+			Object uintptr `json:"object,omitempty"`
 		} `json:"handles"`
 	}
 	if err := json.Unmarshal(output[:jsonObjectEnd(output)], &report); err != nil {
@@ -389,8 +410,12 @@ func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
 	}
 	for name, canary := range canaries {
 		for _, inherited := range report.Handles {
-			if inherited.Value == uintptr(canary) {
-				t.Errorf("production restricted target inherited %s handle %#x", name, uintptr(canary))
+			same, conclusive := canary.CompareCandidate(inherited.Value, inherited.Object)
+			if inherited.Value == canary.Value() && !conclusive {
+				t.Errorf("production restricted target could not identify %s handle candidate %#x (type=%s access=%#x)", name, canary.Value(), inherited.Type, inherited.Access)
+			}
+			if same {
+				t.Errorf("production restricted target inherited %s handle %#x", name, canary.Value())
 			}
 		}
 	}

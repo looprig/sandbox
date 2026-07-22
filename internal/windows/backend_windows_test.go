@@ -3,8 +3,12 @@
 package windows
 
 import (
+	"bytes"
 	"errors"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +16,7 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
+	win "golang.org/x/sys/windows"
 )
 
 func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
@@ -205,5 +210,74 @@ func TestRestrictedGrantCompileReusesBaseLeaseAndTransientReleaseKeepsItActive(t
 	}
 	if baseReleases != 1 {
 		t.Fatalf("base releases = %d, want 1", baseReleases)
+	}
+}
+
+func TestRestrictedGrantCollisionFailsBeforeProjectionAndRetainsRetirement(t *testing.T) {
+	base, err := ExecutorSID("collision-installation", "collision-executor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, collision := range []string{"TokenUser", "TokenGroups"} {
+		t.Run(collision, func(t *testing.T) {
+			entropy := bytes.Repeat([]byte{byte(0x71 + index)}, sidEntropyBytes)
+			store := newMemorySIDRetirementStore()
+			generator, err := NewOneShotSIDGenerator(bytes.NewReader(entropy), store)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			target := filepath.Join(t.TempDir(), "grant.txt")
+			if err := os.WriteFile(target, []byte("grant"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := policy.CapturePathBinding(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := policy.AcquirePathHandle(&binding, binding.CanonicalPath, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer handle.Close()
+			handle.SetAccess(policy.WriteAccess)
+
+			projectCalls := 0
+			backend := &restrictedBackend{
+				config: Config{Mode: RestrictedToken}, baseSID: base,
+				journal: &RestrictedJournal{}, baseActive: true,
+				deps: restrictedCompileDependencies{
+					configure: func(*exec.Cmd, []SID) (func(), error) { return nil, nil },
+					newGrantSIDGenerator: func(*RestrictedJournal) (*OneShotSIDGenerator, error) {
+						return generator, nil
+					},
+					validateTrustees: func(sids []SID) error {
+						parsed := mustTestSID(t, sids[0].String())
+						if collision == "TokenUser" {
+							return ensureRestrictingSIDsAreNew(parsed, nil, []*win.SID{parsed})
+						}
+						return ensureRestrictingSIDsAreNew(nil, []win.SIDAndAttributes{{Sid: parsed}}, []*win.SID{parsed})
+					},
+					projectGrant: func(*policy.PathHandle, []policy.FSEntry, SID, *RestrictedJournal, io.Reader) (*ACLProjection, error) {
+						projectCalls++
+						return nil, nil
+					},
+				},
+			}
+			if _, _, _, _, err := backend.CompileWithPathHandles(policy.Effective{}, []*policy.PathHandle{handle}); err == nil {
+				t.Fatal("colliding one-shot trustee compiled")
+			}
+			if projectCalls != 0 {
+				t.Fatalf("grant projection calls = %d, want zero", projectCalls)
+			}
+
+			replay, err := NewOneShotSIDGenerator(bytes.NewReader(entropy), store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := replay.Next(); !errors.Is(err, ErrSIDReuse) {
+				t.Fatalf("rejected one-shot SID retirement = %v, want ErrSIDReuse", err)
+			}
+		})
 	}
 }

@@ -29,8 +29,11 @@ type restrictedPreparedLease struct {
 }
 
 type restrictedCompileDependencies struct {
-	prepare   func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error)
-	configure func(*exec.Cmd, []SID) (func(), error)
+	prepare              func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error)
+	configure            func(*exec.Cmd, []SID) (func(), error)
+	newGrantSIDGenerator func(*RestrictedJournal) (*OneShotSIDGenerator, error)
+	validateTrustees     func([]SID) error
+	projectGrant         func(*policy.PathHandle, []policy.FSEntry, SID, *RestrictedJournal, io.Reader) (*ACLProjection, error)
 }
 
 type restrictedBackend struct {
@@ -47,6 +50,11 @@ func newRestrictedBackend(config Config, runtime *RestrictedRuntime) enforce.Bac
 	return &restrictedBackend{config: config, runtime: runtime, deps: restrictedCompileDependencies{
 		prepare:   prepareRestrictedLease,
 		configure: configureRestrictedSpawn,
+		newGrantSIDGenerator: func(journal *RestrictedJournal) (*OneShotSIDGenerator, error) {
+			return NewOneShotSIDGenerator(rand.Reader, journal)
+		},
+		validateTrustees: ensureModuleTrusteesAbsentFromCurrentToken,
+		projectGrant:     projectRestrictedGrant,
 	}}
 }
 
@@ -172,9 +180,16 @@ func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, han
 	fail := func(cause error) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, errors.Join(cause, resources.close())
 	}
-	generator, err := NewOneShotSIDGenerator(rand.Reader, journal)
-	if err != nil {
-		return fail(err)
+	var generator *OneShotSIDGenerator
+	if len(handles) != 0 {
+		if backend.deps.newGrantSIDGenerator == nil || backend.deps.validateTrustees == nil || backend.deps.projectGrant == nil {
+			return fail(errors.New("sandbox: restricted grant dependencies are unavailable"))
+		}
+		var generatorErr error
+		generator, generatorErr = backend.deps.newGrantSIDGenerator(journal)
+		if generatorErr != nil {
+			return fail(generatorErr)
+		}
 	}
 	for _, handle := range handles {
 		if handle == nil || handle.NativeHandle() == 0 || handle.Access() == 0 {
@@ -184,7 +199,10 @@ func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, han
 		if err != nil {
 			return fail(err)
 		}
-		projection, err := projectRestrictedGrant(handle, p.FS, sid, journal, rand.Reader)
+		if err := backend.deps.validateTrustees([]SID{sid}); err != nil {
+			return fail(fmt.Errorf("validate one-shot trustee before ACL projection: %w", err))
+		}
+		projection, err := backend.deps.projectGrant(handle, p.FS, sid, journal, rand.Reader)
 		if err != nil {
 			return fail(err)
 		}

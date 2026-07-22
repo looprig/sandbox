@@ -5,7 +5,6 @@ package windows
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,12 +23,7 @@ import (
 
 var getHandleInformation = winapi.NewLazySystemDLL("kernel32.dll").NewProc("GetHandleInformation")
 
-var testNtQuerySystemInformation = winapi.NewLazySystemDLL("ntdll.dll").NewProc("NtQuerySystemInformation")
-
 const (
-	testSystemExtendedHandleInformation = 64
-	testStatusInfoLengthMismatch        = 0xc0000004
-
 	// CreatePipe grants these exact mapped masks to its read and write
 	// endpoints. FILE_WRITE_ATTRIBUTES on the read endpoint and
 	// FILE_READ_ATTRIBUTES on the write endpoint are properties of Windows'
@@ -37,17 +31,6 @@ const (
 	anonymousPipeReadAccess  = winapi.FILE_GENERIC_READ | winapi.FILE_WRITE_ATTRIBUTES
 	anonymousPipeWriteAccess = winapi.FILE_GENERIC_WRITE | winapi.FILE_READ_ATTRIBUTES
 )
-
-type testSystemHandleEntry struct {
-	Object                uintptr
-	UniqueProcessID       uintptr
-	HandleValue           uintptr
-	GrantedAccess         uint32
-	CreatorBackTraceIndex uint16
-	ObjectTypeIndex       uint16
-	HandleAttributes      uint32
-	Reserved              uint32
-}
 
 func TestConfigureExplicitHandleListRejectsInvalidCommand(t *testing.T) {
 	if _, err := ConfigureExplicitHandleList(nil, nil); err == nil {
@@ -544,46 +527,6 @@ func readHandleInformation(handle winapi.Handle, flags *uint32) error {
 	return nil
 }
 
-func currentProcessHandleObject(handle winapi.Handle) (uintptr, error) {
-	buffer := make([]byte, 64<<10)
-	for {
-		var needed uint32
-		status, _, _ := testNtQuerySystemInformation.Call(
-			testSystemExtendedHandleInformation,
-			uintptr(unsafe.Pointer(&buffer[0])),
-			uintptr(len(buffer)),
-			uintptr(unsafe.Pointer(&needed)),
-		)
-		if uint32(status) == testStatusInfoLengthMismatch {
-			buffer = make([]byte, int(needed)+(64<<10))
-			continue
-		}
-		if status != 0 {
-			return 0, fmt.Errorf("NtQuerySystemInformation: NTSTATUS %#x", uint32(status))
-		}
-		break
-	}
-
-	count := *(*uintptr)(unsafe.Pointer(&buffer[0]))
-	headerSize := 2 * unsafe.Sizeof(uintptr(0))
-	entrySize := unsafe.Sizeof(testSystemHandleEntry{})
-	pid := uintptr(os.Getpid())
-	for i := uintptr(0); i < count; i++ {
-		offset := headerSize + i*entrySize
-		if offset+entrySize > uintptr(len(buffer)) {
-			return 0, errors.New("truncated system handle table")
-		}
-		entry := *(*testSystemHandleEntry)(unsafe.Pointer(&buffer[offset]))
-		if entry.UniqueProcessID == pid && entry.HandleValue == uintptr(handle) {
-			if entry.Object == 0 {
-				return 0, errors.New("system handle table returned an empty object identity")
-			}
-			return entry.Object, nil
-		}
-	}
-	return 0, fmt.Errorf("handle %#x absent from system handle table", uintptr(handle))
-}
-
 type probeReport struct {
 	Stdin    string             `json:"stdin"`
 	Standard map[string]uintptr `json:"standard"`
@@ -595,13 +538,6 @@ type probeReport struct {
 	} `json:"handles"`
 }
 
-type handleCanary struct {
-	Handle winapi.Handle
-	Type   string
-	Access uint32
-	Object uintptr
-}
-
 func TestInheritedHandleCanariesAreExcluded(t *testing.T) {
 	helper := buildHandleProbe(t)
 	canaries := createHandleCanaries(t)
@@ -609,23 +545,28 @@ func TestInheritedHandleCanariesAreExcluded(t *testing.T) {
 }
 
 func TestCanaryMatchRequiresKernelObjectIdentity(t *testing.T) {
-	canary := handleCanary{Handle: 0x40, Type: "Token", Access: winapi.TOKEN_QUERY, Object: 0xabc}
+	canary := HandleObjectIdentity{value: 0x40, object: 0xabc}
 	for _, handle := range []struct {
 		Value  uintptr
 		Type   string
 		Access uint32
 		Object uintptr
 	}{
-		{Value: uintptr(canary.Handle), Type: canary.Type, Access: canary.Access, Object: 0xdef},
-		{Value: uintptr(canary.Handle), Type: "Event", Access: canary.Access, Object: canary.Object},
-		{Value: uintptr(canary.Handle), Type: canary.Type, Access: winapi.TOKEN_DUPLICATE, Object: canary.Object},
+		{Value: canary.Value(), Type: "Token", Access: winapi.TOKEN_QUERY, Object: 0xdef},
 	} {
-		if inheritedCanary(handle.Value, handle.Type, handle.Access, handle.Object, canary) {
+		same, conclusive := canary.CompareCandidate(handle.Value, handle.Object)
+		if !conclusive {
+			t.Fatal("nonzero reused object identity was inconclusive")
+		}
+		if same {
 			t.Fatalf("non-identical handle value %#x matched canary with type=%q access=%#x", handle.Value, handle.Type, handle.Access)
 		}
 	}
-	if !inheritedCanary(uintptr(canary.Handle), canary.Type, canary.Access, canary.Object, canary) {
+	if same, conclusive := canary.CompareCandidate(canary.Value(), canary.object); !same || !conclusive {
 		t.Fatal("exact canary identity did not match")
+	}
+	if same, conclusive := canary.CompareCandidate(canary.Value(), 0); same || conclusive {
+		t.Fatal("missing child object identity was treated as conclusive exclusion")
 	}
 }
 
@@ -701,11 +642,11 @@ func buildHandleProbe(t *testing.T) string {
 	return output
 }
 
-func runHandleProbe(t *testing.T, helper string, canaries map[string]handleCanary) {
+func runHandleProbe(t *testing.T, helper string, canaries map[string]HandleObjectIdentity) {
 	t.Helper()
 	requested := make([]uintptr, 0, len(canaries))
 	for _, canary := range canaries {
-		requested = append(requested, uintptr(canary.Handle))
+		requested = append(requested, canary.Value())
 	}
 	sort.Slice(requested, func(i, j int) bool { return requested[i] < requested[j] })
 	args := make([]string, 1, len(requested)+1)
@@ -740,18 +681,15 @@ func runHandleProbe(t *testing.T, helper string, canaries map[string]handleCanar
 	assertStandardHandleAccess(t, report, anonymousPipeReadAccess, anonymousPipeWriteAccess)
 	for name, canary := range canaries {
 		for _, inherited := range report.Handles {
-			if inheritedCanary(inherited.Value, inherited.Type, inherited.Access, inherited.Object, canary) {
-				t.Errorf("target inherited %s canary handle %#x (type=%s access=%#x)", name, uintptr(canary.Handle), inherited.Type, inherited.Access)
+			same, conclusive := canary.CompareCandidate(inherited.Value, inherited.Object)
+			if inherited.Value == canary.Value() && !conclusive {
+				t.Errorf("target %s canary candidate had no kernel object identity (type=%s access=%#x)", name, inherited.Type, inherited.Access)
+			}
+			if same {
+				t.Errorf("target inherited %s canary handle %#x (type=%s access=%#x)", name, canary.Value(), inherited.Type, inherited.Access)
 			}
 		}
 	}
-}
-
-func inheritedCanary(value uintptr, objectType string, access uint32, object uintptr, canary handleCanary) bool {
-	// Handle values are process-local and may be reused by an unrelated object
-	// created during child startup. The SystemExtendedHandleInformation Object
-	// pointer identifies the underlying kernel object across the two processes.
-	return value == uintptr(canary.Handle) && objectType == canary.Type && access == canary.Access && object == canary.Object
 }
 
 func assertStandardHandleAccess(t *testing.T, report probeReport, inputAccess, outputAccess uint32) {
@@ -794,25 +732,17 @@ func ExampleConfigureExplicitHandleList() {
 	// Output: 0
 }
 
-func createHandleCanaries(t *testing.T) map[string]handleCanary {
+func createHandleCanaries(t *testing.T) map[string]HandleObjectIdentity {
 	t.Helper()
-	result := make(map[string]handleCanary)
+	result := make(map[string]HandleObjectIdentity)
 	add := func(name string, handle winapi.Handle, close func() error) {
 		t.Helper()
 		makeInheritable(t, handle)
-		objectType, err := handleObjectType(handle)
+		identity, err := CaptureHandleObjectIdentity(handle)
 		if err != nil {
-			t.Fatalf("inspect %s canary type: %v", name, err)
+			t.Fatalf("capture %s canary identity: %v", name, err)
 		}
-		access, err := handleGrantedAccess(handle)
-		if err != nil {
-			t.Fatalf("inspect %s canary access: %v", name, err)
-		}
-		object, err := currentProcessHandleObject(handle)
-		if err != nil {
-			t.Fatalf("inspect %s canary object identity: %v", name, err)
-		}
-		result[name] = handleCanary{Handle: handle, Type: objectType, Access: access, Object: object}
+		result[name] = identity
 		t.Cleanup(func() { _ = close() })
 	}
 
