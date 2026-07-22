@@ -16,7 +16,9 @@ runner. No ACL on an operating-system runtime object is changed by this spike.
 ## Live command and required images
 
 Run from a clean checkout on every Windows build/filesystem image the product
-supports, using a disposable standard-user worker:
+supports, using a disposable **standard-user** PowerShell. Never run the
+baseline command from the elevated collector shell: that would derive the
+restricted token from an administrator token and invalidate the experiment.
 
 ```powershell
 go test -count=1 -v ./spikes/windows -run TestRestrictedRuntimeBaseline
@@ -107,9 +109,9 @@ Every runtime row records a direct executable inventory:
 
 These diagnostics do **not** identify every transitive loader or startup denial
 and are not accepted as denial evidence. If any required row fails, the harness
-keeps the runtime gate failed and reports `selection_eligible=false`. A reviewed
-failure-based selection additionally requires `LOOPRIG_RUNTIME_TRACE_JSON` to
-name evidence conforming to
+reports `exact_token_gate_passed=false` and
+`failure_selection_evidence_complete=false`. A reviewed failure-based selection
+requires the separate validation-only invocation to accept evidence conforming to
 `spikes/windows/internal/baseline/trace-evidence.schema.json`. For every failed
 row the validator requires at least one trace denial and requires operation,
 requested access, object path/identity, owner, and DACL on every denial. It also
@@ -121,15 +123,45 @@ trace. Missing or partial evidence cannot be selected.
 For filesystem, DLL, registry, named-pipe, process, locale, and console events,
 the currently specified collector is Microsoft Sysinternals Process Monitor
 4.01. Verify the file version is exactly `4.1.0.0`, then run in an elevated
-PowerShell session on the disposable worker:
+PowerShell session on the disposable worker. Collection and the baseline use
+two different shells and security contexts.
+
+First, in an **elevated collector PowerShell**, verify and start ProcMon:
 
 ```powershell
 (Get-Item .\procmon64.exe).VersionInfo.FileVersion
 .\procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml
-go test -count=1 -v ./spikes/windows -run TestRestrictedRuntimeBaseline
+```
+
+Then, in a separate **standard-user PowerShell**, choose a stable caller nonce
+and run the baseline exactly once. The emitted invocation manifest binds source
+revision, Windows build/architecture/filesystem, exact-token inventory digest,
+required-runtime-manifest digest, executable path/identity/hash and PID for each
+row, exit/diagnostic, and matrix digest:
+
+```powershell
+$env:LOOPRIG_RUNTIME_RUN_NONCE = [Guid]::NewGuid().ToString('N')
+$env:LOOPRIG_RUNTIME_RUN_MANIFEST_OUT = 'C:\runtime-invocation.json'
+go test -count=1 -v ./spikes/windows -run '^TestRestrictedRuntimeBaseline$'
+```
+
+Do not rerun the baseline to create evidence. A rerun has different PIDs and is
+not the traced invocation even if the nonce is accidentally reused.
+
+Back in the **elevated collector PowerShell**, stop/export the same capture,
+then finalize the emitted invocation manifest against the immutable raw PML:
+
+```powershell
 .\procmon64.exe /Terminate
 .\procmon64.exe /OpenLog C:\runtime-baseline.pml /SaveAs C:\runtime-baseline.csv
 Get-FileHash -Algorithm SHA256 C:\runtime-baseline.pml
+$env:LOOPRIG_RUNTIME_INVOCATION_MANIFEST = 'C:\runtime-invocation.json'
+$env:LOOPRIG_RUNTIME_RAW_TRACE = 'C:\runtime-baseline.pml'
+$env:LOOPRIG_RUNTIME_COLLECTOR_NAME = 'Microsoft Sysinternals Process Monitor'
+$env:LOOPRIG_RUNTIME_COLLECTOR_VERSION = '4.01'
+$env:LOOPRIG_RUNTIME_COLLECTOR_COMMAND = 'procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml'
+$env:LOOPRIG_RUNTIME_FINAL_MANIFEST_OUT = 'C:\runtime-final.json'
+go test -count=1 -v ./spikes/windows -run '^TestFinalizeRestrictedRuntimeRunManifest$'
 ```
 
 Preserve the PML and CSV. Filter the CSV by the test and child PIDs and retain
@@ -139,12 +171,30 @@ each registry object attach its canonical hive path and
 `(Get-Acl -LiteralPath <registry-provider-path>).Sddl`. Record the exact
 Process Monitor command line in the JSON.
 
+Create trace evidence conforming to the v2 JSON schema. Each failed case must
+repeat the exact runtime record from `runtime-final.json`, set `complete:true`,
+include the captured PID and the same nonce, and attach every denial. Validate
+without rerunning the baseline:
+
+```powershell
+$env:LOOPRIG_RUNTIME_FINAL_MANIFEST = 'C:\runtime-final.json'
+$env:LOOPRIG_RUNTIME_TRACE_JSON = 'C:\runtime-evidence.json'
+go test -count=1 -v ./spikes/windows -run '^TestValidateRestrictedRuntimeTraceEvidence$'
+```
+
+Success reports `exact_token_gate_passed=false` and
+`failure_selection_evidence_complete=true`; it never converts a failed exact
+token run into PASS. The validator opens and hashes the absolute raw trace path
+and rejects stale nonce, platform, token, source revision, runtime manifest,
+runtime path/identity/hash/PID/exit/diagnostic, matrix, collector, raw path, or
+raw hash bindings.
+
 Process Monitor does not provide a proven complete requested-access trace for
 all NT Object Manager objects (for example every section/event/mutant used by
 loader or console startup). No reviewed, repository-owned ETW profile covering
 that remainder is available yet. If a failed row touches such an object, this
 is a concrete external collector blocker: the schema entry cannot honestly be
-completed and `selection_eligible` must remain false. Do not infer or fabricate
+completed and `failure_selection_evidence_complete` must remain false. Do not infer or fabricate
 the missing access, owner, or DACL. Phase review must approve a reproducible
 collector/profile for that class before selecting a result.
 

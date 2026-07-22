@@ -71,33 +71,49 @@ func TestRuntimeManifestPinsProductContract(t *testing.T) {
 }
 
 func TestFailedRuntimeRequiresCompleteTrace(t *testing.T) {
-	failures := []string{"windows-powershell"}
-	if err := ValidateFailureTrace(failures, TraceEvidence{}); err == nil {
-		t.Fatal("missing trace unexpectedly accepted")
+	rawPath := filepath.Join(t.TempDir(), "baseline.pml")
+	if err := os.WriteFile(rawPath, []byte("immutable raw trace"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	trace := TraceEvidence{
-		SchemaVersion:  1,
-		Collector:      TraceCollector{Name: "Microsoft Sysinternals Process Monitor", Version: "4.01", Command: "procmon64.exe /BackingFile baseline.pml"},
-		RawTraceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		Cases: []TraceCase{{
-			Runtime:  "windows-powershell",
-			Complete: true,
-			Denials: []TraceDenial{{
-				Operation:       "CreateFile",
-				RequestedAccess: "Read Data/List Directory, Execute/Traverse",
-				ObjectPath:      `C:\Windows\System32\example.dll`,
-				ObjectIdentity:  "volume=00000001 file=0000000000000002",
-				Owner:           "S-1-5-18",
-				DACL:            "D:(A;;GR;;;RC)",
-			}},
-		}},
+	runtime := RuntimeExecution{Name: "windows-powershell", ExecutablePath: `C:\Windows\powershell.exe`, ObjectIdentity: "volume=1 file=2", ExecutableSHA256: SHA256Hex([]byte("exe")), PID: 42, Status: "FAIL", ExitCode: 5, Diagnostic: "access denied"}
+	manifest := RunManifest{SchemaVersion: 2, RunNonce: "caller-nonce-123", SourceRevision: "0123456789abcdef", Platform: RunPlatform{WindowsBuild: "10.0.26100", Architecture: "amd64", Filesystem: "NTFS:00000001"}, TokenInventorySHA256: SHA256Hex([]byte("token")), RuntimeManifestSHA256: RuntimeManifestDigest(), MatrixSHA256: SHA256Hex([]byte("matrix")), Runtimes: []RuntimeExecution{runtime}}
+	manifest, err := FinalizeRunManifest(manifest, TraceCollector{Name: "Microsoft Sysinternals Process Monitor", Version: "4.01", Command: "procmon64.exe /BackingFile baseline.pml"}, rawPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := ValidateFailureTrace(failures, trace); err != nil {
+	trace := TraceEvidence{SchemaVersion: 2, Run: manifest, Cases: []TraceCase{{Runtime: runtime, Complete: true, CapturedPIDs: []int{42}, CapturedNonce: manifest.RunNonce, Denials: []TraceDenial{{Operation: "CreateFile", RequestedAccess: "Read Data/List Directory, Execute/Traverse", ObjectPath: `C:\Windows\System32\example.dll`, ObjectIdentity: "volume=00000001 file=0000000000000002", Owner: "S-1-5-18", DACL: "D:(A;;GR;;;RC)"}}}}}
+	if err := ValidateFailureTrace(manifest, trace); err != nil {
 		t.Fatalf("complete trace rejected: %v", err)
 	}
-	trace.Cases[0].Denials[0].DACL = ""
-	if err := ValidateFailureTrace(failures, trace); err == nil {
-		t.Fatal("denial without DACL unexpectedly accepted")
+	mutations := map[string]func(*TraceEvidence){
+		"nonce": func(e *TraceEvidence) { e.Run.RunNonce = "stale" }, "revision": func(e *TraceEvidence) { e.Run.SourceRevision = "stale" },
+		"windows build": func(e *TraceEvidence) { e.Run.Platform.WindowsBuild = "stale" }, "architecture": func(e *TraceEvidence) { e.Run.Platform.Architecture = "stale" },
+		"filesystem": func(e *TraceEvidence) { e.Run.Platform.Filesystem = "stale" }, "token": func(e *TraceEvidence) { e.Run.TokenInventorySHA256 = SHA256Hex([]byte("stale")) },
+		"runtime manifest": func(e *TraceEvidence) { e.Run.RuntimeManifestSHA256 = SHA256Hex([]byte("stale")) }, "matrix": func(e *TraceEvidence) { e.Run.MatrixSHA256 = SHA256Hex([]byte("stale")) },
+		"runtime path": func(e *TraceEvidence) { e.Cases[0].Runtime.ExecutablePath = "stale" }, "runtime identity": func(e *TraceEvidence) { e.Cases[0].Runtime.ObjectIdentity = "stale" },
+		"runtime hash": func(e *TraceEvidence) { e.Cases[0].Runtime.ExecutableSHA256 = SHA256Hex([]byte("stale")) }, "runtime exit": func(e *TraceEvidence) { e.Cases[0].Runtime.ExitCode++ },
+		"runtime diagnostic": func(e *TraceEvidence) { e.Cases[0].Runtime.Diagnostic = "stale" }, "raw hash": func(e *TraceEvidence) { e.Run.RawTraceSHA256 = SHA256Hex([]byte("stale")) },
+		"collector name": func(e *TraceEvidence) { e.Run.Collector.Name = "stale" }, "collector version": func(e *TraceEvidence) { e.Run.Collector.Version = "stale" },
+		"collector command": func(e *TraceEvidence) { e.Run.Collector.Command = "stale" }, "raw path": func(e *TraceEvidence) { e.Run.RawTracePath = "stale" },
+		"pid":            func(e *TraceEvidence) { e.Cases[0].CapturedPIDs = []int{99} },
+		"captured nonce": func(e *TraceEvidence) { e.Cases[0].CapturedNonce = "stale" }, "eligibility": func(e *TraceEvidence) { e.Run.ExactTokenGatePassed = true },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			encoded, _ := json.Marshal(trace)
+			var changed TraceEvidence
+			_ = json.Unmarshal(encoded, &changed)
+			mutate(&changed)
+			if err := ValidateFailureTrace(manifest, changed); err == nil {
+				t.Fatal("binding mismatch unexpectedly accepted")
+			}
+		})
+	}
+	if err := os.WriteFile(rawPath, []byte("mutated raw trace"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFailureTrace(manifest, trace); err == nil {
+		t.Fatal("mutated raw artifact unexpectedly accepted")
 	}
 }
 

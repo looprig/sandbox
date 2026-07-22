@@ -43,17 +43,19 @@ type runtimeCase struct {
 }
 
 type runtimeResult struct {
-	Name            string   `json:"name"`
-	Path            string   `json:"path"`
-	Arguments       []string `json:"arguments"`
-	RequestedAccess string   `json:"image_startup_access_estimate"`
-	ObjectIdentity  string   `json:"object_identity"`
-	Owner           string   `json:"owner"`
-	DACL            string   `json:"dacl"`
-	Status          string   `json:"status"`
-	ExitCode        int      `json:"exit_code,omitempty"`
-	Error           string   `json:"error,omitempty"`
-	Output          string   `json:"output,omitempty"`
+	Name             string   `json:"name"`
+	Path             string   `json:"path"`
+	Arguments        []string `json:"arguments"`
+	RequestedAccess  string   `json:"image_startup_access_estimate"`
+	ObjectIdentity   string   `json:"object_identity"`
+	Owner            string   `json:"owner"`
+	DACL             string   `json:"dacl"`
+	Status           string   `json:"status"`
+	ExitCode         int      `json:"exit_code,omitempty"`
+	Error            string   `json:"error,omitempty"`
+	Output           string   `json:"output,omitempty"`
+	PID              int      `json:"pid,omitempty"`
+	ExecutableSHA256 string   `json:"executable_sha256"`
 }
 
 type limitedBuffer struct {
@@ -95,12 +97,14 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 	}
 
 	probe, tlsFixture, aclDelta := buildRuntimeFixtures(t)
-	t.Logf("platform=%s", platformInventory(t))
+	platformText, platform := platformInventory(t)
+	t.Logf("platform=%s", platformText)
 	t.Logf("fixture_acl_delta=%s", aclDelta)
 
 	token := newExactRestrictedToken(t)
 	defer token.Close()
-	t.Logf("exact_token=%s", tokenInventory(t, token))
+	tokenText := tokenInventory(t, token)
+	t.Logf("exact_token=%s", tokenText)
 
 	results := runRuntimeMatrix(t, token, probe, tlsFixture)
 	encoded, err := json.Marshal(results)
@@ -115,21 +119,87 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 			failures = append(failures, result.Name)
 		}
 	}
+	manifest := createRunManifest(t, platform, tokenText, encoded, results, len(failures) == 0)
+	writeInvocationManifest(t, manifest)
 	if len(failures) != 0 {
-		tracePath := os.Getenv("LOOPRIG_RUNTIME_TRACE_JSON")
-		traceStatus := "missing LOOPRIG_RUNTIME_TRACE_JSON"
-		if tracePath != "" {
-			evidence, loadErr := baseline.LoadTraceEvidence(tracePath)
-			if loadErr != nil {
-				traceStatus = loadErr.Error()
-			} else if validateErr := baseline.ValidateFailureTrace(failures, evidence); validateErr != nil {
-				traceStatus = validateErr.Error()
-			} else {
-				traceStatus = "validated; failure analysis may be reviewed, runtime gate still failed"
-			}
-		}
-		t.Fatalf("exact Restricted Code token runtime failures: %s; selection_eligible=false trace_status=%q; inspect runtime_matrix diagnostics above", strings.Join(failures, ", "), traceStatus)
+		t.Fatalf("exact Restricted Code token runtime failures: %s; exact_token_gate_passed=false failure_selection_evidence_complete=false; finalize and validate evidence from this same nonce/PID invocation without rerunning", strings.Join(failures, ", "))
 	}
+	t.Log("exact_token_gate_passed=true failure_selection_evidence_complete=false")
+}
+
+func TestFinalizeRestrictedRuntimeRunManifest(t *testing.T) {
+	manifest := mustLoadRunManifestEnv(t, "LOOPRIG_RUNTIME_INVOCATION_MANIFEST")
+	collector := baseline.TraceCollector{Name: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_NAME"), Version: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_VERSION"), Command: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_COMMAND")}
+	finalized, err := baseline.FinalizeRunManifest(manifest, collector, mustEnv(t, "LOOPRIG_RUNTIME_RAW_TRACE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, mustEnv(t, "LOOPRIG_RUNTIME_FINAL_MANIFEST_OUT"), finalized)
+}
+
+func TestValidateRestrictedRuntimeTraceEvidence(t *testing.T) {
+	manifest := mustLoadRunManifestEnv(t, "LOOPRIG_RUNTIME_FINAL_MANIFEST")
+	evidence, err := baseline.LoadTraceEvidence(mustEnv(t, "LOOPRIG_RUNTIME_TRACE_JSON"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := baseline.ValidateFailureTrace(manifest, evidence); err != nil {
+		t.Fatalf("exact_token_gate_passed=false failure_selection_evidence_complete=false: %v", err)
+	}
+	t.Log("exact_token_gate_passed=false failure_selection_evidence_complete=true")
+}
+
+func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText string, matrix []byte, results []runtimeResult, passed bool) baseline.RunManifest {
+	t.Helper()
+	nonce := os.Getenv("LOOPRIG_RUNTIME_RUN_NONCE")
+	if os.Getenv("LOOPRIG_RUNTIME_RUN_MANIFEST_OUT") != "" && nonce == "" {
+		t.Fatal("LOOPRIG_RUNTIME_RUN_NONCE is required when emitting a traced invocation manifest")
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = repositoryRoot(t)
+	revision, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("source revision: %v", err)
+	}
+	manifest := baseline.RunManifest{SchemaVersion: 2, RunNonce: nonce, SourceRevision: strings.TrimSpace(string(revision)), Platform: platform, TokenInventorySHA256: baseline.SHA256Hex([]byte(tokenText)), RuntimeManifestSHA256: baseline.RuntimeManifestDigest(), MatrixSHA256: baseline.SHA256Hex(matrix), ExactTokenGatePassed: passed}
+	for _, result := range results {
+		manifest.Runtimes = append(manifest.Runtimes, baseline.RuntimeExecution{Name: result.Name, ExecutablePath: result.Path, ObjectIdentity: result.ObjectIdentity, ExecutableSHA256: result.ExecutableSHA256, PID: result.PID, Status: result.Status, ExitCode: result.ExitCode, Diagnostic: result.Error})
+	}
+	return manifest
+}
+
+func writeInvocationManifest(t *testing.T, manifest baseline.RunManifest) {
+	t.Helper()
+	if path := os.Getenv("LOOPRIG_RUNTIME_RUN_MANIFEST_OUT"); path != "" {
+		writeJSONFile(t, path, manifest)
+		t.Logf("run_manifest=%s run_nonce=%s", path, manifest.RunNonce)
+	}
+}
+func writeJSONFile(t *testing.T, path string, value any) {
+	t.Helper()
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+func mustEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := os.Getenv(name)
+	if value == "" {
+		t.Fatalf("%s is required", name)
+	}
+	return value
+}
+func mustLoadRunManifestEnv(t *testing.T, name string) baseline.RunManifest {
+	t.Helper()
+	manifest, err := baseline.LoadRunManifest(mustEnv(t, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
 }
 
 func buildRuntimeFixtures(t *testing.T) (string, string, string) {
@@ -356,6 +426,9 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 		ExitCode:        -1,
 	}
 	result.ObjectIdentity, result.Owner, result.DACL = objectSecurity(testCase.path)
+	if contents, err := os.ReadFile(testCase.path); err == nil {
+		result.ExecutableSHA256 = baseline.SHA256Hex(contents)
+	}
 
 	if _, err := os.Stat(testCase.path); err != nil {
 		result.Error = err.Error()
@@ -371,6 +444,9 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	err, timedOut := runInRestrictedJob(cmd, runtimeTimeout)
+	if cmd.Process != nil {
+		result.PID = cmd.Process.Pid
+	}
 	result.Output = strings.TrimSpace(output.String())
 	if cmd.ProcessState != nil {
 		result.ExitCode = cmd.ProcessState.ExitCode()
@@ -540,7 +616,7 @@ func tokenInfo(t *testing.T, token windows.Token, class uint32) []byte {
 	return buffer
 }
 
-func platformInventory(t *testing.T) string {
+func platformInventory(t *testing.T) (string, baseline.RunPlatform) {
 	t.Helper()
 	version := windows.RtlGetVersion()
 	system32, err := windows.GetSystemDirectory()
@@ -557,5 +633,6 @@ func platformInventory(t *testing.T) string {
 	if err := windows.GetVolumeInformation(rootPtr, nil, 0, &serial, &maxComponent, &flags, &fsName[0], uint32(len(fsName))); err != nil {
 		t.Fatalf("GetVolumeInformation(%s): %v", root, err)
 	}
-	return fmt.Sprintf("windows=%d.%d build=%d service_pack=%q (%d.%d) arch=%s system_volume=%s serial=%08x filesystem=%s flags=%08x", version.MajorVersion, version.MinorVersion, version.BuildNumber, windows.UTF16ToString(version.CsdVersion[:]), version.ServicePackMajor, version.ServicePackMinor, runtime.GOARCH, root, serial, windows.UTF16ToString(fsName), flags)
+	text := fmt.Sprintf("windows=%d.%d build=%d service_pack=%q (%d.%d) arch=%s system_volume=%s serial=%08x filesystem=%s flags=%08x", version.MajorVersion, version.MinorVersion, version.BuildNumber, windows.UTF16ToString(version.CsdVersion[:]), version.ServicePackMajor, version.ServicePackMinor, runtime.GOARCH, root, serial, windows.UTF16ToString(fsName), flags)
+	return text, baseline.RunPlatform{WindowsBuild: fmt.Sprintf("%d.%d.%d", version.MajorVersion, version.MinorVersion, version.BuildNumber), Architecture: runtime.GOARCH, Filesystem: fmt.Sprintf("%s:%08x:%08x", windows.UTF16ToString(fsName), serial, flags)}
 }
