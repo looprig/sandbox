@@ -8,21 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
-	"sync/atomic"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 var (
-	kernel32        = windows.NewLazySystemDLL("kernel32.dll")
-	procFlsAlloc    = kernel32.NewProc("FlsAlloc")
-	procFlsFree     = kernel32.NewProc("FlsFree")
-	procFlsSetValue = kernel32.NewProc("FlsSetValue")
-	procLocaleName  = kernel32.NewProc("GetUserDefaultLocaleName")
-	callbackSeen    atomic.Bool
+	kernel32       = windows.NewLazySystemDLL("kernel32.dll")
+	procLocaleName = kernel32.NewProc("GetUserDefaultLocaleName")
 )
 
 func main() {
@@ -41,8 +34,6 @@ func main() {
 		err = loadRuntimeDLLs()
 	case "locale-console":
 		err = localeAndConsole()
-	case "tls-callback":
-		err = runTLSCallbackFixture()
 	default:
 		err = fmt.Errorf("unknown mode %q", mode)
 	}
@@ -92,35 +83,5 @@ func localeAndConsole() error {
 	// code page are legitimate startup states; the calls themselves must load.
 	_, _ = windows.GetConsoleCP()
 	_, _ = windows.GetConsoleOutputCP()
-	return nil
-}
-
-// runTLSCallbackFixture uses Windows Fiber Local Storage, whose cleanup
-// callback is dispatched by the same per-thread runtime machinery exercised by
-// TLS users. The live report names it precisely; it is not represented as a PE
-// image TLS-directory callback.
-func runTLSCallbackFixture() error {
-	callbackSeen.Store(false)
-	callback := syscall.NewCallback(func(value uintptr) uintptr {
-		if value == 1 {
-			callbackSeen.Store(true)
-		}
-		return 0
-	})
-	index, _, callErr := procFlsAlloc.Call(callback)
-	if index == ^uintptr(0) {
-		return fmt.Errorf("FlsAlloc: %w", callErr)
-	}
-	if r1, _, err := procFlsSetValue.Call(index, 1); r1 == 0 {
-		procFlsFree.Call(index)
-		return fmt.Errorf("FlsSetValue: %w", err)
-	}
-	if r1, _, err := procFlsFree.Call(index); r1 == 0 {
-		return fmt.Errorf("FlsFree: %w", err)
-	}
-	runtime.KeepAlive(callback)
-	if !callbackSeen.Load() {
-		return fmt.Errorf("FLS cleanup callback was not dispatched")
-	}
 	return nil
 }

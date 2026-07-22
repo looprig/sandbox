@@ -18,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/looprig/sandbox/spikes/windows/internal/baseline"
 	"golang.org/x/sys/windows"
 )
 
@@ -33,18 +34,19 @@ var (
 )
 
 type runtimeCase struct {
-	name          string
-	path          string
-	args          []string
-	creationFlags uint32
-	required      bool
+	name           string
+	path           string
+	args           []string
+	creationFlags  uint32
+	required       bool
+	expectedOutput string
 }
 
 type runtimeResult struct {
 	Name            string   `json:"name"`
 	Path            string   `json:"path"`
 	Arguments       []string `json:"arguments"`
-	RequestedAccess string   `json:"requested_access"`
+	RequestedAccess string   `json:"image_startup_access_estimate"`
 	ObjectIdentity  string   `json:"object_identity"`
 	Owner           string   `json:"owner"`
 	DACL            string   `json:"dacl"`
@@ -92,7 +94,7 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 		t.Fatal("restricted runtime baseline is a live gate; -short is not a passing result")
 	}
 
-	probe, aclDelta := buildRuntimeProbe(t)
+	probe, tlsFixture, aclDelta := buildRuntimeFixtures(t)
 	t.Logf("platform=%s", platformInventory(t))
 	t.Logf("fixture_acl_delta=%s", aclDelta)
 
@@ -100,7 +102,7 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 	defer token.Close()
 	t.Logf("exact_token=%s", tokenInventory(t, token))
 
-	results := runRuntimeMatrix(t, token, probe)
+	results := runRuntimeMatrix(t, token, probe, tlsFixture)
 	encoded, err := json.Marshal(results)
 	if err != nil {
 		t.Fatalf("encode runtime matrix: %v", err)
@@ -114,11 +116,23 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 		}
 	}
 	if len(failures) != 0 {
-		t.Fatalf("exact Restricted Code token runtime failures: %s; inspect runtime_matrix diagnostics above", strings.Join(failures, ", "))
+		tracePath := os.Getenv("LOOPRIG_RUNTIME_TRACE_JSON")
+		traceStatus := "missing LOOPRIG_RUNTIME_TRACE_JSON"
+		if tracePath != "" {
+			evidence, loadErr := baseline.LoadTraceEvidence(tracePath)
+			if loadErr != nil {
+				traceStatus = loadErr.Error()
+			} else if validateErr := baseline.ValidateFailureTrace(failures, evidence); validateErr != nil {
+				traceStatus = validateErr.Error()
+			} else {
+				traceStatus = "validated; failure analysis may be reviewed, runtime gate still failed"
+			}
+		}
+		t.Fatalf("exact Restricted Code token runtime failures: %s; selection_eligible=false trace_status=%q; inspect runtime_matrix diagnostics above", strings.Join(failures, ", "), traceStatus)
 	}
 }
 
-func buildRuntimeProbe(t *testing.T) (string, string) {
+func buildRuntimeFixtures(t *testing.T) (string, string, string) {
 	t.Helper()
 	installRoot := filepath.Join(t.TempDir(), "installed-runner")
 	if err := os.Mkdir(installRoot, 0o755); err != nil {
@@ -135,7 +149,15 @@ func buildRuntimeProbe(t *testing.T) (string, string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build installed-runner-shaped runtime probe: %v\n%s", err, output)
 	}
-	return probe, fmt.Sprintf("object=%q before={%s} after={%s}; only this test-owned fixture was changed", installRoot, before, after)
+	tlsImage, err := baseline.GenerateTLSFixture(runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("generate PE TLS callback fixture: %v", err)
+	}
+	tlsFixture := filepath.Join(installRoot, "tlsfixture.exe")
+	if err := os.WriteFile(tlsFixture, tlsImage, 0o755); err != nil {
+		t.Fatalf("write PE TLS callback fixture: %v", err)
+	}
+	return probe, tlsFixture, fmt.Sprintf("object=%q before={%s} after={%s}; only this test-owned fixture was changed", installRoot, before, after)
 }
 
 func repositoryRoot(t *testing.T) string {
@@ -254,22 +276,23 @@ func assertExactRestrictingList(t *testing.T, token windows.Token, want *windows
 	}
 }
 
-func runRuntimeMatrix(t *testing.T, token windows.Token, probe string) []runtimeResult {
+func runRuntimeMatrix(t *testing.T, token windows.Token, probe, tlsFixture string) []runtimeResult {
 	t.Helper()
 	system32, err := windows.GetSystemDirectory()
 	if err != nil {
 		t.Fatalf("GetSystemDirectory: %v", err)
 	}
-	cases := []runtimeCase{
-		{name: "installed-runner-go-helper", path: probe, args: []string{"smoke"}, required: true},
-		{name: "go-subprocess", path: probe, args: []string{"subprocess"}, required: true},
-		{name: "crt-and-dll-initializers", path: probe, args: []string{"dll-initializer"}, required: true},
-		{name: "locale-and-console-startup", path: probe, args: []string{"locale-console"}, creationFlags: windows.CREATE_NEW_CONSOLE, required: true},
-		{name: "tls-callback-fixture", path: probe, args: []string{"tls-callback"}, required: true},
-		{name: "canonical-system32-cmd", path: filepath.Join(system32, "cmd.exe"), args: []string{"/D", "/S", "/C", "exit 0"}, required: true},
-		{name: "windows-powershell", path: filepath.Join(system32, `WindowsPowerShell\v1.0\powershell.exe`), args: []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"}, required: true},
+	manifest, err := baseline.LoadRuntimeManifest()
+	if err != nil {
+		t.Fatalf("load runtime manifest: %v", err)
 	}
-	cases = append(cases, discoverDocumentedRuntimes(t, probe)...)
+	var cases []runtimeCase
+	for _, spec := range manifest.Required {
+		cases = append(cases, resolveRuntimeSpec(t, spec, system32, probe, tlsFixture, true))
+	}
+	for _, spec := range manifest.InventoryOnly {
+		cases = append(cases, resolveRuntimeSpec(t, spec, system32, probe, tlsFixture, false))
+	}
 
 	results := make([]runtimeResult, 0, len(cases))
 	for _, testCase := range cases {
@@ -284,45 +307,43 @@ func runRuntimeMatrix(t *testing.T, token windows.Token, probe string) []runtime
 	return results
 }
 
-func discoverDocumentedRuntimes(t *testing.T, probe string) []runtimeCase {
+func resolveRuntimeSpec(t *testing.T, spec baseline.RuntimeSpec, system32, probe, tlsFixture string, required bool) runtimeCase {
 	t.Helper()
-	// SPEC/design promise native programs, Go helpers, cmd, and PowerShell.
-	// Python is named by the Windows conformance plan. The remaining entries
-	// make the report exhaustive when common tool runtimes are installed; their
-	// absence is inventory, never t.Skip and never a fabricated pass.
-	candidates := []struct {
-		name string
-		exe  string
-		args []string
-	}{
-		{"python", "python.exe", []string{"-c", "pass"}},
-		{"python-launcher", "py.exe", []string{"-c", "pass"}},
-		{"node", "node.exe", []string{"-e", "process.exit(0)"}},
-		{"dotnet", "dotnet.exe", []string{"--info"}},
-		{"java", "java.exe", []string{"-version"}},
-		{"ruby", "ruby.exe", []string{"-e", "exit 0"}},
-		{"perl", "perl.exe", []string{"-e", "exit 0"}},
-		{"powershell-core", "pwsh.exe", []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"}},
+	testCase := runtimeCase{name: spec.Name, args: spec.Args, required: required}
+	if spec.NewConsole {
+		testCase.creationFlags = windows.CREATE_NEW_CONSOLE
 	}
-	seen := map[string]bool{strings.ToLower(probe): true}
-	var cases []runtimeCase
-	for _, candidate := range candidates {
-		path, err := exec.LookPath(candidate.exe)
-		if err != nil {
-			cases = append(cases, runtimeCase{name: candidate.name, path: candidate.exe, args: candidate.args})
-			continue
+	switch spec.Resolver {
+	case "probe":
+		testCase.path = probe
+		testCase.args = []string{spec.Mode}
+	case "tls-fixture":
+		testCase.path = tlsFixture
+		testCase.expectedOutput = "TLS_CALLBACK_EXECUTED\nMAIN_AFTER_TLS"
+	case "system32":
+		if len(spec.Candidates) != 1 {
+			t.Fatalf("system32 runtime %q candidates = %v, want exactly one canonical path", spec.Name, spec.Candidates)
 		}
-		path, err = filepath.Abs(path)
-		if err != nil {
-			t.Fatalf("absolute runtime path for %s: %v", candidate.exe, err)
+		testCase.path = filepath.Join(system32, spec.Candidates[0])
+	case "path":
+		for _, candidate := range spec.Candidates {
+			path, err := exec.LookPath(candidate)
+			if err != nil {
+				continue
+			}
+			testCase.path, err = filepath.Abs(path)
+			if err != nil {
+				t.Fatalf("absolute runtime path for %s: %v", candidate, err)
+			}
+			break
 		}
-		key := strings.ToLower(path)
-		if !seen[key] {
-			seen[key] = true
-			cases = append(cases, runtimeCase{name: candidate.name, path: path, args: candidate.args})
+		if testCase.path == "" && len(spec.Candidates) != 0 {
+			testCase.path = spec.Candidates[0]
 		}
+	default:
+		t.Fatalf("runtime %q has unsupported resolver %q", spec.Name, spec.Resolver)
 	}
-	return cases
+	return testCase
 }
 
 func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
@@ -360,6 +381,10 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 	}
 	if err != nil {
 		result.Error = err.Error()
+		return result
+	}
+	if testCase.expectedOutput != "" && result.Output != testCase.expectedOutput {
+		result.Error = fmt.Sprintf("observable startup order = %q, want %q", result.Output, testCase.expectedOutput)
 		return result
 	}
 	result.Status = "PASS"

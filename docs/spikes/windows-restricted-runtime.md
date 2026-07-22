@@ -28,7 +28,8 @@ complete verbose log as CI evidence. If a worker-level timeout is available,
 set it above the harness's per-process 20-second watchdog so the harness can
 terminate and report a stuck target first.
 
-The live evidence record for each image must add:
+The explicit manifest supports `windows-11` and `windows-server`. The live
+evidence record for each image must add:
 
 - edition, version, build, servicing level, architecture, system-volume serial,
   filesystem name, and filesystem flags from the `platform=` line;
@@ -64,9 +65,10 @@ an installation SID, an executor SID, or a grant SID. This is deliberately the
 narrow runtime-only feasibility token, not the eventual complete elevated
 execution token.
 
-## Runtime table
+## Required runtime contract
 
-The required rows are:
+`spikes/windows/internal/baseline/runtime-manifest.json` is the versioned source
+of truth. All entries in `required` are fatal when missing or unlaunchable:
 
 | Row | Probe |
 |---|---|
@@ -74,29 +76,28 @@ The required rows are:
 | Go subprocess | The helper creates a second copy of itself and waits for it |
 | CRT and DLL initializer | The helper loads and unloads `kernelbase.dll` and `ucrtbase.dll`; a successful `LoadLibraryEx` includes process-attach initializer execution |
 | Locale and console | The helper queries the user locale and console code pages and is launched with a new console |
-| Callback fixture | The helper allocates Windows Fiber Local Storage, sets a value, frees it, and verifies synchronous cleanup-callback dispatch |
+| PE TLS callback fixture | A deterministic owned PE32+ executable for the worker architecture, with an `IMAGE_TLS_DIRECTORY` callback that writes `TLS_CALLBACK_EXECUTED`, followed by an entrypoint that refuses success unless the callback set its flag and then writes `MAIN_AFTER_TLS` |
 | Canonical command shell | `GetSystemDirectory()` + `cmd.exe /D /S /C "exit 0"` |
 | Windows PowerShell | Canonical System32 Windows PowerShell with no profile and no interaction |
 
-The callback row exercises Windows per-thread storage callback dispatch but is
-not a synthetic PE image TLS-directory callback. Before a reviewed result can
-claim the plan's stronger loader-callback coverage, the live review must either
-identify an already-present, safely loadable runtime module with an observable
-PE TLS callback or add an architecture-specific owned fixture. This limitation
-is recorded rather than disguised as live proof.
+Python is named by the Windows conformance plan, so one of `python.exe` or
+`py.exe` is required; its absence is fatal. Node.js, .NET, Java, Ruby, Perl, and
+PowerShell Core are explicitly `inventory_only`, outside the current product
+runtime contract, and reported as `NOT_INSTALLED` when absent. The whole test
+never calls `t.Skip`.
 
-Python is named by the Windows conformance plan, so installed `python.exe` or
-`py.exe` is run. The inventory also discovers installed Node.js, .NET, Java,
-Ruby, Perl, and PowerShell Core runtimes. An absent optional runtime is recorded
-as `NOT_INSTALLED`; the whole test itself never calls `t.Skip`. `cmd.exe`,
-Windows PowerShell, and all helper rows are required and fail if absent or
-unlaunchable.
+The PE fixture is generated from reviewable Go source rather than a checked-in
+binary. Portable tests parse both amd64 and arm64 images with `debug/pe` and
+require a nonzero TLS directory, callback array, entrypoint, and both observable
+markers. The live row passes only when captured output is exactly callback then
+entrypoint. Cross-compilation is still not live proof that Windows accepted the
+image or dispatched the callback.
 
 ## Object and ACL diagnostics
 
-Every runtime row records:
+Every runtime row records a direct executable inventory:
 
-- requested image/loader startup access:
+- an image-startup access estimate:
   `FILE_EXECUTE|FILE_READ_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE`;
 - canonical executable path;
 - volume serial and file ID, plus link count;
@@ -104,11 +105,48 @@ Every runtime row records:
 - security descriptor in SDDL form, including the DACL;
 - process-creation or exit error, exit code, bounded output, and watchdog result.
 
-These diagnostics identify the executable object requested at the failed
-creation boundary. A loader denial involving a transitive DLL may surface from
-Windows only as a process-start or early-exit error; in that case the retained
-log is evidence of the gap but the denied dependent object still requires a
-disposable-worker trace before selecting a result.
+These diagnostics do **not** identify every transitive loader or startup denial
+and are not accepted as denial evidence. If any required row fails, the harness
+keeps the runtime gate failed and reports `selection_eligible=false`. A reviewed
+failure-based selection additionally requires `LOOPRIG_RUNTIME_TRACE_JSON` to
+name evidence conforming to
+`spikes/windows/internal/baseline/trace-evidence.schema.json`. For every failed
+row the validator requires at least one trace denial and requires operation,
+requested access, object path/identity, owner, and DACL on every denial. It also
+requires collector name/version/command and the SHA-256 of the immutable raw
+trace. Missing or partial evidence cannot be selected.
+
+### Disposable-worker trace procedure
+
+For filesystem, DLL, registry, named-pipe, process, locale, and console events,
+the currently specified collector is Microsoft Sysinternals Process Monitor
+4.01. Verify the file version is exactly `4.1.0.0`, then run in an elevated
+PowerShell session on the disposable worker:
+
+```powershell
+(Get-Item .\procmon64.exe).VersionInfo.FileVersion
+.\procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml
+go test -count=1 -v ./spikes/windows -run TestRestrictedRuntimeBaseline
+.\procmon64.exe /Terminate
+.\procmon64.exe /OpenLog C:\runtime-baseline.pml /SaveAs C:\runtime-baseline.csv
+Get-FileHash -Algorithm SHA256 C:\runtime-baseline.pml
+```
+
+Preserve the PML and CSV. Filter the CSV by the test and child PIDs and retain
+every denial, not only `CreateFile`. For each filesystem object attach
+`fsutil file queryfileid <path>` and `(Get-Acl -LiteralPath <path>).Sddl`; for
+each registry object attach its canonical hive path and
+`(Get-Acl -LiteralPath <registry-provider-path>).Sddl`. Record the exact
+Process Monitor command line in the JSON.
+
+Process Monitor does not provide a proven complete requested-access trace for
+all NT Object Manager objects (for example every section/event/mutant used by
+loader or console startup). No reviewed, repository-owned ETW profile covering
+that remainder is available yet. If a failed row touches such an object, this
+is a concrete external collector blocker: the schema entry cannot honestly be
+completed and `selection_eligible` must remain false. Do not infer or fabricate
+the missing access, owner, or DACL. Phase review must approve a reproducible
+collector/profile for that class before selecting a result.
 
 The only DACL mutation is on the test-owned installed-runner directory before
 the helper is built. The harness records its before/after SDDL as
@@ -121,9 +159,9 @@ DACL inventory, not manufacture a delta.
 
 ## Result selection
 
-No result is selected while live evidence and the PE TLS-callback fixture gap
-remain pending. In particular, this document does not select the exact token,
+No result is selected while live evidence and complete denial tracing remain
+pending. In particular, this document does not select the exact token,
 does not approve a runner bootstrap, does not narrow supported targets, and does
 not approve LPAC/AppContainer work. The Phase 2 review must resolve the fixture
-gap and review complete logs from every supported disposable Windows image
-before changing this section.
+review complete logs from every supported disposable Windows image, and validate
+trace evidence for every failure before changing this section.
