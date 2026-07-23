@@ -3,6 +3,7 @@
 package windows
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
+	win "golang.org/x/sys/windows"
 )
 
 // This file is the Task 19 compile/filesystem matrix.  The planning rows are
@@ -272,6 +274,12 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
+				launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, account brokerAccountKind) (int, error) {
+					if token != win.Token(123) || account != test.wantAccount {
+						t.Fatalf("launch token/account = %v/%v", token, account)
+					}
+					return 0, nil
+				},
 			}}
 			spec, report, level, bits, err := backend.Compile(test.policy)
 			if err != nil {
@@ -294,11 +302,15 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 					t.Errorf("missing enforced report row %q: %#v", feature, report)
 				}
 			}
-			_, configure, cleanup := spec.Wrap(`C:\work`, []string{`C:\tool.exe`})
-			if configure != nil || cleanup == nil || lease.account != test.wantAccount {
-				t.Fatalf("spawn account/configure/cleanup = %d/%t/%t", lease.account, configure != nil, cleanup == nil)
+			if spec.Wrap != nil || spec.Launch == nil {
+				t.Fatalf("elevated spec exposed wrong execution seam: %#v", spec)
 			}
-			cleanup()
+			if _, err := spec.Launch(enforce.LaunchRequest{Context: context.Background(), Dir: `C:\work`, Argv: []string{`C:\tool.exe`}}); err != nil {
+				t.Fatal(err)
+			}
+			if lease.account != test.wantAccount {
+				t.Fatalf("spawn account = %d, want %d", lease.account, test.wantAccount)
+			}
 			if err := spec.Release(); err != nil {
 				t.Fatal(err)
 			}

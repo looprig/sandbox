@@ -62,7 +62,7 @@ func (api *fakeElevatedRunnerAPI) CreateRequest(request runnerRequest, streams [
 		close: func() error { api.event("close-inherited"); return nil },
 	}, nil
 }
-func (api *fakeElevatedRunnerAPI) CreateSuspended(token win.Token, host, desktop string, handles runnerInheritedHandles) (runnerProcessHandles, error) {
+func (api *fakeElevatedRunnerAPI) CreateSuspended(token win.Token, host, desktop string, env []string, handles runnerInheritedHandles) (runnerProcessHandles, error) {
 	api.event("create-suspended")
 	api.createToken, api.createHost, api.createDesk, api.createHandle = token, host, desktop, handles
 	return runnerProcessHandles{Process: 31, Thread: 32}, nil

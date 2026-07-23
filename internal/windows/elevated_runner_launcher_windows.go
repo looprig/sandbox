@@ -28,6 +28,7 @@ type elevatedRunnerLaunch struct {
 	HostSHA256   string
 	Argv         []string
 	CWD          string
+	Env          []string
 	Desktop      privateDesktopSpec
 	Stdin        win.Handle
 	Stdout       win.Handle
@@ -42,7 +43,7 @@ type elevatedRunnerProcessAPI interface {
 	CreateDesktop(privateDesktopSpec) (*privateDesktop, error)
 	CreateJob(JobOptions) (*Job, error)
 	CreateRequest(runnerRequest, [3]win.Handle) (runnerInheritedHandles, error)
-	CreateSuspended(win.Token, string, string, runnerInheritedHandles) (runnerProcessHandles, error)
+	CreateSuspended(win.Token, string, string, []string, runnerInheritedHandles) (runnerProcessHandles, error)
 	Assign(*Job, win.Handle) error
 	Resume(win.Handle) error
 	WaitProcess(context.Context, win.Handle) (uint32, error)
@@ -165,7 +166,7 @@ func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *el
 		return nil, fmt.Errorf("%w: create sealed runner handles: %v", errElevatedRunnerLaunch, err)
 	}
 	defer func() { err = errors.Join(err, inherited.Close()) }()
-	process, err := api.CreateSuspended(token, spec.HostPath, desktop.Name, inherited)
+	process, err := api.CreateSuspended(token, spec.HostPath, desktop.Name, append([]string(nil), spec.Env...), inherited)
 	closeTokenErr := closeToken()
 	if err != nil || closeTokenErr != nil {
 		if process.Process != 0 {

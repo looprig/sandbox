@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -20,7 +19,9 @@ import (
 	win "golang.org/x/sys/windows"
 )
 
-var errElevatedActivationAPI = errors.New("sandbox: Windows elevated activation APIs are incomplete")
+var errElevatedBrokerDesktopAPI = errors.New("sandbox: broker-created private desktop capability is unavailable")
+
+type elevatedRunnerLaunchFunc func(enforce.LaunchRequest, elevatedSetupSnapshot, win.Token, policy.Limits, brokerAccountKind) (int, error)
 
 // elevatedSetupSnapshot is the compiler's immutable, already-verified view of
 // the installed tier. Individual mechanism checks remain explicit so a future
@@ -42,12 +43,14 @@ type elevatedSetupSnapshot struct {
 	JobReadbackReady     bool
 	HandleListReady      bool
 	ProxyPorts           []uint16
+	PipeName             string
+	OfflineSID           string
+	OnlineSID            string
 }
 
 type elevatedLease interface {
-	// Wrap creates fresh per-spawn state. Implementations must issue only the
-	// restricted account token and must seal argv/cwd before returning.
-	Wrap(dir string, argv []string, account brokerAccountKind) ([]string, func(*exec.Cmd) error, func(), error)
+	IssueToken(brokerAccountKind) (win.Token, error)
+	Narrowings() []string
 	Release() error
 }
 
@@ -55,6 +58,7 @@ type elevatedCompileDependencies struct {
 	inspect func(Config, policy.Effective) (elevatedSetupSnapshot, error)
 	acquire func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error)
 	reserve func(elevatedSetupSnapshot) (*proxyPortReservation, error)
+	launch  elevatedRunnerLaunchFunc
 }
 
 type elevatedBackend struct {
@@ -83,6 +87,7 @@ func newElevatedBackend(config Config) enforce.Backend {
 		inspect: inspectElevatedSetup,
 		acquire: acquireElevatedLease,
 		reserve: reserveElevatedProxyPorts,
+		launch:  launchElevatedRunner,
 	}}
 }
 
@@ -179,6 +184,10 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 	if err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: inspect installed dependencies: %v", ErrSetupStale, err)
 	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: derive broker endpoint: %v", ErrSetupStale, err)
+	}
 	return elevatedSetupSnapshot{
 		Ready: true, InstallationID: manifest.InstallationID,
 		OwnerSID: manifest.OwnerSID,
@@ -186,10 +195,13 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		Protocol: manifest.Protocol, AccountsReady: health.Accounts,
 		CredentialsReady: health.Credentials, FirewallReady: health.Firewall,
 		RuntimeBaselineReady: health.RuntimeBaseline, RunnerHashVerified: true,
-		// Task 18 verifies these mechanisms whenever it constructs them. They
-		// are launch-time properties, not ambient setup state.
-		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
+		// Job and handle-list properties are verified by the protected launcher.
+		// PrivateDesktopReady remains false until the broker protocol can create
+		// and ACL the desktop without granting the interactive owner access.
+		PrivateDesktopReady: false, JobReadbackReady: true, HandleListReady: true,
 		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
+		PipeName:   `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"),
+		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID,
 	}, nil
 }
 
@@ -286,7 +298,14 @@ func acquireElevatedLease(snapshot elevatedSetupSnapshot, effective policy.Effec
 	if len(effective.FS) == 0 || len(effective.RuntimeBaselines) == 0 {
 		return nil, fmt.Errorf("%w: elevated ACL policy is incomplete", enforce.ErrUnavailable)
 	}
-	return nil, fmt.Errorf("%w: broker nonce handshake and restricted-token runner launcher are unavailable", errElevatedActivationAPI)
+	return nil, fmt.Errorf("%w: %w", enforce.ErrUnavailable, errElevatedBrokerDesktopAPI)
+}
+
+func launchElevatedRunner(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, _ brokerAccountKind) (int, error) {
+	if token != 0 {
+		_ = token.Close()
+	}
+	return -1, fmt.Errorf("%w: %w", enforce.ErrUnavailable, errElevatedBrokerDesktopAPI)
 }
 
 func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
@@ -332,6 +351,10 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	if p.Net.Open {
 		account = brokerAccountOnline
 	}
+	launch := backend.deps.launch
+	if launch == nil {
+		launch = launchElevatedRunner
+	}
 	var releaseOnce sync.Once
 	var releaseErr error
 	release := func() error {
@@ -339,24 +362,39 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 		return releaseErr
 	}
 	spec := enforce.Spec{
-		Wrap: func(dir string, argv []string) ([]string, func(*exec.Cmd) error, func()) {
-			final, configure, cleanup, wrapErr := lease.Wrap(dir, append([]string(nil), argv...), account)
-			if wrapErr != nil {
-				return nil, func(*exec.Cmd) error { return wrapErr }, cleanup
+		Launch: func(request enforce.LaunchRequest) (int, error) {
+			if request.Context == nil {
+				return -1, errors.New("sandbox: elevated launch context is required")
 			}
-			return final, configure, cleanup
+			if err := request.Context.Err(); err != nil {
+				return -1, err
+			}
+			token, err := lease.IssueToken(account)
+			if err != nil {
+				return -1, fmt.Errorf("issue per-spawn restricted token: %w", err)
+			}
+			return launch(request, snapshot, token, p.Limits, account)
 		},
 		Release: release,
 	}
 	level := profile.LevelDegraded
-	if elevatedFullLevel(p, bits) {
+	narrowings := lease.Narrowings()
+	if elevatedFullLevel(p, bits) && len(narrowings) == 0 {
 		level = profile.LevelFull
 	}
-	return spec, elevatedCompileReport(p, snapshot), level, bits, nil
+	report := elevatedCompileReport(p, snapshot)
+	for _, narrowing := range narrowings {
+		report.Entries = append(report.Entries, profile.ReportEntry{
+			Feature: "windows.filesystem.hardlink", Status: "Narrowed", Detail: narrowing,
+		})
+	}
+	return spec, report, level, bits, nil
 }
 
 func validateElevatedSnapshot(snapshot elevatedSetupSnapshot) error {
-	if !snapshot.Ready || snapshot.InstallationID == "" || snapshot.HostPath == "" || snapshot.HostSHA256 == "" ||
+	if !snapshot.Ready || snapshot.InstallationID == "" || snapshot.OwnerSID == "" ||
+		snapshot.HostPath == "" || snapshot.HostSHA256 == "" || snapshot.PipeName == "" ||
+		snapshot.OfflineSID == "" || snapshot.OnlineSID == "" ||
 		snapshot.Protocol != brokerProtocolVersion {
 		return errors.New("Windows elevated setup manifest or protocol is not ready")
 	}

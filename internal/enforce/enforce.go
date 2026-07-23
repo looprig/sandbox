@@ -1,7 +1,9 @@
 package enforce
 
 import (
+	"context"
 	"errors"
+	"io"
 	"os/exec"
 
 	"github.com/looprig/sandbox/internal/policy"
@@ -45,9 +47,30 @@ type Spec struct {
 	// configure or spawn completes.
 	Wrap func(dir string, innerArgv []string) (finalArgv []string, configure func(*exec.Cmd) error, cleanup func())
 
+	// Launch is an optional backend-owned execution path for platforms whose
+	// security boundary cannot be expressed by configuring an exec.Cmd. Inputs
+	// are immutable snapshots owned by the caller. Returning proves the launched
+	// process boundary is empty; this permits the executor to release transient
+	// grants and proxy authority immediately after completion. Ordinary backends
+	// leave Launch nil and continue to use Wrap.
+	Launch func(LaunchRequest) (exitCode int, err error)
+
 	// Release relinquishes immutable resources owned by the compiled spec. It may
 	// be nil when the spec owns none and must be safe to call idempotently.
 	Release func() error
+}
+
+// LaunchRequest is the complete non-authority execution input supplied to a
+// backend-owned launcher. Authority-bearing handles and tokens remain private
+// to the backend.
+type LaunchRequest struct {
+	Context context.Context
+	Dir     string
+	Argv    []string
+	Env     []string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 // backend compiles a policy.Effective into a reusable Spec plus the achieved isolation

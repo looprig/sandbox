@@ -303,7 +303,7 @@ func (e *Executor) resolveErr(compileErr error) error {
 	if compileErr != nil {
 		return compileErr
 	}
-	if e.spec.Wrap == nil {
+	if e.spec.Wrap == nil && e.spec.Launch == nil {
 		return errors.New("sandbox: executor spawn spec not compiled")
 	}
 	return nil
@@ -374,6 +374,9 @@ func (e *Executor) prepareAllowedRoute(s snapshot) (snapshot, string, error) {
 // the whole spawn, and each wrap call yields its own closures, so concurrent
 // spawns never share per-spawn state.
 func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s snapshot, observe func(), afterZero ...func() error) (out []byte, code int, runErr error) {
+	if s.spec.Launch != nil {
+		return e.runBackendOwned(lease, dir, innerArgv, s, observe, afterZero...)
+	}
 	spawn := newQuarantinedSpawn(nil, nil, lease)
 	spawn.observe = observe
 	spawn.afterExecution = append(spawn.afterExecution, afterZero...)
@@ -490,6 +493,57 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		return out, -1, err
 	}
 	return out, 0, nil
+}
+
+func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []string, s snapshot, observe func(), afterZero ...func() error) (out []byte, code int, runErr error) {
+	spawn := newQuarantinedSpawn(nil, nil, lease)
+	spawn.observe = observe
+	spawn.afterExecution = append(spawn.afterExecution, afterZero...)
+	released := false
+	defer func() {
+		if !released {
+			if releaseErr := spawn.release(false, false, nil); releaseErr != nil {
+				runErr = errors.Join(runErr, releaseErr)
+				code = -1
+			}
+		}
+	}()
+	if len(argv) == 0 {
+		return nil, -1, errors.New("sandbox: empty argv")
+	}
+	if err := lease.authorizeBackendStart(); err != nil {
+		return nil, -1, err
+	}
+	env := append([]string(nil), s.env...)
+	if env == nil {
+		env = []string{}
+	}
+	var output bytes.Buffer
+	exit, err := s.spec.Launch(enforce.LaunchRequest{
+		Context: lease.ctx,
+		Dir:     dir,
+		Argv:    append([]string(nil), argv...),
+		Env:     env,
+		Stdout:  &output,
+		Stderr:  &output,
+	})
+	executionCtxErr := lease.ctx.Err()
+	callerCtxErr := lease.caller.Err()
+	releaseErr := spawn.release(true, false, nil)
+	released = true
+	if releaseErr != nil {
+		return output.Bytes(), -1, releaseErr
+	}
+	if executionCtxErr != nil {
+		if callerCtxErr != nil {
+			return output.Bytes(), -1, callerCtxErr
+		}
+		return output.Bytes(), -1, ErrExecutorClosed
+	}
+	if err != nil {
+		return output.Bytes(), -1, err
+	}
+	return output.Bytes(), exit, nil
 }
 
 // Level reports the achieved (probed + compiled, not requested) isolation level

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"unsafe"
 
@@ -121,7 +122,7 @@ func (nativeElevatedRunnerProcessAPI) CreateRequest(request runnerRequest, strea
 	return result, nil
 }
 
-func (nativeElevatedRunnerProcessAPI) CreateSuspended(token win.Token, host, desktop string, handles runnerInheritedHandles) (runnerProcessHandles, error) {
+func (nativeElevatedRunnerProcessAPI) CreateSuspended(token win.Token, host, desktop string, env []string, handles runnerInheritedHandles) (runnerProcessHandles, error) {
 	list := []win.Handle{handles.Stdin, handles.Stdout, handles.Stderr, handles.Request}
 	for _, handle := range list {
 		if invalidExplicitHandle(handle) {
@@ -148,15 +149,10 @@ func (nativeElevatedRunnerProcessAPI) CreateSuspended(token win.Token, host, des
 	if err != nil {
 		return runnerProcessHandles{}, err
 	}
-	systemRoot := os.Getenv("SystemRoot")
-	if systemRoot == "" || strings.IndexByte(systemRoot, 0) >= 0 {
-		return runnerProcessHandles{}, errors.New("SystemRoot is unavailable")
-	}
-	environment, err := win.UTF16FromString("SystemRoot=" + systemRoot)
+	environment, err := windowsEnvironmentBlock(env)
 	if err != nil {
 		return runnerProcessHandles{}, err
 	}
-	environment = append(environment, 0)
 	startup := win.StartupInfoEx{
 		StartupInfo: win.StartupInfo{
 			Cb: uint32(unsafe.Sizeof(win.StartupInfoEx{})), Desktop: desktop16,
@@ -173,6 +169,34 @@ func (nativeElevatedRunnerProcessAPI) CreateSuspended(token win.Token, host, des
 		return runnerProcessHandles{}, err
 	}
 	return runnerProcessHandles{Process: process.Process, Thread: process.Thread}, nil
+}
+
+func windowsEnvironmentBlock(env []string) ([]uint16, error) {
+	entries := append([]string(nil), env...)
+	for _, entry := range entries {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || strings.IndexByte(entry, 0) >= 0 {
+			return nil, errors.New("windows sandbox: invalid child environment")
+		}
+	}
+	slices.SortFunc(entries, func(left, right string) int {
+		return strings.Compare(strings.ToLower(left), strings.ToLower(right))
+	})
+	block := make([]uint16, 0)
+	for _, entry := range entries {
+		encoded, err := win.UTF16FromString(entry)
+		if err != nil {
+			return nil, err
+		}
+		block = append(block, encoded...)
+	}
+	// CreateProcess requires an additional NUL after the final entry. For an
+	// empty environment, retain the canonical double-NUL block.
+	block = append(block, 0)
+	if len(entries) == 0 {
+		block = append(block, 0)
+	}
+	return block, nil
 }
 
 func (nativeElevatedRunnerProcessAPI) Assign(job *Job, process win.Handle) error {

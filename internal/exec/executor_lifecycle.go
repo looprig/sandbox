@@ -80,6 +80,22 @@ func (lease *executionLease) start(cmd *exec.Cmd, tree processTreeBoundary) erro
 	return tree.start(cmd)
 }
 
+// authorizeBackendStart is the launch linearization point for a backend-owned
+// process boundary. The backend receives lease.ctx and must observe cancellation
+// before creating authority or a process.
+func (lease *executionLease) authorizeBackendStart() error {
+	if lease == nil || lease.lifecycle == nil {
+		return ErrExecutorClosed
+	}
+	lifecycle := lease.lifecycle
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.closed {
+		return ErrExecutorClosed
+	}
+	return lease.ctx.Err()
+}
+
 func (lease *executionLease) finishExecution() {
 	if lease == nil {
 		return

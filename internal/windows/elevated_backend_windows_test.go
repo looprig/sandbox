@@ -5,10 +5,13 @@ package windows
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/looprig/sandbox/internal/enforce"
@@ -31,17 +34,24 @@ func (inspector fakeElevatedDependencyInspector) Inspect(context.Context, string
 }
 
 type fakeElevatedLease struct {
+	mu           sync.Mutex
 	account      brokerAccountKind
-	wraps        int
+	issues       int
 	releases     int
-	wrapErr      error
+	issueErr     error
 	releaseError error
+	narrowings   []string
 }
 
-func (lease *fakeElevatedLease) Wrap(_ string, argv []string, account brokerAccountKind) ([]string, func(*exec.Cmd) error, func(), error) {
-	lease.wraps++
+func (lease *fakeElevatedLease) IssueToken(account brokerAccountKind) (win.Token, error) {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	lease.issues++
 	lease.account = account
-	return append([]string{"host"}, argv...), nil, func() {}, lease.wrapErr
+	return win.Token(123), lease.issueErr
+}
+func (lease *fakeElevatedLease) Narrowings() []string {
+	return append([]string(nil), lease.narrowings...)
 }
 func (lease *fakeElevatedLease) Release() error {
 	lease.releases++
@@ -51,10 +61,12 @@ func (lease *fakeElevatedLease) Release() error {
 func readyElevatedSnapshot() elevatedSetupSnapshot {
 	return elevatedSetupSnapshot{
 		Ready: true, InstallationID: "installation", HostPath: `C:\ProgramData\Looprig\slots\generation\sandbox-host.exe`,
-		HostSHA256: "digest", Protocol: brokerProtocolVersion, AccountsReady: true,
+		OwnerSID: "S-1-5-32-544", HostSHA256: "digest", Protocol: brokerProtocolVersion, AccountsReady: true,
 		CredentialsReady: true, FirewallReady: true, RuntimeBaselineReady: true,
 		RunnerHashVerified: true, PrivateDesktopReady: true, JobReadbackReady: true,
 		HandleListReady: true, ProxyPorts: []uint16{39002, 49152},
+		PipeName: `\\.\pipe\broker`, OfflineSID: "S-1-5-21-1-2-3-1001",
+		OnlineSID: "S-1-5-21-1-2-3-1002",
 	}
 }
 
@@ -81,6 +93,7 @@ func elevatedInspectionFixture(t *testing.T) (Config, setupManifest) {
 	manifest := setupManifest{
 		Version: setupManifestVersion, State: setupStateReady,
 		InstallationID: "fixture", OwnerSID: user.User.Sid.String(),
+		OfflineSID: "S-1-5-21-1-2-3-1001", OnlineSID: "S-1-5-21-1-2-3-1002",
 		HostPath: filepath.Clean(host), HostSHA256: digest,
 		ProxyPorts: []uint16{49152}, Protocol: brokerProtocolVersion,
 	}
@@ -126,8 +139,11 @@ func TestInspectElevatedSetupDistinguishesAbsentCorruptAndVerified(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateElevatedSnapshot(snapshot); err != nil {
-		t.Fatalf("verified snapshot is incomplete: %v", err)
+	if snapshot.PrivateDesktopReady {
+		t.Fatal("caller-side inspection claimed broker-created private desktop readiness")
+	}
+	if err := validateElevatedSnapshot(snapshot); err == nil || !strings.Contains(err.Error(), "private desktop") {
+		t.Fatalf("snapshot validation = %v, want private desktop blocker", err)
 	}
 	if snapshot.HostPath != manifest.HostPath || snapshot.HostSHA256 != manifest.HostSHA256 {
 		t.Fatalf("snapshot = %#v, want manifest host identity", snapshot)
@@ -165,12 +181,20 @@ func TestInspectElevatedSetupFailsClosedOnProtectionHashAndDependencyHealth(t *t
 	}
 }
 
-func TestAcquireElevatedLeaseReportsExactMissingActivationAPI(t *testing.T) {
+func TestAcquireElevatedLeaseRejectsIncompleteVerifiedConfiguration(t *testing.T) {
+	snapshot := readyElevatedSnapshot()
+	snapshot.PipeName = ""
+	if _, err := acquireElevatedLease(snapshot, policy.Effective{}); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("incomplete snapshot error = %v", err)
+	}
+}
+
+func TestAcquireElevatedLeaseFailsClosedWithoutBrokerDesktopCapability(t *testing.T) {
 	_, err := acquireElevatedLease(readyElevatedSnapshot(), policy.Effective{
 		FS:               []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess}},
 		RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
 	})
-	if !errors.Is(err, errElevatedActivationAPI) || errors.Is(err, ErrSetupRequired) {
+	if !errors.Is(err, errElevatedBrokerDesktopAPI) || !errors.Is(err, enforce.ErrUnavailable) {
 		t.Fatalf("activation error = %v", err)
 	}
 }
@@ -193,6 +217,15 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
+				launch: func(request enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, account brokerAccountKind) (int, error) {
+					if token != 123 || account != test.account || request.Dir != `C:\work` ||
+						!slices.Equal(request.Argv, []string{`C:\tool.exe`, "arg"}) ||
+						!slices.Equal(request.Env, []string{"A=B"}) {
+						t.Fatalf("launch request = %#v token=%d account=%d", request, token, account)
+					}
+					_, _ = io.WriteString(request.Stdout, "output")
+					return 7, nil
+				},
 			}}
 			p := policy.Effective{
 				Net: testNetPolicy(test.open), Env: policy.EnvPolicy{Inherit: false},
@@ -213,11 +246,15 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 			}) {
 				t.Fatalf("runtime baseline absent from report: %#v", report)
 			}
-			argv, configure, cleanup := spec.Wrap(`C:\work`, []string{`C:\tool.exe`, "arg"})
-			if len(argv) != 3 || argv[0] != "host" || configure != nil || cleanup == nil {
-				t.Fatalf("invalid wrapped spawn: argv=%#v configure-nil=%t cleanup-nil=%t", argv, configure == nil, cleanup == nil)
+			var output strings.Builder
+			code, err := spec.Launch(enforce.LaunchRequest{
+				Context: context.Background(), Dir: `C:\work`,
+				Argv: []string{`C:\tool.exe`, "arg"}, Env: []string{"A=B"},
+				Stdout: &output, Stderr: io.Discard,
+			})
+			if err != nil || code != 7 || output.String() != "output" {
+				t.Fatalf("launch = code %d output %q err %v", code, output.String(), err)
 			}
-			cleanup()
 			if lease.account != test.account {
 				t.Fatalf("account = %d, want %d", lease.account, test.account)
 			}
@@ -231,6 +268,52 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 				t.Fatalf("lease releases = %d, want 1", lease.releases)
 			}
 		})
+	}
+}
+
+func TestElevatedCompiledLeaseSurvivesConcurrentLaunchesUntilSpecRelease(t *testing.T) {
+	lease := &fakeElevatedLease{}
+	started := make(chan struct{}, 2)
+	finish := make(chan struct{})
+	backend := &elevatedBackend{deps: elevatedCompileDependencies{
+		inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) {
+			return readyElevatedSnapshot(), nil
+		},
+		acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
+			return lease, nil
+		},
+		launch: func(enforce.LaunchRequest, elevatedSetupSnapshot, win.Token, policy.Limits, brokerAccountKind) (int, error) {
+			started <- struct{}{}
+			<-finish
+			return 0, nil
+		},
+	}}
+	spec, _, _, _, err := backend.Compile(policy.Effective{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			if _, err := spec.Launch(enforce.LaunchRequest{Context: context.Background()}); err != nil {
+				t.Errorf("launch: %v", err)
+			}
+		}()
+	}
+	<-started
+	<-started
+	if lease.releases != 0 {
+		t.Fatalf("shared ACL lease released while siblings run: %d", lease.releases)
+	}
+	close(finish)
+	wg.Wait()
+	if lease.releases != 0 || lease.issues != 2 {
+		t.Fatalf("before spec close: issues=%d releases=%d", lease.issues, lease.releases)
+	}
+	if err := spec.Release(); err != nil || lease.releases != 1 {
+		t.Fatalf("spec release: releases=%d err=%v", lease.releases, err)
 	}
 }
 
