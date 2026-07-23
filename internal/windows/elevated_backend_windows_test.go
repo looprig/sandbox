@@ -358,6 +358,59 @@ func TestElevatedConcurrentExecutionsOwnIndependentLeasesAndSpecReleaseDrains(t 
 	}
 }
 
+func TestElevatedGrantCompileReportsNoAuthorityBeforeBaseCompile(t *testing.T) {
+	backend := &elevatedBackend{}
+	spec, report, level, bits, err := backend.CompileWithRetainedPathHandles(nil, policy.Effective{}, policy.Effective{}, []*policy.PathHandle{{}})
+	if err == nil {
+		t.Fatal("grant compile without proven base authority succeeded")
+	}
+	for _, entry := range report.Entries {
+		if entry.Status == "Enforced" {
+			t.Fatalf("unproven grant authority reported enforced feature: %#v", entry)
+		}
+	}
+	if spec.Launch != nil || spec.Release != nil || level != profile.LevelNone || bits != 0 {
+		t.Fatalf("unproven grant authority reported posture: level=%d bits=%#x report=%#v spec=%#v", level, bits, report, spec)
+	}
+}
+
+func TestElevatedSpecGrantAuthorityIsExactAndRetiresAfterBorrows(t *testing.T) {
+	base := policy.Effective{
+		FS:  []policy.FSEntry{{Path: `C:\executor-one`, Access: policy.AllAccess}},
+		Env: policy.EnvPolicy{Set: map[string]string{"HOME": `C:\executor-one\home`}},
+	}
+	authority := newElevatedSpecGrantAuthority(base, &fakeElevatedLease{})
+	if _, _, err := authority.borrow(policy.Effective{
+		FS:  []policy.FSEntry{{Path: `C:\executor-two`, Access: policy.AllAccess}},
+		Env: policy.EnvPolicy{Set: map[string]string{"HOME": `C:\executor-two\home`}},
+	}); err == nil {
+		t.Fatal("authority from another executor was accepted")
+	}
+	_, releaseBorrow, err := authority.borrow(policy.Clone(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := make(chan struct{})
+	go func() {
+		authority.retire()
+		close(retired)
+	}()
+	select {
+	case <-retired:
+		t.Fatal("base authority retired while a transient grant borrowed it")
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseBorrow()
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("base authority did not retire after transient grant release")
+	}
+	if _, _, err := authority.borrow(policy.Clone(base)); err == nil {
+		t.Fatal("retired base authority was reused")
+	}
+}
+
 func testNetPolicy(open bool) policy.NetPolicy { return policy.NetPolicy{Open: open} }
 
 func TestElevatedCompileRejectsEveryUnverifiedMechanismBeforeAcquire(t *testing.T) {

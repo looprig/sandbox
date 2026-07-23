@@ -4,9 +4,11 @@ package windows
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/looprig/sandbox/internal/policy"
@@ -181,6 +183,77 @@ func TestCompileElevatedBrokerObjectsPinsExactIdentityAndPolicy(t *testing.T) {
 	}
 }
 
+func TestElevatedGrantLeaseRetainsValidatedHandleAndComposesBaseObjects(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "base.txt")
+	grantPath := filepath.Join(t.TempDir(), "grant.txt")
+	for _, path := range []string{basePath, grantPath} {
+		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseEffective := policy.Effective{
+		FS:               []policy.FSEntry{{Path: basePath, Access: policy.ReadAccess | policy.ExecAccess, Exact: true}},
+		RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+	}
+	baseObjects, closeBase, _, err := compileElevatedBrokerObjects(baseEffective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBase()
+	base := &brokerBackedElevatedLeaseFactory{objects: baseObjects}
+
+	binding, err := policy.CapturePathBinding(grantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := policy.AcquireACLPathHandle(&binding, binding.CanonicalPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.SetAccess(policy.WriteAccess)
+	effective := policy.Effective{
+		FS: []policy.FSEntry{
+			{Path: basePath, Access: policy.ReadAccess | policy.ExecAccess, Exact: true},
+			{Path: grantPath, Access: policy.WriteAccess, Exact: true},
+		},
+		RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+	}
+	deps := elevatedBrokerLeaseDependencies{
+		connect: func(context.Context, string, string) (elevatedBrokerLeaseSession, error) {
+			return elevatedBrokerLeaseSession{}, errors.New("not used")
+		},
+		token: validateBrokerTokenHandle,
+	}
+	factory, err := acquireBrokerBackedElevatedGrantLease(context.Background(), testElevatedLeaseConfig(), effective, base, []*policy.PathHandle{handle}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(factory.objects) != 2 {
+		t.Fatalf("composed objects = %d, want base + grant", len(factory.objects))
+	}
+	var grant brokerObjectReference
+	for _, object := range factory.objects {
+		if strings.EqualFold(object.Path, grantPath) {
+			grant = object
+		}
+	}
+	if grant.Handle == 0 || grant.Handle == uint64(handle.NativeHandle()) || grant.Access&brokerAccessWrite == 0 {
+		t.Fatalf("grant object did not retain independent validated authority: %#v", grant)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handleGrantedAccess(win.Handle(grant.Handle)); err != nil {
+		t.Fatalf("grant authority died with borrowed validation handle: %v", err)
+	}
+	if err := factory.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handleGrantedAccess(win.Handle(grant.Handle)); err == nil {
+		t.Fatal("grant authority survived factory release")
+	}
+}
+
 func TestBrokerReferenceAuthorizesOnlyDeclaredAxesAndScope(t *testing.T) {
 	sid, err := InstallationSID("policy-test")
 	if err != nil {
@@ -199,5 +272,62 @@ func TestBrokerReferenceAuthorizesOnlyDeclaredAxesAndScope(t *testing.T) {
 	}
 	if brokerReferenceAuthorizesACE(reference, nonInherited, sid, ACLObjectDirectory) {
 		t.Fatal("scope mismatch accepted")
+	}
+}
+
+func TestElevatedObjectsRejectAmbientRestrictedCodeAuthorityOnDeniedAxes(t *testing.T) {
+	restrictedCode := restrictedCodeSID()
+	reference := testBrokerLeaseObject()
+	reference.Access = brokerAccessRead
+	reference.Denied = brokerAccessWrite
+
+	read := encodeACE(restrictedCode, ACLObjectDirectory, ACLACE{Type: ACEAllow, Access: ACLRead})
+	if err := rejectAmbientRestrictedCodeAuthority([][]byte{read}, reference); err != nil {
+		t.Fatalf("ambient authority within the declared read axis rejected: %v", err)
+	}
+	write := encodeACE(restrictedCode, ACLObjectDirectory, ACLACE{Type: ACEAllow, Access: ACLWrite})
+	if err := rejectAmbientRestrictedCodeAuthority([][]byte{write}, reference); err == nil {
+		t.Fatal("ambient Restricted Code write authority widened a read-only root")
+	}
+	full := append([]byte(nil), read...)
+	binary.LittleEndian.PutUint32(full[4:8], 0x10000000) // GENERIC_ALL
+	if err := rejectAmbientRestrictedCodeAuthority([][]byte{full}, reference); err == nil {
+		t.Fatal("ambient Restricted Code generic-all authority was accepted")
+	}
+	if err := rejectAmbientRestrictedCodeAuthority([][]byte{{0, 0, 1, 0}}, reference); err == nil {
+		t.Fatal("malformed ambient ACE was accepted")
+	}
+}
+
+func TestExactBrokerRestrictingSIDSetRequiresRuntimeInstallationAndExecution(t *testing.T) {
+	installation, err := InstallationSID("restricting-set")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := deriveModuleTrusteeSID(sidKindOneShot, oneShotSIDDomain, "execution")
+	parse := func(text string) *win.SID {
+		t.Helper()
+		sid, err := win.StringToSid(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sid
+	}
+	installationSID := parse(installation.String())
+	groups := []win.SIDAndAttributes{
+		{Sid: parse(restrictedCodeSID().String())},
+		{Sid: installationSID},
+		{Sid: parse(execution.String())},
+	}
+	if !exactBrokerRestrictingSIDSet(groups, installationSID) {
+		t.Fatal("exact required broker restricting SID set rejected")
+	}
+	groups[0] = win.SIDAndAttributes{Sid: parse(execution.String())}
+	if exactBrokerRestrictingSIDSet(groups, installationSID) {
+		t.Fatal("set without Restricted Code SID accepted")
+	}
+	groups = append(groups, win.SIDAndAttributes{Sid: parse("S-1-1-0")})
+	if exactBrokerRestrictingSIDSet(groups, installationSID) {
+		t.Fatal("restricting SID superset accepted")
 	}
 }

@@ -15,6 +15,43 @@ import (
 	win "golang.org/x/sys/windows"
 )
 
+type recordingPipeImpersonator struct {
+	impersonateThread uint32
+	revertThread      uint32
+	revertErr         error
+}
+
+func (impersonator *recordingPipeImpersonator) Impersonate(win.Handle) error {
+	impersonator.impersonateThread = win.GetCurrentThreadId()
+	return nil
+}
+
+func (impersonator *recordingPipeImpersonator) Revert() error {
+	impersonator.revertThread = win.GetCurrentThreadId()
+	return impersonator.revertErr
+}
+
+func TestBrokerPipeImpersonationPinsAuthorizationAndRevertToOneThread(t *testing.T) {
+	impersonator := &recordingPipeImpersonator{}
+	var operationThread uint32
+	if err := runUnderBrokerClientImpersonation(impersonator, 1, func() error {
+		operationThread = win.GetCurrentThreadId()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if impersonator.impersonateThread == 0 || impersonator.impersonateThread != operationThread ||
+		operationThread != impersonator.revertThread {
+		t.Fatalf("thread-affine authorization migrated: impersonate=%d operation=%d revert=%d",
+			impersonator.impersonateThread, operationThread, impersonator.revertThread)
+	}
+
+	poisoned := &recordingPipeImpersonator{revertErr: errors.New("injected revert failure")}
+	if err := runUnderBrokerClientImpersonation(poisoned, 1, func() error { return nil }); err == nil || poisoned.impersonateThread != poisoned.revertThread {
+		t.Fatalf("revert failure was not returned on its locked thread: %v", err)
+	}
+}
+
 type fakeBrokerJournalFile struct {
 	data       []byte
 	operations []string
@@ -427,7 +464,8 @@ func TestBrokerTokenIssuerRestrictsBeforeDuplicateAndClosesBothLocalTokens(t *te
 	if err := issued.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(restrictor.trustees) != 2 || restrictor.trustees[0] != installation || restrictor.trustees[1] != restricting {
+	if len(restrictor.trustees) != 3 || !restrictor.trustees[0].isRestrictedCode() ||
+		restrictor.trustees[1] != installation || restrictor.trustees[2] != restricting {
 		t.Fatalf("restricting trustees = %#v", restrictor.trustees)
 	}
 	if len(native.closed) != 2 || native.closed[1] != win.Token(17) {

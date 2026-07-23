@@ -55,6 +55,11 @@ type Spec struct {
 	// leave Launch nil and continue to use Wrap.
 	Launch func(LaunchRequest) (exitCode int, err error)
 
+	// GrantAuthority is an opaque backend-owned key for compiling transient
+	// grants against this exact base spec. The executor only returns it to the
+	// same backend; it is never inherited by a child or exposed publicly.
+	GrantAuthority any
+
 	// Release relinquishes immutable resources owned by the compiled spec. It may
 	// be nil when the spec owns none and must be safe to call idempotently.
 	Release func() error

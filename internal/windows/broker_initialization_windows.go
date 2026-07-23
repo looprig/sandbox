@@ -38,6 +38,21 @@ func initializeInstalledBrokerDependencies(config brokerRuntimeConfig) (err erro
 		if config.OfflineSID == "" || config.OnlineSID == "" || config.ServiceIdentity != serviceIdentity {
 			return errors.New("sandbox: partially initialized Windows broker manifest")
 		}
+		owned := map[string]string{
+			desired.OfflineAccount: config.OfflineSID,
+			desired.OnlineAccount:  config.OnlineSID,
+		}
+		accounts := netLSAAccountAPI{native: realAccountNative{}, ownedSID: owned}
+		store := atomicCredentialStore{root: filepath.Join(config.StateRoot, "credentials"), files: realCredentialFileOps{}}
+		health, refreshErr := provisionBrokerIdentityState(brokerIdentityRuntime{
+			accounts: accounts, protector: systemDPAPI{}, store: store, random: rand.Reader,
+		}, desired, true)
+		if refreshErr != nil || health.OfflineSID != config.OfflineSID || health.OnlineSID != config.OnlineSID {
+			return errors.Join(errors.New("sandbox: refreshed Windows broker identity changed manifest-pinned ownership"), refreshErr)
+		}
+		if err := installOfflineFirewall(windowsFirewallPolicy{api: newNetFwAutomation()}, config.InstallationID, config.OfflineSID, config.ProxyPorts); err != nil {
+			return err
+		}
 		data, readErr := os.ReadFile(config.GenerationManifestPath)
 		manifest, decodeErr := decodeSetupManifest(data)
 		if readErr != nil || decodeErr != nil {
@@ -47,8 +62,14 @@ func initializeInstalledBrokerDependencies(config brokerRuntimeConfig) (err erro
 			config:    SetupConfig{InstallationID: config.InstallationID, StateRoot: config.StateRoot, ProxyPorts: append([]uint16(nil), config.ProxyPorts...)},
 			stateRoot: config.StateRoot, ownerSID: config.OwnerSID,
 		}
-		ready, inspectErr := inspectInitializedHostDependencies(context.Background(), setup, manifest)
-		if inspectErr != nil || !ready {
+		readiness, inspectErr := (manifestPinnedSetupInspector{
+			evidence: unavailableApprovedRuntimeEvidence{},
+			policy:   windowsFirewallPolicy{api: newNetFwAutomation()},
+			owners:   windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+		}).Inspect(context.Background(), setup, manifest)
+		machineReady := readiness.service && readiness.accounts && readiness.credentials &&
+			readiness.firewallEffective && readiness.firewallUnchanged && len(readiness.portPID) == 0
+		if inspectErr != nil || !machineReady {
 			return errors.Join(errors.New("sandbox: initialized Windows broker dependencies failed exact read-back"), inspectErr)
 		}
 		return nil

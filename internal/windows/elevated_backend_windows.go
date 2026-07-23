@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -67,6 +68,62 @@ type elevatedCompileDependencies struct {
 type elevatedBackend struct {
 	config Config
 	deps   elevatedCompileDependencies
+}
+
+type elevatedSpecGrantAuthority struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	base    policy.Effective
+	lease   elevatedLease
+	borrows int
+	closing bool
+}
+
+func newElevatedSpecGrantAuthority(base policy.Effective, lease elevatedLease) *elevatedSpecGrantAuthority {
+	authority := &elevatedSpecGrantAuthority{base: policy.Clone(base), lease: lease}
+	authority.cond = sync.NewCond(&authority.mu)
+	return authority
+}
+
+func (authority *elevatedSpecGrantAuthority) borrow(base policy.Effective) (elevatedLease, func(), error) {
+	if authority == nil {
+		return nil, nil, errors.New("windows sandbox: elevated base authority is missing")
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.closing || authority.lease == nil || !reflect.DeepEqual(authority.base, base) {
+		return nil, nil, errors.New("windows sandbox: elevated base authority is released or belongs to another executor")
+	}
+	authority.borrows++
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			authority.mu.Lock()
+			authority.borrows--
+			authority.cond.Broadcast()
+			authority.mu.Unlock()
+		})
+	}
+	return authority.lease, release, nil
+}
+
+func (authority *elevatedSpecGrantAuthority) retire() {
+	if authority == nil {
+		return
+	}
+	authority.mu.Lock()
+	authority.closing = true
+	for authority.borrows != 0 {
+		authority.cond.Wait()
+	}
+	authority.mu.Unlock()
+}
+
+// AcquireGrantPathHandle ensures the executor validates an elevated grant with
+// the exact ACL-authority handle the broker compiler will retain. No pathname
+// reopen is permitted after this boundary.
+func (*elevatedBackend) AcquireGrantPathHandle(binding *policy.PathBinding, target string, exact bool) (*policy.PathHandle, error) {
+	return policy.AcquireACLPathHandle(binding, target, exact)
 }
 
 // SupportsGrantClass is the side-effect-free preflight used by the executor
@@ -336,7 +393,6 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
 			errors.New("sandbox: elevated compiler returned an empty lease")
 	}
-
 	bits := elevatedGuaranteeBits(p)
 	if missing := p.RequiredGuarantees &^ bits; missing != 0 {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, bits,
@@ -355,17 +411,20 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	var lifecycleMu sync.Mutex
 	var active sync.WaitGroup
 	closing := false
+	grantAuthority := newElevatedSpecGrantAuthority(p, lease)
 	release := func() error {
 		releaseOnce.Do(func() {
 			lifecycleMu.Lock()
 			closing = true
 			lifecycleMu.Unlock()
+			grantAuthority.retire()
 			active.Wait()
 			releaseErr = lease.Release()
 		})
 		return releaseErr
 	}
 	spec := enforce.Spec{
+		GrantAuthority: grantAuthority,
 		Launch: func(request enforce.LaunchRequest) (int, error) {
 			if request.Context == nil {
 				return -1, errors.New("sandbox: elevated launch context is required")
@@ -405,6 +464,73 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 		})
 	}
 	return spec, report, level, bits, nil
+}
+
+// CompileWithRetainedPathHandles composes immutable base executor objects with
+// grant-only objects retained from the executor's ACL-authority validation
+// handles. It refuses to report guarantees unless base authority has already
+// compiled successfully.
+func (backend *elevatedBackend) CompileWithRetainedPathHandles(rawAuthority any, base, p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+	authority, ok := rawAuthority.(*elevatedSpecGrantAuthority)
+	if backend == nil || len(handles) == 0 || !ok {
+		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0,
+			errors.New("windows sandbox: elevated grant compilation requires retained handles and base authority")
+	}
+	baseLease, releaseBorrow, err := authority.borrow(base)
+	if err != nil {
+		return enforce.Spec{}, elevatedCompileReport(p, elevatedSetupSnapshot{}), profile.LevelNone, 0,
+			err
+	}
+	clone := *backend
+	originalAcquire := backend.deps.acquire
+	clone.deps.acquire = func(snapshot elevatedSetupSnapshot, effective policy.Effective) (elevatedLease, error) {
+		if originalAcquire == nil {
+			releaseBorrow()
+			return nil, errors.New("windows sandbox: elevated grant lease acquisition is unavailable")
+		}
+		lease, acquireErr := acquireElevatedGrantLease(snapshot, effective, baseLease, handles)
+		if acquireErr != nil {
+			releaseBorrow()
+			return nil, acquireErr
+		}
+		return &borrowedElevatedLease{elevatedLease: lease, releaseBorrow: releaseBorrow}, nil
+	}
+	spec, report, level, bits, err := clone.Compile(p)
+	if err != nil {
+		releaseBorrow()
+		return spec, report, level, bits, err
+	}
+	spec.GrantAuthority = nil
+	return spec, report, level, bits, nil
+}
+
+type borrowedElevatedLease struct {
+	elevatedLease
+	once          sync.Once
+	releaseBorrow func()
+}
+
+func (lease *borrowedElevatedLease) Release() error {
+	err := lease.elevatedLease.Release()
+	lease.once.Do(lease.releaseBorrow)
+	return err
+}
+
+func acquireElevatedGrantLease(snapshot elevatedSetupSnapshot, effective policy.Effective, base elevatedLease, handles []*policy.PathHandle) (elevatedLease, error) {
+	if err := validateElevatedSnapshot(snapshot); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	if len(effective.FS) == 0 || len(effective.RuntimeBaselines) == 0 {
+		return nil, fmt.Errorf("%w: elevated ACL grant policy is incomplete", enforce.ErrUnavailable)
+	}
+	return acquireBrokerBackedElevatedGrantLease(context.Background(), elevatedBrokerLeaseConfig{
+		InstallationID:       snapshot.InstallationID,
+		PipeName:             snapshot.PipeName,
+		HostPath:             snapshot.HostPath,
+		OfflineSID:           snapshot.OfflineSID,
+		OnlineSID:            snapshot.OnlineSID,
+		RuntimeBaselineReady: snapshot.RuntimeBaselineReady,
+	}, policy.Clone(effective), base, handles, productionElevatedBrokerLeaseDependencies())
 }
 
 func validateElevatedSnapshot(snapshot elevatedSetupSnapshot) error {

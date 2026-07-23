@@ -52,6 +52,18 @@ func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInsta
 		}
 	}()
 	stagingManifest := setupManifest{Version: setupManifestVersion, State: setupStateStaging, InstallationID: setup.config.InstallationID, OwnerSID: setup.ownerSID, HostPath: staged.finalHost, HostSHA256: staged.digest, ProxyPorts: append([]uint16(nil), setup.config.ProxyPorts...), Protocol: brokerProtocolVersion}
+	if setup.prior != nil {
+		// A refresh carries only identities pinned by the protected ready
+		// manifest. Names are never adopted as ownership. The service identity
+		// changes because its protected binary path changes with the generation.
+		stagingManifest.OfflineSID = setup.prior.OfflineSID
+		stagingManifest.OnlineSID = setup.prior.OnlineSID
+		if desired, desiredErr := desiredBrokerState(stagingManifest.InstallationID, staged.finalHost); desiredErr != nil {
+			return desiredErr
+		} else {
+			stagingManifest.ServiceIdentity = serviceSpecIdentity(desired.Service)
+		}
+	}
 	stagingData, err := encodeSetupManifest(stagingManifest)
 	if err != nil {
 		return err
@@ -85,8 +97,11 @@ func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInsta
 }
 
 type realHostInstallMechanisms struct {
-	owned          setupManifest
-	serviceCreated bool
+	owned           setupManifest
+	serviceCreated  bool
+	serviceUpdated  bool
+	previousService *brokerServiceRecord
+	runtimeEvidence approvedRuntimeEvidenceInspector
 }
 
 func (realHostInstallMechanisms) Prepare(setup validatedSetup) error {
@@ -181,6 +196,9 @@ func (mechanisms *realHostInstallMechanisms) Rollback(staged stagedHost) error {
 	var result error
 	if mechanisms.owned.InstallationID != "" && mechanisms.serviceCreated {
 		result = errors.Join(result, rollbackInstalledHostDependencies(mechanisms.owned, staged, true))
+	}
+	if mechanisms.serviceUpdated && mechanisms.previousService != nil {
+		result = errors.Join(result, restoreSetupService(realSCMFacade{}, *mechanisms.previousService))
 	}
 	if staged.stagingDir != "" {
 		result = errors.Join(result, os.RemoveAll(staged.stagingDir))

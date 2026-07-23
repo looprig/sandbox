@@ -24,23 +24,29 @@ func (mechanisms *realHostInstallMechanisms) Initialize(ctx context.Context, set
 	mechanisms.owned = manifest
 	mechanisms.owned.ServiceIdentity = identity
 
+	evidence := mechanisms.runtimeEvidence
+	if evidence == nil {
+		evidence = unavailableApprovedRuntimeEvidence{}
+	}
+	approved, err := evidence.Approved(ctx, setup, manifest)
+	if err != nil {
+		return setupManifest{}, fmt.Errorf("inspect approved Windows runtime evidence: %w", err)
+	}
+	if !approved {
+		return setupManifest{}, fmt.Errorf("%w: approved Windows runtime evidence is unavailable", ErrSetupStale)
+	}
+
 	scm := realSCMFacade{}
-	if _, lookupErr := scm.Lookup(brokerServiceSpecModel{Name: desired.Service.Name}); !errors.Is(lookupErr, errServiceNotFound) {
-		if lookupErr == nil {
-			return setupManifest{}, errServiceOwnershipMismatch
-		}
-		return setupManifest{}, lookupErr
+	created, previous, serviceErr := reconcileSetupService(scm, desired.Service, setup.prior)
+	mechanisms.serviceCreated = created
+	mechanisms.serviceUpdated = previous != nil
+	mechanisms.previousService = previous
+	if serviceErr != nil {
+		return setupManifest{}, serviceErr
 	}
-	if err := scm.Create(desired.Service); err != nil {
-		return setupManifest{}, err
-	}
-	mechanisms.serviceCreated = true
 	record, err := scm.Lookup(desired.Service)
 	if err != nil || record.Identity != identity {
 		return setupManifest{}, errors.Join(errors.New("sandbox: created Windows broker service failed exact read-back"), err)
-	}
-	if err := scm.Start(desired.Service.Name); err != nil {
-		return setupManifest{}, err
 	}
 
 	generationManifest := filepath.Join(staged.finalDir, "manifest.json")
@@ -49,9 +55,16 @@ func (mechanisms *realHostInstallMechanisms) Initialize(ctx context.Context, set
 	for {
 		enriched, readErr := readInitializedGenerationManifest(generationManifest, manifest, identity)
 		if readErr == nil {
-			ready, inspectErr := inspectInitializedHostDependencies(ctx, setup, enriched)
+			// Capture manifest-pinned ownership before any later read-back can
+			// fail. Rollback must be able to remove every object the service
+			// published, including after firewall/port/evidence failures.
+			mechanisms.owned = enriched
+			ready, inspectErr := initializedDependenciesReady(ctx, setup, enriched, manifestPinnedSetupInspector{
+				evidence: evidence,
+				policy:   windowsFirewallPolicy{api: newNetFwAutomation()},
+				owners:   windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+			})
 			if inspectErr == nil && ready {
-				mechanisms.owned = enriched
 				return enriched, nil
 			}
 			if inspectErr != nil {
@@ -104,17 +117,9 @@ func equalUint16Sets(left, right []uint16) bool {
 	return true
 }
 
-type initializationEvidence struct{}
-
-func (initializationEvidence) Approved(context.Context, validatedSetup, setupManifest) (bool, error) {
-	return true, nil
-}
-
-func inspectInitializedHostDependencies(ctx context.Context, setup validatedSetup, manifest setupManifest) (bool, error) {
-	inspector := manifestPinnedSetupInspector{
-		evidence: initializationEvidence{},
-		policy:   windowsFirewallPolicy{api: newNetFwAutomation()},
-		owners:   windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+func initializedDependenciesReady(ctx context.Context, setup validatedSetup, manifest setupManifest, inspector setupDependencyInspector) (bool, error) {
+	if inspector == nil {
+		return false, errors.New("sandbox: Windows setup dependency inspector is unavailable")
 	}
 	readiness, err := inspector.Inspect(ctx, setup, manifest)
 	if err != nil {
@@ -123,6 +128,51 @@ func inspectInitializedHostDependencies(ctx context.Context, setup validatedSetu
 	return readiness.service && readiness.accounts && readiness.credentials &&
 		readiness.firewallEffective && readiness.firewallUnchanged &&
 		readiness.runtimeBaseline && len(readiness.portPID) == 0, nil
+}
+
+func reconcileSetupService(api scmFacade, desired brokerServiceSpecModel, prior *setupManifest) (bool, *brokerServiceRecord, error) {
+	record, err := api.Lookup(brokerServiceSpecModel{Name: desired.Name})
+	if errors.Is(err, errServiceNotFound) {
+		if err := api.Create(desired); err != nil {
+			return false, nil, err
+		}
+		if err := api.Start(desired.Name); err != nil {
+			return true, nil, err
+		}
+		return true, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if prior == nil || prior.ServiceIdentity == "" || record.Identity != prior.ServiceIdentity ||
+		record.Spec.Name != desired.Name {
+		return false, nil, errServiceOwnershipMismatch
+	}
+	previous := record
+	if err := api.Stop(desired.Name); err != nil {
+		return false, nil, err
+	}
+	if err := api.Apply(desired); err != nil {
+		return false, &previous, err
+	}
+	if err := api.Start(desired.Name); err != nil {
+		return false, &previous, err
+	}
+	return false, &previous, nil
+}
+
+func restoreSetupService(api scmFacade, previous brokerServiceRecord) error {
+	if previous.Identity == "" || previous.Spec.Name == "" ||
+		serviceSpecIdentity(previous.Spec) != previous.Identity {
+		return errServiceOwnershipMismatch
+	}
+	var result error
+	result = errors.Join(result, api.Stop(previous.Spec.Name))
+	result = errors.Join(result, api.Apply(previous.Spec))
+	if previous.Running {
+		result = errors.Join(result, api.Start(previous.Spec.Name))
+	}
+	return result
 }
 
 func rollbackInstalledHostDependencies(manifest setupManifest, staged stagedHost, removeService bool) error {

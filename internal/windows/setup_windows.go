@@ -229,6 +229,11 @@ func Setup(ctx context.Context, config SetupConfig) error {
 	if err != nil {
 		return err
 	}
+	prior, err := loadOwnedReadyManifest(validated)
+	if err != nil {
+		return err
+	}
+	validated.prior = prior
 	if err := installHost(ctx, validated, &realHostInstallMechanisms{}); err != nil {
 		return err
 	}
@@ -484,6 +489,49 @@ func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest se
 type validatedSetup struct {
 	config                                      SetupConfig
 	stateRoot, sourceHost, ownerSID, sandboxSID string
+	prior                                       *setupManifest
+}
+
+func loadOwnedReadyManifest(setup validatedSetup) (*setupManifest, error) {
+	return loadOwnedReadyManifestWithVerifier(setup, realBrokerInstallPathVerifier{}, hashFile)
+}
+
+func loadOwnedReadyManifestWithVerifier(setup validatedSetup, verifier brokerInstallPathVerifier, hash func(string) (string, error)) (*setupManifest, error) {
+	manifestPath := filepath.Join(setup.stateRoot, readyManifestName)
+	data, err := os.ReadFile(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read existing Windows setup manifest: %w", err)
+	}
+	manifest, err := decodeSetupManifest(data)
+	if err != nil || manifest.State != setupStateReady ||
+		manifest.InstallationID != setup.config.InstallationID ||
+		manifest.OwnerSID != setup.ownerSID ||
+		manifest.OfflineSID == "" || manifest.OnlineSID == "" ||
+		manifest.ServiceIdentity == "" {
+		return nil, errors.Join(ErrSetupStale, errors.New("sandbox: existing Windows installation is not manifest-owned"), err)
+	}
+	if err := validateInstalledHostPath(setup.stateRoot, manifest.HostPath); err != nil {
+		return nil, errors.Join(ErrSetupStale, err)
+	}
+	if verifier == nil || hash == nil {
+		return nil, errors.Join(ErrSetupStale, errors.New("sandbox: existing Windows installation verifier is unavailable"))
+	}
+	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing ready manifest protection: %w", err))
+	}
+	if err := verifier.Verify(manifest.HostPath, manifest.OwnerSID); err != nil {
+		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing host protection: %w", err))
+	}
+	digest, err := hash(manifest.HostPath)
+	if err != nil || !strings.EqualFold(digest, manifest.HostSHA256) {
+		return nil, errors.Join(ErrSetupStale, errors.New("sandbox: existing host hash does not match its ready manifest"), err)
+	}
+	copy := manifest
+	copy.ProxyPorts = append([]uint16(nil), manifest.ProxyPorts...)
+	return &copy, nil
 }
 
 func validateSetupConfig(config SetupConfig, requireElevation bool) (validatedSetup, error) {

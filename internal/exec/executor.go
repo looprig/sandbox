@@ -524,6 +524,7 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 		Dir:     dir,
 		Argv:    append([]string(nil), argv...),
 		Env:     env,
+		Stdin:   bytes.NewReader(nil),
 		Stdout:  &output,
 		Stderr:  &output,
 	})
@@ -768,10 +769,21 @@ func (e *Executor) authorizeGrantScope(kind, scope string) error {
 // RunCommandWithGrants verifies all grants, compiles their least-authority
 // deltas for this spawn, atomically consumes them, and then starts the command.
 func (e *Executor) RunCommandWithGrants(ctx context.Context, executionID, dir, command string, grants []string) ([]byte, int, error) {
-	return e.runCommandWithGrants(ctx, executionID, dir, command, grants, policy.AcquirePathHandle)
+	acquire := grantPathAcquirer(policy.AcquirePathHandle)
+	if backend, ok := e.backend.(grantACLPathAcquirer); ok {
+		acquire = backend.AcquireGrantPathHandle
+	}
+	return e.runCommandWithGrants(ctx, executionID, dir, command, grants, acquire)
 }
 
 type grantPathAcquirer func(*policy.PathBinding, string, bool) (*policy.PathHandle, error)
+
+// grantACLPathAcquirer is implemented by backends whose enforcement authority
+// must be acquired by the same identity-validation open. Generic backends keep
+// the ordinary read-only PathHandle acquisition path.
+type grantACLPathAcquirer interface {
+	AcquireGrantPathHandle(*policy.PathBinding, string, bool) (*policy.PathHandle, error)
+}
 
 type pendingGrantPath struct {
 	id              [32]byte
@@ -926,7 +938,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 			}
 		}
 	}
-	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, pol, pathHandles.Sorted())
+	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, e.spec.GrantAuthority, e.policy, pol, pathHandles.Sorted())
 	if err != nil {
 		return nil, -1, finishExecutionAndRelease(lease, spec, err)
 	}
@@ -1079,8 +1091,15 @@ type grantPathBackend interface {
 	CompileWithPathHandles(policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
 }
 
-func compileBackendWithGrantPaths(b enforce.Backend, pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+type retainedGrantPathBackend interface {
+	CompileWithRetainedPathHandles(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
+}
+
+func compileBackendWithGrantPaths(b enforce.Backend, authority any, base, pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 	if len(handles) != 0 {
+		if retained, ok := b.(retainedGrantPathBackend); ok {
+			return retained.CompileWithRetainedPathHandles(authority, policy.Clone(base), pol, handles)
+		}
 		if pathBackend, ok := b.(grantPathBackend); ok {
 			return pathBackend.CompileWithPathHandles(pol, handles)
 		}

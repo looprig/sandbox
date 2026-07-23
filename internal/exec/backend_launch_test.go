@@ -22,8 +22,12 @@ func TestBackendOwnedLaunchPreservesExecutorLifecycleAndOutputConvention(t *test
 		order = append(order, "launch")
 		if request.Context != lease.ctx || request.Dir != "/work" ||
 			!slices.Equal(request.Argv, []string{"/tool", "arg"}) ||
-			!slices.Equal(request.Env, originalEnv) || request.Stdin != nil {
+			!slices.Equal(request.Env, originalEnv) || request.Stdin == nil {
 			t.Fatalf("launch request = %#v", request)
+		}
+		stdin, err := io.ReadAll(request.Stdin)
+		if err != nil || len(stdin) != 0 {
+			t.Fatalf("stdin = %q, %v; want empty input", stdin, err)
 		}
 		request.Argv[0] = "mutated"
 		request.Env[0] = "mutated"

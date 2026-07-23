@@ -4,10 +4,12 @@ package windows
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -71,6 +73,13 @@ type brokerBackedElevatedLeaseFactory struct {
 	closeErr   error
 }
 
+func (factory *brokerBackedElevatedLeaseFactory) retainedBrokerObjects() []brokerObjectReference {
+	if factory == nil {
+		return nil
+	}
+	return append([]brokerObjectReference(nil), factory.objects...)
+}
+
 func productionElevatedBrokerLeaseDependencies() elevatedBrokerLeaseDependencies {
 	return elevatedBrokerLeaseDependencies{
 		connect: func(ctx context.Context, pipeName, hostPath string) (elevatedBrokerLeaseSession, error) {
@@ -106,6 +115,61 @@ func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBroker
 		objects:    append([]brokerObjectReference(nil), objects...),
 		narrowings: append([]string(nil), narrowings...),
 		close:      closeObjects,
+	}, nil
+}
+
+type elevatedRetainedObjectAuthority interface {
+	retainedBrokerObjects() []brokerObjectReference
+}
+
+// acquireBrokerBackedElevatedGrantLease composes the executor's already
+// retained base objects with grant objects derived only from ACL-capable
+// validation handles. Grant objects override matching base identities; no
+// pathname is reopened and the base factory retains ownership of base handles.
+func acquireBrokerBackedElevatedGrantLease(ctx context.Context, config elevatedBrokerLeaseConfig, effective policy.Effective, base elevatedLease, handles []*policy.PathHandle, deps elevatedBrokerLeaseDependencies) (_ *brokerBackedElevatedLeaseFactory, err error) {
+	authority, ok := base.(elevatedRetainedObjectAuthority)
+	if !ok || len(handles) == 0 {
+		return nil, errors.New("windows sandbox: elevated grant requires retained base authority and grant handles")
+	}
+	baseObjects := authority.retainedBrokerObjects()
+	if len(baseObjects) == 0 {
+		return nil, errors.New("windows sandbox: elevated base authority is empty")
+	}
+	grantObjects, closeGrant, narrowings, err := compileElevatedBrokerObjectsFromHandles(effective, handles)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(cause error) (*brokerBackedElevatedLeaseFactory, error) {
+		return nil, errors.Join(cause, closeGrant())
+	}
+	merged := append([]brokerObjectReference(nil), baseObjects...)
+	for _, grant := range grantObjects {
+		replaced := false
+		for index := range merged {
+			if merged[index].VolumeSerial == grant.VolumeSerial &&
+				merged[index].FileID == grant.FileID && merged[index].Kind == grant.Kind {
+				merged[index] = grant
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			merged = append(merged, grant)
+		}
+	}
+	if len(merged) == 0 || len(merged) > maxBrokerObjects {
+		return fail(errors.New("windows sandbox: composed elevated grant object set is invalid"))
+	}
+	slices.SortFunc(merged, func(a, b brokerObjectReference) int { return winpath.Compare(a.Path, b.Path) })
+	if ctx == nil || config.InstallationID == "" ||
+		!normalizedAbsoluteWindowsPath(config.HostPath) || config.PipeName == "" ||
+		config.OfflineSID == "" || config.OnlineSID == "" || !config.RuntimeBaselineReady ||
+		deps.connect == nil || deps.token == nil {
+		return fail(errors.New("windows sandbox: incomplete verified broker grant configuration"))
+	}
+	return &brokerBackedElevatedLeaseFactory{
+		config: config, deps: deps, objects: merged,
+		narrowings: append([]string(nil), narrowings...), close: closeGrant,
 	}, nil
 }
 
@@ -281,7 +345,11 @@ func compileElevatedBrokerObjects(effective policy.Effective) (_ []brokerObjectR
 			if snapshotErr != nil || closeErr != nil {
 				return nil, nil, nil, errors.Join(snapshotErr, closeErr)
 			}
-			refs = append(refs, policyBrokerReference(handle.NativeHandle(), handle.Target(), snapshot.identity, brokerScopeExact, effective))
+			reference := policyBrokerReference(handle.NativeHandle(), handle.Target(), snapshot.identity, brokerScopeExact, effective)
+			if err := rejectAmbientRestrictedCodeAuthority(snapshot.aces, reference); err != nil {
+				return nil, nil, nil, err
+			}
+			refs = append(refs, reference)
 			continue
 		}
 		tree, treeErr := EnumerateRetainedACLTree(handle)
@@ -307,6 +375,9 @@ func compileElevatedBrokerObjects(effective policy.Effective) (_ []brokerObjectR
 					narrowings = append(narrowings, "denied multi-link tree object "+object.target)
 				}
 			}
+			if err := rejectAmbientRestrictedCodeAuthority(snapshot.aces, reference); err != nil {
+				return nil, nil, nil, err
+			}
 			refs = append(refs, reference)
 		}
 	}
@@ -318,6 +389,177 @@ func compileElevatedBrokerObjects(effective policy.Effective) (_ []brokerObjectR
 	}
 	slices.SortFunc(refs, func(a, b brokerObjectReference) int { return winpath.Compare(a.Path, b.Path) })
 	return refs, closeAll, narrowings, nil
+}
+
+func compileElevatedBrokerObjectsFromHandles(effective policy.Effective, handles []*policy.PathHandle) (_ []brokerObjectReference, _ func() error, _ []string, err error) {
+	if err := validateElevatedRuntimeVocabulary(effective); err != nil {
+		return nil, nil, nil, err
+	}
+	var exactObjects []*win32ACLObject
+	var trees []*RetainedACLTree
+	closeAll := func() error {
+		var result error
+		for _, tree := range trees {
+			result = errors.Join(result, tree.Close())
+		}
+		for _, object := range exactObjects {
+			result = errors.Join(result, object.close())
+		}
+		return result
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, closeAll())
+		}
+	}()
+	var refs []brokerObjectReference
+	var narrowings []string
+	for _, handle := range handles {
+		if handle == nil || handle.NativeHandle() == 0 || handle.Target() == "" ||
+			handle.Access() == policy.DenyAccess {
+			return nil, nil, nil, errors.New("windows sandbox: invalid retained elevated grant handle")
+		}
+		granted, accessErr := handleGrantedAccess(win.Handle(handle.NativeHandle()))
+		if accessErr != nil || granted&(win.READ_CONTROL|win.WRITE_DAC) != win.READ_CONTROL|win.WRITE_DAC {
+			return nil, nil, nil, errors.Join(errors.New("windows sandbox: elevated grant handle lacks ACL authority"), accessErr)
+		}
+		if handle.Exact() {
+			object, duplicateErr := duplicateBoundWin32ACLObject(win.Handle(handle.NativeHandle()), handle.Target(), false)
+			if duplicateErr != nil {
+				return nil, nil, nil, duplicateErr
+			}
+			exactObjects = append(exactObjects, object)
+			snapshot, snapshotErr := object.snapshot()
+			if snapshotErr != nil {
+				return nil, nil, nil, snapshotErr
+			}
+			reference := policyBrokerReference(uintptr(object.handle), object.target, snapshot.identity, brokerScopeExact, effective)
+			if err := rejectAmbientRestrictedCodeAuthority(snapshot.aces, reference); err != nil {
+				return nil, nil, nil, err
+			}
+			refs = append(refs, reference)
+			continue
+		}
+		tree, treeErr := EnumerateRetainedACLTree(handle)
+		if treeErr != nil {
+			return nil, nil, nil, fmt.Errorf("enumerate retained elevated grant tree: %w", treeErr)
+		}
+		trees = append(trees, tree)
+		for _, raw := range tree.objects {
+			object, ok := raw.(*win32ACLObject)
+			if !ok {
+				return nil, nil, nil, errors.New("windows sandbox: retained elevated grant tree returned a non-Windows object")
+			}
+			snapshot, snapshotErr := object.snapshot()
+			if snapshotErr != nil {
+				return nil, nil, nil, snapshotErr
+			}
+			reference := policyBrokerReference(uintptr(object.handle), object.target, snapshot.identity, brokerScopeTree, effective)
+			if snapshot.identity.Kind == ACLObjectFile {
+				reference.Scope = brokerScopeExact
+				if snapshot.identity.LinkCount > 1 {
+					reference.Access, reference.Denied = brokerAccessNone, brokerAccessReadWrite
+					narrowings = append(narrowings, "denied multi-link grant object "+object.target)
+				}
+			}
+			if err := rejectAmbientRestrictedCodeAuthority(snapshot.aces, reference); err != nil {
+				return nil, nil, nil, err
+			}
+			refs = append(refs, reference)
+		}
+	}
+	if len(refs) == 0 || len(refs) > maxBrokerObjects {
+		return nil, nil, nil, errors.New("windows sandbox: retained elevated grant object set is invalid")
+	}
+	slices.SortFunc(refs, func(a, b brokerObjectReference) int { return winpath.Compare(a.Path, b.Path) })
+	return refs, closeAll, narrowings, nil
+}
+
+func rejectAmbientRestrictedCodeAuthority(aces [][]byte, reference brokerObjectReference) error {
+	if reference.Denied == brokerAccessNone {
+		return nil
+	}
+	want := restrictedCodeSID().binary()
+	for _, ace := range aces {
+		mask, sidOffset, allowed, err := allowedACESIDOffset(ace)
+		if err != nil {
+			return fmt.Errorf("windows sandbox: inspect ambient Restricted Code authority on %q: %w", reference.Path, err)
+		}
+		if !allowed || len(ace) < sidOffset+len(want) || !slices.Equal(ace[sidOffset:sidOffset+len(want)], want) {
+			continue
+		}
+		if restrictedCodeMaskConflicts(mask, reference.Denied, reference.Kind) {
+			return fmt.Errorf("windows sandbox: ambient Restricted Code ACE widens denied authority on %q", reference.Path)
+		}
+	}
+	return nil
+}
+
+func allowedACESIDOffset(ace []byte) (mask uint32, sidOffset int, allowed bool, err error) {
+	if len(ace) < 8 || int(binary.LittleEndian.Uint16(ace[2:4])) != len(ace) {
+		return 0, 0, false, errors.New("malformed DACL ACE")
+	}
+	mask = binary.LittleEndian.Uint32(ace[4:8])
+	switch ace[0] {
+	case win.ACCESS_ALLOWED_ACE_TYPE, 9: // ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+		return mask, 8, true, nil
+	case 4: // ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+		if len(ace) < 12 {
+			return 0, 0, false, errors.New("malformed compound allow ACE")
+		}
+		return mask, 12, true, nil
+	case 5, 11: // ACCESS_ALLOWED_OBJECT[_CALLBACK]_ACE_TYPE
+		if len(ace) < 12 {
+			return 0, 0, false, errors.New("malformed object allow ACE")
+		}
+		offset := 12
+		flags := binary.LittleEndian.Uint32(ace[8:12])
+		if flags&1 != 0 {
+			offset += 16
+		}
+		if flags&2 != 0 {
+			offset += 16
+		}
+		if offset > len(ace) {
+			return 0, 0, false, errors.New("malformed object allow ACE")
+		}
+		return mask, offset, true, nil
+	default:
+		return mask, 0, false, nil
+	}
+}
+
+func restrictedCodeMaskConflicts(mask uint32, denied brokerObjectAccess, kind brokerObjectKind) bool {
+	const (
+		genericRead     = uint32(0x80000000)
+		genericWrite    = uint32(0x40000000)
+		genericExecute  = uint32(0x20000000)
+		genericAll      = uint32(0x10000000)
+		writeDAC        = uint32(0x00040000)
+		writeOwner      = uint32(0x00080000)
+		readData        = uint32(0x00000001)
+		readEA          = uint32(0x00000008)
+		execute         = uint32(0x00000020)
+		readAttributes  = uint32(0x00000080)
+		writeData       = uint32(0x00000002)
+		appendData      = uint32(0x00000004)
+		writeEA         = uint32(0x00000010)
+		deleteChild     = uint32(0x00000040)
+		writeAttributes = uint32(0x00000100)
+		deleteObject    = uint32(0x00010000)
+	)
+	if mask&(genericAll|writeDAC|writeOwner) != 0 {
+		return true
+	}
+	if denied&brokerAccessRead != 0 &&
+		mask&(genericRead|genericExecute|readData|readEA|execute|readAttributes) != 0 {
+		return true
+	}
+	writeMask := genericWrite | writeData | appendData | writeEA | writeAttributes | deleteObject
+	if kind == brokerObjectDirectory {
+		writeMask |= deleteChild
+	}
+	return denied&brokerAccessWrite != 0 && mask&writeMask != 0
 }
 
 func policyBrokerReference(handle uintptr, path string, identity ACLObjectIdentity, scope brokerObjectScope, effective policy.Effective) brokerObjectReference {
@@ -370,7 +612,7 @@ func validateBrokerTokenHandle(raw uint64, config elevatedBrokerLeaseConfig, acc
 		return 0, err
 	}
 	restricting, err := readTokenGroups(token, win.TokenRestrictedSids)
-	if err != nil || len(restricting.groups) != 2 || !sidInGroups(restricting.groups, installationSID) {
+	if err != nil || !exactBrokerRestrictingSIDSet(restricting.groups, installationSID) {
 		return 0, errors.Join(errors.New("windows sandbox: broker token restricting SID set mismatch"), err)
 	}
 	privileges, err := tokenPrivilegeList(token)
@@ -387,4 +629,44 @@ func validateBrokerTokenHandle(raw uint64, config elevatedBrokerLeaseConfig, acc
 		}
 	}
 	return token, nil
+}
+
+func exactBrokerRestrictingSIDSet(groups []win.SIDAndAttributes, installation *win.SID) bool {
+	if len(groups) != 3 || installation == nil {
+		return false
+	}
+	restrictedCode, err := win.StringToSid(restrictedCodeSID().String())
+	if err != nil {
+		return false
+	}
+	installationCount, restrictedCodeCount, executionCount := 0, 0, 0
+	for _, group := range groups {
+		if group.Sid == nil || !group.Sid.IsValid() {
+			return false
+		}
+		switch {
+		case win.EqualSid(group.Sid, installation):
+			installationCount++
+		case win.EqualSid(group.Sid, restrictedCode):
+			restrictedCodeCount++
+		case validBrokerExecutionRestrictingSIDText(group.Sid.String()):
+			executionCount++
+		default:
+			return false
+		}
+	}
+	return installationCount == 1 && restrictedCodeCount == 1 && executionCount == 1
+}
+
+func validBrokerExecutionRestrictingSIDText(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) != 12 || parts[0] != "S" || parts[1] != "1" || parts[2] != "5" || parts[3] != "32" {
+		return false
+	}
+	for _, part := range parts[4:] {
+		if _, err := strconv.ParseUint(part, 10, 32); err != nil {
+			return false
+		}
+	}
+	return true
 }

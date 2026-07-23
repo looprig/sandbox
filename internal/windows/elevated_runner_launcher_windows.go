@@ -229,16 +229,48 @@ func (execution *elevatedRunnerExecution) Wait(ctx context.Context) (uint32, err
 			proofErr = execution.api.WaitJobEmpty(drainCtx, execution.job)
 			cancel()
 		}
+		if proofErr != nil {
+			// Ownership moves to a retrying reaper. It deliberately retains the
+			// Job and broker lease until a later exact empty proof; closing either
+			// here could revoke authority while a descendant still runs.
+			job, release := execution.job, execution.release
+			execution.job, execution.release = nil, nil
+			processCloseErr := execution.api.CloseHandle(execution.process)
+			execution.process = 0
+			go reapUnprovedElevatedExecution(execution.api, job, release)
+			execution.err = errors.Join(execution.err, firstProofErr, terminateErr, proofErr, processCloseErr)
+			return
+		}
 		var releaseErr error
-		if proofErr == nil && execution.release != nil {
+		if execution.release != nil {
 			releaseErr = execution.release()
 		}
-		execution.err = errors.Join(execution.err, firstProofErr, terminateErr, proofErr, releaseErr,
-			execution.api.CloseHandle(execution.process),
-			execution.job.Close())
+		processCloseErr := execution.api.CloseHandle(execution.process)
 		execution.process = 0
+		execution.err = errors.Join(execution.err, firstProofErr, terminateErr, releaseErr,
+			processCloseErr, execution.job.Close())
+		execution.job, execution.release = nil, nil
 	})
 	return execution.code, execution.err
+}
+
+func reapUnprovedElevatedExecution(api elevatedRunnerProcessAPI, job *Job, release func() error) {
+	if api == nil || job == nil {
+		return
+	}
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := api.WaitJobEmpty(ctx, job)
+		cancel()
+		if err == nil {
+			if release != nil {
+				_ = release()
+			}
+			_ = job.Close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func validSHA256Hex(value string) bool {

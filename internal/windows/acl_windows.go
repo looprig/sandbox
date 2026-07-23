@@ -537,6 +537,38 @@ func openBoundWin32ACLObject(source win.Handle, target string, directory, freeze
 	return object, nil
 }
 
+// duplicateBoundWin32ACLObject retains the already validated object's exact
+// kernel identity and authority. Unlike openBoundWin32ACLObject it never
+// resolves target again, so an elevated grant cannot be redirected between
+// validation and broker lease construction.
+func duplicateBoundWin32ACLObject(source win.Handle, target string, directory bool) (*win32ACLObject, error) {
+	if invalidExplicitHandle(source) {
+		return nil, errors.New("sandbox: invalid retained ACL source handle")
+	}
+	expected, err := identityFromHandle(source, target)
+	if err != nil {
+		return nil, fmt.Errorf("inspect retained ACL source %q: %w", target, err)
+	}
+	if (expected.Kind == ACLObjectDirectory) != directory {
+		return nil, fmt.Errorf("%w: retained ACL source %q has unexpected type", policy.ErrTargetChanged, target)
+	}
+	var duplicate win.Handle
+	if err := win.DuplicateHandle(win.CurrentProcess(), source, win.CurrentProcess(), &duplicate,
+		0, false, win.DUPLICATE_SAME_ACCESS); err != nil {
+		return nil, fmt.Errorf("duplicate retained ACL source %q: %w", target, err)
+	}
+	object := &win32ACLObject{
+		handle: duplicate, target: target,
+		closeOnce: func() error { return win.CloseHandle(duplicate) },
+	}
+	actual, err := object.snapshot()
+	if err != nil || actual.identity != expected {
+		_ = object.close()
+		return nil, errors.Join(fmt.Errorf("%w: retained ACL source %q changed", policy.ErrTargetChanged, target), err)
+	}
+	return object, nil
+}
+
 func openWin32ACLObject(target string, directory, freezeWrites bool) (*win32ACLObject, error) {
 	pinned, err := winpath.OpenForACL(target, directory, freezeWrites)
 	if err != nil {

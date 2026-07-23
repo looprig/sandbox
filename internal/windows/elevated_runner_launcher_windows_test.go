@@ -7,7 +7,9 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	win "golang.org/x/sys/windows"
 )
@@ -22,7 +24,10 @@ type fakeElevatedRunnerAPI struct {
 	waitCode     uint32
 	waitErr      error
 	jobWaitErr   error
+	jobWaitErrs  []error
 	released     bool
+	releaseCh    chan struct{}
+	mu           sync.Mutex
 }
 
 func (api *fakeElevatedRunnerAPI) event(value string) { api.events = append(api.events, value) }
@@ -73,7 +78,14 @@ func (api *fakeElevatedRunnerAPI) WaitProcess(context.Context, win.Handle) (uint
 	return api.waitCode, api.waitErr
 }
 func (api *fakeElevatedRunnerAPI) WaitJobEmpty(context.Context, *Job) error {
+	api.mu.Lock()
+	defer api.mu.Unlock()
 	api.event("wait-job-empty")
+	if len(api.jobWaitErrs) != 0 {
+		err := api.jobWaitErrs[0]
+		api.jobWaitErrs = api.jobWaitErrs[1:]
+		return err
+	}
 	return api.jobWaitErr
 }
 func (api *fakeElevatedRunnerAPI) TerminateProcess(win.Handle) error {
@@ -101,8 +113,18 @@ func validElevatedRunnerLaunchForTest(api *fakeElevatedRunnerAPI) elevatedRunner
 		Argv:       []string{`C:\work\tool.exe`, "arg"}, CWD: `C:\work`,
 		Desktop: `SandboxStation\SandboxDesktop`,
 		Stdin:   11, Stdout: 12, Stderr: 13,
-		Job:          JobOptions{MaxProcesses: 4, MaxMemoryBytes: 64 << 20, MaxCPUPct: 25},
-		ReleaseLease: func() error { api.event("release"); api.released = true; return nil },
+		Job: JobOptions{MaxProcesses: 4, MaxMemoryBytes: 64 << 20, MaxCPUPct: 25},
+		ReleaseLease: func() error {
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			api.event("release")
+			api.released = true
+			if api.releaseCh != nil {
+				close(api.releaseCh)
+				api.releaseCh = nil
+			}
+			return nil
+		},
 	}
 }
 
@@ -176,6 +198,28 @@ func TestElevatedRunnerWaitDoesNotReleaseOnUnprovedJobEmpty(t *testing.T) {
 	}
 	if api.released {
 		t.Fatal("lease released without Job-empty proof")
+	}
+}
+
+func TestElevatedRunnerQuarantinesAuthorityUntilLaterJobEmptyProof(t *testing.T) {
+	proofErr := errors.New("completion proof unavailable")
+	released := make(chan struct{})
+	api := &fakeElevatedRunnerAPI{
+		jobWaitErrs: []error{proofErr, proofErr, nil},
+		releaseCh:   released,
+	}
+	launcher, _ := newElevatedRunnerLauncher(api)
+	execution, err := launcher.Launch(validElevatedRunnerLaunchForTest(api))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.Wait(context.Background()); err == nil {
+		t.Fatal("initial proof failures were hidden")
+	}
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("quarantined broker lease was not released after later exact proof")
 	}
 }
 

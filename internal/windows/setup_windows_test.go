@@ -203,20 +203,110 @@ func TestInitializedGenerationManifestRejectsChangedProtectedIdentity(t *testing
 }
 
 func TestHostInstallRollsBackEveryPostStageFailure(t *testing.T) {
-	for _, step := range []string{"stage", "persist-staging", "self-test", "promote", "activate"} {
+	for _, step := range []string{"stage", "persist-staging", "self-test", "promote", "initialize", "activate"} {
 		t.Run(step, func(t *testing.T) {
-			f := &fakeHostInstaller{fail: step}
+			var f hostInstallMechanisms
+			base := &fakeHostInstaller{fail: step}
+			f = base
+			if step == "initialize" {
+				f = &initializingHostInstaller{fakeHostInstaller: *base}
+			}
 			err := installHost(context.Background(), validatedSetup{config: SetupConfig{InstallationID: "i", ProxyPorts: []uint16{1}}, ownerSID: "S"}, f)
 			if err == nil {
 				t.Fatal("expected failure")
 			}
-			if !f.rolledBack {
+			rolledBack := base.rolledBack
+			if initializing, ok := f.(*initializingHostInstaller); ok {
+				rolledBack = initializing.rolledBack
+				if len(initializing.manifest) != 0 {
+					t.Fatal("ready manifest published after failed dependency initialization")
+				}
+			}
+			if !rolledBack {
 				t.Fatal("missing rollback")
 			}
-			if step == "self-test" && len(f.manifest) != 0 {
+			if step == "self-test" && len(base.manifest) != 0 {
 				t.Fatal("ready manifest published before self-test")
 			}
 		})
+	}
+}
+
+func TestInitializedDependenciesRequireExplicitRuntimeEvidence(t *testing.T) {
+	setup := validatedSetup{config: SetupConfig{InstallationID: "install"}}
+	manifest := setupManifest{InstallationID: "install"}
+	inspector := staticSetupInspector{readiness: setupDependencyReadiness{
+		service: true, accounts: true, credentials: true,
+		firewallEffective: true, firewallUnchanged: true,
+		runtimeBaseline: false,
+	}}
+	ready, err := initializedDependenciesReady(context.Background(), setup, manifest, inspector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("machine dependencies were treated as ready without approved runtime evidence")
+	}
+	inspector.readiness.runtimeBaseline = true
+	ready, err = initializedDependenciesReady(context.Background(), setup, manifest, inspector)
+	if err != nil || !ready {
+		t.Fatalf("explicitly approved dependencies = %v, %v", ready, err)
+	}
+}
+
+func TestHostRefreshCarriesOnlyManifestPinnedIdentity(t *testing.T) {
+	previous := setupManifest{
+		Version: setupManifestVersion, State: setupStateReady,
+		InstallationID: "install", OwnerSID: "S-1-5-21-owner",
+		HostPath:   `C:\protected\slots\old\sandbox-host.exe`,
+		HostSHA256: strings.Repeat("cd", 32), ProxyPorts: []uint16{9001},
+		Protocol:   brokerProtocolVersion,
+		OfflineSID: "S-1-5-21-101", OnlineSID: "S-1-5-21-102",
+		ServiceIdentity: "old-service",
+	}
+	setup := validatedSetup{
+		config:   SetupConfig{InstallationID: "install", ProxyPorts: []uint16{9001}},
+		ownerSID: previous.OwnerSID, prior: &previous,
+	}
+	f := &fakeHostInstaller{}
+	if err := installHost(context.Background(), setup, f); err != nil {
+		t.Fatal(err)
+	}
+	staging, err := decodeSetupManifest(f.staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staging.OfflineSID != previous.OfflineSID || staging.OnlineSID != previous.OnlineSID {
+		t.Fatalf("refresh lost manifest-pinned account identity: %#v", staging)
+	}
+	if staging.ServiceIdentity == "" || staging.ServiceIdentity == previous.ServiceIdentity {
+		t.Fatalf("refresh did not pin the new generation service identity: %#v", staging)
+	}
+}
+
+func TestRefreshServiceRequiresPriorOwnedIdentity(t *testing.T) {
+	desired, err := desiredBrokerState("install", `C:\protected\slots\new\sandbox-host.exe`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSpec := desired.Service
+	oldSpec.BinaryPath = `C:\protected\slots\old\sandbox-host.exe`
+	oldIdentity := serviceSpecIdentity(oldSpec)
+	prior := setupManifest{ServiceIdentity: oldIdentity}
+
+	foreign := &fakeSCMFacade{record: brokerServiceRecord{Spec: oldSpec, Identity: "foreign"}}
+	if _, _, err := reconcileSetupService(foreign, desired.Service, &prior); !errors.Is(err, errServiceOwnershipMismatch) {
+		t.Fatalf("foreign service refresh error = %v, want ownership mismatch", err)
+	}
+
+	owned := &fakeSCMFacade{record: brokerServiceRecord{Spec: oldSpec, Identity: oldIdentity, Running: true}}
+	created, previous, err := reconcileSetupService(owned, desired.Service, &prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || previous == nil || previous.Identity != oldIdentity ||
+		owned.stopped != desired.Service.Name || owned.applied != desired.Service {
+		t.Fatalf("owned refresh did not preserve rollback state: created=%v previous=%#v facade=%#v", created, previous, owned)
 	}
 }
 
@@ -358,5 +448,48 @@ func TestHostInstallNeverPersistsCallerSourcePath(t *testing.T) {
 	}
 	if strings.Contains(string(f.manifest), "attacker") || strings.Contains(string(f.manifest), "mutable.exe") {
 		t.Fatal("source path persisted")
+	}
+}
+
+type rejectBrokerPaths struct{ err error }
+
+func (verifier rejectBrokerPaths) Verify(string, string) error { return verifier.err }
+
+func TestRefreshRevalidatesReadyManifestProtectionAndHostHash(t *testing.T) {
+	root := t.TempDir()
+	host := filepath.Join(root, "slots", "generation", "sandbox-host.exe")
+	if err := os.MkdirAll(filepath.Dir(host), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(host, []byte("trusted host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashFile(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := setupManifest{
+		Version: setupManifestVersion, State: setupStateReady, InstallationID: "refresh",
+		OwnerSID: "S-1-5-21-1", HostPath: host, HostSHA256: digest,
+		OfflineSID: "S-1-5-21-1-1001", OnlineSID: "S-1-5-21-1-1002",
+		ServiceIdentity: "owned-service", Protocol: brokerProtocolVersion, ProxyPorts: []uint16{41001},
+	}
+	data, err := encodeSetupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, readyManifestName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	setup := validatedSetup{config: SetupConfig{InstallationID: "refresh"}, stateRoot: root, ownerSID: manifest.OwnerSID}
+	if prior, err := loadOwnedReadyManifestWithVerifier(setup, allowBrokerPaths{}, hashFile); err != nil || prior == nil {
+		t.Fatalf("valid refresh manifest = %#v, %v", prior, err)
+	}
+	if _, err := loadOwnedReadyManifestWithVerifier(setup, rejectBrokerPaths{errors.New("unprotected")}, hashFile); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("unprotected refresh error = %v", err)
+	}
+	wrongHash := func(string) (string, error) { return strings.Repeat("0", 64), nil }
+	if _, err := loadOwnedReadyManifestWithVerifier(setup, allowBrokerPaths{}, wrongHash); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("modified host refresh error = %v", err)
 	}
 }

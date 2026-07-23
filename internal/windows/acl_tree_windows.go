@@ -47,7 +47,20 @@ func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error)
 	if root == nil || root.NativeHandle() == 0 || root.Exact() || !root.IsDir() {
 		return nil, errors.New("sandbox: retained ACL tree requires an open directory handle")
 	}
-	rootObject, err := openBoundWin32ACLObject(win.Handle(root.NativeHandle()), root.Target(), true, true)
+	source := win.Handle(root.NativeHandle())
+	granted, accessErr := handleGrantedAccess(source)
+	var rootObject *win32ACLObject
+	var err error
+	if accessErr == nil && granted&(win.READ_CONTROL|win.WRITE_DAC) == win.READ_CONTROL|win.WRITE_DAC {
+		// Elevated grants acquire ACL authority during validation, so retaining
+		// that exact kernel object is mandatory.
+		rootObject, err = duplicateBoundWin32ACLObject(source, root.Target(), true)
+	} else {
+		// Restricted-mode policy handles intentionally carry only identity
+		// authority; their established projection path performs the separately
+		// identity-checked ACL open.
+		rootObject, err = openBoundWin32ACLObject(source, root.Target(), true, true)
+	}
 	if err != nil {
 		return nil, err
 	}

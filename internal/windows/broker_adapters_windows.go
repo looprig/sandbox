@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -170,6 +171,38 @@ type authorizedBrokerPipeConnection struct {
 	impersonator brokerPipeImpersonator
 }
 
+// runUnderBrokerClientImpersonation confines thread-affine named-pipe
+// impersonation to a dedicated locked OS thread. If RevertToSelf fails, the
+// goroutine exits without unlocking so the Go runtime retires the poisoned
+// thread instead of returning client authority to its worker pool.
+func runUnderBrokerClientImpersonation(impersonator brokerPipeImpersonator, pipe win.Handle, operation func() error) error {
+	if impersonator == nil || operation == nil {
+		return errBrokerClientUnauthorized
+	}
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		reusable := false
+		defer func() {
+			if reusable {
+				runtime.UnlockOSThread()
+			}
+		}()
+		if err := impersonator.Impersonate(pipe); err != nil {
+			reusable = true
+			done <- fmt.Errorf("impersonate broker client: %w", err)
+			return
+		}
+		operationErr := operation()
+		revertErr := impersonator.Revert()
+		if revertErr == nil {
+			reusable = true
+		}
+		done <- errors.Join(operationErr, revertErr)
+	}()
+	return <-done
+}
+
 func (connection *authorizedBrokerPipeConnection) AuthorizeObject(reference brokerObjectReference) (brokerAuthorizedObject, error) {
 	if connection == nil || connection.authenticatedBrokerConnection == nil || connection.impersonator == nil || validateBrokerObject(reference) != nil {
 		return brokerAuthorizedObject{}, errBrokerClientUnauthorized
@@ -191,16 +224,16 @@ func (connection *authorizedBrokerPipeConnection) AuthorizeObject(reference brok
 			_ = win.CloseHandle(authorityHandle)
 		}
 	}()
-	if err := connection.impersonator.Impersonate(connection.pipe); err != nil {
-		return brokerAuthorizedObject{}, fmt.Errorf("impersonate broker client: %w", err)
-	}
-	object, openErr := openBoundWin32ACLObject(authorityHandle, reference.Path, reference.Kind == brokerObjectDirectory, false)
-	revertErr := connection.impersonator.Revert()
-	if openErr != nil || revertErr != nil {
+	var object *win32ACLObject
+	openErr := runUnderBrokerClientImpersonation(connection.impersonator, connection.pipe, func() (err error) {
+		object, err = openBoundWin32ACLObject(authorityHandle, reference.Path, reference.Kind == brokerObjectDirectory, false)
+		return err
+	})
+	if openErr != nil {
 		if object != nil {
 			_ = object.close()
 		}
-		return brokerAuthorizedObject{}, errors.Join(openErr, revertErr)
+		return brokerAuthorizedObject{}, openErr
 	}
 	snapshot, err := object.snapshot()
 	closeErr := object.close()
@@ -749,7 +782,9 @@ func (issuer win32BrokerTokenIssuer) IssueRestricted(account brokerAccountKind, 
 	if restrictor == nil {
 		restrictor = win32BrokerTokenRestrictor{}
 	}
-	restrictedToken, restrictErr := restrictor.Restrict(unrestricted, []SID{installation, restricting})
+	restrictedToken, restrictErr := restrictor.Restrict(unrestricted, []SID{
+		restrictedCodeSID(), installation, restricting,
+	})
 	closeErr := issuer.native.CloseToken(unrestricted)
 	if restrictErr != nil || closeErr != nil {
 		if restrictedToken != 0 {
@@ -798,7 +833,9 @@ func (process *windowsBrokerClientProcess) DuplicateClientHandle(source win.Hand
 }
 
 func createBrokerRestrictedToken(source win.Token, trustees []SID) (win.Token, error) {
-	if len(trustees) != 2 || trustees[0].kind != sidKindInstallation || !trustees[0].isModuleTrustee() || !trustees[1].isRestrictedTierTrustee() {
+	if len(trustees) != 3 || !trustees[0].isRestrictedCode() ||
+		trustees[1].kind != sidKindInstallation || !trustees[1].isModuleTrustee() ||
+		!trustees[2].isRestrictedTierTrustee() {
 		return 0, errors.New("windows sandbox: invalid broker restricting SID set")
 	}
 	parsed := make([]*win.SID, len(trustees))
@@ -809,7 +846,8 @@ func createBrokerRestrictedToken(source win.Token, trustees []SID) (win.Token, e
 		}
 		parsed[index] = sid
 	}
-	if win.EqualSid(parsed[0], parsed[1]) {
+	if win.EqualSid(parsed[0], parsed[1]) || win.EqualSid(parsed[0], parsed[2]) ||
+		win.EqualSid(parsed[1], parsed[2]) {
 		return 0, errors.New("windows sandbox: duplicate broker restricting SID")
 	}
 	tokenType, err := tokenUint32Information(source, win.TokenType)
