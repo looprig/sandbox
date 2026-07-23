@@ -240,7 +240,12 @@ func validateGrantClass(kind, scope, class, target string) (grantDelta, uint64, 
 		if err != nil || normalized.String() != target {
 			return grantDelta{}, 0, ErrGrantMalformed
 		}
-		return grantDelta{class: class, target: &normalized}, GuaranteeTargetNetwork, nil
+		// A target proxy is authority only when direct egress is independently
+		// closed. Target normalization/authentication without the offline
+		// NetworkBoundary would merely be advisory because the child could
+		// bypass the listener.
+		return grantDelta{class: class, target: &normalized},
+			GuaranteeNetworkBoundary | GuaranteeTargetNetwork, nil
 	default:
 		return grantDelta{}, 0, ErrGrantUnsupported
 	}

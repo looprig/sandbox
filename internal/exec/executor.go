@@ -530,6 +530,22 @@ func (e *Executor) IssueGrant(ctx context.Context, executionID, command, cwd, ki
 
 type grantTargetAvailabilityFunc func(grantDelta) error
 
+// grantClassBackend is an optional narrowing seam for a backend whose platform
+// cannot enforce one of the canonical grant classes. Absence preserves the
+// canonical cross-platform behavior; an explicit false always fails closed
+// before a token is minted or consumed.
+type grantClassBackend interface {
+	SupportsGrantClass(string) bool
+}
+
+func (e *Executor) supportsGrantClass(class string) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	support, ok := e.backend.(grantClassBackend)
+	return !ok || support.SupportsGrantClass(class)
+}
+
 // issueGrant accepts the platform availability check as a narrow test seam so
 // ordering tests can prove that no target probe precedes canonical validation.
 func (e *Executor) issueGrant(ctx context.Context, executionID, command, cwd, kind, scope, class, target string, expiryUnixMilli int64, checkAvailability grantTargetAvailabilityFunc) (string, error) {
@@ -561,6 +577,9 @@ func (e *Executor) issueGrant(ctx context.Context, executionID, command, cwd, ki
 		return "", ErrGrantWrongCommand
 	}
 	if class == GrantClassNetworkProxyTarget && e.proxy == nil {
+		return "", ErrGrantUnsupported
+	}
+	if !e.supportsGrantClass(class) {
 		return "", ErrGrantUnsupported
 	}
 	if err := e.authorizeGrantScope(kind, authorizedScope); err != nil {
@@ -748,6 +767,9 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		delta, requiredBits, err := validateGrantClass(classKind(payload.Class), classScope(payload.Class, payload.Target), payload.Class, payload.Target)
 		if err != nil {
 			return nil, -1, err
+		}
+		if !e.supportsGrantClass(payload.Class) {
+			return nil, -1, ErrGrantUnsupported
 		}
 		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
 			return nil, -1, ErrGrantGuaranteeMismatch

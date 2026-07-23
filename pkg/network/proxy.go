@@ -87,6 +87,28 @@ func NewProxy(route Route) (*Proxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: listen for egress proxy: %w", err)
 	}
+	proxy, err := NewProxyWithListener(route, listener)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	return proxy, nil
+}
+
+// NewProxyWithListener starts an authenticated enforcement proxy on an
+// already-bound loopback TCP listener. The caller retains ownership when
+// validation fails; after a successful return, Proxy.Close owns the listener.
+//
+// This seam lets a platform reserve every permitted loopback port before
+// sandbox construction and then make a one-way transition of exactly one
+// reservation into the proxy endpoint. It never falls back to another port.
+func NewProxyWithListener(route Route, listener net.Listener) (*Proxy, error) {
+	if err := route.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateProxyListener(listener); err != nil {
+		return nil, err
+	}
 	proxy := &Proxy{
 		route: route, listener: listener, executions: make(map[string]*proxyAuthorization),
 		tunnels: make(map[*proxyTunnel]struct{}), connectHandshakeTimeout: proxyCONNECTHandshakeTimeout,
@@ -97,6 +119,18 @@ func NewProxy(route Route) (*Proxy, error) {
 	}
 	go func() { _ = proxy.server.Serve(listener) }()
 	return proxy, nil
+}
+
+func validateProxyListener(listener net.Listener) error {
+	if listener == nil {
+		return errors.New("sandbox: egress proxy listener is required")
+	}
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || address == nil || address.Port <= 0 || address.Port > 65535 ||
+		address.IP == nil || !address.IP.IsLoopback() {
+		return errors.New("sandbox: egress proxy listener must be loopback TCP")
+	}
+	return nil
 }
 
 func (proxy *Proxy) Addr() string {
@@ -487,13 +521,15 @@ func (proxy *Proxy) Close() error {
 		proxy.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), proxyHeaderTimeout)
 		defer cancel()
-		proxy.closeErr = proxy.server.Shutdown(ctx)
-		if proxy.closeErr == nil {
-			proxy.closeErr = proxy.listener.Close()
-			if errors.Is(proxy.closeErr, net.ErrClosed) {
-				proxy.closeErr = nil
-			}
+		shutdownErr := proxy.server.Shutdown(ctx)
+		listenerErr := proxy.listener.Close()
+		if errors.Is(listenerErr, net.ErrClosed) {
+			listenerErr = nil
 		}
+		// Shutdown can return on a deadline without closing its listeners. The
+		// adopted endpoint is security state, so always close it explicitly and
+		// preserve both errors.
+		proxy.closeErr = errors.Join(shutdownErr, listenerErr)
 		proxy.mu.Lock()
 		proxy.executions = nil
 		proxy.mu.Unlock()

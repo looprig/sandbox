@@ -359,6 +359,101 @@ func TestIssueGrantClassesAndBindings(t *testing.T) {
 	}
 }
 
+func TestUnsupportedBackendGrantClassDoesNotMintOrConsumeToken(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	backend := &classNarrowingBackend{
+		captureBackend: &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub},
+		unsupported:    GrantClassNetworkBroad,
+	}
+	executor, err := newTestExecutor(profile, withBackend(backend), withClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var availabilityChecks int
+	_, err = executor.issueGrant(context.Background(), "exec-unsupported", "true", workspace,
+		"network", "", GrantClassNetworkBroad, "tcp:*:443", now.Add(time.Minute).UnixMilli(),
+		func(grantDelta) error {
+			availabilityChecks++
+			return nil
+		})
+	if !errors.Is(err, ErrGrantUnsupported) {
+		t.Fatalf("IssueGrant error = %v, want ErrGrantUnsupported", err)
+	}
+	if availabilityChecks != 0 {
+		t.Fatalf("unsupported class reached target availability %d times", availabilityChecks)
+	}
+
+	// Model a previously minted or externally retained token crossing a backend
+	// capability change. Execution must reject it before replay state changes.
+	token, err := mintGrant(executor.grantKey, grantPayload{
+		ExecutionID: "exec-unsupported", Command: "true", WorkingDirectory: workspace,
+		ProfileFingerprint: executor.settings.Fingerprint,
+		RouteFingerprint:   executor.routeFingerprint,
+		GuaranteeBits:      executor.guaranteeBits,
+		Class:              GrantClassNetworkBroad,
+		Target:             "tcp:*:443",
+		ExpiryUnixMilli:    now.Add(time.Minute).UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := executor.RunCommandWithGrants(context.Background(), "exec-unsupported", workspace, "true", []string{token}); !errors.Is(err, ErrGrantUnsupported) {
+		t.Fatalf("RunCommandWithGrants error = %v, want ErrGrantUnsupported", err)
+	}
+	if got := len(executor.usedGrants); got != 0 {
+		t.Fatalf("unsupported class consumed %d grant tokens", got)
+	}
+}
+
+func TestProxyTargetGrantRequiresVerifiedOfflineBoundary(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	route, err := NewDirectEgressRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Target parsing and proxy authentication are not an offline posture. A
+	// backend must independently prove that direct egress is denied.
+	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeTargetNetwork | GuaranteeEnvScrub}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
+		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("not-offline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate drift between executor construction and issuance. The token
+	// layer must retain the same fail-closed check as construction.
+	executor.guaranteeBits &^= GuaranteeNetworkBoundary
+	_, err = executor.IssueGrant(context.Background(), "exec-not-offline", "true", workspace,
+		"network", "", GrantClassNetworkProxyTarget, "tcp:example.test:443", now.Add(time.Minute).UnixMilli())
+	if !errors.Is(err, ErrGrantGuaranteeMismatch) {
+		t.Fatalf("IssueGrant error = %v, want ErrGrantGuaranteeMismatch", err)
+	}
+}
+
+type classNarrowingBackend struct {
+	*captureBackend
+	unsupported string
+}
+
+func (backend *classNarrowingBackend) SupportsGrantClass(class string) bool {
+	return class != backend.unsupported
+}
+
 func TestIssueGrantRejectsMismatchedScopeAndCommandTarget(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())

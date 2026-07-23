@@ -18,6 +18,49 @@ import (
 	"time"
 )
 
+func TestNewProxyWithListenerAdoptsExactLoopbackEndpoint(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := NewDirectRoute()
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	want := listener.Addr().String()
+	proxy, err := NewProxyWithListener(route, listener)
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	if got := proxy.Addr(); got != want {
+		_ = proxy.Close()
+		t.Fatalf("proxy address = %q, want reserved address %q", got, want)
+	}
+	if err := proxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if connection, err := net.DialTimeout("tcp", want, 100*time.Millisecond); err == nil {
+		_ = connection.Close()
+		t.Fatal("adopted listener remained open after proxy Close")
+	}
+}
+
+func TestNewProxyWithListenerRejectsUnsafeEndpointWithoutTakingOwnership(t *testing.T) {
+	route, err := NewDirectRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &stubProxyListener{address: &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 9001}}
+	if _, err := NewProxyWithListener(route, listener); err == nil {
+		t.Fatal("non-loopback listener accepted")
+	}
+	if listener.closed.Load() {
+		t.Fatal("failed constructor took ownership of caller's listener")
+	}
+}
+
 func TestProxyAuthenticationExactTargetAndPrivateDenial(t *testing.T) {
 	origin := newHTTPOrigin(t)
 	_, port, _ := net.SplitHostPort(origin.Listener.Addr().String())
@@ -105,6 +148,18 @@ func TestProxyAuthenticationExactTargetAndPrivateDenial(t *testing.T) {
 		t.Fatalf("private target denial = %v, want ErrTargetDenied", denial)
 	}
 }
+
+type stubProxyListener struct {
+	address net.Addr
+	closed  atomic.Bool
+}
+
+func (listener *stubProxyListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (listener *stubProxyListener) Close() error {
+	listener.closed.Store(true)
+	return nil
+}
+func (listener *stubProxyListener) Addr() net.Addr { return listener.address }
 
 func TestPublicDestinationRejectsSpecialUsePrefixes(t *testing.T) {
 	for _, prefix := range deniedDestinationPrefixes {
