@@ -69,6 +69,18 @@ type executorConfig struct {
 	processTree processTreeFactory
 }
 
+// egressProxyBackend is an optional capability implemented by a backend that
+// must reserve the loopback proxy endpoint as part of its platform boundary.
+// The returned proxy is shared by every Executor in one ExecutorSet. release
+// relinquishes any reservation state that remains after Proxy.Close and must be
+// safe to call exactly once.
+//
+// Backends without this capability retain the legacy behavior: ExecutorSet
+// creates and owns one network.Proxy per memoized Executor.
+type egressProxyBackend interface {
+	ReserveEgressProxy(network.Route) (*network.Proxy, func() error, error)
+}
+
 // Executor compiles a policy.Effective once via the platform backend and then runs
 // commands under the resulting reusable spawn transform (SPEC §6, §7). It
 // holds the compiled policy, the chosen backend, its enforce.Spec, the compilation
@@ -96,6 +108,10 @@ type Executor struct {
 	grantTTL            time.Duration
 	routeFingerprint    string
 	proxy               *network.Proxy
+	proxyRelease        func() error
+	proxyOwned          bool
+	proxyReleaseOnce    sync.Once
+	proxyReleaseErr     error
 	home                string
 	tmp                 string
 	grantMu             sync.Mutex
@@ -144,17 +160,9 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 	// platformBackend can fail (an unsupported platform, or — on Linux — a re-exec
 	// backend selected without Init() having been called), which fails construction
 	// closed rather than building an executor that would spawn incorrectly.
-	b := config.backend
-	if b == nil {
-		if prof != nil && settings.Isolation == Unconfined {
-			b = enforce.NewNull()
-		} else {
-			var berr error
-			b, berr = platform.Backend(config.platform)
-			if berr != nil {
-				return nil, berr
-			}
-		}
+	b, err := selectExecutorBackend(prof, settings, config)
+	if err != nil {
+		return nil, err
 	}
 	spec, report, level, bits, err := b.Compile(p)
 	if err != nil {
@@ -208,6 +216,20 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		quarantine:          quarantine,
 		processTree:         processTree,
 	}, nil
+}
+
+// selectExecutorBackend resolves the backend without compiling a policy.
+// ExecutorSet calls it once and pins the result so all keyed executors share
+// the same backend instance. The direct unit-test seam may still enter
+// newExecutorFromEffective with no preselected backend.
+func selectExecutorBackend(prof *Profile, settings profile.Settings, config executorConfig) (enforce.Backend, error) {
+	if config.backend != nil {
+		return config.backend, nil
+	}
+	if prof != nil && settings.Isolation == Unconfined {
+		return enforce.NewNull(), nil
+	}
+	return platform.Backend(config.platform)
 }
 
 // clockOrDefault resolves the executor clock, defaulting to time.Now.

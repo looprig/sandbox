@@ -84,6 +84,12 @@ type ExecutorSet struct {
 	closeErr              error
 	closeDone             chan struct{}
 	windowsRuntimeRelease func()
+	sharedProxy           *network.Proxy
+	sharedProxyRelease    func() error
+	sharedProxyAttempted  bool
+	sharedProxyErr        error
+	sharedProxyCloseOnce  sync.Once
+	sharedProxyCloseErr   error
 }
 
 // NewExecutorSet creates one owner-only child beneath a required scratch root.
@@ -119,6 +125,12 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 		return nil, fmt.Errorf("sandbox: executor set scratch root: %w", err)
 	}
 	snapshotWindowsOptions(&config, scratch)
+	backend, err := selectExecutorBackend(prof, prof.Settings(), config.executor)
+	if err != nil {
+		config.windowsRuntimeRelease()
+		return nil, err
+	}
+	config.executor.backend = backend
 	owned, err := os.MkdirTemp(scratch, "sandbox-executors-")
 	if err != nil {
 		config.windowsRuntimeRelease()
@@ -227,8 +239,10 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	pol.FS = append(pol.FS, policy.FSEntry{Path: tmp, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
 	pol.ProjectionRoots = append(pol.ProjectionRoots, tmp)
 	var proxy *network.Proxy
+	var proxyRelease func() error
+	var proxyOwned bool
 	if set.route != nil {
-		proxy, err = network.NewProxy(*set.route)
+		proxy, proxyRelease, proxyOwned, err = set.acquireEgressProxy()
 		if err != nil {
 			if ownedHome {
 				_ = os.RemoveAll(home)
@@ -239,12 +253,12 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 		_, portText, splitErr := net.SplitHostPort(proxy.Addr())
 		port, parseErr := strconv.ParseUint(portText, 10, 16)
 		if splitErr != nil || parseErr != nil || port == 0 {
-			_ = proxy.Close()
+			closeErr := set.releaseFailedEgressProxy(proxy, proxyRelease, proxyOwned)
 			if ownedHome {
 				_ = os.RemoveAll(home)
 			}
 			_ = os.RemoveAll(tmp)
-			return nil, errors.New("sandbox: invalid egress proxy listener")
+			return nil, errors.Join(errors.New("sandbox: invalid egress proxy listener"), closeErr)
 		}
 		pol.Net = policy.NetPolicy{ProxyPort: uint16(port)}
 	}
@@ -253,7 +267,7 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	executor, err := newExecutorFromEffective(set.profile, pol, config)
 	if err != nil {
 		if proxy != nil {
-			_ = proxy.Close()
+			err = errors.Join(err, set.releaseFailedEgressProxy(proxy, proxyRelease, proxyOwned))
 		}
 		if ownedHome {
 			_ = os.RemoveAll(home)
@@ -265,6 +279,8 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	executor.tmp = tmp
 	if proxy != nil {
 		executor.proxy = proxy
+		executor.proxyRelease = proxyRelease
+		executor.proxyOwned = proxyOwned
 		executor.routeFingerprint = set.route.Fingerprint()
 		executor.guaranteeBits = executor.composeRouteGuarantees(executor.guaranteeBits)
 	}
@@ -306,8 +322,9 @@ func (set *ExecutorSet) Close() error {
 		releaseErr = errors.Join(releaseErr, executor.releaseCompiledSpec())
 	}
 	for _, executor := range executors {
-		executor.revokeResources()
+		releaseErr = errors.Join(releaseErr, executor.revokeResources())
 	}
+	releaseErr = errors.Join(releaseErr, set.closeSharedProxy())
 	if set.windowsRuntimeRelease != nil {
 		set.windowsRuntimeRelease()
 	}
@@ -331,9 +348,9 @@ func (e *Executor) markClosed() {
 	e.grantExpiryWG.Wait()
 }
 
-func (e *Executor) revokeResources() {
+func (e *Executor) revokeResources() error {
 	if e == nil {
-		return
+		return nil
 	}
 	e.grantMu.Lock()
 	e.closed = true
@@ -347,7 +364,82 @@ func (e *Executor) revokeResources() {
 	proxy := e.proxy
 	e.grantMu.Unlock()
 	e.grantExpiryWG.Wait()
-	if proxy != nil {
-		_ = proxy.Close()
+	if proxy != nil && e.proxyOwned {
+		e.proxyReleaseOnce.Do(func() {
+			e.proxyReleaseErr = errors.Join(proxy.Close(), callRelease(e.proxyRelease))
+		})
 	}
+	return e.proxyReleaseErr
+}
+
+func (set *ExecutorSet) acquireEgressProxy() (*network.Proxy, func() error, bool, error) {
+	provider, shared := set.executor.backend.(egressProxyBackend)
+	if !shared {
+		proxy, err := network.NewProxy(*set.route)
+		return proxy, nil, true, err
+	}
+	if set.sharedProxyAttempted {
+		if set.sharedProxyErr != nil {
+			return nil, nil, false, set.sharedProxyErr
+		}
+		return set.sharedProxy, nil, false, nil
+	}
+	set.sharedProxyAttempted = true
+	proxy, release, err := provider.ReserveEgressProxy(*set.route)
+	if err != nil {
+		set.sharedProxyErr = errors.Join(err, closeProxyResources(proxy, release))
+		return nil, nil, false, set.sharedProxyErr
+	}
+	if proxy == nil {
+		set.sharedProxyErr = errors.Join(
+			errors.New("sandbox: backend returned no egress proxy"),
+			callRelease(release),
+		)
+		return nil, nil, false, set.sharedProxyErr
+	}
+	set.sharedProxy = proxy
+	set.sharedProxyRelease = release
+	return proxy, nil, false, nil
+}
+
+func (set *ExecutorSet) releaseFailedEgressProxy(proxy *network.Proxy, release func() error, owned bool) error {
+	if owned {
+		return closeProxyResources(proxy, release)
+	}
+	// A shared proxy belongs to the set, not the individual construction
+	// attempt. If another keyed executor already exists it may have active
+	// authenticated executions, so retain the proxy until ExecutorSet.Close.
+	if len(set.executors) != 0 {
+		return nil
+	}
+	err := set.closeSharedProxy()
+	set.sharedProxyErr = errors.Join(errors.New("sandbox: shared egress proxy unavailable after executor construction failure"), err)
+	return err
+}
+
+func (set *ExecutorSet) closeSharedProxy() error {
+	if set == nil {
+		return nil
+	}
+	set.sharedProxyCloseOnce.Do(func() {
+		set.sharedProxyCloseErr = closeProxyResources(set.sharedProxy, set.sharedProxyRelease)
+		set.sharedProxy = nil
+		set.sharedProxyRelease = nil
+	})
+	return set.sharedProxyCloseErr
+}
+
+func closeProxyResources(proxy *network.Proxy, release func() error) error {
+	var closeErr error
+	if proxy != nil {
+		closeErr = proxy.Close()
+	}
+	return errors.Join(closeErr, callRelease(release))
+}
+
+func callRelease(release func() error) error {
+	if release == nil {
+		return nil
+	}
+	return release()
 }
