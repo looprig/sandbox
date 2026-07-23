@@ -28,10 +28,17 @@ func PlatformBackend(config Config, runtime *RestrictedRuntime) (enforce.Backend
 		return nil, err
 	}
 	switch config.Mode {
-	case Auto, RestrictedToken:
+	case Auto:
+		restrictedConfig := config
+		restrictedConfig.Mode = Auto
+		return &autoBackend{
+			elevated:   newElevatedBackend(config),
+			restricted: newRestrictedBackend(restrictedConfig, runtime),
+		}, nil
+	case RestrictedToken:
 		return newRestrictedBackend(config, runtime), nil
 	case Elevated:
-		return nil, ErrSetupRequired
+		return newElevatedBackend(config), nil
 	default:
 		panic("validated Windows mode became invalid")
 	}

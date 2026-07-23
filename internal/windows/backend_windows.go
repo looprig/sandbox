@@ -46,6 +46,28 @@ type restrictedBackend struct {
 	baseActive bool
 }
 
+// autoBackend prefers the installed tier. It falls back only when that tier is
+// unavailable, never after a malformed/partially constructed elevated result.
+// The restricted compiler independently rejects requirements it cannot prove.
+type autoBackend struct {
+	elevated   enforce.Backend
+	restricted enforce.Backend
+}
+
+func (backend *autoBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+	if backend == nil || backend.elevated == nil || backend.restricted == nil {
+		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, errors.New("sandbox: invalid Windows auto backend")
+	}
+	spec, report, level, bits, err := backend.elevated.Compile(policy.Clone(p))
+	if err == nil {
+		return spec, report, level, bits, nil
+	}
+	if !errors.Is(err, ErrSetupRequired) {
+		return spec, report, level, bits, err
+	}
+	return backend.restricted.Compile(policy.Clone(p))
+}
+
 func newRestrictedBackend(config Config, runtime *RestrictedRuntime) enforce.Backend {
 	return &restrictedBackend{config: config, runtime: runtime, deps: restrictedCompileDependencies{
 		prepare:   prepareRestrictedLease,
