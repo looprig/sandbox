@@ -51,6 +51,38 @@ func TestSealCredentialRejectsBroadOrInheritedCiphertextACL(t *testing.T) {
 	}
 }
 
+func TestAtomicCredentialStoreRejectsNamesAndDelegatesExactPath(t *testing.T) {
+	files := &fakeCredentialFileOps{protection: credentialProtection{SystemRead: true, AdministratorsRead: true}}
+	store := atomicCredentialStore{root: `C:\ProgramData\Looprig\state`, files: files}
+	if err := store.WriteProtected("offline", []byte("cipher")); err != nil {
+		t.Fatal(err)
+	}
+	if files.path != `C:\ProgramData\Looprig\state\offline.dpapi` {
+		t.Fatalf("path = %q", files.path)
+	}
+	for _, name := range []string{"", `..\foreign`, `C:escape`, `nested/name`} {
+		if err := store.WriteProtected(name, []byte("cipher")); err == nil {
+			t.Fatalf("accepted credential name %q", name)
+		}
+	}
+}
+
+func TestOpenCredentialZerosCiphertextAndReturnsMutablePassword(t *testing.T) {
+	store := &fakeCredentialStore{data: []byte("cipher"), protection: credentialProtection{SystemRead: true, AdministratorsRead: true}}
+	unprotector := &fakeUnprotector{}
+	password, err := openCredential(store, unprotector, "offline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(password) != "password" || !allZero(unprotector.seen) || !allZero(store.data) {
+		t.Fatalf("credential buffers not handled safely: password=%q seen=%v ciphertext=%v", password, unprotector.seen, store.data)
+	}
+	zeroBytes(password)
+	if !allZero(password) {
+		t.Fatal("returned password is not mutable")
+	}
+}
+
 type fakeCredentialProtector struct {
 	seen       []byte
 	ciphertext []byte
@@ -70,10 +102,39 @@ type fakeCredentialStore struct {
 	removed    bool
 }
 
+type fakeCredentialFileOps struct {
+	path       string
+	data       []byte
+	protection credentialProtection
+}
+
+func (f *fakeCredentialFileOps) AtomicWrite(path string, data []byte) error {
+	f.path = path
+	f.data = append([]byte(nil), data...)
+	return nil
+}
+func (f *fakeCredentialFileOps) Inspect(path string) (credentialProtection, error) {
+	f.path = path
+	return f.protection, nil
+}
+func (f *fakeCredentialFileOps) Read(path string) ([]byte, error) {
+	f.path = path
+	return append([]byte(nil), f.data...), nil
+}
+func (f *fakeCredentialFileOps) Remove(path string) error { f.path = path; return nil }
+
 func (f *fakeCredentialStore) InspectProtection(string) (credentialProtection, error) {
 	return f.protection, nil
 }
-func (f *fakeCredentialStore) RemoveProtected(string) error { f.removed = true; return nil }
+func (f *fakeCredentialStore) ReadProtected(string) ([]byte, error) { return f.data, nil }
+func (f *fakeCredentialStore) RemoveProtected(string) error         { f.removed = true; return nil }
+
+type fakeUnprotector struct{ seen []byte }
+
+func (f *fakeUnprotector) Unprotect(ciphertext []byte) ([]byte, error) {
+	f.seen = ciphertext
+	return []byte("password"), nil
+}
 
 func (f *fakeCredentialStore) WriteProtected(name string, ciphertext []byte) error {
 	f.name, f.data, f.systemOnly = name, append([]byte(nil), ciphertext...), true

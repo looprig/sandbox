@@ -43,6 +43,7 @@ func Inspect(ctx context.Context, config SetupConfig) (SetupStatus, error) {
 
 type setupDependencyReadiness struct {
 	service, accounts, credentials, firewallEffective, firewallUnchanged, runtimeBaseline bool
+	portPID                                                                               map[uint16]uint32
 }
 
 type setupDependencyInspector interface {
@@ -88,6 +89,7 @@ func inspectSetup(ctx context.Context, config SetupConfig, dependencies setupDep
 			facts.CredentialsReady = readiness.credentials
 			facts.FirewallEffective = readiness.firewallEffective
 			facts.FirewallUnchanged = readiness.firewallUnchanged
+			facts.PortPID = readiness.portPID
 			facts.RuntimeBaselineReady = readiness.runtimeBaseline
 		}
 	}
@@ -152,6 +154,114 @@ func initializeSetupIdentities(ctx context.Context, setup validatedSetup, manife
 		return brokerIdentityHealth{}, err
 	}
 	return initializeBrokerIdentities(ctx, initializer, desired)
+}
+
+type brokerRuntimeConfig struct {
+	StateRoot, HostPath, InstallationID, OwnerSID string
+	Protocol                                      uint16
+	OfflineAccount, OnlineAccount                 string
+	OfflineCredential, OnlineCredential           string
+	PipeName, JournalPath                         string
+}
+
+func loadInstalledBrokerRuntimeConfig() (brokerRuntimeConfig, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	return loadBrokerRuntimeConfigAt(executable, os.Getenv("ProgramData"))
+}
+
+func loadBrokerRuntimeConfigAt(executable, programData string) (brokerRuntimeConfig, error) {
+	return loadBrokerRuntimeConfigWithVerifier(executable, programData, realBrokerInstallPathVerifier{})
+}
+
+type brokerInstallPathVerifier interface {
+	Verify(path, ownerSID string) error
+}
+type realBrokerInstallPathVerifier struct{}
+
+func (realBrokerInstallPathVerifier) Verify(path, ownerSID string) error {
+	sd, err := win.GetNamedSecurityInfo(path, win.SE_FILE_OBJECT, win.OWNER_SECURITY_INFORMATION|win.DACL_SECURITY_INFORMATION)
+	if err != nil || sd == nil {
+		return errors.Join(errors.New("sandbox: installed broker security descriptor is unavailable"), err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		return err
+	}
+	want, err := win.StringToSid(ownerSID)
+	if err != nil {
+		return err
+	}
+	control, _, err := sd.Control()
+	if err != nil {
+		return err
+	}
+	if owner == nil || !owner.Equals(want) || control&win.SE_DACL_PROTECTED == 0 {
+		return errors.New("sandbox: installed broker object is not manifest-owner protected")
+	}
+	return nil
+}
+
+func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifier brokerInstallPathVerifier) (brokerRuntimeConfig, error) {
+	executable, err := filepath.Abs(executable)
+	if err != nil || !strings.EqualFold(filepath.Base(executable), "sandbox-host.exe") {
+		return brokerRuntimeConfig{}, errors.New("sandbox: broker executable path is invalid")
+	}
+	generationDir, parent := filepath.Dir(executable), filepath.Dir(filepath.Dir(executable))
+	var stateRoot, manifestPath string
+	switch {
+	case strings.EqualFold(filepath.Base(parent), "slots"):
+		stateRoot, manifestPath = filepath.Dir(parent), filepath.Join(filepath.Dir(parent), readyManifestName)
+	case strings.HasPrefix(strings.ToLower(filepath.Base(generationDir)), ".staging-"):
+		stateRoot, manifestPath = filepath.Dir(generationDir), filepath.Join(generationDir, "manifest.json")
+	default:
+		return brokerRuntimeConfig{}, errors.New("sandbox: broker executable is outside an installation generation")
+	}
+	programData, err = filepath.Abs(programData)
+	if err != nil || programData == "." {
+		return brokerRuntimeConfig{}, errors.New("sandbox: ProgramData is unavailable")
+	}
+	relative, err := filepath.Rel(programData, stateRoot)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, `..\`) {
+		return brokerRuntimeConfig{}, errors.New("sandbox: broker state root is outside ProgramData")
+	}
+	if err := rejectExistingSetupReparse(programData, stateRoot); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	manifest, err := decodeSetupManifest(data)
+	if err != nil || (manifest.State != setupStateReady && manifest.State != setupStateStaging) {
+		return brokerRuntimeConfig{}, errors.Join(errors.New("sandbox: broker manifest is not usable"), err)
+	}
+	if verifier == nil {
+		return brokerRuntimeConfig{}, errors.New("sandbox: broker path verifier is unavailable")
+	}
+	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	if err := verifier.Verify(executable, manifest.OwnerSID); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	digest, err := hashFile(executable)
+	if err != nil || !strings.EqualFold(digest, manifest.HostSHA256) {
+		return brokerRuntimeConfig{}, errors.Join(errors.New("sandbox: broker executable hash does not match manifest"), err)
+	}
+	if manifest.State == setupStateReady && !strings.EqualFold(filepath.Clean(manifest.HostPath), filepath.Clean(executable)) {
+		return brokerRuntimeConfig{}, errors.New("sandbox: ready manifest does not own broker executable")
+	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	credentials, suffix := filepath.Join(stateRoot, "credentials"), strings.TrimPrefix(names.Service, "lsb-svc-")
+	return brokerRuntimeConfig{StateRoot: filepath.Clean(stateRoot), HostPath: filepath.Clean(executable), InstallationID: manifest.InstallationID, OwnerSID: manifest.OwnerSID, Protocol: manifest.Protocol,
+		OfflineAccount: names.Offline, OnlineAccount: names.Online, OfflineCredential: filepath.Join(credentials, "offline.dpapi"), OnlineCredential: filepath.Join(credentials, "online.dpapi"),
+		PipeName: `\\.\pipe\looprig-sandbox-` + suffix, JournalPath: filepath.Join(stateRoot, "broker-leases.journal")}, nil
 }
 
 func Remove(context.Context, SetupConfig) error { return enforce.ErrUnavailable }

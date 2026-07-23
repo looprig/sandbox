@@ -5,9 +5,49 @@ package windows
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadBrokerRuntimeConfigDerivesOnlyFromInstalledExecutable(t *testing.T) {
+	programData := t.TempDir()
+	root := filepath.Join(programData, "Looprig")
+	executable := filepath.Join(root, "slots", "generation", "sandbox-host.exe")
+	if err := os.MkdirAll(filepath.Dir(executable), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := setupManifest{Version: setupManifestVersion, State: setupStateReady, InstallationID: "install", OwnerSID: "S-1-5-21-1", HostPath: executable, HostSHA256: digest, ProxyPorts: []uint16{9001}, Protocol: brokerProtocolVersion}
+	data, err := encodeSetupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, readyManifestName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadBrokerRuntimeConfigWithVerifier(executable, programData, allowBrokerPaths{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.InstallationID != "install" || config.OwnerSID != manifest.OwnerSID || config.Protocol != brokerProtocolVersion || config.OfflineAccount == "" || config.OnlineAccount == "" || config.PipeName == "" || config.JournalPath == "" {
+		t.Fatalf("incomplete broker config: %#v", config)
+	}
+	if _, err := loadBrokerRuntimeConfigWithVerifier(filepath.Join(root, "attacker.exe"), programData, allowBrokerPaths{}); err == nil {
+		t.Fatal("accepted executable outside installed generation")
+	}
+}
+
+type allowBrokerPaths struct{}
+
+func (allowBrokerPaths) Verify(string, string) error { return nil }
 
 type fakeHostInstaller struct {
 	fail       string

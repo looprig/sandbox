@@ -3,8 +3,10 @@
 package windows
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -77,10 +79,124 @@ func TestInitializeBrokerIdentitiesSendsNoCredentialAndRequiresExactHealth(t *te
 	}
 }
 
+func TestSCMServiceAdapterRequiresManifestFingerprintAndReadBack(t *testing.T) {
+	spec := brokerServiceSpec("lsb-svc-0123456789ab", `C:\ProgramData\Looprig\sandbox-host.exe`)
+	identity := serviceSpecIdentity(spec)
+	facade := &fakeSCMFacade{record: brokerServiceRecord{Spec: spec, Identity: identity}}
+	api := scmServiceAPI{scm: facade, ownedIdentity: identity}
+	record, err := api.Create(spec)
+	if err != nil || !record.Owned || facade.created != spec {
+		t.Fatalf("create failed: record=%#v err=%v", record, err)
+	}
+	facade.record.Identity = "different"
+	if _, err := api.Create(spec); err == nil {
+		t.Fatal("SCM read-back mismatch was accepted")
+	}
+	foreign := brokerServiceSpec("foreign", spec.BinaryPath)
+	if _, err := api.Create(foreign); !errors.Is(err, errServiceOwnershipMismatch) {
+		t.Fatalf("foreign spec got %v", err)
+	}
+}
+
+func TestProvisionBrokerIdentityStateCreatesAndRefreshesInsideService(t *testing.T) {
+	desired, err := desiredBrokerState("installation-alpha", `C:\ProgramData\Looprig\slots\one\sandbox-host.exe`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := &fakeRuntimeAccounts{records: map[string]sandboxAccountRecord{}}
+	store := &fakeCredentialStore{protection: credentialProtection{SystemRead: true, AdministratorsRead: true}}
+	runtime := brokerIdentityRuntime{accounts: accounts, protector: freshCredentialProtector{}, store: store, random: bytes.NewReader(bytes.Repeat([]byte{17}, 256))}
+	health, err := provisionBrokerIdentityState(runtime, desired, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.CredentialsProtected || health.OfflineSID == "" || health.OnlineSID == "" || health.OfflineSID == health.OnlineSID {
+		t.Fatalf("unhealthy provision result: %#v", health)
+	}
+	if accounts.passwordUpdates != 0 {
+		t.Fatal("initial creation unexpectedly used refresh path")
+	}
+	runtime.random = bytes.NewReader(bytes.Repeat([]byte{19}, 256))
+	if _, err := provisionBrokerIdentityState(runtime, desired, true); err != nil {
+		t.Fatal(err)
+	}
+	if accounts.passwordUpdates != 2 {
+		t.Fatalf("refresh password updates = %d", accounts.passwordUpdates)
+	}
+}
+
+func TestProtectedBrokerCredentialSourceReturnsCallerOwnedPassword(t *testing.T) {
+	store := &fakeCredentialStore{data: []byte("cipher"), protection: credentialProtection{SystemRead: true, AdministratorsRead: true}}
+	source := protectedBrokerCredentialSource{config: brokerRuntimeConfig{OfflineAccount: "offline-account"}, store: store, unprotector: &fakeUnprotector{}}
+	account, password, err := source.LoadCredential(brokerAccountOffline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account != "offline-account" || string(password) != "password" {
+		t.Fatalf("credential = %q %q", account, password)
+	}
+	zeroBytes(password)
+	if !allZero(password) {
+		t.Fatal("credential source returned immutable password")
+	}
+	if _, _, err := source.LoadCredential(brokerAccountUnspecified); err == nil {
+		t.Fatal("accepted unspecified account")
+	}
+}
+
 type fakeServiceInitializer struct {
 	desired brokerDesiredState
 	health  brokerIdentityHealth
 }
+
+type fakeSCMFacade struct {
+	record  brokerServiceRecord
+	created brokerServiceSpecModel
+	applied brokerServiceSpecModel
+	stopped string
+	deleted string
+}
+
+type freshCredentialProtector struct{}
+
+func (freshCredentialProtector) Protect(plaintext []byte) ([]byte, error) {
+	return append([]byte("cipher-"), plaintext...), nil
+}
+
+type fakeRuntimeAccounts struct {
+	records         map[string]sandboxAccountRecord
+	passwordUpdates int
+	nextSID         int
+}
+
+func (f *fakeRuntimeAccounts) Lookup(name string) (sandboxAccountRecord, error) {
+	record, ok := f.records[name]
+	if !ok {
+		return sandboxAccountRecord{}, errAccountNotFound
+	}
+	return record, nil
+}
+func (f *fakeRuntimeAccounts) Create(record sandboxAccountRecord, _ []byte) (sandboxAccountRecord, error) {
+	f.nextSID++
+	record.SID = fmt.Sprintf("S-1-5-21-%d", f.nextSID)
+	record.Owned = true
+	f.records[record.Name] = record
+	return record, nil
+}
+func (f *fakeRuntimeAccounts) ApplyPolicy(record sandboxAccountRecord) error {
+	f.records[record.Name] = record
+	return nil
+}
+func (f *fakeRuntimeAccounts) SetPassword(string, []byte) error { f.passwordUpdates++; return nil }
+func (f *fakeRuntimeAccounts) Delete(name string) error         { delete(f.records, name); return nil }
+
+func (f *fakeSCMFacade) Lookup(brokerServiceSpecModel) (brokerServiceRecord, error) {
+	return f.record, nil
+}
+func (f *fakeSCMFacade) Create(spec brokerServiceSpecModel) error { f.created = spec; return nil }
+func (f *fakeSCMFacade) Apply(spec brokerServiceSpecModel) error  { f.applied = spec; return nil }
+func (f *fakeSCMFacade) Stop(name string) error                   { f.stopped = name; return nil }
+func (f *fakeSCMFacade) Delete(name string) error                 { f.deleted = name; return nil }
 
 func (f *fakeServiceInitializer) EnsureService(context.Context, brokerServiceSpecModel) error {
 	return nil

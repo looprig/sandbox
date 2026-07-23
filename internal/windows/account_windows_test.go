@@ -120,6 +120,32 @@ func TestRemoveSandboxAccountRequiresManifestIdentity(t *testing.T) {
 	}
 }
 
+func TestNetLSAAdapterPinsSIDAndReadsBackPolicy(t *testing.T) {
+	policy := requiredSandboxAccountPolicy()
+	native := &fakeAccountNative{state: nativeAccountState{SID: "S-1-5-21-100", Policy: policy}}
+	api := netLSAAccountAPI{native: native, ownedSID: map[string]string{"sandbox": "S-1-5-21-100"}}
+	record, err := api.Lookup("sandbox")
+	if err != nil || !record.Owned {
+		t.Fatalf("lookup = %#v, %v", record, err)
+	}
+	if err := api.ApplyPolicy(record); err != nil {
+		t.Fatal(err)
+	}
+	native.state.SID = "S-1-5-21-replaced"
+	if err := api.ApplyPolicy(record); err == nil {
+		t.Fatal("SID replacement escaped read-back validation")
+	}
+}
+
+func TestNetLSAAdapterRollsBackPartiallyCreatedAccount(t *testing.T) {
+	native := &fakeAccountNative{state: nativeAccountState{SID: "S-1-5-21-new"}, setPolicyErr: errors.New("rights failed")}
+	api := netLSAAccountAPI{native: native, ownedSID: map[string]string{}}
+	_, err := api.Create(sandboxAccountRecord{Name: "sandbox", Policy: requiredSandboxAccountPolicy()}, []byte("secret"))
+	if err == nil || native.deletedSID != native.state.SID {
+		t.Fatalf("partial account not rolled back: err=%v native=%#v", err, native)
+	}
+}
+
 type fakeAccountAPI struct {
 	record    sandboxAccountRecord
 	lookupErr error
@@ -128,6 +154,20 @@ type fakeAccountAPI struct {
 	passwords []string
 	deleted   string
 }
+
+type fakeAccountNative struct {
+	state        nativeAccountState
+	setPolicyErr error
+	deletedSID   string
+}
+
+func (f *fakeAccountNative) Lookup(string) (nativeAccountState, error) { return f.state, nil }
+func (f *fakeAccountNative) Create(string, []byte) error               { return nil }
+func (f *fakeAccountNative) SetPassword(string, []byte) error          { return nil }
+func (f *fakeAccountNative) SetPolicy(string, string, sandboxAccountPolicy) error {
+	return f.setPolicyErr
+}
+func (f *fakeAccountNative) Delete(_ string, sid string) error { f.deletedSID = sid; return nil }
 
 func (f *fakeAccountAPI) Lookup(name string) (sandboxAccountRecord, error) {
 	if f.lookupErr != nil {
