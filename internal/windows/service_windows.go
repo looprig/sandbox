@@ -63,6 +63,7 @@ type brokerServiceRecord struct {
 	Spec     brokerServiceSpecModel
 	Identity string
 	Owned    bool
+	Running  bool
 }
 
 type serviceAPI interface {
@@ -407,7 +408,11 @@ func (realSCMFacade) Lookup(want brokerServiceSpecModel) (brokerServiceRecord, e
 		observed.FailureActions = serviceFailureActions{Restart: true, RestartDelayMillis: uint32(actions[0].Delay / time.Millisecond)}
 		observed.FailureActions.ResetPeriodSeconds = resetPeriod
 	}
-	return brokerServiceRecord{Spec: observed, Identity: serviceSpecIdentity(observed)}, nil
+	status, err := service.Query()
+	if err != nil {
+		return brokerServiceRecord{}, err
+	}
+	return brokerServiceRecord{Spec: observed, Identity: serviceSpecIdentity(observed), Running: status.State == svc.Running}, nil
 }
 
 func (realSCMFacade) Create(spec brokerServiceSpecModel) error {

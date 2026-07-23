@@ -24,14 +24,17 @@ const (
 // setupManifest is the only authority for locating the installed host. Source
 // paths are deliberately not persisted, so runtime cannot execute them.
 type setupManifest struct {
-	Version        uint32     `json:"version"`
-	State          setupState `json:"state"`
-	InstallationID string     `json:"installation_id"`
-	OwnerSID       string     `json:"owner_sid"`
-	HostPath       string     `json:"host_path"`
-	HostSHA256     string     `json:"host_sha256"`
-	ProxyPorts     []uint16   `json:"proxy_ports"`
-	Protocol       uint16     `json:"protocol"`
+	Version         uint32     `json:"version"`
+	State           setupState `json:"state"`
+	InstallationID  string     `json:"installation_id"`
+	OwnerSID        string     `json:"owner_sid"`
+	OfflineSID      string     `json:"offline_sid,omitempty"`
+	OnlineSID       string     `json:"online_sid,omitempty"`
+	ServiceIdentity string     `json:"service_identity,omitempty"`
+	HostPath        string     `json:"host_path"`
+	HostSHA256      string     `json:"host_sha256"`
+	ProxyPorts      []uint16   `json:"proxy_ports"`
+	Protocol        uint16     `json:"protocol"`
 }
 
 func (manifest setupManifest) validate() error {

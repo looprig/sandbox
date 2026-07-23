@@ -45,7 +45,7 @@ func PlatformBackend(config Config, runtime *RestrictedRuntime) (enforce.Backend
 }
 
 func Inspect(ctx context.Context, config SetupConfig) (SetupStatus, error) {
-	return inspectSetup(ctx, config, pendingSetupDependencyInspector{})
+	return inspectSetup(ctx, config, productionSetupDependencyInspector())
 }
 
 type setupDependencyReadiness struct {
@@ -57,12 +57,112 @@ type setupDependencyInspector interface {
 	Inspect(context.Context, validatedSetup, setupManifest) (setupDependencyReadiness, error)
 }
 
-// Tasks 15, 16, and the runtime evidence gate replace these fail-closed
-// answers with their narrow live inspectors. Absence is never treated as ready.
-type pendingSetupDependencyInspector struct{}
+// approvedRuntimeEvidenceInspector is deliberately a separate gate. Account,
+// service, credential, firewall, and port health are live machine facts; the
+// runtime baseline is approved evidence produced on supported disposable
+// workers and must never be inferred from those facts.
+type approvedRuntimeEvidenceInspector interface {
+	Approved(context.Context, validatedSetup, setupManifest) (bool, error)
+}
 
-func (pendingSetupDependencyInspector) Inspect(context.Context, validatedSetup, setupManifest) (setupDependencyReadiness, error) {
-	return setupDependencyReadiness{}, nil
+type unavailableApprovedRuntimeEvidence struct{}
+
+func (unavailableApprovedRuntimeEvidence) Approved(context.Context, validatedSetup, setupManifest) (bool, error) {
+	return false, nil
+}
+
+type installedSetupDependencyInspector struct {
+	accounts    accountAPI
+	services    serviceAPI
+	credentials protectedCredentialStore
+	evidence    approvedRuntimeEvidenceInspector
+}
+
+func (i installedSetupDependencyInspector) Inspect(ctx context.Context, setup validatedSetup, manifest setupManifest) (setupDependencyReadiness, error) {
+	if i.accounts == nil || i.services == nil || i.credentials == nil || i.evidence == nil {
+		return setupDependencyReadiness{}, errors.New("sandbox: incomplete installed Windows setup inspector")
+	}
+	readiness := setupDependencyReadiness{}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return readiness, err
+	}
+	offline, offlineErr := i.accounts.Lookup(names.Offline)
+	online, onlineErr := i.accounts.Lookup(names.Online)
+	switch {
+	case offlineErr != nil && !errors.Is(offlineErr, errAccountNotFound):
+		return readiness, offlineErr
+	case onlineErr != nil && !errors.Is(onlineErr, errAccountNotFound):
+		return readiness, onlineErr
+	}
+	readiness.accounts = offlineErr == nil && onlineErr == nil &&
+		manifest.OfflineSID != "" && manifest.OnlineSID != "" &&
+		offline.Owned && online.Owned && offline.SID == manifest.OfflineSID &&
+		online.SID == manifest.OnlineSID && offline.Policy.equal(requiredSandboxAccountPolicy()) &&
+		online.Policy.equal(requiredSandboxAccountPolicy())
+	offlineProtection, offlineCredentialErr := i.credentials.InspectProtection("offline")
+	onlineProtection, onlineCredentialErr := i.credentials.InspectProtection("online")
+	if offlineCredentialErr != nil && !os.IsNotExist(offlineCredentialErr) {
+		return readiness, offlineCredentialErr
+	}
+	if onlineCredentialErr != nil && !os.IsNotExist(onlineCredentialErr) {
+		return readiness, onlineCredentialErr
+	}
+	readiness.credentials = offlineCredentialErr == nil && onlineCredentialErr == nil &&
+		offlineProtection.valid() && onlineProtection.valid()
+	desired, err := desiredBrokerState(manifest.InstallationID, manifest.HostPath)
+	if err != nil {
+		return readiness, err
+	}
+	service, serviceErr := i.services.Lookup(names.Service)
+	if serviceErr != nil && !errors.Is(serviceErr, errServiceNotFound) {
+		return readiness, serviceErr
+	}
+	readiness.service = serviceErr == nil && manifest.ServiceIdentity != "" &&
+		service.Owned && service.Running && service.Identity == manifest.ServiceIdentity &&
+		service.Spec == desired.Service
+	readiness.runtimeBaseline, err = i.evidence.Approved(ctx, setup, manifest)
+	return readiness, err
+}
+
+func productionSetupDependencyInspector() setupDependencyInspector {
+	// The manifest-pinned SIDs and service identity are the sole ownership
+	// source. A deterministic name is never sufficient to adopt an object.
+	// Runtime evidence stays explicitly unavailable until supported-worker
+	// evidence is installed by the evidence phase.
+	return manifestPinnedSetupInspector{
+		evidence: unavailableApprovedRuntimeEvidence{},
+		policy:   windowsFirewallPolicy{api: newNetFwAutomation()},
+		owners:   windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+	}
+}
+
+type manifestPinnedSetupInspector struct {
+	evidence approvedRuntimeEvidenceInspector
+	policy   offlineFirewallPolicy
+	owners   proxyPortOwner
+}
+
+func (i manifestPinnedSetupInspector) Inspect(ctx context.Context, setup validatedSetup, manifest setupManifest) (setupDependencyReadiness, error) {
+	if i.evidence == nil || i.policy == nil || i.owners == nil {
+		return setupDependencyReadiness{}, errors.New("sandbox: incomplete production Windows setup inspector")
+	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return setupDependencyReadiness{}, err
+	}
+	owned := map[string]string{names.Offline: manifest.OfflineSID, names.Online: manifest.OnlineSID}
+	accounts := netLSAAccountAPI{native: realAccountNative{}, ownedSID: owned}
+	base := installedSetupDependencyInspector{
+		accounts:    accounts,
+		services:    scmServiceAPI{scm: realSCMFacade{}, ownedIdentity: manifest.ServiceIdentity},
+		credentials: atomicCredentialStore{root: filepath.Join(setup.stateRoot, "credentials"), files: realCredentialFileOps{}},
+		evidence:    i.evidence,
+	}
+	return (firewallSetupDependencyInspector{
+		base: base, accounts: accountOfflineSIDSource{accounts: accounts},
+		policy: i.policy, owners: i.owners,
+	}).Inspect(ctx, setup, manifest)
 }
 
 func inspectSetup(ctx context.Context, config SetupConfig, dependencies setupDependencyInspector) (SetupStatus, error) {
@@ -271,7 +371,103 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 		PipeName: `\\.\pipe\looprig-sandbox-` + suffix, JournalPath: filepath.Join(stateRoot, "broker-leases.journal")}, nil
 }
 
-func Remove(context.Context, SetupConfig) error { return enforce.ErrUnavailable }
+type setupRemovalMechanisms struct {
+	accounts    accountAPI
+	services    serviceAPI
+	credentials protectedCredentialStore
+	firewall    offlineFirewallPolicy
+	removeFile  func(string) error
+	removeDir   func(string) error
+}
+
+func Remove(ctx context.Context, config SetupConfig) error {
+	validated, err := validateSetupConfig(config, false)
+	if err != nil {
+		return err
+	}
+	if !win.GetCurrentProcessToken().IsElevated() {
+		return ErrElevationRequired
+	}
+	data, err := os.ReadFile(filepath.Join(validated.stateRoot, readyManifestName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read Windows setup manifest for removal: %w", err)
+	}
+	manifest, err := decodeSetupManifest(data)
+	if err != nil {
+		return fmt.Errorf("%w: removal requires a valid owned manifest", ErrSetupStale)
+	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return err
+	}
+	mechanisms := setupRemovalMechanisms{
+		accounts: netLSAAccountAPI{native: realAccountNative{}, ownedSID: map[string]string{
+			names.Offline: manifest.OfflineSID, names.Online: manifest.OnlineSID,
+		}},
+		services:    scmServiceAPI{scm: realSCMFacade{}, ownedIdentity: manifest.ServiceIdentity},
+		credentials: atomicCredentialStore{root: filepath.Join(validated.stateRoot, "credentials"), files: realCredentialFileOps{}},
+		firewall:    windowsFirewallPolicy{api: newNetFwAutomation()},
+		removeFile: func(path string) error {
+			err := os.Remove(path)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		},
+		removeDir: os.RemoveAll,
+	}
+	return removeInstalledSetup(ctx, validated, manifest, mechanisms)
+}
+
+func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest setupManifest, mechanisms setupRemovalMechanisms) error {
+	if mechanisms.accounts == nil || mechanisms.services == nil || mechanisms.credentials == nil ||
+		mechanisms.firewall == nil || mechanisms.removeFile == nil || mechanisms.removeDir == nil {
+		return errors.New("sandbox: incomplete Windows setup removal mechanisms")
+	}
+	if manifest.InstallationID != setup.config.InstallationID || manifest.OwnerSID != setup.ownerSID ||
+		manifest.OfflineSID == "" || manifest.OnlineSID == "" || manifest.ServiceIdentity == "" {
+		return errors.New("sandbox: Windows removal manifest does not pin all owned identities")
+	}
+	if err := validateInstalledHostPath(setup.stateRoot, manifest.HostPath); err != nil {
+		return err
+	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		return err
+	}
+	rules, err := offlineFirewallRules(manifest.InstallationID, manifest.OfflineSID, manifest.ProxyPorts)
+	if err != nil {
+		return err
+	}
+	var result error
+	result = errors.Join(result, removeOfflineFirewall(mechanisms.firewall, rules))
+	result = errors.Join(result, removeBrokerIdentityState(mechanisms.accounts, mechanisms.services, brokerOwnedIdentity{
+		OfflineName: names.Offline, OfflineSID: manifest.OfflineSID,
+		OnlineName: names.Online, OnlineSID: manifest.OnlineSID,
+		ServiceName: names.Service, ServiceIdentity: manifest.ServiceIdentity,
+	}))
+	result = errors.Join(result, mechanisms.credentials.RemoveProtected("offline"))
+	result = errors.Join(result, mechanisms.credentials.RemoveProtected("online"))
+	if result != nil {
+		return result
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	// Delete only the generation named by the protected manifest. The state
+	// root itself is retained so unrelated installations can never be swept.
+	result = errors.Join(result, mechanisms.removeFile(filepath.Join(setup.stateRoot, "broker-leases.journal")))
+	result = errors.Join(result, mechanisms.removeDir(filepath.Dir(manifest.HostPath)))
+	if result != nil {
+		return result
+	}
+	return mechanisms.removeFile(filepath.Join(setup.stateRoot, readyManifestName))
+}
 
 type validatedSetup struct {
 	config                                      SetupConfig

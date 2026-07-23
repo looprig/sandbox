@@ -124,22 +124,93 @@ func TestHostInstallRollsBackEveryPostStageFailure(t *testing.T) {
 	}
 }
 
-func TestPendingSetupDependenciesNeverReportReady(t *testing.T) {
-	readiness, err := (pendingSetupDependencyInspector{}).Inspect(context.Background(), validatedSetup{}, setupManifest{})
+func TestUnavailableRuntimeEvidenceNeverReportsApproved(t *testing.T) {
+	approved, err := (unavailableApprovedRuntimeEvidence{}).Approved(context.Background(), validatedSetup{}, setupManifest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	facts := healthyInspection()
-	facts.ServiceReady = readiness.service
-	facts.AccountsReady = readiness.accounts
-	facts.CredentialsReady = readiness.credentials
-	facts.FirewallEffective = readiness.firewallEffective
-	facts.FirewallUnchanged = readiness.firewallUnchanged
-	facts.RuntimeBaselineReady = readiness.runtimeBaseline
-	status := statusFromInspection(facts)
-	if status.Ready || len(status.Problems) == 0 {
-		t.Fatalf("pending dependencies reported ready: %+v", status)
+	if approved {
+		t.Fatal("missing supported-worker runtime evidence was approved")
 	}
+}
+
+func TestInstalledSetupInspectorRequiresManifestPinnedOwnedObjects(t *testing.T) {
+	names, err := deriveInstallationPrincipalNames("install")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := `C:\ProgramData\Looprig\slots\one\sandbox-host.exe`
+	desired, err := desiredBrokerState("install", host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := setupManifest{InstallationID: "install", HostPath: host, OfflineSID: "S-1-5-21-1", OnlineSID: "S-1-5-21-2", ServiceIdentity: serviceSpecIdentity(desired.Service)}
+	accounts := &mappedSetupAccounts{records: map[string]sandboxAccountRecord{
+		names.Offline: {Name: names.Offline, SID: manifest.OfflineSID, Owned: true, Policy: requiredSandboxAccountPolicy()},
+		names.Online:  {Name: names.Online, SID: manifest.OnlineSID, Owned: true, Policy: requiredSandboxAccountPolicy()},
+	}}
+	service := &fakeServiceAPI{record: brokerServiceRecord{Spec: desired.Service, Identity: manifest.ServiceIdentity, Owned: true, Running: true}}
+	credentials := &fakeCredentialStore{protection: credentialProtection{SystemRead: true, AdministratorsRead: true}}
+	got, err := (installedSetupDependencyInspector{accounts: accounts, services: service, credentials: credentials, evidence: staticRuntimeEvidence(true)}).
+		Inspect(context.Background(), validatedSetup{}, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.accounts || !got.credentials || !got.service || !got.runtimeBaseline {
+		t.Fatalf("healthy pinned installation reported %#v", got)
+	}
+	manifest.OfflineSID = ""
+	got, err = (installedSetupDependencyInspector{accounts: accounts, services: service, credentials: credentials, evidence: staticRuntimeEvidence(true)}).
+		Inspect(context.Background(), validatedSetup{}, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.accounts {
+		t.Fatal("deterministic account name was treated as ownership without a manifest SID pin")
+	}
+}
+
+func TestRemoveInstalledSetupRefusesUnpinnedIdentity(t *testing.T) {
+	manifest := setupManifest{InstallationID: "install", OwnerSID: "S-1-5-21-owner", HostPath: `C:\ProgramData\Looprig\slots\one\sandbox-host.exe`, ProxyPorts: []uint16{9001}}
+	setup := validatedSetup{config: SetupConfig{InstallationID: "install"}, stateRoot: `C:\ProgramData\Looprig`, ownerSID: manifest.OwnerSID}
+	err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
+		accounts: &mappedSetupAccounts{}, services: &fakeServiceAPI{}, credentials: &fakeCredentialStore{},
+		firewall: &fakeFirewallPolicy{effective: true}, removeFile: func(string) error { return nil }, removeDir: func(string) error { return nil },
+	})
+	if err == nil {
+		t.Fatal("removal adopted deterministic names without manifest-pinned identities")
+	}
+}
+
+type staticRuntimeEvidence bool
+
+func (approved staticRuntimeEvidence) Approved(context.Context, validatedSetup, setupManifest) (bool, error) {
+	return bool(approved), nil
+}
+
+type mappedSetupAccounts struct {
+	records map[string]sandboxAccountRecord
+}
+
+func (a *mappedSetupAccounts) Lookup(name string) (sandboxAccountRecord, error) {
+	record, ok := a.records[name]
+	if !ok {
+		return sandboxAccountRecord{}, errAccountNotFound
+	}
+	return record, nil
+}
+func (*mappedSetupAccounts) Create(sandboxAccountRecord, []byte) (sandboxAccountRecord, error) {
+	return sandboxAccountRecord{}, errors.New("unexpected create")
+}
+func (*mappedSetupAccounts) ApplyPolicy(sandboxAccountRecord) error {
+	return errors.New("unexpected policy update")
+}
+func (*mappedSetupAccounts) SetPassword(string, []byte) error {
+	return errors.New("unexpected password update")
+}
+func (a *mappedSetupAccounts) Delete(name string) error {
+	delete(a.records, name)
+	return nil
 }
 
 func TestInitializeSetupIdentitiesUsesOnlyOwnedStagingGeneration(t *testing.T) {
