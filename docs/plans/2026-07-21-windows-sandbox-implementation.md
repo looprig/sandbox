@@ -91,9 +91,10 @@ Work is on branch `feat/windows-sandbox`.
   protected runner, per-launch isolation, and target-scoped proxy integration
   are present. Focused tests and vet pass; the Phase 4 independent specification
   and code/security reviews are pending at the phase boundary.
-- Task 21 is in progress. Hermetic elevated acceptance/recovery coverage and
-  explicit supported-worker live gates are being completed without converting
-  missing Windows 11/Server evidence into a pass.
+- Task 21 is implemented at code level. Hermetic elevated acceptance/recovery
+  coverage and explicit supported-worker live gates fail closed without
+  converting missing Windows 11/Server evidence into a pass. Final consolidated
+  validation remains pending.
 - Task 22 is implemented at code level. Windows amd64/arm64 cross-build,
   standard-user no-broker, and disposable elevated CI gates plus package/host
   documentation are present. Final consolidated validation remains pending.
@@ -114,7 +115,7 @@ Work is on branch `feat/windows-sandbox`.
 - [x] Task 18 — protected runner and broker-owned private desktop.
 - [x] Task 19 — elevated filesystem/process compiler and per-launch lifecycle.
 - [x] Task 20 — reserved proxy networking and target-scoped grant leases.
-- [ ] Task 21 — elevated adversarial and recovery coverage (in progress).
+- [x] Task 21 — elevated adversarial and recovery coverage (validation pending).
 - [x] Task 22 — CI gates and package documentation (validation pending).
 - [ ] Task 23 — final security review and release gate.
 

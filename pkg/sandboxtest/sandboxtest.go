@@ -182,6 +182,46 @@ func CheckClaimedImplications(t *testing.T, sut SUT, probes ImplicationProbes) {
 // factory builds the executor for the env-scrub check to be meaningful.
 type Factory func(t *testing.T, workspace string) SUT
 
+// LiveGate describes an opt-in disposable-worker requirement. A gate that was
+// not requested is reported as explicitly unrun. Once requested, an unsupported
+// worker or missing evidence is a hard failure so CI can never turn a skipped
+// security matrix into a green acceptance result.
+type LiveGate struct {
+	OptInEnv    string
+	Description string
+	Supported   func() (bool, string)
+	Evidence    func() (bool, string)
+}
+
+// RequireLiveGate enforces a fail-closed live-test contract. It returns only
+// when the caller opted in and both worker support and required evidence have
+// been proven.
+func RequireLiveGate(t testing.TB, gate LiveGate) {
+	t.Helper()
+	if gate.OptInEnv == "" {
+		t.Fatal("live gate has no opt-in environment variable")
+	}
+	description := gate.Description
+	if description == "" {
+		description = "live acceptance suite"
+	}
+	if os.Getenv(gate.OptInEnv) != "1" {
+		t.Skipf("%s=1 is required; %s remains explicitly unrun", gate.OptInEnv, description)
+	}
+	if gate.Supported == nil {
+		t.Fatalf("%s requested without a supported-worker check", description)
+	}
+	if ok, detail := gate.Supported(); !ok {
+		t.Fatalf("%s requested on an unsupported worker: %s", description, detail)
+	}
+	if gate.Evidence == nil {
+		t.Fatalf("%s requested without an evidence check", description)
+	}
+	if ok, detail := gate.Evidence(); !ok {
+		t.Fatalf("%s requested without required evidence: %s", description, detail)
+	}
+}
+
 // plantedSecretKey is an environment variable name the suite injects to prove
 // scrubbing. It is not in the §5.5 baseline allowlist, so a conformant EnvScrub
 // backend must drop it; a made-up prefix avoids clashing with any real variable a

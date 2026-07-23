@@ -29,9 +29,6 @@ const windowsDisposableACLTest = "SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST"
 // suite through the real restricted backend. It is opt-in because construction
 // projects and rolls back ACLs on a disposable Windows worker.
 func TestWindowsRestrictedSandboxtestAcceptance(t *testing.T) {
-	if os.Getenv(windowsDisposableACLTest) != "1" {
-		t.Skip(windowsDisposableACLTest + "=1 is required; live ACL acceptance remains unrun")
-	}
 	requireWindowsDisposableStandardSourceToken(t)
 
 	factory := func(t *testing.T, workspace string) sandboxtest.SUT {
@@ -62,14 +59,23 @@ func TestWindowsRestrictedSandboxtestAcceptance(t *testing.T) {
 
 func requireWindowsDisposableStandardSourceToken(t *testing.T) {
 	t.Helper()
-	var token win.Token
-	if err := win.OpenProcessToken(win.CurrentProcess(), win.TOKEN_QUERY, &token); err != nil {
-		t.Fatalf("inspect disposable-worker source token: %v", err)
-	}
-	defer token.Close()
-	if err := windows.ValidateDisposableStandardUserToken(token); err != nil {
-		t.Fatalf("disposable restricted acceptance source token: %v", err)
-	}
+	sandboxtest.RequireLiveGate(t, sandboxtest.LiveGate{
+		OptInEnv: windowsDisposableACLTest, Description: "restricted Windows ACL acceptance",
+		Supported: func() (bool, string) {
+			return runtime.GOOS == "windows", "Windows worker is required"
+		},
+		Evidence: func() (bool, string) {
+			var token win.Token
+			if err := win.OpenProcessToken(win.CurrentProcess(), win.TOKEN_QUERY, &token); err != nil {
+				return false, "source token cannot be inspected: " + err.Error()
+			}
+			defer token.Close()
+			if err := windows.ValidateDisposableStandardUserToken(token); err != nil {
+				return false, err.Error()
+			}
+			return true, ""
+		},
+	})
 }
 
 // TestWindowsRestrictedDescendantPayload is the ordinary CreateProcess child
@@ -116,9 +122,6 @@ func TestWindowsRestrictedDescendantPayload(t *testing.T) {
 }
 
 func TestWindowsRestrictedExecutorKillsOrdinaryDescendantsOnCancellation(t *testing.T) {
-	if os.Getenv(windowsDisposableACLTest) != "1" {
-		t.Skip(windowsDisposableACLTest + "=1 is required; live descendant cancellation remains unrun")
-	}
 	requireWindowsDisposableStandardSourceToken(t)
 	workspace := t.TempDir()
 	executor := newWindowsRestrictedAcceptanceExecutor(t, workspace)
@@ -274,9 +277,6 @@ func newWindowsRestrictedAcceptanceExecutor(t *testing.T, workspace string) *Exe
 }
 
 func TestWindowsRestrictedProductionHandleCanaries(t *testing.T) {
-	if os.Getenv(windowsDisposableACLTest) != "1" {
-		t.Skip(windowsDisposableACLTest + "=1 is required; live production handle canaries remain unrun")
-	}
 	requireWindowsDisposableStandardSourceToken(t)
 	workspace, scratch := t.TempDir(), t.TempDir()
 	profile := mustProfile(t, ProfileConfig{
