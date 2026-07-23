@@ -3,33 +3,43 @@
 package windows
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
+	win "golang.org/x/sys/windows"
 )
+
+var errElevatedActivationAPI = errors.New("sandbox: Windows elevated activation APIs are incomplete")
 
 // elevatedSetupSnapshot is the compiler's immutable, already-verified view of
 // the installed tier. Individual mechanism checks remain explicit so a future
 // addition cannot accidentally become healthy merely because the manifest is
 // ready.
 type elevatedSetupSnapshot struct {
-	Ready                 bool
-	HostPath              string
-	HostSHA256            string
-	Protocol              uint16
-	AccountsReady         bool
-	CredentialsReady      bool
-	FirewallReady         bool
-	RuntimeBaselineReady  bool
-	RunnerHashVerified    bool
-	PrivateDesktopReady   bool
-	JobReadbackReady      bool
-	HandleListReady       bool
+	Ready                bool
+	InstallationID       string
+	HostPath             string
+	HostSHA256           string
+	Protocol             uint16
+	AccountsReady        bool
+	CredentialsReady     bool
+	FirewallReady        bool
+	RuntimeBaselineReady bool
+	RunnerHashVerified   bool
+	PrivateDesktopReady  bool
+	JobReadbackReady     bool
+	HandleListReady      bool
+	ProxyPorts           []uint16
 }
 
 type elevatedLease interface {
@@ -72,18 +82,144 @@ func newElevatedBackend(config Config) enforce.Backend {
 	}}
 }
 
-// inspectElevatedSetup deliberately remains closed until the setup health
-// inspector can prove all Task 15-17 dependencies and the approved runtime
-// baseline. A ready manifest alone is not evidence for those properties.
-func inspectElevatedSetup(Config, policy.Effective) (elevatedSetupSnapshot, error) {
-	return elevatedSetupSnapshot{}, ErrSetupRequired
+type elevatedInstallationVerifier interface {
+	Verify(path, ownerSID string) error
 }
 
-// acquireElevatedLease is unreachable until inspectElevatedSetup can return a
-// complete snapshot. Keeping this seam explicit prevents an interactive-token
-// fallback while the installed client composition is unavailable.
-func acquireElevatedLease(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
-	return nil, ErrSetupRequired
+type elevatedDependencyHealth struct {
+	Accounts, Credentials, Firewall, RuntimeBaseline bool
+}
+
+type elevatedDependencyHealthInspector interface {
+	Inspect(context.Context, string, setupManifest, policy.Effective) (elevatedDependencyHealth, error)
+}
+
+type productionElevatedDependencyInspector struct{}
+
+func (productionElevatedDependencyInspector) Inspect(ctx context.Context, stateRoot string, manifest setupManifest, _ policy.Effective) (elevatedDependencyHealth, error) {
+	setup := validatedSetup{
+		config: SetupConfig{
+			InstallationID: manifest.InstallationID, StateRoot: stateRoot,
+			ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
+		},
+		stateRoot: stateRoot, ownerSID: manifest.OwnerSID,
+	}
+	readiness, err := productionSetupDependencyInspector().Inspect(ctx, setup, manifest)
+	if err != nil {
+		return elevatedDependencyHealth{}, err
+	}
+	return elevatedDependencyHealth{
+		Accounts:        readiness.accounts && readiness.service,
+		Credentials:     readiness.credentials,
+		Firewall:        readiness.firewallEffective && readiness.firewallUnchanged && len(readiness.portPID) == 0,
+		RuntimeBaseline: readiness.runtimeBaseline,
+	}, nil
+}
+
+func inspectElevatedSetup(config Config, effective policy.Effective) (elevatedSetupSnapshot, error) {
+	return inspectElevatedSetupWith(config, effective, realBrokerInstallPathVerifier{}, productionElevatedDependencyInspector{})
+}
+
+func inspectElevatedSetupWith(config Config, effective policy.Effective, verifier elevatedInstallationVerifier, dependencies elevatedDependencyHealthInspector) (elevatedSetupSnapshot, error) {
+	if verifier == nil || dependencies == nil {
+		return elevatedSetupSnapshot{}, errors.New("sandbox: incomplete Windows elevated setup inspector")
+	}
+	stateRoot, err := validateElevatedStateRoot(config.StateRoot)
+	if err != nil {
+		return elevatedSetupSnapshot{}, err
+	}
+	manifestPath := filepath.Join(stateRoot, readyManifestName)
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return elevatedSetupSnapshot{}, ErrSetupRequired
+		}
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: read ready manifest: %v", ErrSetupStale, err)
+	}
+	manifest, err := decodeSetupManifest(data)
+	if err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: decode ready manifest: %v", ErrSetupStale, err)
+	}
+	if manifest.State != setupStateReady || manifest.Protocol != brokerProtocolVersion ||
+		manifest.InstallationID == "" || manifest.OwnerSID == "" {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: ready manifest identity or protocol mismatch", ErrSetupStale)
+	}
+	if err := validateInstalledHostPath(stateRoot, manifest.HostPath); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	programData, err := filepath.Abs(os.Getenv("ProgramData"))
+	if err != nil || programData == "." {
+		return elevatedSetupSnapshot{}, errors.New("sandbox: ProgramData is unavailable")
+	}
+	if err := rejectExistingSetupReparse(programData, stateRoot); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	owner, err := win.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || owner == nil || owner.User.Sid == nil || !equalSIDText(owner.User.Sid.String(), manifest.OwnerSID) {
+		return elevatedSetupSnapshot{}, errors.Join(ErrSetupStale, errors.New("sandbox: ready manifest owner does not match the caller"), err)
+	}
+	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify ready manifest protection: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(manifest.HostPath, manifest.OwnerSID); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify installed runner protection: %v", ErrSetupStale, err)
+	}
+	digest, err := hashFile(manifest.HostPath)
+	if err != nil || !strings.EqualFold(digest, manifest.HostSHA256) {
+		return elevatedSetupSnapshot{}, errors.Join(ErrSetupStale, errors.New("sandbox: installed runner hash does not match the ready manifest"), err)
+	}
+	health, err := dependencies.Inspect(context.Background(), stateRoot, manifest, policy.Clone(effective))
+	if err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: inspect installed dependencies: %v", ErrSetupStale, err)
+	}
+	return elevatedSetupSnapshot{
+		Ready: true, InstallationID: manifest.InstallationID,
+		HostPath: filepath.Clean(manifest.HostPath), HostSHA256: strings.ToLower(digest),
+		Protocol: manifest.Protocol, AccountsReady: health.Accounts,
+		CredentialsReady: health.Credentials, FirewallReady: health.Firewall,
+		RuntimeBaselineReady: health.RuntimeBaseline, RunnerHashVerified: true,
+		// Task 18 verifies these mechanisms whenever it constructs them. They
+		// are launch-time properties, not ambient setup state.
+		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
+		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
+	}, nil
+}
+
+func validateElevatedStateRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("sandbox: Windows elevated state root is required")
+	}
+	absolute, err := filepath.Abs(root)
+	if err != nil || !filepath.IsAbs(absolute) || filepath.Clean(root) != filepath.Clean(absolute) {
+		return "", errors.New("sandbox: Windows elevated state root must be canonical and absolute")
+	}
+	programData, err := filepath.Abs(os.Getenv("ProgramData"))
+	if err != nil || programData == "." {
+		return "", errors.New("sandbox: ProgramData is unavailable")
+	}
+	relative, err := filepath.Rel(programData, absolute)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, `..\`) {
+		return "", errors.New("sandbox: Windows elevated state root must be beneath ProgramData")
+	}
+	return filepath.Clean(absolute), nil
+}
+
+// acquireElevatedLease cannot safely manufacture the two capabilities that
+// the current lower-level APIs do not expose:
+//   - the service-selected authenticated connection nonce needed by brokerClient;
+//   - a caller-side launcher that consumes the duplicated restricted token into
+//     a suspended, Job-assigned, private-desktop installed runner process.
+//
+// Returning this typed activation error preserves stale-vs-absent setup
+// classification and, critically, cannot fall back to the interactive token.
+func acquireElevatedLease(snapshot elevatedSetupSnapshot, effective policy.Effective) (elevatedLease, error) {
+	if err := validateElevatedSnapshot(snapshot); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	if len(effective.FS) == 0 || len(effective.RuntimeBaselines) == 0 {
+		return nil, fmt.Errorf("%w: elevated ACL policy is incomplete", enforce.ErrUnavailable)
+	}
+	return nil, fmt.Errorf("%w: broker nonce handshake and restricted-token runner launcher are unavailable", errElevatedActivationAPI)
 }
 
 func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
@@ -99,6 +235,14 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	if err := validateElevatedSnapshot(snapshot); err != nil {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
 			fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	if p.Net.Open && p.Net.ProxyPort != 0 {
+		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
+			fmt.Errorf("%w: online Windows policy cannot claim an offline proxy endpoint", enforce.ErrUnavailable)
+	}
+	if p.Net.ProxyPort != 0 && !slices.Contains(snapshot.ProxyPorts, p.Net.ProxyPort) {
+		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
+			fmt.Errorf("%w: proxy port is not pinned by the verified installation", enforce.ErrUnavailable)
 	}
 	lease, err := backend.deps.acquire(snapshot, policy.Clone(p))
 	if err != nil {
@@ -145,7 +289,7 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 }
 
 func validateElevatedSnapshot(snapshot elevatedSetupSnapshot) error {
-	if !snapshot.Ready || snapshot.HostPath == "" || snapshot.HostSHA256 == "" ||
+	if !snapshot.Ready || snapshot.InstallationID == "" || snapshot.HostPath == "" || snapshot.HostSHA256 == "" ||
 		snapshot.Protocol != brokerProtocolVersion {
 		return errors.New("Windows elevated setup manifest or protocol is not ready")
 	}
@@ -176,8 +320,13 @@ func elevatedGuaranteeBits(p policy.Effective) uint64 {
 	if !p.Env.Inherit {
 		bits |= profile.GuaranteeEnvScrub
 	}
-	// Task 20 owns offline network composition. Online mode deliberately claims
-	// no network boundary, and this phase never infers one from account choice.
+	if !p.Net.Open {
+		bits |= profile.GuaranteeNetworkBoundary
+		if p.Net.ProxyPort != 0 {
+			bits |= profile.GuaranteeTargetNetwork
+		}
+	}
+	// AddressNetwork remains route-dependent and is composed by the executor.
 	return bits
 }
 

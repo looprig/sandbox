@@ -3,15 +3,32 @@
 package windows
 
 import (
+	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
+	win "golang.org/x/sys/windows"
 )
+
+type fakeElevatedVerifier struct{ err error }
+
+func (verifier fakeElevatedVerifier) Verify(string, string) error { return verifier.err }
+
+type fakeElevatedDependencyInspector struct {
+	health elevatedDependencyHealth
+	err    error
+}
+
+func (inspector fakeElevatedDependencyInspector) Inspect(context.Context, string, setupManifest, policy.Effective) (elevatedDependencyHealth, error) {
+	return inspector.health, inspector.err
+}
 
 type fakeElevatedLease struct {
 	account      brokerAccountKind
@@ -33,11 +50,128 @@ func (lease *fakeElevatedLease) Release() error {
 
 func readyElevatedSnapshot() elevatedSetupSnapshot {
 	return elevatedSetupSnapshot{
-		Ready: true, HostPath: `C:\ProgramData\Looprig\slots\generation\sandbox-host.exe`,
+		Ready: true, InstallationID: "installation", HostPath: `C:\ProgramData\Looprig\slots\generation\sandbox-host.exe`,
 		HostSHA256: "digest", Protocol: brokerProtocolVersion, AccountsReady: true,
 		CredentialsReady: true, FirewallReady: true, RuntimeBaselineReady: true,
 		RunnerHashVerified: true, PrivateDesktopReady: true, JobReadbackReady: true,
-		HandleListReady: true,
+		HandleListReady: true, ProxyPorts: []uint16{39002, 49152},
+	}
+}
+
+func elevatedInspectionFixture(t *testing.T) (Config, setupManifest) {
+	t.Helper()
+	programData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	root := filepath.Join(programData, "Looprig")
+	host := filepath.Join(root, "slots", "generation", "sandbox-host.exe")
+	if err := os.MkdirAll(filepath.Dir(host), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(host, []byte("runner"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashFile(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := win.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := setupManifest{
+		Version: setupManifestVersion, State: setupStateReady,
+		InstallationID: "fixture", OwnerSID: user.User.Sid.String(),
+		HostPath: filepath.Clean(host), HostSHA256: digest,
+		ProxyPorts: []uint16{49152}, Protocol: brokerProtocolVersion,
+	}
+	return Config{Mode: Elevated, StateRoot: root}, manifest
+}
+
+func writeElevatedManifest(t *testing.T, config Config, manifest setupManifest) {
+	t.Helper()
+	data, err := encodeSetupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(config.StateRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.StateRoot, readyManifestName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInspectElevatedSetupDistinguishesAbsentCorruptAndVerified(t *testing.T) {
+	config, manifest := elevatedInspectionFixture(t)
+	verifier := fakeElevatedVerifier{}
+	dependencies := fakeElevatedDependencyInspector{health: elevatedDependencyHealth{
+		Accounts: true, Credentials: true, Firewall: true, RuntimeBaseline: true,
+	}}
+
+	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, verifier, dependencies); !errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("absent manifest = %v, want setup required", err)
+	}
+	if err := os.MkdirAll(config.StateRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.StateRoot, readyManifestName), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, verifier, dependencies); !errors.Is(err, ErrSetupStale) || errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("corrupt manifest = %v, want stale", err)
+	}
+
+	writeElevatedManifest(t, config, manifest)
+	snapshot, err := inspectElevatedSetupWith(config, policy.Effective{}, verifier, dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateElevatedSnapshot(snapshot); err != nil {
+		t.Fatalf("verified snapshot is incomplete: %v", err)
+	}
+	if snapshot.HostPath != manifest.HostPath || snapshot.HostSHA256 != manifest.HostSHA256 {
+		t.Fatalf("snapshot = %#v, want manifest host identity", snapshot)
+	}
+}
+
+func TestInspectElevatedSetupFailsClosedOnProtectionHashAndDependencyHealth(t *testing.T) {
+	config, manifest := elevatedInspectionFixture(t)
+	writeElevatedManifest(t, config, manifest)
+	healthy := fakeElevatedDependencyInspector{health: elevatedDependencyHealth{
+		Accounts: true, Credentials: true, Firewall: true, RuntimeBaseline: true,
+	}}
+	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, fakeElevatedVerifier{err: errors.New("unprotected")}, healthy); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("unprotected installation = %v", err)
+	}
+	if err := os.WriteFile(manifest.HostPath, []byte("tampered"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, fakeElevatedVerifier{}, healthy); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("tampered runner = %v", err)
+	}
+
+	if err := os.WriteFile(manifest.HostPath, []byte("runner"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := inspectElevatedSetupWith(config, policy.Effective{}, fakeElevatedVerifier{}, fakeElevatedDependencyInspector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AccountsReady || snapshot.CredentialsReady || snapshot.FirewallReady || snapshot.RuntimeBaselineReady {
+		t.Fatalf("unverified dependency reported ready: %#v", snapshot)
+	}
+	if err := validateElevatedSnapshot(snapshot); err == nil {
+		t.Fatal("unverified dependency snapshot passed validation")
+	}
+}
+
+func TestAcquireElevatedLeaseReportsExactMissingActivationAPI(t *testing.T) {
+	_, err := acquireElevatedLease(readyElevatedSnapshot(), policy.Effective{
+		FS:               []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess}},
+		RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+	})
+	if !errors.Is(err, errElevatedActivationAPI) || errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("activation error = %v", err)
 	}
 }
 
@@ -71,8 +205,8 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if level != profile.LevelFull || bits != p.RequiredGuarantees {
-				t.Fatalf("level/bits = %d/%#x, want full/%#x", level, bits, p.RequiredGuarantees)
+			if level != profile.LevelFull || bits&p.RequiredGuarantees != p.RequiredGuarantees {
+				t.Fatalf("level/bits = %d/%#x, want full and at least %#x", level, bits, p.RequiredGuarantees)
 			}
 			if len(report.Entries) == 0 || !slices.ContainsFunc(report.Entries, func(entry profile.ReportEntry) bool {
 				return entry.Feature == policy.WindowsRuntimeBaseline && entry.Status == "Enforced"
@@ -159,8 +293,8 @@ func TestElevatedCompileReleasesPartialAndMissingGuaranteeFailures(t *testing.T)
 
 	lease = &fakeElevatedLease{}
 	backend.deps.acquire = func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) { return lease, nil }
-	_, _, _, bits, err := backend.Compile(policy.Effective{RequiredGuarantees: profile.GuaranteeNetworkBoundary})
-	if !errors.Is(err, enforce.ErrUnavailable) || bits&profile.GuaranteeNetworkBoundary != 0 || lease.releases != 1 {
+	_, _, _, bits, err := backend.Compile(policy.Effective{RequiredGuarantees: profile.GuaranteeAddressNetwork})
+	if !errors.Is(err, enforce.ErrUnavailable) || bits&profile.GuaranteeAddressNetwork != 0 || lease.releases != 1 {
 		t.Fatalf("missing network guarantee result = bits %#x err %v releases=%d", bits, err, lease.releases)
 	}
 }
