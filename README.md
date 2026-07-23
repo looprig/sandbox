@@ -319,6 +319,7 @@ cfg := sandbox.WindowsSetupConfig{
 	InstallationID: "my-product",
 	StateRoot:      `C:\ProgramData\MyProduct\Sandbox`,
 	HostBinary:     `C:\build\sandbox-host.exe`,
+	RuntimeEvidencePath: `C:\build\runtime-evidence.json`,
 	ProxyPorts:     []uint16{43191, 43192},
 }
 if err := sandbox.SetupWindowsSandbox(ctx, cfg); err != nil {
@@ -348,6 +349,11 @@ if err != nil || status.Ready {
 	return fmt.Errorf("Windows sandbox residue: status=%+v err=%w", status, err)
 }
 ```
+
+`RuntimeEvidencePath` must name the approved Task 5 exact-token evidence from
+the matching Windows build, architecture, filesystem, Go toolchain, and source
+revision. Setup copies it into protected installation state and fails closed
+when any required runtime row is missing, skipped, stale, or modified.
 
 Windows v1 supports canonical local DOS-drive roots on NTFS or ReFS. UNC/SMB,
 FAT/exFAT, drive-relative paths, alternate streams, object-manager/device

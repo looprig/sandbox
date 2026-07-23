@@ -112,6 +112,9 @@ func (realHostInstallMechanisms) Prepare(setup validatedSetup) error {
 	if err := protectSetupPath(setup.stateRoot, setup.ownerSID, setup.sandboxSID, true); err != nil {
 		return err
 	}
+	if err := protectSetupPath(filepath.Join(setup.stateRoot, "slots"), setup.ownerSID, setup.sandboxSID, true); err != nil {
+		return err
+	}
 	return importApprovedRuntimeEvidence(setup)
 }
 
@@ -253,9 +256,9 @@ func protectSetupPath(path, ownerSID, sandboxSID string, directory bool) error {
 	if directory {
 		inherit = "(CI)(OI)"
 	}
-	// SYSTEM, Administrators and the installing owner retain full control. The
-	// sandbox trustee gets only generic read/execute, including descendants.
-	sddl := fmt.Sprintf("O:%sG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)(A;%s;GRGX;;;%s)", ownerSID, ownerSID, inherit, sandboxSID)
+	// Only SYSTEM and Administrators may modify protected installation state.
+	// The installing owner and sandbox trustee receive read/execute only.
+	sddl := fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;%s;GRGX;;;%s)(A;%s;GRGX;;;%s)", inherit, ownerSID, inherit, sandboxSID)
 	sd, err := win.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err
@@ -264,7 +267,7 @@ func protectSetupPath(path, ownerSID, sandboxSID string, directory bool) error {
 	if err != nil {
 		return err
 	}
-	owner, err := win.StringToSid(ownerSID)
+	owner, err := win.StringToSid("S-1-5-32-544")
 	if err != nil {
 		return err
 	}

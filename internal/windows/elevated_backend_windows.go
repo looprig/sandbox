@@ -162,7 +162,7 @@ func newElevatedBackend(config Config) enforce.Backend {
 }
 
 type elevatedInstallationVerifier interface {
-	Verify(path, ownerSID string) error
+	Verify(path string, expectation installedPathExpectation) error
 }
 
 type elevatedDependencyHealth struct {
@@ -183,6 +183,11 @@ func (productionElevatedDependencyInspector) Inspect(ctx context.Context, stateR
 		},
 		stateRoot: stateRoot, ownerSID: manifest.OwnerSID,
 	}
+	sandboxSID, err := InstallationSID(manifest.InstallationID)
+	if err != nil {
+		return elevatedDependencyHealth{}, err
+	}
+	setup.sandboxSID = sandboxSID.String()
 	readiness, err := productionSetupDependencyInspector().Inspect(ctx, setup, manifest)
 	if err != nil {
 		return elevatedDependencyHealth{}, err
@@ -226,6 +231,13 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		manifest.InstallationID == "" || manifest.OwnerSID == "" {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: ready manifest identity or protocol mismatch", ErrSetupStale)
 	}
+	sandboxSID, err := InstallationSID(manifest.InstallationID)
+	if err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: invalid installation identity: %v", ErrSetupStale, err)
+	}
+	expectation := installedPathExpectation{ownerSID: manifest.OwnerSID, sandboxSID: sandboxSID.String()}
+	directoryExpectation := expectation
+	directoryExpectation.directory = true
 	if err := validateInstalledHostPath(stateRoot, manifest.HostPath); err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: %v", ErrSetupStale, err)
 	}
@@ -236,14 +248,23 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 	if err := rejectExistingSetupReparse(programData, stateRoot); err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: %v", ErrSetupStale, err)
 	}
+	if err := verifier.Verify(stateRoot, directoryExpectation); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify state-root protection: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(filepath.Join(stateRoot, "slots"), directoryExpectation); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify slots protection: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(filepath.Dir(manifest.HostPath), directoryExpectation); err != nil {
+		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify generation protection: %v", ErrSetupStale, err)
+	}
 	owner, err := win.GetCurrentProcessToken().GetTokenUser()
 	if err != nil || owner == nil || owner.User.Sid == nil || !equalSIDText(owner.User.Sid.String(), manifest.OwnerSID) {
 		return elevatedSetupSnapshot{}, errors.Join(ErrSetupStale, errors.New("sandbox: ready manifest owner does not match the caller"), err)
 	}
-	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+	if err := verifier.Verify(manifestPath, expectation); err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify ready manifest protection: %v", ErrSetupStale, err)
 	}
-	if err := verifier.Verify(manifest.HostPath, manifest.OwnerSID); err != nil {
+	if err := verifier.Verify(manifest.HostPath, expectation); err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: verify installed runner protection: %v", ErrSetupStale, err)
 	}
 	digest, err := hashFile(manifest.HostPath)

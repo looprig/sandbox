@@ -23,7 +23,9 @@ import (
 
 type fakeElevatedVerifier struct{ err error }
 
-func (verifier fakeElevatedVerifier) Verify(string, string) error { return verifier.err }
+func (verifier fakeElevatedVerifier) Verify(string, installedPathExpectation) error {
+	return verifier.err
+}
 
 type fakeElevatedDependencyInspector struct {
 	health elevatedDependencyHealth

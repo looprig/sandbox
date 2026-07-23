@@ -75,6 +75,7 @@ func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetup
 		Stdout:     win.Handle(bridge.childStdout.Fd()),
 		Stderr:     win.Handle(bridge.childStderr.Fd()),
 		Job: JobOptions{
+			Sandboxed:    true,
 			MaxProcesses: limits.MaxPIDs, MaxMemoryBytes: limits.MaxMemBytes,
 			MaxCPUPct: limits.MaxCPUPct,
 		},

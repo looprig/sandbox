@@ -5,10 +5,13 @@ package windows
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	win "golang.org/x/sys/windows"
 )
 
 func TestLoadBrokerRuntimeConfigDerivesOnlyFromInstalledExecutable(t *testing.T) {
@@ -80,7 +83,7 @@ func TestLoadBrokerRuntimeConfigUsesProtectedGenerationManifestBeforeReady(t *te
 
 type allowBrokerPaths struct{}
 
-func (allowBrokerPaths) Verify(string, string) error { return nil }
+func (allowBrokerPaths) Verify(string, installedPathExpectation) error { return nil }
 
 type fakeHostInstaller struct {
 	fail       string
@@ -556,7 +559,7 @@ func TestHostInstallNeverPersistsCallerSourcePath(t *testing.T) {
 
 type rejectBrokerPaths struct{ err error }
 
-func (verifier rejectBrokerPaths) Verify(string, string) error { return verifier.err }
+func (verifier rejectBrokerPaths) Verify(string, installedPathExpectation) error { return verifier.err }
 
 func TestRefreshRevalidatesReadyManifestProtectionAndHostHash(t *testing.T) {
 	root := t.TempDir()
@@ -634,5 +637,81 @@ func TestRefreshRollbackRestoresPriorFirewallBeforeService(t *testing.T) {
 	}
 	if scm.stopped != previous.Spec.Name || scm.applied.Name != "" {
 		t.Fatalf("old service restarted before firewall restoration: stopped %q applied %#v", scm.stopped, scm.applied)
+	}
+}
+
+func TestOwnedTreeRemovalPreservesReadyManifestAcrossPartialFailure(t *testing.T) {
+	root := t.TempDir()
+	ready := filepath.Join(root, readyManifestName)
+	artifact := filepath.Join(root, "broker-leases.journal")
+	if err := os.WriteFile(ready, []byte("owned"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("lease"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected artifact removal failure")
+	if err := removeOwnedSetupTreeWith(root, func(path string) error {
+		if path == artifact {
+			return injected
+		}
+		return os.RemoveAll(path)
+	}, os.Remove); !errors.Is(err, injected) {
+		t.Fatalf("partial removal error = %v", err)
+	}
+	if _, err := os.Stat(ready); err != nil {
+		t.Fatalf("ready manifest was removed before owned artifacts: %v", err)
+	}
+	if err := removeOwnedSetupTree(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned root still exists after retry: %v", err)
+	}
+}
+
+func TestInstalledPathVerifierRejectsInstallerWriteAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "protected.json")
+	if err := os.WriteFile(path, []byte("evidence"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	user, err := win.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := user.User.Sid.String()
+	sandboxSID, err := InstallationSID("verifier-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protectSetupPath(path, owner, sandboxSID.String(), false); err != nil {
+		if errors.Is(err, win.ERROR_ACCESS_DENIED) || errors.Is(err, win.ERROR_INVALID_OWNER) {
+			t.Skipf("ALLOWED_WINDOWS_LIMITATION: host denies temporary-file DACL control: %v", err)
+		}
+		t.Fatal(err)
+	}
+	expectation := installedPathExpectation{ownerSID: owner, sandboxSID: sandboxSID.String()}
+	if err := (realBrokerInstallPathVerifier{}).Verify(path, expectation); err != nil {
+		t.Fatalf("exact protected DACL rejected: %v", err)
+	}
+	sd, err := win.SecurityDescriptorFromString(fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)(A;;GRGX;;;%s)", owner, sandboxSID.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	administratorsSID, _ := win.StringToSid("S-1-5-32-544")
+	if err := win.SetNamedSecurityInfo(path, win.SE_FILE_OBJECT,
+		win.OWNER_SECURITY_INFORMATION|win.DACL_SECURITY_INFORMATION|win.PROTECTED_DACL_SECURITY_INFORMATION,
+		administratorsSID, nil, dacl, nil); err != nil {
+		if errors.Is(err, win.ERROR_ACCESS_DENIED) {
+			t.Skipf("ALLOWED_WINDOWS_LIMITATION: host denies temporary-file DACL mutation: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := (realBrokerInstallPathVerifier{}).Verify(path, expectation); err == nil {
+		t.Fatal("protected installer-writable DACL was accepted")
 	}
 }

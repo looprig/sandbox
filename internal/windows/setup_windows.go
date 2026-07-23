@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unsafe"
 
 	"github.com/looprig/sandbox/internal/enforce"
 	win "golang.org/x/sys/windows"
@@ -186,10 +187,23 @@ func inspectSetup(ctx context.Context, config SetupConfig, dependencies setupDep
 	facts := setupInspection{Manifest: &manifest, ManifestErr: decodeErr, Requested: config, OwnerSID: validated.ownerSID, Protocol: brokerProtocolVersion,
 		ServiceReady: false, AccountsReady: false, CredentialsReady: false, FirewallEffective: false, FirewallUnchanged: false, RuntimeBaselineReady: false}
 	if decodeErr == nil {
-		if pathErr := validateInstalledHostPath(validated.stateRoot, manifest.HostPath); pathErr != nil {
+		verifier := realBrokerInstallPathVerifier{}
+		rootExpectation := installedPathExpectation{ownerSID: validated.ownerSID, sandboxSID: validated.sandboxSID, directory: true}
+		fileExpectation := installedPathExpectation{ownerSID: validated.ownerSID, sandboxSID: validated.sandboxSID}
+		if protectionErr := verifier.Verify(validated.stateRoot, rootExpectation); protectionErr != nil {
+			facts.ManifestErr = protectionErr
+		} else if protectionErr := verifier.Verify(filepath.Join(validated.stateRoot, readyManifestName), fileExpectation); protectionErr != nil {
+			facts.ManifestErr = protectionErr
+		} else if pathErr := validateInstalledHostPath(validated.stateRoot, manifest.HostPath); pathErr != nil {
 			facts.ManifestErr = pathErr
 		} else if reparseErr := rejectExistingSetupReparse(validated.stateRoot, manifest.HostPath); reparseErr != nil {
 			facts.ManifestErr = reparseErr
+		} else if protectionErr := verifier.Verify(filepath.Join(validated.stateRoot, "slots"), rootExpectation); protectionErr != nil {
+			facts.ManifestErr = protectionErr
+		} else if protectionErr := verifier.Verify(filepath.Dir(manifest.HostPath), rootExpectation); protectionErr != nil {
+			facts.ManifestErr = protectionErr
+		} else if protectionErr := verifier.Verify(manifest.HostPath, fileExpectation); protectionErr != nil {
+			facts.ManifestErr = protectionErr
 		} else {
 			facts.HostSHA256, _ = hashFile(manifest.HostPath)
 			readiness, inspectErr := dependencies.Inspect(ctx, validated, manifest)
@@ -304,11 +318,17 @@ func loadBrokerRuntimeConfigAt(executable, programData string) (brokerRuntimeCon
 }
 
 type brokerInstallPathVerifier interface {
-	Verify(path, ownerSID string) error
+	Verify(path string, expectation installedPathExpectation) error
 }
 type realBrokerInstallPathVerifier struct{}
 
-func (realBrokerInstallPathVerifier) Verify(path, ownerSID string) error {
+type installedPathExpectation struct {
+	ownerSID   string
+	sandboxSID string
+	directory  bool
+}
+
+func (realBrokerInstallPathVerifier) Verify(path string, expectation installedPathExpectation) error {
 	sd, err := win.GetNamedSecurityInfo(path, win.SE_FILE_OBJECT, win.OWNER_SECURITY_INFORMATION|win.DACL_SECURITY_INFORMATION)
 	if err != nil || sd == nil {
 		return errors.Join(errors.New("sandbox: installed broker security descriptor is unavailable"), err)
@@ -317,7 +337,11 @@ func (realBrokerInstallPathVerifier) Verify(path, ownerSID string) error {
 	if err != nil {
 		return err
 	}
-	want, err := win.StringToSid(ownerSID)
+	wantOwner, err := win.StringToSid(expectation.ownerSID)
+	if err != nil {
+		return err
+	}
+	wantSandbox, err := win.StringToSid(expectation.sandboxSID)
 	if err != nil {
 		return err
 	}
@@ -325,8 +349,44 @@ func (realBrokerInstallPathVerifier) Verify(path, ownerSID string) error {
 	if err != nil {
 		return err
 	}
-	if owner == nil || !owner.Equals(want) || control&win.SE_DACL_PROTECTED == 0 {
-		return errors.New("sandbox: installed broker object is not manifest-owner protected")
+	if owner == nil || !owner.IsWellKnown(win.WinBuiltinAdministratorsSid) || control&win.SE_DACL_PROTECTED == 0 {
+		return errors.New("sandbox: installed broker object is not Administrators-owned and DACL-protected")
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil || dacl.AceCount != 4 {
+		return errors.Join(errors.New("sandbox: installed broker object has an unexpected DACL"), err)
+	}
+	seenSystem, seenAdministrators, seenOwner, seenSandbox := false, false, false, false
+	const setupFileAllAccess = uint32(0x001f01ff)
+	wantFlags := uint8(0)
+	if expectation.directory {
+		wantFlags = win.CONTAINER_INHERIT_ACE | win.OBJECT_INHERIT_ACE
+	}
+	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
+		var ace *win.ACCESS_ALLOWED_ACE
+		if err := win.GetAce(dacl, index, &ace); err != nil {
+			return err
+		}
+		if ace.Header.AceType != win.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags&win.INHERITED_ACE != 0 {
+			return errors.New("sandbox: installed broker object DACL contains an unexpected ACE")
+		}
+		sid := (*win.SID)(unsafe.Pointer(&ace.SidStart))
+		mask := uint32(ace.Mask)
+		switch {
+		case sid.IsWellKnown(win.WinLocalSystemSid) && mask == setupFileAllAccess && ace.Header.AceFlags == 0:
+			seenSystem = true
+		case sid.IsWellKnown(win.WinBuiltinAdministratorsSid) && mask == setupFileAllAccess && ace.Header.AceFlags == 0:
+			seenAdministrators = true
+		case sid.Equals(wantOwner) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+			seenOwner = true
+		case sid.Equals(wantSandbox) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+			seenSandbox = true
+		default:
+			return errors.New("sandbox: installed broker object DACL grants unexpected authority")
+		}
+	}
+	if !seenSystem || !seenAdministrators || !seenOwner || !seenSandbox {
+		return errors.New("sandbox: installed broker object DACL omits a required trustee")
 	}
 	return nil
 }
@@ -374,10 +434,28 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 	if verifier == nil {
 		return brokerRuntimeConfig{}, errors.New("sandbox: broker path verifier is unavailable")
 	}
-	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+	sandboxSID, err := InstallationSID(manifest.InstallationID)
+	if err != nil {
 		return brokerRuntimeConfig{}, err
 	}
-	if err := verifier.Verify(executable, manifest.OwnerSID); err != nil {
+	expectation := installedPathExpectation{ownerSID: manifest.OwnerSID, sandboxSID: sandboxSID.String()}
+	directoryExpectation := expectation
+	directoryExpectation.directory = true
+	if err := verifier.Verify(stateRoot, directoryExpectation); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	if strings.EqualFold(filepath.Base(parent), "slots") {
+		if err := verifier.Verify(parent, directoryExpectation); err != nil {
+			return brokerRuntimeConfig{}, err
+		}
+	}
+	if err := verifier.Verify(generationDir, directoryExpectation); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	if err := verifier.Verify(manifestPath, expectation); err != nil {
+		return brokerRuntimeConfig{}, err
+	}
+	if err := verifier.Verify(executable, expectation); err != nil {
 		return brokerRuntimeConfig{}, err
 	}
 	digest, err := hashFile(executable)
@@ -428,11 +506,25 @@ func Remove(ctx context.Context, config SetupConfig) error {
 		return fmt.Errorf("%w: removal requires a valid owned manifest", ErrSetupStale)
 	}
 	verifier := realBrokerInstallPathVerifier{}
-	if err := verifier.Verify(validated.stateRoot, validated.ownerSID); err != nil {
+	rootExpectation := installedPathExpectation{ownerSID: validated.ownerSID, sandboxSID: validated.sandboxSID, directory: true}
+	fileExpectation := installedPathExpectation{ownerSID: validated.ownerSID, sandboxSID: validated.sandboxSID}
+	if err := verifier.Verify(validated.stateRoot, rootExpectation); err != nil {
 		return fmt.Errorf("%w: verify owned Windows state root: %v", ErrSetupStale, err)
 	}
-	if err := verifier.Verify(filepath.Join(validated.stateRoot, readyManifestName), validated.ownerSID); err != nil {
+	if err := verifier.Verify(filepath.Join(validated.stateRoot, readyManifestName), fileExpectation); err != nil {
 		return fmt.Errorf("%w: verify owned Windows ready manifest: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(filepath.Join(validated.stateRoot, "slots"), rootExpectation); err != nil {
+		return fmt.Errorf("%w: verify owned Windows slots root: %v", ErrSetupStale, err)
+	}
+	if err := validateInstalledHostPath(validated.stateRoot, manifest.HostPath); err != nil {
+		return fmt.Errorf("%w: verify owned Windows host path: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(filepath.Dir(manifest.HostPath), rootExpectation); err != nil {
+		return fmt.Errorf("%w: verify owned Windows generation: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(manifest.HostPath, fileExpectation); err != nil {
+		return fmt.Errorf("%w: verify owned Windows host: %v", ErrSetupStale, err)
 	}
 	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
 	if err != nil {
@@ -445,10 +537,46 @@ func Remove(ctx context.Context, config SetupConfig) error {
 		services:          scmServiceAPI{scm: realSCMFacade{}, ownedIdentity: manifest.ServiceIdentity},
 		credentials:       atomicCredentialStore{root: filepath.Join(validated.stateRoot, "credentials"), files: realCredentialFileOps{}},
 		firewall:          windowsFirewallPolicy{api: newNetFwAutomation()},
-		removeDir:         os.RemoveAll,
+		removeDir:         removeOwnedSetupTree,
 		validateArtifacts: validateOwnedSetupArtifacts,
 	}
 	return removeInstalledSetup(ctx, validated, manifest, mechanisms)
+}
+
+// removeOwnedSetupTree deletes the protected ready manifest last. If deletion
+// of any owned artifact fails, a later Remove can still revalidate the manifest
+// and safely converge on the partial tree.
+func removeOwnedSetupTree(root string) error {
+	return removeOwnedSetupTreeWith(root, os.RemoveAll, os.Remove)
+}
+
+func removeOwnedSetupTreeWith(root string, removeAll, remove func(string) error) error {
+	if removeAll == nil || remove == nil {
+		return errors.New("sandbox: Windows owned-tree remover is unavailable")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	ready := filepath.Join(root, readyManifestName)
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), readyManifestName) {
+			continue
+		}
+		if err := removeAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	if err := remove(ready); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest setupManifest, mechanisms setupRemovalMechanisms) error {
@@ -648,10 +776,22 @@ func loadOwnedReadyManifestWithVerifier(setup validatedSetup, verifier brokerIns
 	if verifier == nil || hash == nil {
 		return nil, errors.Join(ErrSetupStale, errors.New("sandbox: existing Windows installation verifier is unavailable"))
 	}
-	if err := verifier.Verify(manifestPath, manifest.OwnerSID); err != nil {
+	expectation := installedPathExpectation{ownerSID: setup.ownerSID, sandboxSID: setup.sandboxSID}
+	directoryExpectation := expectation
+	directoryExpectation.directory = true
+	if err := verifier.Verify(setup.stateRoot, directoryExpectation); err != nil {
+		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing state-root protection: %w", err))
+	}
+	if err := verifier.Verify(filepath.Join(setup.stateRoot, "slots"), directoryExpectation); err != nil {
+		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing slots protection: %w", err))
+	}
+	if err := verifier.Verify(filepath.Dir(manifest.HostPath), directoryExpectation); err != nil {
+		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing generation protection: %w", err))
+	}
+	if err := verifier.Verify(manifestPath, expectation); err != nil {
 		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing ready manifest protection: %w", err))
 	}
-	if err := verifier.Verify(manifest.HostPath, manifest.OwnerSID); err != nil {
+	if err := verifier.Verify(manifest.HostPath, expectation); err != nil {
 		return nil, errors.Join(ErrSetupStale, fmt.Errorf("verify existing host protection: %w", err))
 	}
 	digest, err := hash(manifest.HostPath)

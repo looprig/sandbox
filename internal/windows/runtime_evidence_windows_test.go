@@ -17,7 +17,7 @@ type runtimeEvidenceVerifier struct {
 	err   error
 }
 
-func (v *runtimeEvidenceVerifier) Verify(path, _ string) error {
+func (v *runtimeEvidenceVerifier) Verify(path string, _ installedPathExpectation) error {
 	v.paths = append(v.paths, path)
 	return v.err
 }
@@ -87,6 +87,14 @@ func TestApprovedRuntimeEvidenceBindsImageFilesystemClassNotWorkerSerial(t *test
 	current.Filesystem = "NTFS:ffffffff:00000004"
 	if err := validateApprovedRuntimeEvidence(evidence, evidence.SupportedImage, current, build); !errors.Is(err, ErrSetupStale) {
 		t.Fatalf("changed filesystem flags error = %v, want ErrSetupStale", err)
+	}
+}
+
+func TestApprovedRuntimeEvidenceRejectsModifiedHostBuild(t *testing.T) {
+	evidence := validApprovedRuntimeEvidence()
+	build := runtimeEvidenceBuild{GoVersion: evidence.GoVersion, Revision: evidence.Run.SourceRevision, Modified: true}
+	if err := validateApprovedRuntimeEvidence(evidence, evidence.SupportedImage, evidence.Run.Platform, build); !errors.Is(err, ErrSetupStale) {
+		t.Fatalf("modified host build error = %v, want ErrSetupStale", err)
 	}
 }
 

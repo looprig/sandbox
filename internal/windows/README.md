@@ -32,11 +32,12 @@ When every prerequisite and requested policy axis verifies, it may report:
 restricted tier cannot claim. It falls back only when setup is absent, never
 when installed state is stale or corrupt. Explicit `Elevated` never falls back.
 
-The Windows implementation and cross-build tests are present, but elevated
-runtime readiness is not currently approved: the exact-token/runtime matrix
-still requires passing evidence on supported disposable Windows 11 and Windows
-Server workers. Until that evidence is reviewed and wired into inspection,
-elevated setup remains stale and must not be described as production-ready.
+Elevated runtime readiness requires a protected approved evidence artifact from
+the exact-token/runtime matrix on the matching supported disposable Windows 11
+or Windows Server worker. Setup imports that artifact and inspection revalidates
+its source revision, clean-build state, Go toolchain, platform/filesystem facts,
+and all required runtime rows. Missing, skipped, stale, or mismatched evidence
+fails closed and must not be described as production-ready.
 
 ## Trust boundary
 

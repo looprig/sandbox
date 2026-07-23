@@ -8,7 +8,27 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"golang.org/x/sys/windows/svc"
 )
+
+func TestPollServiceStoppedWaitsForExactStoppedState(t *testing.T) {
+	states := []svc.State{svc.StopPending, svc.Stopped}
+	queries, waits := 0, 0
+	err := pollServiceStopped(func() (svc.Status, error) {
+		state := states[queries]
+		queries++
+		return svc.Status{State: state}, nil
+	}, func() bool { waits++; return true })
+	if err != nil || queries != 2 || waits != 1 {
+		t.Fatalf("stop polling = queries %d waits %d err %v", queries, waits, err)
+	}
+	if err := pollServiceStopped(func() (svc.Status, error) {
+		return svc.Status{State: svc.StopPending}, nil
+	}, func() bool { return false }); err == nil {
+		t.Fatal("service stop timeout was accepted")
+	}
+}
 
 func TestEnsureBrokerServiceUsesFailClosedConfiguration(t *testing.T) {
 	api := &fakeServiceAPI{lookupErr: errServiceNotFound}

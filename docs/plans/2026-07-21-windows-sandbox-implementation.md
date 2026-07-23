@@ -91,15 +91,19 @@ Work is on branch `feat/windows-sandbox`.
   protected runner, per-launch isolation, and target-scoped proxy integration
   are present. Focused tests and vet pass; the Phase 4 independent specification
   and code/security reviews are pending at the phase boundary.
-- Task 21 is implemented at code level. Hermetic elevated acceptance/recovery
-  coverage and explicit supported-worker live gates fail closed without
-  converting missing Windows 11/Server evidence into a pass. Final consolidated
-  validation remains pending.
-- Task 22 is implemented at code level. Windows amd64/arm64 cross-build,
-  standard-user no-broker, and disposable elevated CI gates plus package/host
-  documentation are present. Final consolidated validation remains pending.
-- Task 23 has not started. It is the final Phase 5 security review and release
-  gate.
+- Task 21 implementation and static validation are complete. Hermetic elevated
+  acceptance/recovery coverage includes target-network denial, broker-surface
+  positive controls, exact Job configuration, and setup/removal recovery. The
+  supported-worker live gate remains pending and fails closed.
+- Task 22 implementation and local validation are complete. Windows amd64 and
+  arm64 cross-builds, standard-user no-broker, disposable elevated CI gates,
+  runtime-evidence handoff, and package/host documentation are present. The
+  supported-worker CI jobs remain pending.
+- Task 23 independent reviews and review-driven remediation are complete at
+  code/static level. Focused tests, vet, diff checks, and Windows amd64/arm64
+  package/host cross-compiles pass. Release certification remains pending until
+  the complete standard-user and elevated suites pass without skips on supported
+  disposable Windows 11 and Windows Server workers and their logs are recorded.
 
 ### Task completion ledger
 
@@ -117,7 +121,8 @@ Work is on branch `feat/windows-sandbox`.
 - [x] Task 20 — reserved proxy networking and target-scoped grant leases.
 - [x] Task 21 — elevated adversarial and recovery coverage (validation pending).
 - [x] Task 22 — CI gates and package documentation (validation pending).
-- [ ] Task 23 — final security review and release gate.
+- [ ] Task 23 — final reviews/remediation and local gates complete; supported-
+  worker live release evidence remains required before checking this item.
 
 Run these gates on the Windows handoff branch:
 
@@ -1681,6 +1686,16 @@ Use @superpowers:verification-before-completion before claiming completion and
 @superpowers:finishing-a-development-branch to choose merge/PR/cleanup. Do not
 promote a guarantee bit or mark elevated mode ready while any corresponding live
 probe is missing or skipped.
+
+**Status (2026-07-22):** The two independent Phase 5 reviews completed and all
+accepted P0/P1 findings were remediated with regression coverage. Local focused
+Windows tests, `go vet`, `git diff --check`, and Windows amd64/arm64 package,
+facade, and `sandbox-host` cross-compiles pass. The complete local `go test ./...`
+is intentionally not a release pass on this Windows 10 build: the supported
+Windows 11/Server runtime-evidence gates fail closed, and the managed host denies
+the documented retained-directory ACL enumeration probe. Task 23 therefore
+remains unchecked until the standard-user and elevated disposable-worker jobs
+run without required-row skips and their exact logs/URLs are recorded.
 
 ## Explicitly deferred work
 

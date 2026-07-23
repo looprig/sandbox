@@ -101,6 +101,7 @@ type approvedRuntimeEvidence struct {
 
 type runtimeEvidenceBuild struct {
 	GoVersion, Revision string
+	Modified            bool
 }
 
 type runtimeEvidencePlatformProvider func(string) (string, runtimeEvidencePlatform, error)
@@ -117,7 +118,7 @@ func (p protectedApprovedRuntimeEvidence) Approved(_ context.Context, setup vali
 		return false, errors.New("sandbox: incomplete approved runtime evidence verifier")
 	}
 	path := filepath.Join(setup.stateRoot, runtimeEvidenceName)
-	if err := p.verifier.Verify(path, setup.ownerSID); err != nil {
+	if err := p.verifier.Verify(path, installedPathExpectation{ownerSID: setup.ownerSID, sandboxSID: setup.sandboxSID}); err != nil {
 		return false, fmt.Errorf("verify protected Windows runtime evidence: %w", err)
 	}
 	data, err := readBoundedRuntimeEvidence(path)
@@ -158,7 +159,7 @@ func validateApprovedRuntimeEvidence(e approvedRuntimeEvidence, image string, pl
 		evidenceFilesystem != currentFilesystem {
 		return fail("does not bind the current supported OS image")
 	}
-	if e.GoVersion == "" || e.GoVersion != build.GoVersion ||
+	if build.Modified || e.GoVersion == "" || e.GoVersion != build.GoVersion ||
 		e.Run.SourceRevision == "" || !strings.EqualFold(e.Run.SourceRevision, build.Revision) {
 		return fail("does not bind the installed host toolchain and source revision")
 	}
@@ -286,9 +287,11 @@ func readRuntimeEvidenceBuild(path string) (runtimeEvidenceBuild, error) {
 	}
 	result := runtimeEvidenceBuild{GoVersion: info.GoVersion}
 	for _, setting := range info.Settings {
-		if setting.Key == "vcs.revision" {
+		switch setting.Key {
+		case "vcs.revision":
 			result.Revision = setting.Value
-			break
+		case "vcs.modified":
+			result.Modified = setting.Value == "true"
 		}
 	}
 	if result.GoVersion == "" || result.Revision == "" {
@@ -332,7 +335,7 @@ func importApprovedRuntimeEvidence(setup validatedSetup) error {
 	}
 	destination := filepath.Join(setup.stateRoot, runtimeEvidenceName)
 	if strings.EqualFold(source, destination) {
-		return (realBrokerInstallPathVerifier{}).Verify(destination, setup.ownerSID)
+		return (realBrokerInstallPathVerifier{}).Verify(destination, installedPathExpectation{ownerSID: setup.ownerSID, sandboxSID: setup.sandboxSID})
 	}
 	temporary := destination + ".tmp"
 	_ = os.Remove(temporary)
@@ -361,7 +364,7 @@ func importApprovedRuntimeEvidence(setup validatedSetup) error {
 		return err
 	}
 	cleanup = false
-	return (realBrokerInstallPathVerifier{}).Verify(destination, setup.ownerSID)
+	return (realBrokerInstallPathVerifier{}).Verify(destination, installedPathExpectation{ownerSID: setup.ownerSID, sandboxSID: setup.sandboxSID})
 }
 
 func readBoundedRuntimeEvidence(path string) ([]byte, error) {

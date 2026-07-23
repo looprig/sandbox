@@ -488,8 +488,35 @@ func (realSCMFacade) Stop(name string) error {
 	if status.State == svc.Stopped {
 		return nil
 	}
-	_, err = service.Control(svc.Stop)
-	return err
+	if _, err = service.Control(svc.Stop); err != nil && !errors.Is(err, win.ERROR_SERVICE_NOT_ACTIVE) {
+		return err
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	return pollServiceStopped(service.Query, func() bool {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+		return true
+	})
+}
+
+func pollServiceStopped(query func() (svc.Status, error), wait func() bool) error {
+	if query == nil || wait == nil {
+		return errors.New("sandbox: Windows service stop observer is unavailable")
+	}
+	for {
+		status, err := query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		if !wait() {
+			return errors.New("sandbox: timed out waiting for Windows broker service to stop")
+		}
+	}
 }
 
 func (realSCMFacade) Delete(name string) error {
