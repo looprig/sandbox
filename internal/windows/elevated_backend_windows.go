@@ -15,6 +15,7 @@ import (
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
+	sandboxnetwork "github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 	win "golang.org/x/sys/windows"
 )
@@ -28,6 +29,7 @@ var errElevatedActivationAPI = errors.New("sandbox: Windows elevated activation 
 type elevatedSetupSnapshot struct {
 	Ready                bool
 	InstallationID       string
+	OwnerSID             string
 	HostPath             string
 	HostSHA256           string
 	Protocol             uint16
@@ -52,6 +54,7 @@ type elevatedLease interface {
 type elevatedCompileDependencies struct {
 	inspect func(Config, policy.Effective) (elevatedSetupSnapshot, error)
 	acquire func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error)
+	reserve func(elevatedSetupSnapshot) (*proxyPortReservation, error)
 }
 
 type elevatedBackend struct {
@@ -79,6 +82,7 @@ func newElevatedBackend(config Config) enforce.Backend {
 	return &elevatedBackend{config: config, deps: elevatedCompileDependencies{
 		inspect: inspectElevatedSetup,
 		acquire: acquireElevatedLease,
+		reserve: reserveElevatedProxyPorts,
 	}}
 }
 
@@ -123,6 +127,9 @@ func inspectElevatedSetup(config Config, effective policy.Effective) (elevatedSe
 func inspectElevatedSetupWith(config Config, effective policy.Effective, verifier elevatedInstallationVerifier, dependencies elevatedDependencyHealthInspector) (elevatedSetupSnapshot, error) {
 	if verifier == nil || dependencies == nil {
 		return elevatedSetupSnapshot{}, errors.New("sandbox: incomplete Windows elevated setup inspector")
+	}
+	if strings.TrimSpace(config.StateRoot) == "" {
+		return elevatedSetupSnapshot{}, ErrSetupRequired
 	}
 	stateRoot, err := validateElevatedStateRoot(config.StateRoot)
 	if err != nil {
@@ -174,6 +181,7 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 	}
 	return elevatedSetupSnapshot{
 		Ready: true, InstallationID: manifest.InstallationID,
+		OwnerSID: manifest.OwnerSID,
 		HostPath: filepath.Clean(manifest.HostPath), HostSHA256: strings.ToLower(digest),
 		Protocol: manifest.Protocol, AccountsReady: health.Accounts,
 		CredentialsReady: health.Credentials, FirewallReady: health.Firewall,
@@ -183,6 +191,65 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
 		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
 	}, nil
+}
+
+// ReserveEgressProxy reserves the complete manifest-pinned loopback surface
+// before exposing one authenticated endpoint. The immutable setup inspection
+// is repeated here because proxy construction is a separate authority boundary
+// from policy compilation and must not reuse stale ambient state.
+func (backend *elevatedBackend) ReserveEgressProxy(route sandboxnetwork.Route) (*sandboxnetwork.Proxy, func() error, error) {
+	if backend == nil || backend.deps.inspect == nil || backend.deps.reserve == nil {
+		return nil, nil, errors.New("sandbox: invalid Windows elevated proxy backend")
+	}
+	if err := route.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("validate Windows egress proxy route: %w", err)
+	}
+	snapshot, err := backend.deps.inspect(backend.config, policy.Effective{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect elevated installation for egress proxy: %w", err)
+	}
+	if err := validateElevatedSnapshot(snapshot); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrSetupStale, err)
+	}
+	if snapshot.OwnerSID == "" {
+		return nil, nil, fmt.Errorf("%w: verified installation owner is missing", ErrSetupStale)
+	}
+	if err := validateProxyPorts(snapshot.ProxyPorts); err != nil {
+		return nil, nil, fmt.Errorf("%w: invalid verified proxy ports: %v", ErrSetupStale, err)
+	}
+
+	reservation, err := backend.deps.reserve(snapshot)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reserve verified Windows proxy ports: %w", err)
+	}
+	if reservation == nil {
+		return nil, nil, errors.New("sandbox: Windows proxy reservation returned no endpoints")
+	}
+
+	ports := append([]uint16(nil), snapshot.ProxyPorts...)
+	slices.Sort(ports)
+	listener, err := reservation.ClaimProxy(ports[0])
+	if err != nil {
+		return nil, nil, errors.Join(err, reservation.Close())
+	}
+	proxy, err := sandboxnetwork.NewProxyWithListener(route, listener)
+	if err != nil {
+		return nil, nil, errors.Join(err, reservation.Close())
+	}
+	return proxy, reservation.Close, nil
+}
+
+func reserveElevatedProxyPorts(snapshot elevatedSetupSnapshot) (*proxyPortReservation, error) {
+	if snapshot.InstallationID == "" || snapshot.OwnerSID == "" {
+		return nil, errors.New("sandbox: verified Windows installation identity is incomplete")
+	}
+	return reserveProxyPorts(
+		snapshot.InstallationID,
+		append([]uint16(nil), snapshot.ProxyPorts...),
+		windowsLoopbackGuardBinder{sockets: exclusiveLoopbackSocketFactory{}},
+		protectedInstallationLocker{ownerSID: snapshot.OwnerSID, mutexes: win32NamedMutexAPI{}},
+		windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+	)
 }
 
 func validateElevatedStateRoot(root string) (string, error) {

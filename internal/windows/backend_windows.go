@@ -18,6 +18,7 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/internal/winpath"
+	"github.com/looprig/sandbox/pkg/network"
 	"github.com/looprig/sandbox/pkg/profile"
 	win "golang.org/x/sys/windows"
 )
@@ -52,6 +53,24 @@ type restrictedBackend struct {
 type autoBackend struct {
 	elevated   enforce.Backend
 	restricted enforce.Backend
+}
+
+// ReserveEgressProxy deliberately forwards only to the installed tier. A
+// target-scoped route requires the offline firewall boundary, which the
+// restricted-token fallback cannot prove; falling back to an ephemeral
+// listener here would create a bypass before Compile gets a chance to reject
+// the policy.
+func (backend *autoBackend) ReserveEgressProxy(route network.Route) (*network.Proxy, func() error, error) {
+	if backend == nil || backend.elevated == nil {
+		return nil, nil, errors.New("sandbox: invalid Windows auto proxy backend")
+	}
+	provider, ok := backend.elevated.(interface {
+		ReserveEgressProxy(network.Route) (*network.Proxy, func() error, error)
+	})
+	if !ok {
+		return nil, nil, ErrSetupRequired
+	}
+	return provider.ReserveEgressProxy(route)
 }
 
 func (backend *autoBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
