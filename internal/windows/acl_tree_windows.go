@@ -208,7 +208,8 @@ func directoryEntries(handle win.Handle) ([]aclDirectoryEntry, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			granted, inspectErr := handleGrantedAccess(handle)
+			return nil, errors.Join(fmt.Errorf("directory query failed with granted access %#x: %w", granted, err), inspectErr)
 		}
 		batch, err := parseFileIDBothDirectoryInfo(buffer)
 		if err != nil {
