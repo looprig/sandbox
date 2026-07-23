@@ -70,6 +70,46 @@ func TestRuntimeManifestPinsProductContract(t *testing.T) {
 	}
 }
 
+func TestClassifyWindowsImage(t *testing.T) {
+	tests := []struct {
+		name        string
+		major       uint32
+		minor       uint32
+		build       uint32
+		productType byte
+		want        string
+		wantError   bool
+	}{
+		{name: "Windows 11", major: 10, build: 22631, productType: 1, want: "windows-11"},
+		{name: "Windows Server", major: 10, build: 20348, productType: 3, want: "windows-server"},
+		{name: "Windows domain controller", major: 10, build: 26100, productType: 2, want: "windows-server"},
+		{name: "Windows 10", major: 10, build: 19045, productType: 1, wantError: true},
+		{name: "unknown version", major: 6, minor: 3, build: 9600, productType: 1, wantError: true},
+		{name: "unknown product", major: 10, build: 26100, productType: 0, wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ClassifyWindowsImage(tt.major, tt.minor, tt.build, tt.productType)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("ClassifyWindowsImage() error = %v, wantError %v", err, tt.wantError)
+			}
+			if got != tt.want {
+				t.Fatalf("ClassifyWindowsImage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeManifestSupportsImage(t *testing.T) {
+	manifest := RuntimeManifest{SupportedImages: []string{"windows-11", "windows-server"}}
+	if !manifest.SupportsImage("windows-11") || !manifest.SupportsImage("windows-server") {
+		t.Fatal("manifest rejected an explicitly supported image")
+	}
+	if manifest.SupportsImage("windows-10") || manifest.SupportsImage("") {
+		t.Fatal("manifest accepted an image outside the explicit support list")
+	}
+}
+
 func TestFailedRuntimeRequiresCompleteTrace(t *testing.T) {
 	rawPath := filepath.Join(t.TempDir(), "baseline.pml")
 	if err := os.WriteFile(rawPath, []byte("immutable raw trace"), 0o600); err != nil {

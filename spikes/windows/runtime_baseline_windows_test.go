@@ -106,9 +106,18 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 		t.Fatal("restricted runtime baseline is a live gate; -short is not a passing result")
 	}
 
-	probe, tlsFixture, aclDelta := buildRuntimeFixtures(t)
-	platformText, platform := platformInventory(t)
+	platformText, platform, image := platformInventory(t)
 	t.Logf("platform=%s", platformText)
+	runtimeContract, err := baseline.LoadRuntimeManifest()
+	if err != nil {
+		t.Fatalf("load runtime manifest for platform eligibility: %v", err)
+	}
+	if !runtimeContract.SupportsImage(image) {
+		t.Fatalf("runtime baseline image %q is not in the supported image set %v", image, runtimeContract.SupportedImages)
+	}
+	t.Logf("supported_image=%s", image)
+
+	probe, tlsFixture, aclDelta := buildRuntimeFixtures(t)
 	t.Logf("fixture_acl_delta=%s", aclDelta)
 
 	token := newExactRestrictedToken(t)
@@ -310,8 +319,9 @@ func newExactRestrictedToken(t *testing.T) windows.Token {
 	disable := make([]windows.SIDAndAttributes, 0, groups.GroupCount)
 	for _, group := range groups.AllGroups() {
 		// CreateRestrictedToken converts enabled groups to deny-only. Preserve
-		// no ambient allow group; already-deny-only groups need not be repeated.
-		if group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+		// no ambient discretionary allow group. Integrity labels, disabled
+		// groups, and already-deny-only groups are not valid disable entries.
+		if shouldDisableGroup(group.Attributes) {
 			disable = append(disable, windows.SIDAndAttributes{Sid: group.Sid})
 		}
 	}
@@ -355,6 +365,34 @@ func newExactRestrictedToken(t *testing.T) windows.Token {
 	return token
 }
 
+func shouldDisableGroup(attributes uint32) bool {
+	const integrityAttributes = windows.SE_GROUP_INTEGRITY | windows.SE_GROUP_INTEGRITY_ENABLED
+	return attributes&windows.SE_GROUP_ENABLED != 0 &&
+		attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 &&
+		attributes&integrityAttributes == 0
+}
+
+func TestShouldDisableGroup(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes uint32
+		want       bool
+	}{
+		{name: "enabled normal", attributes: windows.SE_GROUP_ENABLED, want: true},
+		{name: "enabled mandatory", attributes: windows.SE_GROUP_ENABLED | windows.SE_GROUP_MANDATORY, want: true},
+		{name: "integrity label", attributes: windows.SE_GROUP_INTEGRITY | windows.SE_GROUP_INTEGRITY_ENABLED, want: false},
+		{name: "deny only", attributes: windows.SE_GROUP_ENABLED | windows.SE_GROUP_USE_FOR_DENY_ONLY, want: false},
+		{name: "not enabled", attributes: windows.SE_GROUP_MANDATORY, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldDisableGroup(tt.attributes); got != tt.want {
+				t.Fatalf("shouldDisableGroup(%#x) = %v, want %v", tt.attributes, got, tt.want)
+			}
+		})
+	}
+}
+
 func assertExactTokenShape(t *testing.T, source, restricted windows.Token, disabled []windows.SIDAndAttributes) {
 	t.Helper()
 	for _, token := range []windows.Token{source, restricted} {
@@ -383,7 +421,7 @@ func assertExactTokenShape(t *testing.T, source, restricted windows.Token, disab
 		groupAttrs[g.Sid.String()] = g.Attributes
 	}
 	for _, g := range sourceGroups.AllGroups() {
-		if g.Attributes&windows.SE_GROUP_ENABLED != 0 && groupAttrs[g.Sid.String()]&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+		if shouldDisableGroup(g.Attributes) && groupAttrs[g.Sid.String()]&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
 			t.Fatalf("enabled source group %s was not made deny-only", g.Sid)
 		}
 	}
@@ -756,9 +794,13 @@ func tokenInfo(t *testing.T, token windows.Token, class uint32) []byte {
 	return buffer
 }
 
-func platformInventory(t *testing.T) (string, baseline.RunPlatform) {
+func platformInventory(t *testing.T) (string, baseline.RunPlatform, string) {
 	t.Helper()
 	version := windows.RtlGetVersion()
+	image, err := baseline.ClassifyWindowsImage(version.MajorVersion, version.MinorVersion, version.BuildNumber, version.ProductType)
+	if err != nil {
+		t.Fatalf("runtime baseline worker image is ineligible: %v", err)
+	}
 	system32, err := windows.GetSystemDirectory()
 	if err != nil {
 		t.Fatalf("GetSystemDirectory: %v", err)
@@ -774,5 +816,5 @@ func platformInventory(t *testing.T) (string, baseline.RunPlatform) {
 		t.Fatalf("GetVolumeInformation(%s): %v", root, err)
 	}
 	text := fmt.Sprintf("windows=%d.%d build=%d service_pack=%q (%d.%d) arch=%s system_volume=%s serial=%08x filesystem=%s flags=%08x", version.MajorVersion, version.MinorVersion, version.BuildNumber, windows.UTF16ToString(version.CsdVersion[:]), version.ServicePackMajor, version.ServicePackMinor, runtime.GOARCH, root, serial, windows.UTF16ToString(fsName), flags)
-	return text, baseline.RunPlatform{WindowsBuild: fmt.Sprintf("%d.%d.%d", version.MajorVersion, version.MinorVersion, version.BuildNumber), Architecture: runtime.GOARCH, Filesystem: fmt.Sprintf("%s:%08x:%08x", windows.UTF16ToString(fsName), serial, flags)}
+	return text, baseline.RunPlatform{WindowsBuild: fmt.Sprintf("%d.%d.%d", version.MajorVersion, version.MinorVersion, version.BuildNumber), Architecture: runtime.GOARCH, Filesystem: fmt.Sprintf("%s:%08x:%08x", windows.UTF16ToString(fsName), serial, flags)}, image
 }
