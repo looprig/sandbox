@@ -16,6 +16,11 @@ import (
 // all desired state from that generation's protected manifest and returns
 // identity pins by atomically enriching the same manifest.
 func (mechanisms *realHostInstallMechanisms) Initialize(ctx context.Context, setup validatedSetup, staged stagedHost, manifest setupManifest) (setupManifest, error) {
+	if setup.prior != nil {
+		prior := *setup.prior
+		prior.ProxyPorts = append([]uint16(nil), setup.prior.ProxyPorts...)
+		mechanisms.previousManifest = &prior
+	}
 	desired, err := desiredBrokerState(manifest.InstallationID, staged.finalHost)
 	if err != nil {
 		return setupManifest{}, err
@@ -173,6 +178,26 @@ func restoreSetupService(api scmFacade, previous brokerServiceRecord) error {
 		result = errors.Join(result, api.Start(previous.Spec.Name))
 	}
 	return result
+}
+
+// restoreSetupServiceAndFirewall keeps the broker stopped until the exact
+// prior offline rule model has been restored. Starting the old generation with
+// the refreshed port complement would transiently widen loopback egress.
+func restoreSetupServiceAndFirewall(api scmFacade, policy offlineFirewallPolicy, previous brokerServiceRecord, prior setupManifest) error {
+	if api == nil || policy == nil || previous.Identity == "" || previous.Spec.Name == "" ||
+		serviceSpecIdentity(previous.Spec) != previous.Identity || prior.InstallationID == "" || prior.OfflineSID == "" {
+		return errServiceOwnershipMismatch
+	}
+	if err := api.Stop(previous.Spec.Name); err != nil {
+		return err
+	}
+	if err := installOfflineFirewall(policy, prior.InstallationID, prior.OfflineSID, prior.ProxyPorts); err != nil {
+		return err
+	}
+	if err := api.Apply(previous.Spec); err != nil {
+		return err
+	}
+	return api.Start(previous.Spec.Name)
 }
 
 func rollbackInstalledHostDependencies(manifest setupManifest, staged stagedHost, removeService bool) error {

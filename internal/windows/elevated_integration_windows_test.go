@@ -1,73 +1,377 @@
 //go:build windows
 
-package windows
+package windows_test
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
+	sandbox "github.com/looprig/sandbox"
 	"github.com/looprig/sandbox/pkg/sandboxtest"
 	win "golang.org/x/sys/windows"
 )
 
 const elevatedDisposableGate = "SANDBOX_WINDOWS_ELEVATED_TEST"
 
-type elevatedAcceptanceCase struct {
-	name, guarantee string
-	positiveControl bool
-	cleanupCheck    bool
-}
-
-// This registry is the single checklist consumed by disposable-worker
-// orchestration. A new claimed mechanism cannot silently omit its positive
-// control or residue inspection.
-func TestElevatedAcceptanceMatrixIsFailClosed(t *testing.T) {
-	cases := []elevatedAcceptanceCase{
-		{"setup-corruption-staleness", "setup", true, true},
-		{"credential-state-protection", "state", true, true},
-		{"read-write-races", "filesystem", true, true},
-		{"unsupported-roots-classes", "filesystem", true, true},
-		{"offline-target-online", "network", true, true},
-		{"private-desktop-launch-surfaces", "process", true, true},
-		{"detached-job-limits-handles", "process", true, true},
-		{"concurrency-client-death-restart", "lifecycle", true, true},
-		{"credential-refresh", "state", true, true},
-		{"setup-removal-residue", "cleanup", true, true},
-	}
-	seen := map[string]bool{}
-	for _, test := range cases {
-		if test.name == "" || test.guarantee == "" || seen[test.name] {
-			t.Fatalf("invalid or duplicate acceptance case %#v", test)
-		}
-		seen[test.name] = true
-		if !test.positiveControl || !test.cleanupCheck {
-			t.Fatalf("%s can hide a false pass: positive-control=%t cleanup=%t", test.name, test.positiveControl, test.cleanupCheck)
-		}
-	}
-}
-
-func TestElevatedDisposableAcceptanceGate(t *testing.T) {
+func TestElevatedDisposableAcceptance(t *testing.T) {
 	sandboxtest.RequireLiveGate(t, sandboxtest.LiveGate{
-		OptInEnv: elevatedDisposableGate, Description: "elevated Windows adversarial matrix",
+		OptInEnv: elevatedDisposableGate, Description: "installed elevated Windows adversarial matrix",
 		Supported: elevatedWorkerSupported,
 		Evidence:  elevatedWorkerPrerequisites,
 	})
+
+	config := elevatedSetupConfig(t)
+	setupAndRequireReady(t, config)
+
+	// A second setup is a real refresh: it revalidates the protected ready
+	// generation, rotates credentials, reconciles the exact owned service and
+	// replaces ready state only after all dependency checks pass.
+	setupAndRequireReady(t, config)
+	restartInstalledService(t, config.StateRoot)
+	requireElevatedReady(t, config)
+
+	factory := func(t *testing.T, workspace string) sandboxtest.SUT {
+		return newElevatedAcceptanceExecutor(t, workspace, config.StateRoot)
+	}
+	sandboxtest.RunSuite(t, "windows-elevated", factory)
+
+	t.Run("claimed-implications", func(t *testing.T) {
+		workspace := t.TempDir()
+		sut := factory(t, workspace)
+		sandboxtest.CheckClaimedImplications(t, sut, sandboxtest.ImplicationProbes{
+			Read:     elevatedReadProbe(t, workspace),
+			Process:  elevatedBrokerEscapeProbe(t, workspace),
+			Network:  elevatedOfflineNetworkProbe(t, workspace),
+			Resource: elevatedJobProbe(t, workspace),
+		})
+	})
+
+	// Exercise owned removal in the live suite, then reinstall so the workflow's
+	// unconditional cleanup remains the final authority and independently
+	// verifies residue even if a later test or the job is cancelled.
+	if err := sandbox.RemoveWindowsSandbox(context.Background(), config); err != nil {
+		t.Fatalf("remove elevated setup: %v", err)
+	}
+	status, err := sandbox.InspectWindowsSandbox(context.Background(), config)
+	if err != nil {
+		t.Fatalf("inspect removed elevated setup: %v", err)
+	}
+	if status.Ready {
+		t.Fatal("removed elevated setup still reports ready")
+	}
+	setupAndRequireReady(t, config)
 }
 
-type rtlOSVersionInfo struct {
-	size, major, minor, build, platform uint32
-	csd                                 [128]uint16
+// TestElevatedAcceptancePayload is copied into a projected workspace and
+// launched by the real installed runner. It is inert in the ordinary test
+// process.
+func TestElevatedAcceptancePayload(t *testing.T) {
+	separator := -1
+	for index, argument := range os.Args {
+		if argument == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 || len(os.Args) != separator+3 || os.Args[separator+1] != "job" {
+		return
+	}
+	var inJob uint32
+	ok, _, callErr := win.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob").Call(
+		uintptr(win.CurrentProcess()), 0, uintptr(unsafe.Pointer(&inJob)))
+	if ok == 0 {
+		t.Fatalf("query installed-runner Job membership: %v", callErr)
+	}
+	if err := os.WriteFile(os.Args[separator+2], []byte(strconv.FormatBool(inJob != 0)), 0o600); err != nil {
+		t.Fatalf("write installed-runner Job result: %v", err)
+	}
+}
+
+func elevatedSetupConfig(t *testing.T) sandbox.WindowsSetupConfig {
+	t.Helper()
+	ports := parseElevatedProxyPorts(t, os.Getenv("SANDBOX_WINDOWS_PROXY_PORTS"))
+	return sandbox.WindowsSetupConfig{
+		InstallationID:      mustElevatedEnv(t, "SANDBOX_WINDOWS_INSTALLATION_ID"),
+		StateRoot:           mustAbsoluteElevatedEnv(t, "SANDBOX_WINDOWS_STATE_ROOT"),
+		HostBinary:          mustAbsoluteElevatedEnv(t, "SANDBOX_WINDOWS_HOST_BINARY"),
+		ProxyPorts:          ports,
+		RuntimeEvidencePath: mustAbsoluteElevatedEnv(t, "SANDBOX_WINDOWS_RUNTIME_EVIDENCE"),
+	}
+}
+
+func setupAndRequireReady(t *testing.T, config sandbox.WindowsSetupConfig) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := sandbox.SetupWindowsSandbox(ctx, config); err != nil {
+		t.Fatalf("setup elevated Windows sandbox: %v", err)
+	}
+	requireElevatedReady(t, config)
+}
+
+func requireElevatedReady(t *testing.T, config sandbox.WindowsSetupConfig) {
+	t.Helper()
+	status, err := sandbox.InspectWindowsSandbox(context.Background(), config)
+	if err != nil {
+		t.Fatalf("inspect elevated Windows sandbox: %v", err)
+	}
+	if !status.Ready || len(status.Problems) != 0 {
+		t.Fatalf("elevated setup is not ready: %+v", status)
+	}
+}
+
+func newElevatedAcceptanceExecutor(t *testing.T, workspace, stateRoot string) *sandbox.Executor {
+	t.Helper()
+	profile, err := sandbox.NewProfile(sandbox.ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: sandbox.Allow, WorkspaceWrite: sandbox.Allow,
+		HostRead: sandbox.Deny, HostWrite: sandbox.Deny,
+		Network: sandbox.Deny, Command: sandbox.Allow,
+	})
+	if err != nil {
+		t.Fatalf("create elevated acceptance profile: %v", err)
+	}
+	set, err := sandbox.NewExecutorSet(profile,
+		sandbox.WithScratchRoot(t.TempDir()), sandbox.WithMaxExecutors(1),
+		sandbox.WithWindowsSandboxMode(sandbox.WindowsElevated),
+		sandbox.WithWindowsSandboxStateRoot(stateRoot),
+	)
+	if err != nil {
+		t.Fatalf("create elevated executor set: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("close elevated executor set: %v", err)
+		}
+	})
+	executor, err := set.For("elevated-acceptance")
+	if err != nil {
+		t.Fatalf("create elevated executor: %v", err)
+	}
+	return executor
+}
+
+func elevatedReadProbe(t *testing.T, workspace string) sandboxtest.ImplicationProbe {
+	t.Helper()
+	outside := filepath.Join(filepath.Dir(workspace), "elevated-read-positive.txt")
+	if err := os.WriteFile(outside, []byte("positive"), 0o600); err != nil {
+		t.Fatalf("create elevated read positive control: %v", err)
+	}
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "positive" {
+		t.Fatalf("elevated read positive control: data=%q err=%v", data, err)
+	}
+	return func(ctx context.Context, sut sandboxtest.SUT) (sandboxtest.ImplicationResult, error) {
+		argv, ok := sut.(sandboxtest.ArgvSUT)
+		if !ok {
+			return sandboxtest.ImplicationResult{}, errors.New("elevated executor lacks argv execution")
+		}
+		_, code, runErr := argv.RunArgv(ctx, workspace, []string{
+			filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"), "/D", "/C", "type", outside,
+		})
+		return sandboxtest.ImplicationResult{
+			PositiveControl: true, GuaranteeHeld: runErr != nil || code != 0,
+			Detail: fmt.Sprintf("outside read code=%d err=%v", code, runErr),
+		}, nil
+	}
+}
+
+func elevatedBrokerEscapeProbe(t *testing.T, workspace string) sandboxtest.ImplicationProbe {
+	t.Helper()
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := strconv.FormatInt(time.Now().UnixNano(), 36)
+	marker := filepath.Join(filepath.Dir(workspace), "elevated-broker-"+nonce+".marker")
+	assertEscapePayloadPositiveControl(t, testExecutable, marker, nonce)
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatalf("PowerShell positive control is unavailable: %v", err)
+	}
+	payloadArgs := fmt.Sprintf("-test.run=^%s$ -- %s %s", escapeHelperTest, quoteWindowsArgument(marker), quoteWindowsArgument(nonce))
+	scripts := []string{
+		fmt.Sprintf(`Start-Process -FilePath %s -ArgumentList %s -WindowStyle Hidden`,
+			quotePowerShellLiteral(testExecutable), quotePowerShellLiteral(payloadArgs)),
+		fmt.Sprintf(`$r=([wmiclass]'Win32_Process').Create(%s); Write-Output $r.ReturnValue`,
+			quotePowerShellLiteral(quoteWindowsArgument(testExecutable)+" "+payloadArgs)),
+		fmt.Sprintf(`$s=New-Object -ComObject 'Shell.Application'; $s.ShellExecute(%s,%s,'','open',0)`,
+			quotePowerShellLiteral(testExecutable), quotePowerShellLiteral(payloadArgs)),
+	}
+	t.Cleanup(func() { cleanupEscapeMarker(t, marker, nonce, testExecutable) })
+	return func(ctx context.Context, sut sandboxtest.SUT) (sandboxtest.ImplicationResult, error) {
+		argv, ok := sut.(sandboxtest.ArgvSUT)
+		if !ok {
+			return sandboxtest.ImplicationResult{}, errors.New("elevated executor lacks argv execution")
+		}
+		for _, script := range scripts {
+			_, _, _ = argv.RunArgv(ctx, workspace, []string{
+				powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+				"-EncodedCommand", encodePowerShell(script),
+			})
+			if escaped, _ := waitForEscapeMarker(marker, nonce, 2*time.Second); escaped {
+				cleanupEscapeMarker(t, marker, nonce, testExecutable)
+				return sandboxtest.ImplicationResult{
+					PositiveControl: true, GuaranteeHeld: false,
+					Detail: "full-user process broker created the bound escape marker",
+				}, nil
+			}
+		}
+		return sandboxtest.ImplicationResult{PositiveControl: true, GuaranteeHeld: true}, nil
+	}
+}
+
+func elevatedOfflineNetworkProbe(t *testing.T, workspace string) sandboxtest.ImplicationProbe {
+	t.Helper()
+	listener, address := listenNonLoopback(t)
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan struct{}, 8)
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = connection.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	positive, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		t.Fatalf("offline-network positive control: %v", err)
+	}
+	_ = positive.Close()
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("offline-network positive control was not accepted")
+	}
+	host, port, _ := net.SplitHostPort(address)
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf(`$c=New-Object Net.Sockets.TcpClient; $c.Connect(%s,%s); $c.Close()`,
+		quotePowerShellLiteral(host), port)
+	return func(ctx context.Context, sut sandboxtest.SUT) (sandboxtest.ImplicationResult, error) {
+		argv, ok := sut.(sandboxtest.ArgvSUT)
+		if !ok {
+			return sandboxtest.ImplicationResult{}, errors.New("elevated executor lacks argv execution")
+		}
+		_, code, runErr := argv.RunArgv(ctx, workspace, []string{
+			powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+			"-EncodedCommand", encodePowerShell(script),
+		})
+		escaped := false
+		select {
+		case <-accepted:
+			escaped = true
+		case <-time.After(500 * time.Millisecond):
+		}
+		return sandboxtest.ImplicationResult{
+			PositiveControl: true, GuaranteeHeld: !escaped && (runErr != nil || code != 0),
+			Detail: fmt.Sprintf("non-loopback connection code=%d err=%v accepted=%t", code, runErr, escaped),
+		}, nil
+	}
+}
+
+func elevatedJobProbe(t *testing.T, workspace string) sandboxtest.ImplicationProbe {
+	t.Helper()
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(workspace, "elevated-acceptance-probe.exe")
+	copyFileForAcceptance(t, source, helper)
+	control := filepath.Join(workspace, "job-positive-control.txt")
+	if output, err := exec.Command(helper, "-test.run=^TestElevatedAcceptancePayload$", "--", "job", control).CombinedOutput(); err != nil {
+		t.Fatalf("Job probe positive control: %v: %s", err, output)
+	}
+	if _, err := os.Stat(control); err != nil {
+		t.Fatalf("Job probe positive control did not execute: %v", err)
+	}
+	return func(ctx context.Context, sut sandboxtest.SUT) (sandboxtest.ImplicationResult, error) {
+		argv, ok := sut.(sandboxtest.ArgvSUT)
+		if !ok {
+			return sandboxtest.ImplicationResult{}, errors.New("elevated executor lacks argv execution")
+		}
+		result := filepath.Join(workspace, "job-sandboxed.txt")
+		output, code, runErr := argv.RunArgv(ctx, workspace, []string{
+			helper, "-test.run=^TestElevatedAcceptancePayload$", "--", "job", result,
+		})
+		data, readErr := os.ReadFile(result)
+		return sandboxtest.ImplicationResult{
+			PositiveControl: true,
+			GuaranteeHeld:   runErr == nil && code == 0 && readErr == nil && strings.TrimSpace(string(data)) == "true",
+			Detail:          fmt.Sprintf("Job result=%q output=%q code=%d runErr=%v readErr=%v", data, output, code, runErr, readErr),
+		}, nil
+	}
+}
+
+func restartInstalledService(t *testing.T, stateRoot string) {
+	t.Helper()
+	script := fmt.Sprintf(
+		`$s=@(Get-CimInstance Win32_Service | Where-Object {$_.PathName -like ('*'+%s+'*')}); if($s.Count -ne 1){throw "owned service lookup failed"}; Stop-Service -Name $s[0].Name -Force; Start-Service -Name $s[0].Name`,
+		quotePowerShellLiteral(stateRoot))
+	if output, err := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput(); err != nil {
+		t.Fatalf("restart installed broker service: %v: %s", err, output)
+	}
+}
+
+func listenNonLoopback(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err != nil || ip.IsLoopback() || ip.To4() == nil {
+			continue
+		}
+		listener, err := net.Listen("tcp4", net.JoinHostPort(ip.String(), "0"))
+		if err == nil {
+			return listener, listener.Addr().String()
+		}
+	}
+	t.Fatal("no bindable non-loopback IPv4 address for firewall positive control")
+	return nil, ""
+}
+
+func copyFileForAcceptance(t *testing.T, source, destination string) {
+	t.Helper()
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func elevatedWorkerSupported() (bool, string) {
-	var version rtlOSVersionInfo
+	var version struct {
+		size, major, minor, build, platform uint32
+		csd                                 [128]uint16
+	}
 	version.size = uint32(unsafe.Sizeof(version))
-	proc := win.NewLazySystemDLL("ntdll.dll").NewProc("RtlGetVersion")
-	status, _, _ := proc.Call(uintptr(unsafe.Pointer(&version)))
+	status, _, _ := win.NewLazySystemDLL("ntdll.dll").NewProc("RtlGetVersion").Call(uintptr(unsafe.Pointer(&version)))
 	if status != 0 || version.build < 22000 {
 		return false, "Windows 11/Server disposable worker build 22000+ is required"
 	}
@@ -77,39 +381,65 @@ func elevatedWorkerSupported() (bool, string) {
 	return true, ""
 }
 
-// elevatedWorkerPrerequisites validates the concrete inputs consumed by the
-// repository's ordinary go test ./... live matrix. CI owns aggregation and its
-// unconditional post-test residue audit; this test must not recursively launch
-// another test harness or require evidence that only that harness can produce.
 func elevatedWorkerPrerequisites() (bool, string) {
-	host := os.Getenv("SANDBOX_WINDOWS_HOST_BINARY")
-	if !filepath.IsAbs(host) {
-		return false, "SANDBOX_WINDOWS_HOST_BINARY must be absolute"
+	for _, name := range []string{
+		"SANDBOX_WINDOWS_HOST_BINARY", "SANDBOX_WINDOWS_STATE_ROOT",
+		"SANDBOX_WINDOWS_INSTALLATION_ID", "SANDBOX_WINDOWS_PROXY_PORTS",
+		"SANDBOX_WINDOWS_RUNTIME_EVIDENCE",
+	} {
+		if strings.TrimSpace(os.Getenv(name)) == "" {
+			return false, name + " is required"
+		}
 	}
-	if info, err := os.Stat(host); err != nil || info.IsDir() {
-		return false, "SANDBOX_WINDOWS_HOST_BINARY is missing or not a file"
+	for _, name := range []string{"SANDBOX_WINDOWS_HOST_BINARY", "SANDBOX_WINDOWS_RUNTIME_EVIDENCE"} {
+		path := os.Getenv(name)
+		if !filepath.IsAbs(path) {
+			return false, name + " must be absolute"
+		}
+		if info, err := os.Stat(path); err != nil || info.IsDir() {
+			return false, name + " is missing or not a file"
+		}
 	}
-	stateRoot := os.Getenv("SANDBOX_WINDOWS_STATE_ROOT")
-	if !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot {
+	root := os.Getenv("SANDBOX_WINDOWS_STATE_ROOT")
+	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return false, "SANDBOX_WINDOWS_STATE_ROOT must be canonical and absolute"
 	}
-	if strings.TrimSpace(os.Getenv("SANDBOX_WINDOWS_INSTALLATION_ID")) == "" {
-		return false, "SANDBOX_WINDOWS_INSTALLATION_ID is required"
+	return true, ""
+}
+
+func mustElevatedEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		t.Fatalf("%s is required", name)
 	}
-	rawPorts := strings.Split(os.Getenv("SANDBOX_WINDOWS_PROXY_PORTS"), ",")
-	if len(rawPorts) == 0 {
-		return false, "SANDBOX_WINDOWS_PROXY_PORTS is required"
+	return value
+}
+
+func mustAbsoluteElevatedEnv(t *testing.T, name string) string {
+	t.Helper()
+	value := mustElevatedEnv(t, name)
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		t.Fatalf("%s must be canonical and absolute", name)
 	}
-	seen := make(map[uint64]struct{}, len(rawPorts))
-	for _, raw := range rawPorts {
-		port, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 16)
+	return value
+}
+
+func parseElevatedProxyPorts(t *testing.T, raw string) []uint16 {
+	t.Helper()
+	var ports []uint16
+	seen := map[uint16]struct{}{}
+	for _, item := range strings.Split(raw, ",") {
+		value, err := strconv.ParseUint(strings.TrimSpace(item), 10, 16)
+		port := uint16(value)
 		if err != nil || port == 0 {
-			return false, "SANDBOX_WINDOWS_PROXY_PORTS contains an invalid port"
+			t.Fatalf("invalid SANDBOX_WINDOWS_PROXY_PORTS value %q", item)
 		}
 		if _, duplicate := seen[port]; duplicate {
-			return false, "SANDBOX_WINDOWS_PROXY_PORTS contains a duplicate port"
+			t.Fatalf("duplicate SANDBOX_WINDOWS_PROXY_PORTS value %d", port)
 		}
 		seen[port] = struct{}{}
+		ports = append(ports, port)
 	}
-	return true, ""
+	return ports
 }

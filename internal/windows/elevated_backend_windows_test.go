@@ -379,7 +379,8 @@ func TestElevatedSpecGrantAuthorityIsExactAndRetiresAfterBorrows(t *testing.T) {
 		FS:  []policy.FSEntry{{Path: `C:\executor-one`, Access: policy.AllAccess}},
 		Env: policy.EnvPolicy{Set: map[string]string{"HOME": `C:\executor-one\home`}},
 	}
-	authority := newElevatedSpecGrantAuthority(base, &fakeElevatedLease{})
+	lease := &fakeElevatedLease{}
+	authority := newElevatedSpecGrantAuthority(base, lease)
 	if _, _, err := authority.borrow(policy.Effective{
 		FS:  []policy.FSEntry{{Path: `C:\executor-two`, Access: policy.AllAccess}},
 		Env: policy.EnvPolicy{Set: map[string]string{"HOME": `C:\executor-two\home`}},
@@ -390,21 +391,17 @@ func TestElevatedSpecGrantAuthorityIsExactAndRetiresAfterBorrows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	retired := make(chan struct{})
-	go func() {
-		authority.retire()
-		close(retired)
-	}()
-	select {
-	case <-retired:
-		t.Fatal("base authority retired while a transient grant borrowed it")
-	case <-time.After(25 * time.Millisecond):
+	if err := authority.retire(); err != nil {
+		t.Fatal(err)
 	}
-	releaseBorrow()
-	select {
-	case <-retired:
-	case <-time.After(time.Second):
-		t.Fatal("base authority did not retire after transient grant release")
+	if lease.releases != 0 {
+		t.Fatal("base lease released while a transient grant borrowed it")
+	}
+	if err := releaseBorrow(); err != nil {
+		t.Fatal(err)
+	}
+	if lease.releases != 1 {
+		t.Fatalf("base lease releases = %d, want 1 after transient grant release", lease.releases)
 	}
 	if _, _, err := authority.borrow(policy.Clone(base)); err == nil {
 		t.Fatal("retired base authority was reused")

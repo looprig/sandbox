@@ -113,8 +113,8 @@ func TestSetupIntegrationPartialCleanupRetainsRecoveryAuthority(t *testing.T) {
 	var removed []string
 	err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
 		accounts: accounts, services: service, credentials: credentials, firewall: firewall,
-		removeFile: func(path string) error { removed = append(removed, path); return nil },
-		removeDir:  func(path string) error { removed = append(removed, path); return nil },
+		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		removeDir:         func(path string) error { removed = append(removed, path); return nil },
 	})
 	if err == nil {
 		t.Fatal("partial cleanup failure was hidden")
@@ -132,16 +132,12 @@ func TestSetupIntegrationSuccessfulRemovalOrdersResidueLast(t *testing.T) {
 	var removed []string
 	if err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
 		accounts: accounts, services: service, credentials: credentials, firewall: firewall,
-		removeFile: func(path string) error { removed = append(removed, path); return nil },
-		removeDir:  func(path string) error { removed = append(removed, path); return nil },
+		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		removeDir:         func(path string) error { removed = append(removed, path); return nil },
 	}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{
-		filepath.Join(setup.stateRoot, "broker-leases.journal"),
-		filepath.Dir(manifest.HostPath),
-		filepath.Join(setup.stateRoot, readyManifestName),
-	}
+	want := []string{setup.stateRoot}
 	if !slices.Equal(removed, want) || len(firewall.rules) != 0 {
 		t.Fatalf("removal order/residue = %v rules=%d, want %v/0", removed, len(firewall.rules), want)
 	}

@@ -28,7 +28,11 @@ type SetupConfig struct {
 	InstallationID string
 	StateRoot      string
 	HostBinary     string
-	ProxyPorts     []uint16
+	// RuntimeEvidencePath names the reviewed Task 5 evidence artifact to
+	// import into the protected installation. Setup never treats an
+	// environment variable or a boolean flag as runtime approval.
+	RuntimeEvidencePath string
+	ProxyPorts          []uint16
 }
 
 // WindowsSetupProblemCode identifies one stable setup inspection problem.

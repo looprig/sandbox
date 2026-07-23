@@ -64,6 +64,13 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		AdditionalRoots: []sandbox.RootAccess{},
 		AckUnconfined:   false,
 	}
+	if runtime.GOOS == "windows" {
+		// The no-installation facade smoke uses guarantees available in the
+		// restricted tier; elevated guarantee probes run only on its disposable
+		// worker gate.
+		config.HostWrite = sandbox.Allow
+		config.Network = sandbox.Allow
+	}
 	profile, err := sandbox.NewProfile(config)
 	if err != nil {
 		t.Fatalf("NewProfile: %v", err)
@@ -108,12 +115,19 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 	}
 
 	// Executor ownership: every option a consumer passes today.
-	set, err := sandbox.NewExecutorSet(profile,
+	options := []sandbox.ExecutorSetOption{
 		sandbox.WithScratchRoot(t.TempDir()),
 		sandbox.WithMaxExecutors(1),
 		sandbox.WithGrantTTL(time.Minute),
-		sandbox.WithEgressRoute(direct),
-	)
+	}
+	// This portable facade test must not require an installed elevated broker;
+	// its purpose is API-surface coverage, not the disposable-worker live gate.
+	if runtime.GOOS == "windows" {
+		options = append(options, sandbox.WithWindowsSandboxMode(sandbox.WindowsRestrictedToken))
+	} else {
+		options = append(options, sandbox.WithEgressRoute(direct))
+	}
+	set, err := sandbox.NewExecutorSet(profile, options...)
 	if err != nil {
 		t.Fatalf("NewExecutorSet: %v", err)
 	}

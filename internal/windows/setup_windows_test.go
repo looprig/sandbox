@@ -361,10 +361,113 @@ func TestRemoveInstalledSetupRefusesUnpinnedIdentity(t *testing.T) {
 	setup := validatedSetup{config: SetupConfig{InstallationID: "install"}, stateRoot: `C:\ProgramData\Looprig`, ownerSID: manifest.OwnerSID}
 	err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
 		accounts: &mappedSetupAccounts{}, services: &fakeServiceAPI{}, credentials: &fakeCredentialStore{},
-		firewall: &fakeFirewallPolicy{effective: true}, removeFile: func(string) error { return nil }, removeDir: func(string) error { return nil },
+		firewall: &fakeFirewallPolicy{effective: true}, removeDir: func(string) error { return nil },
+		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
 	})
 	if err == nil {
 		t.Fatal("removal adopted deterministic names without manifest-pinned identities")
+	}
+}
+
+func TestValidateOwnedSetupArtifactsAcceptsCompleteOwnedTreeAndRejectsForeignResidue(t *testing.T) {
+	root := t.TempDir()
+	generation := strings.Repeat("a1", 16)
+	host := filepath.Join(root, "slots", generation, "sandbox-host.exe")
+	manifest := setupManifest{
+		Version: setupManifestVersion, State: setupStateReady,
+		InstallationID: "remove-owned", OwnerSID: "S-1-5-21-owner",
+		OfflineSID: "S-1-5-21-1", OnlineSID: "S-1-5-21-2",
+		ServiceIdentity: "service", HostPath: host, HostSHA256: strings.Repeat("ab", 32),
+		ProxyPorts: []uint16{41001}, Protocol: brokerProtocolVersion,
+	}
+	generationManifest := manifest
+	generationManifest.State = setupStateStaging
+	data, err := encodeSetupManifest(generationManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{
+		filepath.Dir(host),
+		filepath.Join(root, "credentials"),
+		filepath.Join(root, ".staging-"+strings.Repeat("b2", 16)),
+	} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, contents := range map[string][]byte{
+		filepath.Join(root, readyManifestName):          data,
+		filepath.Join(root, runtimeEvidenceName):        {},
+		filepath.Join(root, runtimeEvidenceName+".tmp"): {},
+		filepath.Join(root, "broker-leases.journal"):    {},
+		host: []byte("host"),
+		filepath.Join(filepath.Dir(host), "manifest.json"):                               data,
+		filepath.Join(root, "credentials", "offline.dpapi"):                              []byte("cipher"),
+		filepath.Join(root, "credentials", "online.dpapi.tmp-"+strings.Repeat("c3", 16)): []byte("temp"),
+		filepath.Join(root, ".staging-"+strings.Repeat("b2", 16), "sandbox-host.exe"):    []byte("stage"),
+	} {
+		if err := os.WriteFile(path, contents, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setup := validatedSetup{
+		config:    SetupConfig{InstallationID: manifest.InstallationID},
+		stateRoot: root, ownerSID: manifest.OwnerSID,
+	}
+	if err := validateOwnedSetupArtifacts(setup, manifest); err != nil {
+		t.Fatalf("owned artifact tree rejected: %v", err)
+	}
+	foreign := filepath.Join(root, "do-not-delete.txt")
+	if err := os.WriteFile(foreign, []byte("foreign"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOwnedSetupArtifacts(setup, manifest); err == nil {
+		t.Fatal("foreign state-root artifact was accepted for recursive removal")
+	}
+}
+
+func TestRemoveInstalledSetupDeletesWholeInventoriedRootAfterDependencies(t *testing.T) {
+	root := t.TempDir()
+	host := filepath.Join(root, "slots", strings.Repeat("d4", 16), "sandbox-host.exe")
+	manifest := setupManifest{
+		InstallationID: "remove-all", OwnerSID: "S-1-5-21-owner", HostPath: host,
+		OfflineSID: "S-1-5-21-1", OnlineSID: "S-1-5-21-2",
+		ServiceIdentity: "owned-service", ProxyPorts: []uint16{41001},
+	}
+	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := &mappedSetupAccounts{records: map[string]sandboxAccountRecord{
+		names.Offline: {Name: names.Offline, SID: manifest.OfflineSID, Owned: true},
+		names.Online:  {Name: names.Online, SID: manifest.OnlineSID, Owned: true},
+	}}
+	service := &fakeServiceAPI{record: brokerServiceRecord{
+		Spec:     brokerServiceSpecModel{Name: names.Service},
+		Identity: manifest.ServiceIdentity, Owned: true,
+	}}
+	credentials := &fakeCredentialStore{}
+	var removed string
+	err = removeInstalledSetup(context.Background(), validatedSetup{
+		config:    SetupConfig{InstallationID: manifest.InstallationID},
+		stateRoot: root, ownerSID: manifest.OwnerSID,
+	}, manifest, setupRemovalMechanisms{
+		accounts: accounts, services: service, credentials: credentials,
+		firewall:          &fakeFirewallPolicy{effective: true},
+		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		removeDir: func(path string) error {
+			if len(accounts.records) != 0 || service.deleted == "" || !credentials.removed {
+				return errors.New("artifact deletion preceded dependency removal")
+			}
+			removed = path
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != root {
+		t.Fatalf("removed root = %q, want %q", removed, root)
 	}
 }
 
@@ -491,5 +594,45 @@ func TestRefreshRevalidatesReadyManifestProtectionAndHostHash(t *testing.T) {
 	wrongHash := func(string) (string, error) { return strings.Repeat("0", 64), nil }
 	if _, err := loadOwnedReadyManifestWithVerifier(setup, allowBrokerPaths{}, wrongHash); !errors.Is(err, ErrSetupStale) {
 		t.Fatalf("modified host refresh error = %v", err)
+	}
+}
+
+func TestRefreshRollbackRestoresPriorFirewallBeforeService(t *testing.T) {
+	prior := setupManifest{
+		InstallationID: "refresh", OfflineSID: "S-1-5-21-1-1001",
+		ProxyPorts: []uint16{41001},
+	}
+	oldDesired, err := desiredBrokerState(prior.InstallationID, `C:\ProgramData\Looprig\slots\old\sandbox-host.exe`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := brokerServiceRecord{Spec: oldDesired.Service, Identity: serviceSpecIdentity(oldDesired.Service), Owned: true}
+	newRules, err := offlineFirewallRules(prior.InstallationID, prior.OfflineSID, []uint16{42001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := &fakeFirewallPolicy{effective: true, rules: ruleMap(newRules)}
+	scm := &fakeSCMFacade{}
+	if err := restoreSetupServiceAndFirewall(scm, policy, previous, prior); err != nil {
+		t.Fatal(err)
+	}
+	want, err := offlineFirewallRules(prior.InstallationID, prior.OfflineSID, prior.ProxyPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective, unchanged, err := inspectOfflineFirewall(policy, want); err != nil || !effective || !unchanged {
+		t.Fatalf("restored firewall = effective %t unchanged %t err %v", effective, unchanged, err)
+	}
+	if scm.stopped != previous.Spec.Name || scm.applied != previous.Spec {
+		t.Fatalf("service rollback = stopped %q applied %#v", scm.stopped, scm.applied)
+	}
+
+	failing := &fakeFirewallPolicy{effective: true, rules: ruleMap(newRules), failPut: 1}
+	scm = &fakeSCMFacade{}
+	if err := restoreSetupServiceAndFirewall(scm, failing, previous, prior); err == nil {
+		t.Fatal("firewall restore failure was hidden")
+	}
+	if scm.stopped != previous.Spec.Name || scm.applied.Name != "" {
+		t.Fatalf("old service restarted before firewall restoration: stopped %q applied %#v", scm.stopped, scm.applied)
 	}
 }

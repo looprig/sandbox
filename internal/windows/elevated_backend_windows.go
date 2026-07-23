@@ -72,7 +72,6 @@ type elevatedBackend struct {
 
 type elevatedSpecGrantAuthority struct {
 	mu      sync.Mutex
-	cond    *sync.Cond
 	base    policy.Effective
 	lease   elevatedLease
 	borrows int
@@ -80,12 +79,10 @@ type elevatedSpecGrantAuthority struct {
 }
 
 func newElevatedSpecGrantAuthority(base policy.Effective, lease elevatedLease) *elevatedSpecGrantAuthority {
-	authority := &elevatedSpecGrantAuthority{base: policy.Clone(base), lease: lease}
-	authority.cond = sync.NewCond(&authority.mu)
-	return authority
+	return &elevatedSpecGrantAuthority{base: policy.Clone(base), lease: lease}
 }
 
-func (authority *elevatedSpecGrantAuthority) borrow(base policy.Effective) (elevatedLease, func(), error) {
+func (authority *elevatedSpecGrantAuthority) borrow(base policy.Effective) (elevatedLease, func() error, error) {
 	if authority == nil {
 		return nil, nil, errors.New("windows sandbox: elevated base authority is missing")
 	}
@@ -96,27 +93,40 @@ func (authority *elevatedSpecGrantAuthority) borrow(base policy.Effective) (elev
 	}
 	authority.borrows++
 	var once sync.Once
-	release := func() {
+	var releaseErr error
+	release := func() error {
 		once.Do(func() {
 			authority.mu.Lock()
 			authority.borrows--
-			authority.cond.Broadcast()
+			var retired elevatedLease
+			if authority.closing && authority.borrows == 0 {
+				retired, authority.lease = authority.lease, nil
+			}
 			authority.mu.Unlock()
+			if retired != nil {
+				releaseErr = retired.Release()
+			}
 		})
+		return releaseErr
 	}
 	return authority.lease, release, nil
 }
 
-func (authority *elevatedSpecGrantAuthority) retire() {
+func (authority *elevatedSpecGrantAuthority) retire() error {
 	if authority == nil {
-		return
+		return nil
 	}
 	authority.mu.Lock()
 	authority.closing = true
-	for authority.borrows != 0 {
-		authority.cond.Wait()
+	var retired elevatedLease
+	if authority.borrows == 0 {
+		retired, authority.lease = authority.lease, nil
 	}
 	authority.mu.Unlock()
+	if retired != nil {
+		return retired.Release()
+	}
+	return nil
 }
 
 // AcquireGrantPathHandle ensures the executor validates an elevated grant with
@@ -417,9 +427,8 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 			lifecycleMu.Lock()
 			closing = true
 			lifecycleMu.Unlock()
-			grantAuthority.retire()
 			active.Wait()
-			releaseErr = lease.Release()
+			releaseErr = grantAuthority.retire()
 		})
 		return releaseErr
 	}
@@ -485,19 +494,19 @@ func (backend *elevatedBackend) CompileWithRetainedPathHandles(rawAuthority any,
 	originalAcquire := backend.deps.acquire
 	clone.deps.acquire = func(snapshot elevatedSetupSnapshot, effective policy.Effective) (elevatedLease, error) {
 		if originalAcquire == nil {
-			releaseBorrow()
+			_ = releaseBorrow()
 			return nil, errors.New("windows sandbox: elevated grant lease acquisition is unavailable")
 		}
 		lease, acquireErr := acquireElevatedGrantLease(snapshot, effective, baseLease, handles)
 		if acquireErr != nil {
-			releaseBorrow()
+			_ = releaseBorrow()
 			return nil, acquireErr
 		}
 		return &borrowedElevatedLease{elevatedLease: lease, releaseBorrow: releaseBorrow}, nil
 	}
 	spec, report, level, bits, err := clone.Compile(p)
 	if err != nil {
-		releaseBorrow()
+		_ = releaseBorrow()
 		return spec, report, level, bits, err
 	}
 	spec.GrantAuthority = nil
@@ -507,12 +516,12 @@ func (backend *elevatedBackend) CompileWithRetainedPathHandles(rawAuthority any,
 type borrowedElevatedLease struct {
 	elevatedLease
 	once          sync.Once
-	releaseBorrow func()
+	releaseBorrow func() error
 }
 
 func (lease *borrowedElevatedLease) Release() error {
 	err := lease.elevatedLease.Release()
-	lease.once.Do(lease.releaseBorrow)
+	lease.once.Do(func() { err = errors.Join(err, lease.releaseBorrow()) })
 	return err
 }
 

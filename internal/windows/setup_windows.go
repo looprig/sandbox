@@ -4,6 +4,7 @@ package windows
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -131,9 +132,13 @@ func productionSetupDependencyInspector() setupDependencyInspector {
 	// Runtime evidence stays explicitly unavailable until supported-worker
 	// evidence is installed by the evidence phase.
 	return manifestPinnedSetupInspector{
-		evidence: unavailableApprovedRuntimeEvidence{},
-		policy:   windowsFirewallPolicy{api: newNetFwAutomation()},
-		owners:   windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
+		evidence: protectedApprovedRuntimeEvidence{
+			verifier: realBrokerInstallPathVerifier{},
+			platform: currentRuntimeEvidencePlatform,
+			build:    readRuntimeEvidenceBuild,
+		},
+		policy: windowsFirewallPolicy{api: newNetFwAutomation()},
+		owners: windowsTCPPortOwner{tables: ipHelperTCPTableAPI{}},
 	}
 }
 
@@ -234,7 +239,13 @@ func Setup(ctx context.Context, config SetupConfig) error {
 		return err
 	}
 	validated.prior = prior
-	if err := installHost(ctx, validated, &realHostInstallMechanisms{}); err != nil {
+	if err := installHost(ctx, validated, &realHostInstallMechanisms{
+		runtimeEvidence: protectedApprovedRuntimeEvidence{
+			verifier: realBrokerInstallPathVerifier{},
+			platform: currentRuntimeEvidencePlatform,
+			build:    readRuntimeEvidenceBuild,
+		},
+	}); err != nil {
 		return err
 	}
 	status, err := Inspect(ctx, config)
@@ -389,12 +400,12 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 }
 
 type setupRemovalMechanisms struct {
-	accounts    accountAPI
-	services    serviceAPI
-	credentials protectedCredentialStore
-	firewall    offlineFirewallPolicy
-	removeFile  func(string) error
-	removeDir   func(string) error
+	accounts          accountAPI
+	services          serviceAPI
+	credentials       protectedCredentialStore
+	firewall          offlineFirewallPolicy
+	removeDir         func(string) error
+	validateArtifacts func(validatedSetup, setupManifest) error
 }
 
 func Remove(ctx context.Context, config SetupConfig) error {
@@ -416,6 +427,13 @@ func Remove(ctx context.Context, config SetupConfig) error {
 	if err != nil {
 		return fmt.Errorf("%w: removal requires a valid owned manifest", ErrSetupStale)
 	}
+	verifier := realBrokerInstallPathVerifier{}
+	if err := verifier.Verify(validated.stateRoot, validated.ownerSID); err != nil {
+		return fmt.Errorf("%w: verify owned Windows state root: %v", ErrSetupStale, err)
+	}
+	if err := verifier.Verify(filepath.Join(validated.stateRoot, readyManifestName), validated.ownerSID); err != nil {
+		return fmt.Errorf("%w: verify owned Windows ready manifest: %v", ErrSetupStale, err)
+	}
 	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
 	if err != nil {
 		return err
@@ -424,24 +442,19 @@ func Remove(ctx context.Context, config SetupConfig) error {
 		accounts: netLSAAccountAPI{native: realAccountNative{}, ownedSID: map[string]string{
 			names.Offline: manifest.OfflineSID, names.Online: manifest.OnlineSID,
 		}},
-		services:    scmServiceAPI{scm: realSCMFacade{}, ownedIdentity: manifest.ServiceIdentity},
-		credentials: atomicCredentialStore{root: filepath.Join(validated.stateRoot, "credentials"), files: realCredentialFileOps{}},
-		firewall:    windowsFirewallPolicy{api: newNetFwAutomation()},
-		removeFile: func(path string) error {
-			err := os.Remove(path)
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		},
-		removeDir: os.RemoveAll,
+		services:          scmServiceAPI{scm: realSCMFacade{}, ownedIdentity: manifest.ServiceIdentity},
+		credentials:       atomicCredentialStore{root: filepath.Join(validated.stateRoot, "credentials"), files: realCredentialFileOps{}},
+		firewall:          windowsFirewallPolicy{api: newNetFwAutomation()},
+		removeDir:         os.RemoveAll,
+		validateArtifacts: validateOwnedSetupArtifacts,
 	}
 	return removeInstalledSetup(ctx, validated, manifest, mechanisms)
 }
 
 func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest setupManifest, mechanisms setupRemovalMechanisms) error {
 	if mechanisms.accounts == nil || mechanisms.services == nil || mechanisms.credentials == nil ||
-		mechanisms.firewall == nil || mechanisms.removeFile == nil || mechanisms.removeDir == nil {
+		mechanisms.firewall == nil || mechanisms.removeDir == nil ||
+		mechanisms.validateArtifacts == nil {
 		return errors.New("sandbox: incomplete Windows setup removal mechanisms")
 	}
 	if manifest.InstallationID != setup.config.InstallationID || manifest.OwnerSID != setup.ownerSID ||
@@ -449,6 +462,9 @@ func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest se
 		return errors.New("sandbox: Windows removal manifest does not pin all owned identities")
 	}
 	if err := validateInstalledHostPath(setup.stateRoot, manifest.HostPath); err != nil {
+		return err
+	}
+	if err := mechanisms.validateArtifacts(setup, manifest); err != nil {
 		return err
 	}
 	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
@@ -476,14 +492,127 @@ func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest se
 		return ctx.Err()
 	default:
 	}
-	// Delete only the generation named by the protected manifest. The state
-	// root itself is retained so unrelated installations can never be swept.
-	result = errors.Join(result, mechanisms.removeFile(filepath.Join(setup.stateRoot, "broker-leases.journal")))
-	result = errors.Join(result, mechanisms.removeDir(filepath.Dir(manifest.HostPath)))
-	if result != nil {
-		return result
+	// The complete tree was inventoried before any dependency mutation. The
+	// state root belongs to exactly one installation, so removing it clears old
+	// generations, interrupted staging, credentials, journal, and ready state
+	// without sweeping an unrecognized/foreign artifact.
+	return mechanisms.removeDir(setup.stateRoot)
+}
+
+func validateOwnedSetupArtifacts(setup validatedSetup, manifest setupManifest) error {
+	root := filepath.Clean(setup.stateRoot)
+	if root == "." || !filepath.IsAbs(root) || manifest.InstallationID != setup.config.InstallationID ||
+		manifest.OwnerSID != setup.ownerSID {
+		return errors.New("sandbox: invalid Windows artifact inventory identity")
 	}
-	return mechanisms.removeFile(filepath.Join(setup.stateRoot, readyManifestName))
+	if err := validateInstalledHostPath(root, manifest.HostPath); err != nil {
+		return err
+	}
+	return validateOwnedSetupDirectory(root, func(entry os.DirEntry) error {
+		name := strings.ToLower(entry.Name())
+		switch name {
+		case strings.ToLower(readyManifestName), runtimeEvidenceName, runtimeEvidenceName + ".tmp",
+			"broker-leases.journal", ".ready.tmp":
+			if entry.IsDir() {
+				return errors.New("sandbox: owned Windows state file is a directory")
+			}
+			return nil
+		case "credentials":
+			if !entry.IsDir() {
+				return errors.New("sandbox: Windows credential artifact is not a directory")
+			}
+			return validateOwnedSetupDirectory(filepath.Join(root, entry.Name()), validateOwnedCredentialArtifact)
+		case "slots":
+			if !entry.IsDir() {
+				return errors.New("sandbox: Windows slots artifact is not a directory")
+			}
+			return validateOwnedGenerationContainer(filepath.Join(root, entry.Name()), manifest)
+		default:
+			if entry.IsDir() && strings.HasPrefix(name, ".staging-") && validSetupGenerationName(strings.TrimPrefix(name, ".staging-")) {
+				return validateOwnedGeneration(filepath.Join(root, entry.Name()), manifest)
+			}
+			return fmt.Errorf("sandbox: refusing to remove unrecognized Windows state artifact %q", entry.Name())
+		}
+	})
+}
+
+func validateOwnedSetupDirectory(path string, validate func(os.DirEntry) error) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return errors.Join(errors.New("sandbox: Windows removal artifact is unavailable or link-backed"), err)
+		}
+		attributes, attributeErr := win.GetFileAttributes(win.StringToUTF16Ptr(filepath.Join(path, entry.Name())))
+		if attributeErr != nil || attributes&win.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return errors.Join(errors.New("sandbox: Windows removal artifact is unavailable or reparse-backed"), attributeErr)
+		}
+		if err := validate(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOwnedCredentialArtifact(entry os.DirEntry) error {
+	if entry.IsDir() {
+		return errors.New("sandbox: unrecognized Windows credential directory")
+	}
+	name := strings.ToLower(entry.Name())
+	if name == "offline.dpapi" || name == "online.dpapi" {
+		return nil
+	}
+	for _, prefix := range []string{"offline.dpapi.tmp-", "online.dpapi.tmp-"} {
+		if strings.HasPrefix(name, prefix) && validSetupGenerationName(strings.TrimPrefix(name, prefix)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("sandbox: refusing to remove unrecognized Windows credential artifact %q", entry.Name())
+}
+
+func validateOwnedGenerationContainer(path string, manifest setupManifest) error {
+	return validateOwnedSetupDirectory(path, func(entry os.DirEntry) error {
+		if !entry.IsDir() || !validSetupGenerationName(entry.Name()) {
+			return fmt.Errorf("sandbox: refusing to remove unrecognized Windows generation %q", entry.Name())
+		}
+		return validateOwnedGeneration(filepath.Join(path, entry.Name()), manifest)
+	})
+}
+
+func validateOwnedGeneration(path string, manifest setupManifest) error {
+	return validateOwnedSetupDirectory(path, func(entry os.DirEntry) error {
+		if entry.IsDir() {
+			return fmt.Errorf("sandbox: unrecognized nested Windows generation artifact %q", entry.Name())
+		}
+		switch strings.ToLower(entry.Name()) {
+		case "sandbox-host.exe":
+			return nil
+		case "manifest.json":
+			data, err := os.ReadFile(filepath.Join(path, entry.Name()))
+			if err != nil {
+				return err
+			}
+			generation, err := decodeSetupManifest(data)
+			if err != nil || generation.InstallationID != manifest.InstallationID ||
+				generation.OwnerSID != manifest.OwnerSID {
+				return errors.Join(errors.New("sandbox: foreign Windows generation manifest"), err)
+			}
+			return nil
+		default:
+			return fmt.Errorf("sandbox: refusing to remove unrecognized Windows generation artifact %q", entry.Name())
+		}
+	})
+}
+
+func validSetupGenerationName(name string) bool {
+	if len(name) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(name)
+	return err == nil
 }
 
 type validatedSetup struct {

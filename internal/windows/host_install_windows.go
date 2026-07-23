@@ -97,18 +97,22 @@ func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInsta
 }
 
 type realHostInstallMechanisms struct {
-	owned           setupManifest
-	serviceCreated  bool
-	serviceUpdated  bool
-	previousService *brokerServiceRecord
-	runtimeEvidence approvedRuntimeEvidenceInspector
+	owned            setupManifest
+	serviceCreated   bool
+	serviceUpdated   bool
+	previousService  *brokerServiceRecord
+	previousManifest *setupManifest
+	runtimeEvidence  approvedRuntimeEvidenceInspector
 }
 
 func (realHostInstallMechanisms) Prepare(setup validatedSetup) error {
 	if err := os.MkdirAll(filepath.Join(setup.stateRoot, "slots"), 0700); err != nil {
 		return err
 	}
-	return protectSetupPath(setup.stateRoot, setup.ownerSID, setup.sandboxSID, true)
+	if err := protectSetupPath(setup.stateRoot, setup.ownerSID, setup.sandboxSID, true); err != nil {
+		return err
+	}
+	return importApprovedRuntimeEvidence(setup)
 }
 
 func (realHostInstallMechanisms) Stage(setup validatedSetup) (stagedHost, error) {
@@ -198,7 +202,12 @@ func (mechanisms *realHostInstallMechanisms) Rollback(staged stagedHost) error {
 		result = errors.Join(result, rollbackInstalledHostDependencies(mechanisms.owned, staged, true))
 	}
 	if mechanisms.serviceUpdated && mechanisms.previousService != nil {
-		result = errors.Join(result, restoreSetupService(realSCMFacade{}, *mechanisms.previousService))
+		if mechanisms.previousManifest == nil {
+			result = errors.Join(result, errors.New("sandbox: refreshed Windows setup lost its prior manifest"))
+		} else {
+			result = errors.Join(result, restoreSetupServiceAndFirewall(realSCMFacade{},
+				windowsFirewallPolicy{api: newNetFwAutomation()}, *mechanisms.previousService, *mechanisms.previousManifest))
+		}
 	}
 	if staged.stagingDir != "" {
 		result = errors.Join(result, os.RemoveAll(staged.stagingDir))

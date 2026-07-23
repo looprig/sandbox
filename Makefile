@@ -50,7 +50,9 @@ test-windows-build:
 test-windows-restricted:
 ifeq ($(GOOS),windows)
 	powershell -NoProfile -Command 'if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "restricted gate requires a standard-user token" }'
-	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST="1"; $$env:SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST="1"; go test -race -count=1 ./internal/windows ./internal/exec -run "RestrictedDisposable|RestrictedBrokerEscape|WindowsRestricted"'
+	go test -count=1 -v ./spikes/windows -run "^TestRestrictedRuntimeBaseline$$"
+	go test -race -count=1 ./internal/winpath ./internal/policy ./pkg/profile
+	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST="1"; $$env:SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST="1"; go test -race -count=1 ./internal/windows ./internal/exec ./pkg/sandboxtest -run "Disposable|RestrictedBrokerEscape|WindowsRestricted|WindowsPath|ACLProjection"'
 else
 	@echo "test-windows-restricted requires a disposable Windows standard-user worker" >&2
 	@exit 1
@@ -59,8 +61,8 @@ endif
 test-windows-elevated:
 ifeq ($(GOOS),windows)
 	powershell -NoProfile -Command 'if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "elevated gate requires an elevated disposable worker" }'
-	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST="1"; $$env:SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST="1"; go test -race -count=1 ./...'
-	powershell -NoProfile -Command 'go test -count=100 ./internal/windows -run "Race|Recovery|BrokerEscape"'
+	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_ELEVATED_TEST="1"; go test -race -count=1 ./internal/windows ./internal/exec -run "Elevated|SetupIntegration|RecoveryIntegration"'
+	powershell -NoProfile -Command 'go test -count=100 ./internal/windows -run "Elevated.*Race|RecoveryIntegration|Broker.*Recovery"'
 else
 	@echo "test-windows-elevated requires a disposable elevated Windows worker" >&2
 	@exit 1
