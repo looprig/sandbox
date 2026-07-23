@@ -28,8 +28,13 @@ type hostInstallMechanisms interface {
 	Stage(validatedSetup) (stagedHost, error)
 	PersistStaging(validatedSetup, stagedHost, []byte) error
 	SelfTest(context.Context, stagedHost) error
+	Promote(validatedSetup, stagedHost) error
 	Activate(validatedSetup, stagedHost, []byte) error
 	Rollback(stagedHost) error
+}
+
+type hostDependencyInitializer interface {
+	Initialize(context.Context, validatedSetup, stagedHost, setupManifest) (setupManifest, error)
 }
 
 func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInstallMechanisms) (err error) {
@@ -57,7 +62,17 @@ func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInsta
 	if err = mechanisms.SelfTest(ctx, staged); err != nil {
 		return fmt.Errorf("self-test staged Windows host: %w", err)
 	}
-	manifest := setupManifest{Version: setupManifestVersion, State: setupStateReady, InstallationID: setup.config.InstallationID, OwnerSID: setup.ownerSID, HostPath: staged.finalHost, HostSHA256: staged.digest, ProxyPorts: append([]uint16(nil), setup.config.ProxyPorts...), Protocol: brokerProtocolVersion}
+	if err = mechanisms.Promote(setup, staged); err != nil {
+		return fmt.Errorf("promote protected Windows host generation: %w", err)
+	}
+	manifest := stagingManifest
+	if initializer, ok := mechanisms.(hostDependencyInitializer); ok {
+		manifest, err = initializer.Initialize(ctx, setup, staged, stagingManifest)
+		if err != nil {
+			return fmt.Errorf("initialize protected Windows host dependencies: %w", err)
+		}
+	}
+	manifest.State = setupStateReady
 	data, err := encodeSetupManifest(manifest)
 	if err != nil {
 		return err
@@ -69,7 +84,10 @@ func installHost(ctx context.Context, setup validatedSetup, mechanisms hostInsta
 	return nil
 }
 
-type realHostInstallMechanisms struct{}
+type realHostInstallMechanisms struct {
+	owned          setupManifest
+	serviceCreated bool
+}
 
 func (realHostInstallMechanisms) Prepare(setup validatedSetup) error {
 	if err := os.MkdirAll(filepath.Join(setup.stateRoot, "slots"), 0700); err != nil {
@@ -136,10 +154,14 @@ func (realHostInstallMechanisms) SelfTest(ctx context.Context, staged stagedHost
 	return nil
 }
 
-func (realHostInstallMechanisms) Activate(setup validatedSetup, staged stagedHost, manifest []byte) error {
+func (realHostInstallMechanisms) Promote(_ validatedSetup, staged stagedHost) error {
 	if err := os.Rename(staged.stagingDir, staged.finalDir); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (realHostInstallMechanisms) Activate(setup validatedSetup, staged stagedHost, manifest []byte) error {
 	temporary := filepath.Join(setup.stateRoot, ".ready.tmp")
 	if err := os.WriteFile(temporary, manifest, 0600); err != nil {
 		return err
@@ -155,8 +177,11 @@ func (realHostInstallMechanisms) Activate(setup validatedSetup, staged stagedHos
 	return nil
 }
 
-func (realHostInstallMechanisms) Rollback(staged stagedHost) error {
+func (mechanisms *realHostInstallMechanisms) Rollback(staged stagedHost) error {
 	var result error
+	if mechanisms.owned.InstallationID != "" && mechanisms.serviceCreated {
+		result = errors.Join(result, rollbackInstalledHostDependencies(mechanisms.owned, staged, true))
+	}
 	if staged.stagingDir != "" {
 		result = errors.Join(result, os.RemoveAll(staged.stagingDir))
 	}

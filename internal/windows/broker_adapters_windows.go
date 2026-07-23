@@ -544,6 +544,9 @@ func (service windowsBrokerServiceLoop) serveConnection(accepted brokerServiceCo
 	defer accepted.stream.Close()
 	defer accepted.connection.Close()
 	defer service.broker.Disconnect(binding)
+	if err := writeBrokerGreeting(accepted.stream, binding.Nonce); err != nil {
+		return err
+	}
 	for {
 		request, err := decodeBrokerFrame(accepted.stream)
 		if err != nil {
@@ -859,6 +862,11 @@ func runBrokerService(ctx context.Context, config brokerRuntimeConfig) error {
 	}
 	if err := requireLocalSystemBroker(); err != nil {
 		return err
+	}
+	if config.ManifestState == setupStateStaging {
+		if err := initializeInstalledBrokerDependencies(config); err != nil {
+			return err
+		}
 	}
 	installation, err := InstallationSID(config.InstallationID)
 	if err != nil {

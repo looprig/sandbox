@@ -190,6 +190,9 @@ func TestBrokerServiceLoopRoundTripsAndCleansDisconnect(t *testing.T) {
 	go func() {
 		done <- (windowsBrokerServiceLoop{broker: broker}).serveConnection(brokerServiceConnection{stream: brokerLoopStream{server}, connection: connection})
 	}()
+	if nonce, err := readBrokerGreeting(client); err != nil || nonce != connection.binding.Nonce {
+		t.Fatalf("greeting = %x, %v", nonce, err)
+	}
 	request := brokerFrame{Kind: brokerMessageStatus, Direction: brokerRequest, Nonce: connection.binding.Nonce}
 	encoded, err := encodeBrokerFrame(request)
 	if err != nil {
@@ -225,6 +228,9 @@ func TestBrokerServiceLoopServesClientsConcurrentlyAndWaitsForShutdown(t *testin
 	acceptor.connections <- brokerServiceConnection{stream: brokerLoopStream{serverTwo}, connection: &secondConnection}
 	requestStatus := func(client net.Conn, connection *brokerTestConnection) brokerFrame {
 		t.Helper()
+		if nonce, err := readBrokerGreeting(client); err != nil || nonce != connection.binding.Nonce {
+			t.Fatalf("greeting = %x, %v", nonce, err)
+		}
 		encoded, err := encodeBrokerFrame(brokerFrame{Kind: brokerMessageStatus, Direction: brokerRequest, Nonce: connection.binding.Nonce})
 		if err != nil {
 			t.Fatal(err)
@@ -296,6 +302,9 @@ func TestBrokerServiceLoopContainsPanickingConnectionAndClosesIt(t *testing.T) {
 	second.binding.PID++
 	second.binding.Process = &brokerTestProcess{id: 3}
 	acceptor.connections <- brokerServiceConnection{stream: brokerLoopStream{server}, connection: &second}
+	if nonce, err := readBrokerGreeting(client); err != nil || nonce != second.binding.Nonce {
+		t.Fatalf("greeting = %x, %v", nonce, err)
+	}
 	encoded, _ := encodeBrokerFrame(brokerFrame{Kind: brokerMessageStatus, Direction: brokerRequest, Nonce: second.binding.Nonce})
 	if err := writeBrokerFrame(client, encoded); err != nil {
 		t.Fatal(err)

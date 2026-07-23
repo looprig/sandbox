@@ -195,6 +195,7 @@ func (f *fakeSCMFacade) Lookup(brokerServiceSpecModel) (brokerServiceRecord, err
 }
 func (f *fakeSCMFacade) Create(spec brokerServiceSpecModel) error { f.created = spec; return nil }
 func (f *fakeSCMFacade) Apply(spec brokerServiceSpecModel) error  { f.applied = spec; return nil }
+func (f *fakeSCMFacade) Start(string) error                       { return nil }
 func (f *fakeSCMFacade) Stop(name string) error                   { f.stopped = name; return nil }
 func (f *fakeSCMFacade) Delete(name string) error                 { f.deleted = name; return nil }
 

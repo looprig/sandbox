@@ -229,7 +229,7 @@ func Setup(ctx context.Context, config SetupConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := installHost(ctx, validated, realHostInstallMechanisms{}); err != nil {
+	if err := installHost(ctx, validated, &realHostInstallMechanisms{}); err != nil {
 		return err
 	}
 	status, err := Inspect(ctx, config)
@@ -266,6 +266,10 @@ func initializeSetupIdentities(ctx context.Context, setup validatedSetup, manife
 type brokerRuntimeConfig struct {
 	StateRoot, HostPath, InstallationID, OwnerSID string
 	Protocol                                      uint16
+	ManifestState                                 setupState
+	GenerationManifestPath                        string
+	ProxyPorts                                    []uint16
+	OfflineSID, OnlineSID, ServiceIdentity        string
 	OfflineAccount, OnlineAccount                 string
 	OfflineCredential, OnlineCredential           string
 	PipeName, JournalPath                         string
@@ -320,7 +324,13 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 	var stateRoot, manifestPath string
 	switch {
 	case strings.EqualFold(filepath.Base(parent), "slots"):
-		stateRoot, manifestPath = filepath.Dir(parent), filepath.Join(filepath.Dir(parent), readyManifestName)
+		stateRoot = filepath.Dir(parent)
+		manifestPath = filepath.Join(stateRoot, readyManifestName)
+		if _, statErr := os.Stat(manifestPath); errors.Is(statErr, os.ErrNotExist) {
+			manifestPath = filepath.Join(generationDir, "manifest.json")
+		} else if statErr != nil {
+			return brokerRuntimeConfig{}, statErr
+		}
 	case strings.HasPrefix(strings.ToLower(filepath.Base(generationDir)), ".staging-"):
 		stateRoot, manifestPath = filepath.Dir(generationDir), filepath.Join(generationDir, "manifest.json")
 	default:
@@ -358,8 +368,8 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 	if err != nil || !strings.EqualFold(digest, manifest.HostSHA256) {
 		return brokerRuntimeConfig{}, errors.Join(errors.New("sandbox: broker executable hash does not match manifest"), err)
 	}
-	if manifest.State == setupStateReady && !strings.EqualFold(filepath.Clean(manifest.HostPath), filepath.Clean(executable)) {
-		return brokerRuntimeConfig{}, errors.New("sandbox: ready manifest does not own broker executable")
+	if !strings.EqualFold(filepath.Clean(manifest.HostPath), filepath.Clean(executable)) {
+		return brokerRuntimeConfig{}, errors.New("sandbox: manifest does not own broker executable")
 	}
 	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
 	if err != nil {
@@ -367,6 +377,8 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 	}
 	credentials, suffix := filepath.Join(stateRoot, "credentials"), strings.TrimPrefix(names.Service, "lsb-svc-")
 	return brokerRuntimeConfig{StateRoot: filepath.Clean(stateRoot), HostPath: filepath.Clean(executable), InstallationID: manifest.InstallationID, OwnerSID: manifest.OwnerSID, Protocol: manifest.Protocol,
+		ManifestState: manifest.State, GenerationManifestPath: manifestPath, ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
+		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID, ServiceIdentity: manifest.ServiceIdentity,
 		OfflineAccount: names.Offline, OnlineAccount: names.Online, OfflineCredential: filepath.Join(credentials, "offline.dpapi"), OnlineCredential: filepath.Join(credentials, "online.dpapi"),
 		PipeName: `\\.\pipe\looprig-sandbox-` + suffix, JournalPath: filepath.Join(stateRoot, "broker-leases.journal")}, nil
 }

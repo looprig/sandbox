@@ -2,7 +2,17 @@
 
 package windows
 
-import "errors"
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+)
+
+const brokerGreetingSize = 8 + 2 + 2 + brokerNonceSize
+
+var brokerGreetingMagic = [8]byte{'L', 'S', 'B', 'R', 'O', 'K', 'E', 'R'}
 
 type brokerFrameTransport interface {
 	RoundTrip(brokerFrame) (brokerFrame, error)
@@ -13,6 +23,63 @@ type brokerFrameTransport interface {
 type brokerClient struct {
 	transport brokerFrameTransport
 	nonce     [brokerNonceSize]byte
+}
+
+// writeBrokerGreeting transfers the service-selected connection nonce only
+// after the server has authenticated the kernel-reported pipe client. It is
+// deliberately not a broker frame: no unauthenticated request can choose or
+// reflect the nonce.
+func writeBrokerGreeting(writer io.Writer, nonce [brokerNonceSize]byte) error {
+	if writer == nil || nonce == ([brokerNonceSize]byte{}) {
+		return errors.New("windows sandbox: invalid broker greeting")
+	}
+	var greeting [brokerGreetingSize]byte
+	copy(greeting[:8], brokerGreetingMagic[:])
+	binary.LittleEndian.PutUint16(greeting[8:10], brokerProtocolVersion)
+	copy(greeting[12:], nonce[:])
+	if err := writeBrokerFrame(writer, greeting[:]); err != nil {
+		return fmt.Errorf("write authenticated broker greeting: %w", err)
+	}
+	return nil
+}
+
+func readBrokerGreeting(reader io.Reader) ([brokerNonceSize]byte, error) {
+	var nonce [brokerNonceSize]byte
+	if reader == nil {
+		return nonce, errors.New("windows sandbox: authenticated broker greeting is required")
+	}
+	var greeting [brokerGreetingSize]byte
+	if _, err := io.ReadFull(reader, greeting[:]); err != nil {
+		return nonce, fmt.Errorf("read authenticated broker greeting: %w", err)
+	}
+	if !bytes.Equal(greeting[:8], brokerGreetingMagic[:]) ||
+		binary.LittleEndian.Uint16(greeting[8:10]) != brokerProtocolVersion ||
+		binary.LittleEndian.Uint16(greeting[10:12]) != 0 {
+		return nonce, errors.New("windows sandbox: invalid broker greeting")
+	}
+	copy(nonce[:], greeting[12:])
+	if nonce == ([brokerNonceSize]byte{}) {
+		return nonce, errors.New("windows sandbox: empty broker greeting nonce")
+	}
+	return nonce, nil
+}
+
+func newBrokerClientFromAuthenticatedStream(stream brokerFrameStream) (*brokerClient, *pipeBrokerFrameTransport, error) {
+	if stream == nil {
+		return nil, nil, errors.New("windows sandbox: authenticated broker stream is required")
+	}
+	nonce, err := readBrokerGreeting(stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, nil, err
+	}
+	transport := &pipeBrokerFrameTransport{stream: stream}
+	client, err := newBrokerClient(transport, nonce)
+	if err != nil {
+		_ = transport.Close()
+		return nil, nil, err
+	}
+	return client, transport, nil
 }
 
 func newBrokerClient(transport brokerFrameTransport, nonce [brokerNonceSize]byte) (*brokerClient, error) {

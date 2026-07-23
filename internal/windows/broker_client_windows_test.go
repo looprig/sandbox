@@ -3,7 +3,9 @@
 package windows
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -94,6 +96,72 @@ func TestBrokerClientRejectsMismatchedOrFailureResponses(t *testing.T) {
 			}
 			if _, err := client.Status(); err == nil {
 				t.Fatal("response accepted")
+			}
+		})
+	}
+}
+
+type closeTrackingBrokerStream struct {
+	*bytes.Reader
+	closed bool
+}
+
+func (stream *closeTrackingBrokerStream) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (stream *closeTrackingBrokerStream) Close() error {
+	stream.closed = true
+	return nil
+}
+
+func TestAuthenticatedBrokerGreetingConstructsClientAndClosableTransport(t *testing.T) {
+	nonce := [brokerNonceSize]byte{7}
+	var encoded bytes.Buffer
+	if err := writeBrokerGreeting(&encoded, nonce); err != nil {
+		t.Fatal(err)
+	}
+	stream := &closeTrackingBrokerStream{Reader: bytes.NewReader(encoded.Bytes())}
+	client, transport, err := newBrokerClientFromAuthenticatedStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.nonce != nonce || client.transport != transport {
+		t.Fatal("authenticated nonce was not bound to transport")
+	}
+	if err := transport.Close(); err != nil || !stream.closed {
+		t.Fatalf("close = %v, closed=%v", err, stream.closed)
+	}
+}
+
+func TestAuthenticatedBrokerGreetingFailsClosed(t *testing.T) {
+	validNonce := [brokerNonceSize]byte{9}
+	var valid bytes.Buffer
+	if err := writeBrokerGreeting(&valid, validNonce); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "truncated", data: valid.Bytes()[:brokerGreetingSize-1]},
+		{name: "magic", data: append([]byte(nil), valid.Bytes()...)},
+		{name: "version", data: append([]byte(nil), valid.Bytes()...)},
+		{name: "reserved", data: append([]byte(nil), valid.Bytes()...)},
+		{name: "zero nonce", data: func() []byte {
+			data := append([]byte(nil), valid.Bytes()...)
+			clear(data[12:])
+			return data
+		}()},
+	}
+	tests[1].data[0] ^= 0xff
+	tests[2].data[8] ^= 0xff
+	tests[3].data[10] = 1
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream := &closeTrackingBrokerStream{Reader: bytes.NewReader(test.data)}
+			if _, _, err := newBrokerClientFromAuthenticatedStream(stream); err == nil {
+				t.Fatal("invalid greeting accepted")
+			}
+			if !stream.closed {
+				t.Fatal("failed handshake did not close pipe")
 			}
 		})
 	}

@@ -45,6 +45,39 @@ func TestLoadBrokerRuntimeConfigDerivesOnlyFromInstalledExecutable(t *testing.T)
 	}
 }
 
+func TestLoadBrokerRuntimeConfigUsesProtectedGenerationManifestBeforeReady(t *testing.T) {
+	programData := t.TempDir()
+	root := filepath.Join(programData, "Looprig")
+	executable := filepath.Join(root, "slots", "generation", "sandbox-host.exe")
+	if err := os.MkdirAll(filepath.Dir(executable), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := setupManifest{Version: setupManifestVersion, State: setupStateStaging, InstallationID: "install", OwnerSID: "S-1-5-21-1", HostPath: executable, HostSHA256: digest, ProxyPorts: []uint16{9001}, Protocol: brokerProtocolVersion}
+	data, err := encodeSetupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationManifest := filepath.Join(filepath.Dir(executable), "manifest.json")
+	if err := os.WriteFile(generationManifest, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadBrokerRuntimeConfigWithVerifier(executable, programData, allowBrokerPaths{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ManifestState != setupStateStaging || config.GenerationManifestPath != generationManifest ||
+		config.HostPath != executable || len(config.ProxyPorts) != 1 || config.ProxyPorts[0] != 9001 {
+		t.Fatalf("incomplete staging config: %#v", config)
+	}
+}
+
 type allowBrokerPaths struct{}
 
 func (allowBrokerPaths) Verify(string, string) error { return nil }
@@ -55,6 +88,15 @@ type fakeHostInstaller struct {
 	rolledBack bool
 	manifest   []byte
 	staging    []byte
+}
+
+type initializingHostInstaller struct{ fakeHostInstaller }
+
+func (f *initializingHostInstaller) Initialize(_ context.Context, _ validatedSetup, _ stagedHost, manifest setupManifest) (setupManifest, error) {
+	manifest.OfflineSID = "S-1-5-21-1"
+	manifest.OnlineSID = "S-1-5-21-2"
+	manifest.ServiceIdentity = "service-identity"
+	return manifest, f.hit("initialize")
 }
 
 func (f *fakeHostInstaller) PersistStaging(_ validatedSetup, _ stagedHost, data []byte) error {
@@ -78,6 +120,7 @@ func (f *fakeHostInstaller) Stage(validatedSetup) (stagedHost, error) {
 	return staged, nil
 }
 func (f *fakeHostInstaller) SelfTest(context.Context, stagedHost) error { return f.hit("self-test") }
+func (f *fakeHostInstaller) Promote(validatedSetup, stagedHost) error   { return f.hit("promote") }
 func (f *fakeHostInstaller) Activate(_ validatedSetup, _ stagedHost, data []byte) error {
 	f.manifest = append([]byte(nil), data...)
 	return f.hit("activate")
@@ -106,8 +149,61 @@ func TestHostInstallPublishesReadyOnlyAfterSelfTest(t *testing.T) {
 	}
 }
 
+func TestHostInstallPublishesIdentityPinsOnlyAfterDependencyInitialization(t *testing.T) {
+	f := &initializingHostInstaller{}
+	setup := validatedSetup{config: SetupConfig{InstallationID: "install", ProxyPorts: []uint16{9001}}, ownerSID: "S-1-5-21-owner"}
+	if err := installHost(context.Background(), setup, f); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := decodeSetupManifest(f.manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.State != setupStateReady || manifest.OfflineSID == "" || manifest.OnlineSID == "" || manifest.ServiceIdentity == "" {
+		t.Fatalf("ready manifest lacks initialized identity pins: %#v", manifest)
+	}
+	initialize := -1
+	activate := -1
+	for index, call := range f.calls {
+		switch call {
+		case "initialize":
+			initialize = index
+		case "activate":
+			activate = index
+		}
+	}
+	if initialize < 0 || activate <= initialize {
+		t.Fatalf("ready activation preceded dependency initialization: %v", f.calls)
+	}
+}
+
+func TestInitializedGenerationManifestRejectsChangedProtectedIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	original := setupManifest{Version: setupManifestVersion, State: setupStateStaging, InstallationID: "install", OwnerSID: "S-1-5-21-owner", HostPath: `C:\root\slots\one\sandbox-host.exe`, HostSHA256: strings.Repeat("ab", 32), ProxyPorts: []uint16{9001}, Protocol: brokerProtocolVersion}
+	enriched := original
+	enriched.OfflineSID, enriched.OnlineSID, enriched.ServiceIdentity = "S-1-5-21-1", "S-1-5-21-2", "service"
+	write := func(manifest setupManifest) {
+		data, err := encodeSetupManifest(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(enriched)
+	if _, err := readInitializedGenerationManifest(path, original, "service"); err != nil {
+		t.Fatal(err)
+	}
+	enriched.HostSHA256 = strings.Repeat("cd", 32)
+	write(enriched)
+	if _, err := readInitializedGenerationManifest(path, original, "service"); err == nil {
+		t.Fatal("changed protected generation identity was accepted")
+	}
+}
+
 func TestHostInstallRollsBackEveryPostStageFailure(t *testing.T) {
-	for _, step := range []string{"stage", "persist-staging", "self-test", "activate"} {
+	for _, step := range []string{"stage", "persist-staging", "self-test", "promote", "activate"} {
 		t.Run(step, func(t *testing.T) {
 			f := &fakeHostInstaller{fail: step}
 			err := installHost(context.Background(), validatedSetup{config: SetupConfig{InstallationID: "i", ProxyPorts: []uint16{1}}, ownerSID: "S"}, f)

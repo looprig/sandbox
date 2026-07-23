@@ -297,6 +297,7 @@ type scmFacade interface {
 	Lookup(brokerServiceSpecModel) (brokerServiceRecord, error)
 	Create(brokerServiceSpecModel) error
 	Apply(brokerServiceSpecModel) error
+	Start(string) error
 	Stop(string) error
 	Delete(string) error
 }
@@ -421,12 +422,32 @@ func (realSCMFacade) Create(spec brokerServiceSpecModel) error {
 		return err
 	}
 	defer manager.Disconnect()
-	service, err := manager.CreateService(spec.Name, spec.BinaryPath, scmConfig(spec), "--service")
+	// No command-line authority is needed. With an empty argument list the
+	// installed executable discovers SCM service mode and dispatches using the
+	// service name derived from its protected generation manifest.
+	service, err := manager.CreateService(spec.Name, spec.BinaryPath, scmConfig(spec))
 	if err != nil {
 		return err
 	}
 	defer service.Close()
-	return service.SetRecoveryActions([]mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: time.Duration(spec.FailureActions.RestartDelayMillis) * time.Millisecond}}, spec.FailureActions.ResetPeriodSeconds)
+	if err := service.SetRecoveryActions([]mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: time.Duration(spec.FailureActions.RestartDelayMillis) * time.Millisecond}}, spec.FailureActions.ResetPeriodSeconds); err != nil {
+		return errors.Join(err, service.Delete())
+	}
+	return nil
+}
+
+func (realSCMFacade) Start(name string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	return service.Start()
 }
 
 func (realSCMFacade) Apply(spec brokerServiceSpecModel) error {
