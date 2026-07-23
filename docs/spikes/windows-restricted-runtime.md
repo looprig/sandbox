@@ -136,14 +136,17 @@ trace. Missing or partial evidence cannot be selected.
 
 For filesystem, DLL, registry, named-pipe, process, locale, and console events,
 the currently specified collector is Microsoft Sysinternals Process Monitor
-4.01. Verify the file version is exactly `4.1.0.0`, then run in an elevated
-PowerShell session on the disposable worker. Collection and the baseline use
-two different shells and security contexts.
+4.04, published by Microsoft on 2026-06-17. Verify the file and product versions
+are exactly `4.04` and that `Get-AuthenticodeSignature` reports a valid Microsoft
+Corporation signer, then run in an elevated PowerShell session on the disposable
+worker. Collection and the baseline use two different shells and security
+contexts.
 
 First, in an **elevated collector PowerShell**, verify and start ProcMon:
 
 ```powershell
 (Get-Item .\procmon64.exe).VersionInfo.FileVersion
+Get-AuthenticodeSignature .\procmon64.exe
 .\procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml
 ```
 
@@ -172,7 +175,7 @@ Get-FileHash -Algorithm SHA256 C:\runtime-baseline.pml
 $env:LOOPRIG_RUNTIME_INVOCATION_MANIFEST = 'C:\runtime-invocation.json'
 $env:LOOPRIG_RUNTIME_RAW_TRACE = 'C:\runtime-baseline.pml'
 $env:LOOPRIG_RUNTIME_COLLECTOR_NAME = 'Microsoft Sysinternals Process Monitor'
-$env:LOOPRIG_RUNTIME_COLLECTOR_VERSION = '4.01'
+$env:LOOPRIG_RUNTIME_COLLECTOR_VERSION = '4.04'
 $env:LOOPRIG_RUNTIME_COLLECTOR_COMMAND = 'procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml'
 $env:LOOPRIG_RUNTIME_FINAL_MANIFEST_OUT = 'C:\runtime-final.json'
 go test -count=1 -v ./spikes/windows -run '^TestFinalizeRestrictedRuntimeRunManifest$'
