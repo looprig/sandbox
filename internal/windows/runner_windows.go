@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -19,10 +20,11 @@ import (
 )
 
 const (
-	runnerRequestVersion = uint16(1)
-	maxRunnerRequestSize = 64 << 10
-	maxRunnerArgCount    = 256
-	maxRunnerStringBytes = 32 << 10
+	runnerRequestVersion   = uint16(1)
+	maxRunnerRequestSize   = 64 << 10
+	maxRunnerArgCount      = 256
+	maxRunnerStringBytes   = 32 << 10
+	objectAttributeInherit = uint32(0x2)
 )
 
 var (
@@ -63,6 +65,17 @@ func marshalRunnerRequest(request runnerRequest) ([]byte, error) {
 		return nil, fmt.Errorf("%w: frame is oversized", errRunnerRequest)
 	}
 	return payload.Bytes(), nil
+}
+
+func marshalSealedRunnerRequest(request runnerRequest) ([]byte, error) {
+	frame, err := marshalRunnerRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	envelope := make([]byte, 0, len(request.Nonce)+len(frame))
+	envelope = append(envelope, request.Nonce[:]...)
+	envelope = append(envelope, frame...)
+	return envelope, nil
 }
 
 func decodeRunnerRequest(source io.Reader) (runnerRequest, error) {
@@ -220,6 +233,134 @@ func (runner *protectedRunner) Run(source runnerRequestSource, stdin, stdout, st
 }
 
 type nativeRunnerLauncher struct{}
+
+// RunInstalledProtectedRunner runs the installed host's sealed runner entry
+// mode. The entry mode deliberately accepts no handle values, nonces, paths, or
+// other authority-bearing inputs through argv or the environment. Its launcher
+// must provide exactly the three standard streams and one additional,
+// inheritable, read-only anonymous-pipe handle through a Windows
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+//
+// The sealed pipe starts with a second copy of the request nonce followed by the
+// runner request frame. Keeping the envelope nonce outside the frame catches
+// truncation and cross-wiring while the inherited pipe remains the capability
+// that authorizes this one launch.
+func RunInstalledProtectedRunner() (uint32, error) {
+	source, err := openSealedRunnerRequest()
+	if err != nil {
+		return 0, err
+	}
+	var expectedNonce [32]byte
+	if _, err := io.ReadFull(source, expectedNonce[:]); err != nil {
+		return 0, errors.Join(
+			fmt.Errorf("windows sandbox: read protected runner envelope: %w", err),
+			source.Close(),
+		)
+	}
+	if nonceIsZero(expectedNonce) {
+		return 0, errors.Join(
+			errors.New("windows sandbox: protected runner envelope has an empty nonce"),
+			source.Close(),
+		)
+	}
+	return (&protectedRunner{
+		launcher: &nativeRunnerLauncher{},
+		nonce:    expectedNonce,
+	}).Run(source, win.Handle(os.Stdin.Fd()), win.Handle(os.Stdout.Fd()), win.Handle(os.Stderr.Fd()))
+}
+
+func openSealedRunnerRequest() (*os.File, error) {
+	standard := make(map[uintptr]struct{}, 3)
+	for _, id := range []uint32{win.STD_INPUT_HANDLE, win.STD_OUTPUT_HANDLE, win.STD_ERROR_HANDLE} {
+		handle, err := win.GetStdHandle(id)
+		if err != nil || invalidExplicitHandle(handle) {
+			return nil, errors.Join(
+				fmt.Errorf("windows sandbox: inspect protected runner standard handle %#x", id),
+				err,
+			)
+		}
+		standard[uintptr(handle)] = struct{}{}
+	}
+	entries, err := currentProcessSystemHandles()
+	if err != nil {
+		return nil, fmt.Errorf("windows sandbox: enumerate protected runner handles: %w", err)
+	}
+	var candidate win.Handle
+	for _, entry := range entries {
+		if entry.HandleAttributes&objectAttributeInherit == 0 {
+			continue
+		}
+		if _, ok := standard[entry.HandleValue]; ok {
+			continue
+		}
+		handle := win.Handle(entry.HandleValue)
+		if candidate != 0 || !isSealedRunnerRequestHandle(handle, entry.GrantedAccess) {
+			return nil, errors.New("windows sandbox: protected runner inherited handle set is not sealed")
+		}
+		candidate = handle
+	}
+	if candidate == 0 {
+		return nil, errors.New("windows sandbox: protected runner request handle is missing")
+	}
+	if err := win.SetHandleInformation(candidate, win.HANDLE_FLAG_INHERIT, 0); err != nil {
+		return nil, fmt.Errorf("windows sandbox: make protected runner request non-inheritable: %w", err)
+	}
+	source := os.NewFile(uintptr(candidate), "sandbox-sealed-runner-request")
+	if source == nil {
+		_ = win.CloseHandle(candidate)
+		return nil, errors.New("windows sandbox: wrap protected runner request handle")
+	}
+	return source, nil
+}
+
+func currentProcessSystemHandles() ([]systemHandleEntry, error) {
+	buffer := make([]byte, 64<<10)
+	for {
+		var needed uint32
+		status, _, _ := ntQuerySystemInformation.Call(
+			systemExtendedHandleInformation,
+			uintptr(unsafe.Pointer(&buffer[0])),
+			uintptr(len(buffer)),
+			uintptr(unsafe.Pointer(&needed)),
+		)
+		if uint32(status) == statusInfoLengthMismatch {
+			buffer = make([]byte, int(needed)+(64<<10))
+			continue
+		}
+		if status != 0 {
+			return nil, fmt.Errorf("NtQuerySystemInformation: NTSTATUS %#x", uint32(status))
+		}
+		break
+	}
+	count := *(*uintptr)(unsafe.Pointer(&buffer[0]))
+	headerSize := 2 * unsafe.Sizeof(uintptr(0))
+	entrySize := unsafe.Sizeof(systemHandleEntry{})
+	pid := uintptr(os.Getpid())
+	result := make([]systemHandleEntry, 0, 8)
+	for i := uintptr(0); i < count; i++ {
+		offset := headerSize + i*entrySize
+		if offset+entrySize > uintptr(len(buffer)) {
+			return nil, errors.New("truncated system handle table")
+		}
+		entry := *(*systemHandleEntry)(unsafe.Pointer(&buffer[offset]))
+		if entry.UniqueProcessID == pid {
+			result = append(result, entry)
+		}
+	}
+	return result, nil
+}
+
+func isSealedRunnerRequestHandle(handle win.Handle, granted uint32) bool {
+	if invalidExplicitHandle(handle) || granted != standardInputAccess {
+		return false
+	}
+	typeName, err := handleObjectType(handle)
+	if err != nil || typeName != "File" {
+		return false
+	}
+	fileType, err := win.GetFileType(handle)
+	return err == nil && fileType&^win.FILE_TYPE_REMOTE == win.FILE_TYPE_PIPE
+}
 
 func (*nativeRunnerLauncher) Launch(launch runnerLaunch) (uint32, error) {
 	request := runnerRequest{Argv: launch.Argv, CWD: launch.CWD, Desktop: launch.Desktop, Nonce: [32]byte{1}}

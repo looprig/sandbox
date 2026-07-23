@@ -5,6 +5,7 @@ package windows
 import (
 	"bytes"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -45,6 +46,27 @@ func TestRunnerRequestCodecRoundTripIsStrictAndLossless(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request = %#v, want %#v", got, want)
+	}
+}
+
+func TestSealedRunnerRequestBindsEnvelopeAndFrameNonce(t *testing.T) {
+	request := validRunnerRequestForTest()
+	envelope, err := marshalSealedRunnerRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope) <= len(request.Nonce) {
+		t.Fatal("sealed request omitted the framed request")
+	}
+	if !bytes.Equal(envelope[:len(request.Nonce)], request.Nonce[:]) {
+		t.Fatal("sealed request envelope nonce mismatch")
+	}
+	decoded, err := decodeRunnerRequest(bytes.NewReader(envelope[len(request.Nonce):]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, request) {
+		t.Fatalf("decoded request = %#v, want %#v", decoded, request)
 	}
 }
 
@@ -178,6 +200,50 @@ func TestProtectedRunnerRejectsNonceMismatchAfterClosingRequest(t *testing.T) {
 	}
 	if !source.closed || launcher.got.Argv != nil {
 		t.Fatalf("nonce failure did not close without launch: closed=%v launch=%#v", source.closed, launcher.got)
+	}
+}
+
+func TestInstalledRunnerEntryHasNoAuthorityBearingParameters(t *testing.T) {
+	entryType := reflect.TypeOf(RunInstalledProtectedRunner)
+	if entryType.NumIn() != 0 {
+		t.Fatalf("RunInstalledProtectedRunner accepts %d inputs, want none", entryType.NumIn())
+	}
+	if entryType.NumOut() != 2 {
+		t.Fatalf("RunInstalledProtectedRunner returns %d values, want exit code and error", entryType.NumOut())
+	}
+}
+
+func TestSealedRunnerRequestRejectsWiderOrWrongKindHandles(t *testing.T) {
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readPipe.Close()
+	defer writePipe.Close()
+	var readHandle win.Handle
+	if err := win.DuplicateHandle(
+		win.CurrentProcess(), win.Handle(readPipe.Fd()), win.CurrentProcess(),
+		&readHandle, standardInputAccess, false, 0,
+	); err != nil {
+		t.Fatal(err)
+	}
+	defer win.CloseHandle(readHandle)
+	granted, err := handleGrantedAccess(readHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isSealedRunnerRequestHandle(readHandle, granted) {
+		t.Fatalf("read-only pipe access %#x rejected", granted)
+	}
+	if isSealedRunnerRequestHandle(readHandle, granted|win.WRITE_DAC) {
+		t.Fatal("wider request handle accepted")
+	}
+	writeAccess, err := handleGrantedAccess(win.Handle(writePipe.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isSealedRunnerRequestHandle(win.Handle(writePipe.Fd()), writeAccess) {
+		t.Fatal("write pipe accepted as sealed request source")
 	}
 }
 

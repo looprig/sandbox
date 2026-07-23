@@ -25,6 +25,14 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "--runner" {
+		code, err := win.RunInstalledProtectedRunner()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(int(code))
+	}
 	if len(os.Args) == 1 {
 		service, err := svc.IsWindowsService()
 		if err == nil && service {
