@@ -39,6 +39,7 @@ type brokerLeaseEvent struct {
 	Object      ACLObjectIdentity     `json:"object,omitempty"`
 	ACE         []byte                `json:"ace,omitempty"`
 	Baseline    uint32                `json:"baseline,omitempty"`
+	Path        string                `json:"path,omitempty"`
 }
 
 type brokerLeaseJournalStore interface {
@@ -129,7 +130,7 @@ func (journal *brokerLeaseJournal) recover() (map[ACLLeaseID]recoveredBrokerLeas
 			if lease.SID != event.SID || uint32(len(lease.Mutations)) != event.MutationID {
 				return nil, errors.New("windows sandbox: out-of-order lease mutation")
 			}
-			lease.Mutations = append(lease.Mutations, brokerACLMutation{Object: event.Object, SID: event.Trustee, ACE: append([]byte(nil), event.ACE...), BaselineOccurrences: event.Baseline})
+			lease.Mutations = append(lease.Mutations, brokerACLMutation{Object: event.Object, SID: event.Trustee, ACE: append([]byte(nil), event.ACE...), BaselineOccurrences: event.Baseline, Path: event.Path})
 		case brokerLeaseEventActive:
 			if lease.SID != event.SID || lease.Active {
 				return nil, errors.New("windows sandbox: invalid active lease event")
@@ -153,11 +154,11 @@ func validateBrokerLeaseEvent(event brokerLeaseEvent) error {
 	}
 	switch event.Kind {
 	case brokerLeaseEventReserved, brokerLeaseEventActive, brokerLeaseEventReleased:
-		if event.MutationID != 0 || event.Object != (ACLObjectIdentity{}) || len(event.ACE) != 0 || event.Baseline != 0 || event.Trustee.String() != "" {
+		if event.MutationID != 0 || event.Object != (ACLObjectIdentity{}) || len(event.ACE) != 0 || event.Baseline != 0 || event.Trustee.String() != "" || event.Path != "" {
 			return errors.New("windows sandbox: unexpected lease event mutation")
 		}
 	case brokerLeaseEventMutationPrepared:
-		if !event.Object.valid() || (event.Trustee != event.SID && event.Trustee.kind != sidKindInstallation) || !event.Trustee.isModuleTrustee() || !brokerAllowACEForSID(event.ACE, event.Trustee, event.Object.Kind) {
+		if !event.Object.valid() || !canonicalBrokerPath(event.Path) || (event.Trustee != event.SID && event.Trustee.kind != sidKindInstallation) || !event.Trustee.isModuleTrustee() || !brokerAllowACEForSID(event.ACE, event.Trustee, event.Object.Kind) {
 			return errors.New("windows sandbox: invalid prepared lease mutation")
 		}
 	default:

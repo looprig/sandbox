@@ -17,7 +17,7 @@ func TestBrokerLeaseJournalRecoversExactPreparedMutation(t *testing.T) {
 	object := connection.authorized[reference.Handle].Identity
 	ace := encodeACE(restricting, ACLObjectFile, ACLACE{Type: ACEAllow, Access: ACLRead})
 	lease := &brokerLease{id: leaseID, binding: connection.binding, restricting: restricting}
-	mutation := brokerACLMutation{Object: object, SID: restricting, ACE: ace, BaselineOccurrences: 3}
+	mutation := brokerACLMutation{Object: object, SID: restricting, ACE: ace, BaselineOccurrences: 3, Path: reference.Path, Handle: reference.Handle}
 	if err := broker.writeEvent(lease, brokerLeaseEventReserved, 0, brokerACLMutation{}); err != nil {
 		t.Fatal(err)
 	}

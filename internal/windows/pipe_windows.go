@@ -56,7 +56,7 @@ func (windowsBrokerPipeSystem) ClientPID(pipe xwindows.Handle) (uint32, error) {
 }
 
 func (windowsBrokerPipeSystem) OpenClient(pid uint32) (brokerClientProcess, error) {
-	handle, err := xwindows.OpenProcess(xwindows.PROCESS_QUERY_LIMITED_INFORMATION|xwindows.SYNCHRONIZE, false, pid)
+	handle, err := xwindows.OpenProcess(xwindows.PROCESS_QUERY_LIMITED_INFORMATION|xwindows.PROCESS_DUP_HANDLE|xwindows.SYNCHRONIZE, false, pid)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +250,10 @@ func brokerPipeSDDL(ownerSID string) (string, error) {
 }
 
 func createAuthenticatedBrokerPipe(name, ownerSID string) (xwindows.Handle, error) {
+	return createBrokerPipeInstance(name, ownerSID, true)
+}
+
+func createBrokerPipeInstance(name, ownerSID string, first bool) (xwindows.Handle, error) {
 	if !strings.HasPrefix(strings.ToLower(name), `\\.\pipe\`) || len(name) <= len(`\\.\pipe\`) || strings.IndexByte(name, 0) >= 0 {
 		return xwindows.InvalidHandle, errors.New("windows sandbox: invalid local broker pipe name")
 	}
@@ -266,8 +270,12 @@ func createAuthenticatedBrokerPipe(name, ownerSID string) (xwindows.Handle, erro
 		return xwindows.InvalidHandle, err
 	}
 	attributes := xwindows.SecurityAttributes{Length: uint32(unsafe.Sizeof(xwindows.SecurityAttributes{})), SecurityDescriptor: descriptor}
+	openMode := uint32(xwindows.PIPE_ACCESS_DUPLEX)
+	if first {
+		openMode |= xwindows.FILE_FLAG_FIRST_PIPE_INSTANCE
+	}
 	pipe, err := xwindows.CreateNamedPipe(name16,
-		xwindows.PIPE_ACCESS_DUPLEX|xwindows.FILE_FLAG_FIRST_PIPE_INSTANCE,
+		openMode,
 		xwindows.PIPE_TYPE_MESSAGE|xwindows.PIPE_READMODE_MESSAGE|xwindows.PIPE_WAIT|xwindows.PIPE_REJECT_REMOTE_CLIENTS,
 		xwindows.PIPE_UNLIMITED_INSTANCES, maxBrokerFrameSize, maxBrokerFrameSize, 0, &attributes)
 	if err != nil {

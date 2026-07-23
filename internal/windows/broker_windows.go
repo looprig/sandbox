@@ -26,8 +26,10 @@ type brokerConnection interface {
 }
 
 type brokerAuthorizedObject struct {
-	Reference brokerObjectReference
-	Identity  ACLObjectIdentity
+	Reference       brokerObjectReference
+	Identity        ACLObjectIdentity
+	AuthorityHandle uint64
+	Release         func() error
 }
 
 type brokerACLMutation struct {
@@ -35,6 +37,8 @@ type brokerACLMutation struct {
 	SID                 SID
 	ACE                 []byte
 	BaselineOccurrences uint32
+	Path                string
+	Handle              uint64
 }
 
 type brokerACLMechanism interface {
@@ -160,13 +164,22 @@ func (broker *windowsBroker) acquire(connection brokerConnection, references []b
 		}
 		authorized, err := connection.AuthorizeObject(reference)
 		if err != nil || !sameBrokerObject(reference, authorized) {
+			if authorized.Release != nil {
+				_ = authorized.Release()
+			}
 			return ACLLeaseID{}, broker.abort(lease, errors.Join(errBrokerClientUnauthorized, err))
 		}
 		if _, duplicate := seenObjects[authorized.Identity]; duplicate {
+			if authorized.Release != nil {
+				_ = authorized.Release()
+			}
 			return ACLLeaseID{}, broker.abort(lease, errBrokerClientUnauthorized)
 		}
 		seenObjects[authorized.Identity] = struct{}{}
 		mutations, err := broker.acl.Plan(authorized, []SID{broker.installationSID, restricting})
+		if authorized.Release != nil {
+			err = errors.Join(err, authorized.Release())
+		}
 		if err != nil {
 			return ACLLeaseID{}, broker.abort(lease, err)
 		}
@@ -174,7 +187,7 @@ func (broker *windowsBroker) acquire(connection brokerConnection, references []b
 			return ACLLeaseID{}, broker.abort(lease, errors.New("windows sandbox: ACL plan contained no mutations"))
 		}
 		for _, mutation := range mutations {
-			if !broker.allowedMutation(mutation, authorized.Identity, restricting) {
+			if !broker.allowedMutation(mutation, authorized, restricting) {
 				return ACLLeaseID{}, broker.abort(lease, errBrokerClientUnauthorized)
 			}
 			signature := fmt.Sprintf("%#v/%s/%x", mutation.Object, mutation.SID.String(), mutation.ACE)
@@ -310,7 +323,7 @@ func (broker *windowsBroker) rollback(lease *brokerLease) error {
 }
 
 func (broker *windowsBroker) writeEvent(lease *brokerLease, kind brokerLeaseEventKind, mutationID uint32, mutation brokerACLMutation) error {
-	return broker.journal.appendAndFlush(brokerLeaseEvent{Kind: kind, LeaseID: lease.id, Nonce: lease.binding.Nonce, PID: lease.binding.PID, Created: lease.binding.CreationTime, SID: lease.restricting, Trustee: mutation.SID, MutationID: mutationID, Object: mutation.Object, ACE: append([]byte(nil), mutation.ACE...), Baseline: mutation.BaselineOccurrences})
+	return broker.journal.appendAndFlush(brokerLeaseEvent{Kind: kind, LeaseID: lease.id, Nonce: lease.binding.Nonce, PID: lease.binding.PID, Created: lease.binding.CreationTime, SID: lease.restricting, Trustee: mutation.SID, MutationID: mutationID, Object: mutation.Object, ACE: append([]byte(nil), mutation.ACE...), Baseline: mutation.BaselineOccurrences, Path: mutation.Path})
 }
 
 func (broker *windowsBroker) nextLeaseID() (ACLLeaseID, error) {
@@ -326,8 +339,9 @@ func (broker *windowsBroker) nextLeaseID() (ACLLeaseID, error) {
 	return ACLLeaseID{}, errors.New("windows sandbox: lease identity collision")
 }
 
-func (broker *windowsBroker) allowedMutation(mutation brokerACLMutation, object ACLObjectIdentity, restricting SID) bool {
-	return mutation.Object == object && (mutation.SID == broker.installationSID || mutation.SID == restricting) && brokerAllowACEForSID(mutation.ACE, mutation.SID, object.Kind)
+func (broker *windowsBroker) allowedMutation(mutation brokerACLMutation, authorized brokerAuthorizedObject, restricting SID) bool {
+	return mutation.Object == authorized.Identity && mutation.Path == authorized.Reference.Path && canonicalBrokerPath(mutation.Path) &&
+		(mutation.SID == broker.installationSID || mutation.SID == restricting) && brokerAllowACEForSID(mutation.ACE, mutation.SID, authorized.Identity.Kind)
 }
 
 func brokerAllowACEForSID(ace []byte, sid SID, kind ACLObjectKind) bool {
@@ -346,7 +360,9 @@ func brokerAllowACEForSID(ace []byte, sid SID, kind ACLObjectKind) bool {
 }
 
 func sameBrokerObject(reference brokerObjectReference, authorized brokerAuthorizedObject) bool {
-	return authorized.Reference == reference && authorized.Identity.valid() && authorized.Identity.VolumeSerial == reference.VolumeSerial && authorized.Identity.FileID == reference.FileID && ((reference.Kind == brokerObjectFile && authorized.Identity.Kind == ACLObjectFile) || (reference.Kind == brokerObjectDirectory && authorized.Identity.Kind == ACLObjectDirectory))
+	return authorized.Reference == reference && authorized.Identity.valid() && authorized.Identity.VolumeSerial == reference.VolumeSerial && authorized.Identity.FileID == reference.FileID &&
+		((reference.Kind == brokerObjectFile && authorized.Identity.Kind == ACLObjectFile && authorized.Identity.LinkCount == 1) ||
+			(reference.Kind == brokerObjectDirectory && authorized.Identity.Kind == ACLObjectDirectory))
 }
 
 func sameBrokerBinding(left, right brokerLeaseBinding) bool {

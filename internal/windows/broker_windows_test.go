@@ -38,6 +38,7 @@ func (connection *brokerTestConnection) AuthorizeObject(reference brokerObjectRe
 	}
 	return object, nil
 }
+func (*brokerTestConnection) Close() error { return nil }
 
 type brokerTestJournalStore struct {
 	data       bytes.Buffer
@@ -92,7 +93,7 @@ func (acl *brokerTestACL) Plan(object brokerAuthorizedObject, trustees []SID) ([
 		if acl.corruptMask {
 			ace[4] ^= 0x40
 		}
-		mutations = append(mutations, brokerACLMutation{Object: identity, SID: mutationSID, ACE: ace, BaselineOccurrences: uint32(countIdenticalACE(acl.aces[identity], ace))})
+		mutations = append(mutations, brokerACLMutation{Object: identity, SID: mutationSID, ACE: ace, BaselineOccurrences: uint32(countIdenticalACE(acl.aces[identity], ace)), Path: object.Reference.Path, Handle: object.Reference.Handle})
 	}
 	return mutations, nil
 }
