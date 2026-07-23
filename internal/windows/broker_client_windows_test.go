@@ -41,7 +41,7 @@ func TestBrokerClientExposesExactOperationFrames(t *testing.T) {
 	}
 	var fileID [16]byte
 	fileID[0] = 3
-	object := brokerObjectReference{Handle: 9, Path: `C:\input.txt`, VolumeSerial: 1, FileID: fileID, Kind: brokerObjectFile}
+	object := brokerObjectReference{Handle: 9, Path: `C:\input.txt`, VolumeSerial: 1, FileID: fileID, Kind: brokerObjectFile, Access: brokerAccessReadWrite, Scope: brokerScopeExact}
 	if generation, err := client.Status(); err != nil || generation != 4 {
 		t.Fatalf("status = %d, %v", generation, err)
 	}

@@ -593,10 +593,24 @@ func (win32BrokerACLMechanism) Plan(authorized brokerAuthorizedObject, trustees 
 	if err != nil || snapshot.identity != authorized.Identity {
 		return nil, errors.Join(errBrokerClientChanged, err)
 	}
-	mutations := make([]brokerACLMutation, 0, len(trustees)*3)
+	axes := func(access brokerObjectAccess) []ACLAccess {
+		var result []ACLAccess
+		if access&brokerAccessRead != 0 {
+			result = append(result, ACLRead, ACLExecute)
+		}
+		if access&brokerAccessWrite != 0 {
+			result = append(result, ACLWrite)
+		}
+		return result
+	}
+	mutations := make([]brokerACLMutation, 0, len(trustees)*6)
 	for _, trustee := range trustees {
-		for _, access := range []ACLAccess{ACLRead, ACLExecute, ACLWrite} {
-			ace := encodeACE(trustee, authorized.Identity.Kind, ACLACE{Type: ACEAllow, Access: access, Inheritable: authorized.Identity.Kind == ACLObjectDirectory})
+		for _, access := range axes(authorized.Reference.Denied) {
+			ace := encodeACE(trustee, authorized.Identity.Kind, ACLACE{Type: ACEDeny, Access: access, Inheritable: authorized.Reference.Scope == brokerScopeTree})
+			mutations = append(mutations, brokerACLMutation{Object: authorized.Identity, SID: trustee, ACE: ace, BaselineOccurrences: uint32(countIdenticalACE(snapshot.aces, ace)), Path: authorized.Reference.Path})
+		}
+		for _, access := range axes(authorized.Reference.Access) {
+			ace := encodeACE(trustee, authorized.Identity.Kind, ACLACE{Type: ACEAllow, Access: access, Inheritable: authorized.Reference.Scope == brokerScopeTree})
 			mutations = append(mutations, brokerACLMutation{Object: authorized.Identity, SID: trustee, ACE: ace, BaselineOccurrences: uint32(countIdenticalACE(snapshot.aces, ace)), Path: authorized.Reference.Path})
 		}
 	}

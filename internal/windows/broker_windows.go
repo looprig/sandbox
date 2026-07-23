@@ -341,19 +341,50 @@ func (broker *windowsBroker) nextLeaseID() (ACLLeaseID, error) {
 
 func (broker *windowsBroker) allowedMutation(mutation brokerACLMutation, authorized brokerAuthorizedObject, restricting SID) bool {
 	return mutation.Object == authorized.Identity && mutation.Path == authorized.Reference.Path && canonicalBrokerPath(mutation.Path) &&
-		(mutation.SID == broker.installationSID || mutation.SID == restricting) && brokerAllowACEForSID(mutation.ACE, mutation.SID, authorized.Identity.Kind)
+		(mutation.SID == broker.installationSID || mutation.SID == restricting) &&
+		brokerReferenceAuthorizesACE(authorized.Reference, mutation.ACE, mutation.SID, authorized.Identity.Kind)
+}
+
+func brokerReferenceAuthorizesACE(reference brokerObjectReference, ace []byte, sid SID, kind ACLObjectKind) bool {
+	if !brokerAllowACEForSID(ace, sid, kind) {
+		return false
+	}
+	inheritable := reference.Scope == brokerScopeTree
+	for _, candidate := range []struct {
+		kind   ACEType
+		access brokerObjectAccess
+	}{
+		{ACEAllow, reference.Access},
+		{ACEDeny, reference.Denied},
+	} {
+		axes := []ACLAccess{}
+		if candidate.access&brokerAccessRead != 0 {
+			axes = append(axes, ACLRead, ACLExecute)
+		}
+		if candidate.access&brokerAccessWrite != 0 {
+			axes = append(axes, ACLWrite)
+		}
+		for _, axis := range axes {
+			if bytes.Equal(ace, encodeACE(sid, kind, ACLACE{Type: candidate.kind, Access: axis, Inheritable: inheritable})) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func brokerAllowACEForSID(ace []byte, sid SID, kind ACLObjectKind) bool {
-	if len(ace) < 8 || ace[0] != 0 || int(binary.LittleEndian.Uint16(ace[2:4])) != len(ace) || !bytes.Equal(ace[8:], sid.binary()) {
+	if len(ace) < 8 || (ace[0] != 0 && ace[0] != 1) || int(binary.LittleEndian.Uint16(ace[2:4])) != len(ace) || !bytes.Equal(ace[8:], sid.binary()) {
 		return false
 	}
-	for _, access := range []ACLAccess{ACLRead, ACLExecute, ACLWrite} {
-		if bytes.Equal(ace, encodeACE(sid, kind, ACLACE{Type: ACEAllow, Access: access})) {
-			return true
-		}
-		if kind == ACLObjectDirectory && bytes.Equal(ace, encodeACE(sid, kind, ACLACE{Type: ACEAllow, Access: access, Inheritable: true})) {
-			return true
+	for _, aceType := range []ACEType{ACEAllow, ACEDeny} {
+		for _, access := range []ACLAccess{ACLRead, ACLExecute, ACLWrite} {
+			if bytes.Equal(ace, encodeACE(sid, kind, ACLACE{Type: aceType, Access: access})) {
+				return true
+			}
+			if kind == ACLObjectDirectory && bytes.Equal(ace, encodeACE(sid, kind, ACLACE{Type: aceType, Access: access, Inheritable: true})) {
+				return true
+			}
 		}
 	}
 	return false
@@ -361,7 +392,8 @@ func brokerAllowACEForSID(ace []byte, sid SID, kind ACLObjectKind) bool {
 
 func sameBrokerObject(reference brokerObjectReference, authorized brokerAuthorizedObject) bool {
 	return authorized.Reference == reference && authorized.Identity.valid() && authorized.Identity.VolumeSerial == reference.VolumeSerial && authorized.Identity.FileID == reference.FileID &&
-		((reference.Kind == brokerObjectFile && authorized.Identity.Kind == ACLObjectFile && authorized.Identity.LinkCount == 1) ||
+		((reference.Kind == brokerObjectFile && authorized.Identity.Kind == ACLObjectFile &&
+			(authorized.Identity.LinkCount == 1 || (reference.Access == brokerAccessNone && reference.Denied != brokerAccessNone))) ||
 			(reference.Kind == brokerObjectDirectory && authorized.Identity.Kind == ACLObjectDirectory))
 }
 

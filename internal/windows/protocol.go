@@ -15,7 +15,7 @@ const (
 	brokerProtocolVersion uint16 = 1
 	maxBrokerFrameSize           = 1 << 20
 	maxBrokerPathUnits           = 32767
-	maxBrokerObjects             = 256
+	maxBrokerObjects             = 4096
 	brokerNonceSize              = 32
 	brokerLeaseIDSize            = 16
 	brokerHeaderSize             = 8
@@ -65,6 +65,24 @@ const (
 	brokerObjectDirectory
 )
 
+// brokerObjectAccess is deliberately not a Windows access mask.
+type brokerObjectAccess uint8
+
+const (
+	brokerAccessNone brokerObjectAccess = iota
+	brokerAccessRead
+	brokerAccessWrite
+	brokerAccessReadWrite
+)
+
+type brokerObjectScope uint8
+
+const (
+	brokerScopeInvalid brokerObjectScope = iota
+	brokerScopeExact
+	brokerScopeTree
+)
+
 type brokerResult uint16
 
 const (
@@ -83,6 +101,9 @@ type brokerObjectReference struct {
 	VolumeSerial uint64
 	FileID       [16]byte
 	Kind         brokerObjectKind
+	Access       brokerObjectAccess
+	Denied       brokerObjectAccess
+	Scope        brokerObjectScope
 }
 
 // brokerFrame is the complete v1 protocol vocabulary. Operation-specific
@@ -331,6 +352,13 @@ func validateBrokerObject(object brokerObjectReference) error {
 	if object.Handle == 0 || (object.Kind != brokerObjectFile && object.Kind != brokerObjectDirectory) || object.VolumeSerial == 0 || object.FileID == ([16]byte{}) {
 		return errBrokerFrameMalformed
 	}
+	if object.Access > brokerAccessReadWrite || object.Denied > brokerAccessReadWrite ||
+		(object.Access == brokerAccessNone && object.Denied == brokerAccessNone) ||
+		object.Access&object.Denied != 0 ||
+		(object.Kind == brokerObjectFile && object.Scope != brokerScopeExact) ||
+		(object.Kind == brokerObjectDirectory && object.Scope != brokerScopeExact && object.Scope != brokerScopeTree) {
+		return errBrokerFrameMalformed
+	}
 	if !canonicalBrokerPath(object.Path) || !utf8.ValidString(object.Path) {
 		return errBrokerFrameMalformed
 	}
@@ -373,6 +401,9 @@ func encodeBrokerObjects(objects []brokerObjectReference) ([]byte, error) {
 		_ = binary.Write(buffer, binary.LittleEndian, object.VolumeSerial)
 		_, _ = buffer.Write(object.FileID[:])
 		_ = buffer.WriteByte(byte(object.Kind))
+		_ = buffer.WriteByte(byte(object.Access))
+		_ = buffer.WriteByte(byte(object.Denied))
+		_ = buffer.WriteByte(byte(object.Scope))
 		_ = binary.Write(buffer, binary.LittleEndian, uint16(len(units)))
 		for _, unit := range units {
 			_ = binary.Write(buffer, binary.LittleEndian, unit)
@@ -392,17 +423,20 @@ func decodeBrokerObjects(data []byte) ([]brokerObjectReference, error) {
 	offset := 2
 	objects := make([]brokerObjectReference, 0, count)
 	for range count {
-		if len(data)-offset < 35 {
+		if len(data)-offset < 38 {
 			return nil, errBrokerFrameMalformed
 		}
 		object := brokerObjectReference{
 			Handle:       binary.LittleEndian.Uint64(data[offset : offset+8]),
 			VolumeSerial: binary.LittleEndian.Uint64(data[offset+8 : offset+16]),
 			Kind:         brokerObjectKind(data[offset+32]),
+			Access:       brokerObjectAccess(data[offset+33]),
+			Denied:       brokerObjectAccess(data[offset+34]),
+			Scope:        brokerObjectScope(data[offset+35]),
 		}
 		copy(object.FileID[:], data[offset+16:offset+32])
-		unitsCount := int(binary.LittleEndian.Uint16(data[offset+33 : offset+35]))
-		offset += 35
+		unitsCount := int(binary.LittleEndian.Uint16(data[offset+36 : offset+38]))
+		offset += 38
 		if unitsCount == 0 || unitsCount > maxBrokerPathUnits || unitsCount > (len(data)-offset)/2 {
 			return nil, errBrokerFrameMalformed
 		}

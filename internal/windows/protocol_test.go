@@ -100,8 +100,11 @@ func TestBrokerProtocolRejectsMalformedLengthsAndTrailingBytes(t *testing.T) {
 func TestBrokerProtocolRejectsInvalidUTF16AndPathLimits(t *testing.T) {
 	frame := brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: testBrokerNonce(), Objects: []brokerObjectReference{testBrokerObject()}}
 	encoded := mustEncodeBrokerFrame(t, frame)
-	// The first path code unit follows prefix(4), header(8), TLV(6), count(2), and object metadata(35).
-	pathOffset := 4 + 8 + 6 + 2 + 35
+	pathBytes := []byte{'C', 0, ':', 0, '\\', 0}
+	pathOffset := bytes.Index(encoded, pathBytes)
+	if pathOffset < 0 {
+		t.Fatal("encoded object path not found")
+	}
 	binary.LittleEndian.PutUint16(encoded[pathOffset:pathOffset+2], 0xd800)
 	if _, err := decodeBrokerFrame(bytes.NewReader(encoded)); err == nil {
 		t.Fatal("unpaired UTF-16 surrogate accepted")
@@ -110,6 +113,24 @@ func TestBrokerProtocolRejectsInvalidUTF16AndPathLimits(t *testing.T) {
 	frame.Objects[0].Path = `C:\` + strings.Repeat("x", maxBrokerPathUnits)
 	if _, err := encodeBrokerFrame(frame); !errors.Is(err, errBrokerFrameTooLarge) {
 		t.Fatalf("oversize path error = %v", err)
+	}
+}
+
+func TestBrokerProtocolObjectPolicyVocabularyIsClosed(t *testing.T) {
+	tests := []func(*brokerObjectReference){
+		func(object *brokerObjectReference) { object.Access = 4 },
+		func(object *brokerObjectReference) { object.Denied = 4 },
+		func(object *brokerObjectReference) { object.Denied = object.Access },
+		func(object *brokerObjectReference) { object.Scope = brokerScopeInvalid },
+		func(object *brokerObjectReference) { object.Kind, object.Scope = brokerObjectFile, brokerScopeTree },
+	}
+	for index, mutate := range tests {
+		object := testBrokerObject()
+		mutate(&object)
+		frame := brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: testBrokerNonce(), Objects: []brokerObjectReference{object}}
+		if _, err := encodeBrokerFrame(frame); err == nil {
+			t.Fatalf("invalid broker object policy %d accepted", index)
+		}
 	}
 }
 
@@ -186,5 +207,14 @@ func testBrokerNonce() [brokerNonceSize]byte {
 }
 
 func testBrokerObject() brokerObjectReference {
-	return brokerObjectReference{Handle: 12, Path: `C:\work\file.txt`, VolumeSerial: 9, FileID: [16]byte{4}, Kind: brokerObjectFile}
+	return brokerObjectReference{Handle: 12, Path: `C:\work\file.txt`, VolumeSerial: 9, FileID: [16]byte{4}, Kind: brokerObjectFile, Access: brokerAccessReadWrite, Scope: brokerScopeExact}
+}
+
+func TestBrokerObjectAllowsExactDirectoryWithoutInheritance(t *testing.T) {
+	object := testBrokerObject()
+	object.Kind = brokerObjectDirectory
+	object.Scope = brokerScopeExact
+	if err := validateBrokerObject(object); err != nil {
+		t.Fatalf("exact directory reference rejected: %v", err)
+	}
 }

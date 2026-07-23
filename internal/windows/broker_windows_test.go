@@ -181,7 +181,7 @@ func newBrokerTestRig(t *testing.T) (*windowsBroker, *brokerTestConnection, *bro
 	binding := brokerLeaseBinding{Nonce: nonce, PID: 41, CreationTime: 99, Process: process}
 	var fileID [16]byte
 	fileID[0] = 7
-	reference := brokerObjectReference{Handle: 55, Path: `C:\data\input.txt`, VolumeSerial: 3, FileID: fileID, Kind: brokerObjectFile}
+	reference := brokerObjectReference{Handle: 55, Path: `C:\data\input.txt`, VolumeSerial: 3, FileID: fileID, Kind: brokerObjectFile, Access: brokerAccessReadWrite, Scope: brokerScopeExact}
 	identity := ACLObjectIdentity{VolumeSerial: 3, FileID: fileID, Kind: ACLObjectFile, LinkCount: 1}
 	connection := &brokerTestConnection{binding: binding, authorized: map[uint64]brokerAuthorizedObject{55: {Reference: reference, Identity: identity}}}
 	return broker, connection, acl, store, tokens, reference
