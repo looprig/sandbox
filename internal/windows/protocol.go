@@ -12,10 +12,13 @@ import (
 )
 
 const (
+	// Version 1 has not shipped. Adding the broker-selected desktop to its
+	// token response completes v1 rather than changing a released contract.
 	brokerProtocolVersion uint16 = 1
 	maxBrokerFrameSize           = 1 << 20
 	maxBrokerPathUnits           = 32767
 	maxBrokerObjects             = 4096
+	maxBrokerDesktopUnits        = 255
 	brokerNonceSize              = 32
 	brokerLeaseIDSize            = 16
 	brokerHeaderSize             = 8
@@ -117,6 +120,7 @@ type brokerFrame struct {
 	Account     brokerAccountKind
 	Objects     []brokerObjectReference
 	TokenHandle uint64
+	Desktop     string
 	Result      brokerResult
 	Generation  uint64
 }
@@ -129,6 +133,7 @@ const (
 	fieldTokenHandle
 	fieldResult
 	fieldGeneration
+	fieldDesktop
 )
 
 func encodeBrokerFrame(frame brokerFrame) ([]byte, error) {
@@ -157,6 +162,9 @@ func encodeBrokerFrame(frame brokerFrame) ([]byte, error) {
 	}
 	if frame.TokenHandle != 0 {
 		writeField(fieldTokenHandle, uint64Bytes(frame.TokenHandle))
+	}
+	if frame.Desktop != "" {
+		writeField(fieldDesktop, encodeBrokerUTF16(frame.Desktop))
 	}
 	if frame.Direction == brokerResponse {
 		writeField(fieldResult, uint16Bytes(uint16(frame.Result)))
@@ -277,6 +285,12 @@ func decodeBrokerField(frame *brokerFrame, id uint16, value []byte) error {
 			return errBrokerFrameMalformed
 		}
 		frame.Generation = binary.LittleEndian.Uint64(value)
+	case fieldDesktop:
+		units, err := decodeBrokerUTF16(value, maxBrokerDesktopUnits)
+		if err != nil {
+			return err
+		}
+		frame.Desktop = string(utf16.Decode(units))
 	default:
 		return fmt.Errorf("%w: unknown field %d", errBrokerFrameMalformed, id)
 	}
@@ -297,7 +311,7 @@ func validateBrokerFrame(frame brokerFrame) error {
 	}
 	hasLease := frame.LeaseID != ([brokerLeaseIDSize]byte{})
 	if frame.Direction == brokerRequest {
-		if frame.Result != brokerResultOK || frame.TokenHandle != 0 || frame.Generation != 0 {
+		if frame.Result != brokerResultOK || frame.TokenHandle != 0 || frame.Desktop != "" || frame.Generation != 0 {
 			return errBrokerFrameMalformed
 		}
 		switch frame.Kind {
@@ -324,28 +338,79 @@ func validateBrokerFrame(frame brokerFrame) error {
 		}
 		switch frame.Kind {
 		case brokerMessageStatus:
-			if hasLease || frame.TokenHandle != 0 {
+			if hasLease || frame.TokenHandle != 0 || frame.Desktop != "" {
 				return errBrokerFrameMalformed
 			}
 		case brokerMessageAcquireLease:
-			if frame.TokenHandle != 0 || frame.Generation != 0 || (frame.Result == brokerResultOK) != hasLease {
+			if frame.TokenHandle != 0 || frame.Desktop != "" || frame.Generation != 0 || (frame.Result == brokerResultOK) != hasLease {
 				return errBrokerFrameMalformed
 			}
 		case brokerMessageReleaseLease:
-			if !hasLease || frame.TokenHandle != 0 || frame.Generation != 0 {
+			if !hasLease || frame.TokenHandle != 0 || frame.Desktop != "" || frame.Generation != 0 {
 				return errBrokerFrameMalformed
 			}
 		case brokerMessageIssueRestrictedToken:
-			if !hasLease || frame.Generation != 0 || (frame.Result == brokerResultOK) != (frame.TokenHandle != 0) {
+			hasTokenAndDesktop := frame.TokenHandle != 0 && validBrokerDesktopName(frame.Desktop)
+			if !hasLease || frame.Generation != 0 || (frame.Result == brokerResultOK) != hasTokenAndDesktop ||
+				(frame.Result != brokerResultOK && (frame.TokenHandle != 0 || frame.Desktop != "")) {
 				return errBrokerFrameMalformed
 			}
 		case brokerMessageReconcile:
-			if hasLease || frame.TokenHandle != 0 {
+			if hasLease || frame.TokenHandle != 0 || frame.Desktop != "" {
 				return errBrokerFrameMalformed
 			}
 		}
 	}
 	return nil
+}
+
+func validBrokerDesktopName(value string) bool {
+	if value == "" || !utf8.ValidString(value) || strings.EqualFold(value, `WinSta0\Default`) {
+		return false
+	}
+	units := utf16.Encode([]rune(value))
+	if len(units) == 0 || len(units) > maxBrokerDesktopUnits {
+		return false
+	}
+	parts := strings.Split(value, `\`)
+	if len(parts) != 2 || strings.EqualFold(parts[0], "WinSta0") {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.TrimSpace(part) != part {
+			return false
+		}
+		for _, r := range part {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func encodeBrokerUTF16(value string) []byte {
+	units := utf16.Encode([]rune(value))
+	encoded := make([]byte, len(units)*2)
+	for index, unit := range units {
+		binary.LittleEndian.PutUint16(encoded[index*2:], unit)
+	}
+	return encoded
+}
+
+func decodeBrokerUTF16(value []byte, maxUnits int) ([]uint16, error) {
+	if len(value) == 0 || len(value)%2 != 0 || len(value)/2 > maxUnits {
+		return nil, errBrokerFrameMalformed
+	}
+	units := make([]uint16, len(value)/2)
+	for index := range units {
+		units[index] = binary.LittleEndian.Uint16(value[index*2:])
+	}
+	if !validUTF16(units) {
+		return nil, errBrokerFrameMalformed
+	}
+	return units, nil
 }
 
 func validateBrokerObject(object brokerObjectReference) error {

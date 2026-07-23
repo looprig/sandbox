@@ -33,9 +33,9 @@ func (client *fakeElevatedLeaseClient) AcquireLease(objects []brokerObjectRefere
 	}
 	return client.lease, client.err
 }
-func (client *fakeElevatedLeaseClient) IssueRestrictedToken(ACLLeaseID, brokerAccountKind) (uint64, error) {
+func (client *fakeElevatedLeaseClient) IssueRestrictedToken(ACLLeaseID, brokerAccountKind) (brokerIssuedToken, error) {
 	client.issueCalls++
-	return client.token, client.err
+	return brokerIssuedToken{Handle: client.token, Desktop: `Sandbox-77\Default`}, client.err
 }
 func (client *fakeElevatedLeaseClient) ReleaseLease(ACLLeaseID) error {
 	client.releaseCalls++
@@ -85,27 +85,34 @@ func TestBrokerBackedElevatedLeaseAcquiresBeforeTokenAndReleasesOnce(t *testing.
 			return win.Token(raw), nil
 		},
 	}
-	lease, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps)
+	factory, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := lease.Narrowings(); len(got) != 1 || got[0] != "narrowed" {
+	if got := factory.Narrowings(); len(got) != 1 || got[0] != "narrowed" {
 		t.Fatalf("narrowings = %v", got)
 	}
-	if _, err := lease.IssueToken(brokerAccountOffline); err != nil {
+	execution, err := factory.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.IssueToken(brokerAccountOffline); err != nil {
 		t.Fatal(err)
 	}
 	if validated != 1 || client.issueCalls != 1 {
 		t.Fatalf("validated=%d issue=%d", validated, client.issueCalls)
 	}
-	if err := lease.Release(); err != nil {
+	if err := execution.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if err := lease.Release(); err != nil {
+	if err := execution.Release(); err != nil {
 		t.Fatal(err)
 	}
 	if client.releaseCalls != 1 || closed != 1 {
 		t.Fatalf("release=%d close=%d", client.releaseCalls, closed)
+	}
+	if err := factory.Release(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -121,7 +128,11 @@ func TestBrokerBackedElevatedLeaseGenerationMismatchClosesWithoutAcquire(t *test
 		},
 		token: validateBrokerTokenHandle,
 	}
-	if _, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps); err == nil {
+	factory, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := factory.Acquire(context.Background()); err == nil {
 		t.Fatal("generation mismatch accepted")
 	}
 	if client.acquireCalls != 0 || client.releaseCalls != 0 || closed != 1 {

@@ -40,14 +40,6 @@ func (nativeElevatedRunnerProcessAPI) VerifyToken(token win.Token) error {
 	return nil
 }
 
-func (nativeElevatedRunnerProcessAPI) CreateDesktop(spec privateDesktopSpec) (*privateDesktop, error) {
-	factory, err := newPrivateDesktopFactory(&nativePrivateDesktopAPI{})
-	if err != nil {
-		return nil, err
-	}
-	return factory.Create(spec)
-}
-
 func (nativeElevatedRunnerProcessAPI) CreateJob(options JobOptions) (*Job, error) {
 	options.Sandboxed = true
 	return NewJob(options)
@@ -173,11 +165,17 @@ func (nativeElevatedRunnerProcessAPI) CreateSuspended(token win.Token, host, des
 
 func windowsEnvironmentBlock(env []string) ([]uint16, error) {
 	entries := append([]string(nil), env...)
+	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		name, _, ok := strings.Cut(entry, "=")
 		if !ok || name == "" || strings.IndexByte(entry, 0) >= 0 {
 			return nil, errors.New("windows sandbox: invalid child environment")
 		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			return nil, errors.New("windows sandbox: duplicate child environment variable")
+		}
+		seen[key] = struct{}{}
 	}
 	slices.SortFunc(entries, func(left, right string) int {
 		return strings.Compare(strings.ToLower(left), strings.ToLower(right))

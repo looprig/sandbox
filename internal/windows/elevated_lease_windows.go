@@ -32,7 +32,7 @@ type elevatedBrokerLeaseConfig struct {
 type elevatedBrokerLeaseClient interface {
 	Status() (uint64, error)
 	AcquireLease([]brokerObjectReference) (ACLLeaseID, error)
-	IssueRestrictedToken(ACLLeaseID, brokerAccountKind) (uint64, error)
+	IssueRestrictedToken(ACLLeaseID, brokerAccountKind) (brokerIssuedToken, error)
 	ReleaseLease(ACLLeaseID) error
 }
 
@@ -58,6 +58,19 @@ type brokerBackedElevatedLease struct {
 	releaseErr error
 }
 
+// brokerBackedElevatedLeaseFactory retains only immutable, identity-bound
+// object handles. Each execution obtains its own authenticated connection and
+// ACL lease so completing one execution cannot revoke a sibling's authority.
+type brokerBackedElevatedLeaseFactory struct {
+	config     elevatedBrokerLeaseConfig
+	deps       elevatedBrokerLeaseDependencies
+	objects    []brokerObjectReference
+	narrowings []string
+	close      func() error
+	once       sync.Once
+	closeErr   error
+}
+
 func productionElevatedBrokerLeaseDependencies() elevatedBrokerLeaseDependencies {
 	return elevatedBrokerLeaseDependencies{
 		connect: func(ctx context.Context, pipeName, hostPath string) (elevatedBrokerLeaseSession, error) {
@@ -72,7 +85,7 @@ func productionElevatedBrokerLeaseDependencies() elevatedBrokerLeaseDependencies
 	}
 }
 
-func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBrokerLeaseConfig, effective policy.Effective, deps elevatedBrokerLeaseDependencies) (_ *brokerBackedElevatedLease, err error) {
+func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBrokerLeaseConfig, effective policy.Effective, deps elevatedBrokerLeaseDependencies) (_ *brokerBackedElevatedLeaseFactory, err error) {
 	if ctx == nil || config.InstallationID == "" ||
 		!normalizedAbsoluteWindowsPath(config.HostPath) || config.PipeName == "" ||
 		config.OfflineSID == "" || config.OnlineSID == "" || !config.RuntimeBaselineReady {
@@ -88,9 +101,20 @@ func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBroker
 	if closeObjects == nil {
 		closeObjects = func() error { return nil }
 	}
-	defer func() { err = errors.Join(err, closeObjects()) }()
+	return &brokerBackedElevatedLeaseFactory{
+		config: config, deps: deps,
+		objects:    append([]brokerObjectReference(nil), objects...),
+		narrowings: append([]string(nil), narrowings...),
+		close:      closeObjects,
+	}, nil
+}
 
-	session, err := deps.connect(ctx, config.PipeName, config.HostPath)
+func (factory *brokerBackedElevatedLeaseFactory) Acquire(ctx context.Context) (_ elevatedExecutionLease, err error) {
+	if factory == nil || ctx == nil || factory.deps.connect == nil || factory.deps.token == nil ||
+		len(factory.objects) == 0 {
+		return nil, errors.New("windows sandbox: incomplete elevated execution lease factory")
+	}
+	session, err := factory.deps.connect(ctx, factory.config.PipeName, factory.config.HostPath)
 	if err != nil {
 		return nil, fmt.Errorf("connect authenticated Windows broker: %w", err)
 	}
@@ -104,10 +128,10 @@ func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBroker
 		return nil, errors.Join(cause, session.close())
 	}
 	generation, err := session.client.Status()
-	if err != nil || generation == 0 || (config.Generation != 0 && generation != config.Generation) {
+	if err != nil || generation == 0 || (factory.config.Generation != 0 && generation != factory.config.Generation) {
 		return fail(errors.Join(errors.New("windows sandbox: broker generation does not match verified setup"), err))
 	}
-	id, err := session.client.AcquireLease(objects)
+	id, err := session.client.AcquireLease(factory.objects)
 	if err != nil {
 		return fail(fmt.Errorf("acquire Windows broker ACL lease: %w", err))
 	}
@@ -115,39 +139,39 @@ func acquireBrokerBackedElevatedLease(ctx context.Context, config elevatedBroker
 		return fail(errors.New("windows sandbox: broker returned an empty ACL lease"))
 	}
 	return &brokerBackedElevatedLease{
-		client: session.client, close: session.close, id: id, config: config,
-		validate:   deps.token,
-		narrowings: append([]string(nil), narrowings...),
+		client: session.client, close: session.close, id: id, config: factory.config,
+		validate: factory.deps.token,
 	}, nil
 }
 
 // Narrowings returns immutable compiler facts such as deny-only multi-link
 // objects. The backend uses these facts to avoid claiming LevelFull.
-func (lease *brokerBackedElevatedLease) Narrowings() []string {
-	if lease == nil {
+func (factory *brokerBackedElevatedLeaseFactory) Narrowings() []string {
+	if factory == nil {
 		return nil
 	}
-	return append([]string(nil), lease.narrowings...)
+	return append([]string(nil), factory.narrowings...)
 }
 
 // IssueToken is the only token operation and is intentionally per spawn.
-func (lease *brokerBackedElevatedLease) IssueToken(account brokerAccountKind) (win.Token, error) {
+func (lease *brokerBackedElevatedLease) IssueToken(account brokerAccountKind) (brokerIssuedToken, error) {
 	if lease == nil || lease.client == nil || lease.id == (ACLLeaseID{}) ||
 		(account != brokerAccountOffline && account != brokerAccountOnline) || lease.validate == nil {
-		return 0, errors.New("windows sandbox: invalid restricted-token lease request")
+		return brokerIssuedToken{}, errors.New("windows sandbox: invalid restricted-token lease request")
 	}
-	raw, err := lease.client.IssueRestrictedToken(lease.id, account)
+	issued, err := lease.client.IssueRestrictedToken(lease.id, account)
 	if err != nil {
-		return 0, err
+		return brokerIssuedToken{}, err
 	}
-	token, err := lease.validate(raw, lease.config, account)
+	token, err := lease.validate(issued.Handle, lease.config, account)
 	if err != nil {
-		if raw != 0 {
-			_ = win.CloseHandle(win.Handle(raw))
+		if issued.Handle != 0 {
+			_ = win.CloseHandle(win.Handle(issued.Handle))
 		}
-		return 0, fmt.Errorf("validate broker duplicated token: %w", err)
+		return brokerIssuedToken{}, fmt.Errorf("validate broker duplicated token: %w", err)
 	}
-	return token, nil
+	issued.Handle = uint64(token)
+	return issued, nil
 }
 
 func (lease *brokerBackedElevatedLease) Release() error {
@@ -163,6 +187,18 @@ func (lease *brokerBackedElevatedLease) Release() error {
 		}
 	})
 	return lease.releaseErr
+}
+
+func (factory *brokerBackedElevatedLeaseFactory) Release() error {
+	if factory == nil {
+		return nil
+	}
+	factory.once.Do(func() {
+		if factory.close != nil {
+			factory.closeErr = factory.close()
+		}
+	})
+	return factory.closeErr
 }
 
 func validateElevatedRuntimeVocabulary(effective policy.Effective) error {

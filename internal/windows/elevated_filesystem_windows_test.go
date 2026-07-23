@@ -14,7 +14,6 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
-	win "golang.org/x/sys/windows"
 )
 
 // This file is the Task 19 compile/filesystem matrix.  The planning rows are
@@ -274,9 +273,12 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
-				launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, account brokerAccountKind) (int, error) {
-					if token != win.Token(123) || account != test.wantAccount {
-						t.Fatalf("launch token/account = %v/%v", token, account)
+				launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+					if issued.Handle != 123 || lease.account != test.wantAccount {
+						t.Fatalf("launch token/account = %v/%v", issued.Handle, lease.account)
+					}
+					if err := release(); err != nil {
+						return -1, err
 					}
 					return 0, nil
 				},

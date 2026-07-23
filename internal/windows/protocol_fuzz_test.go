@@ -10,6 +10,7 @@ func FuzzBrokerFrame(f *testing.F) {
 		{Kind: brokerMessageStatus, Direction: brokerRequest, Nonce: testBrokerNonce()},
 		{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: testBrokerNonce(), Objects: []brokerObjectReference{testBrokerObject()}},
 		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: testBrokerNonce(), LeaseID: [16]byte{1}, Account: brokerAccountOnline},
+		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: testBrokerNonce(), LeaseID: [16]byte{1}, TokenHandle: 7, Desktop: `Sandbox-7\Default`, Result: brokerResultOK},
 	}
 	for _, seed := range seeds {
 		encoded, err := encodeBrokerFrame(seed)

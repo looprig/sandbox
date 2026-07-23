@@ -909,7 +909,11 @@ func runBrokerService(ctx context.Context, config brokerRuntimeConfig) error {
 		unprotector: systemDPAPI{},
 	}
 	tokens := win32BrokerTokenIssuer{credentials: credentials, native: win32BrokerLogonNative{}, restrictor: win32BrokerTokenRestrictor{}}
-	broker, err := newWindowsBroker(installation, sids, journal, win32BrokerACLMechanism{}, tokens, rand.Reader)
+	desktops, err := newWin32BrokerDesktopManager(config)
+	if err != nil {
+		return err
+	}
+	broker, err := newWindowsBroker(installation, sids, journal, win32BrokerACLMechanism{}, tokens, desktops, rand.Reader)
 	if err != nil {
 		return err
 	}

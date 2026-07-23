@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
@@ -34,26 +35,46 @@ func (inspector fakeElevatedDependencyInspector) Inspect(context.Context, string
 }
 
 type fakeElevatedLease struct {
-	mu           sync.Mutex
-	account      brokerAccountKind
-	issues       int
-	releases     int
-	issueErr     error
-	releaseError error
-	narrowings   []string
+	mu                sync.Mutex
+	account           brokerAccountKind
+	acquires          int
+	issues            int
+	releases          int
+	executionReleases int
+	issueErr          error
+	releaseError      error
+	narrowings        []string
 }
 
-func (lease *fakeElevatedLease) IssueToken(account brokerAccountKind) (win.Token, error) {
+type fakeElevatedExecutionLease struct{ factory *fakeElevatedLease }
+
+func (lease *fakeElevatedLease) Acquire(context.Context) (elevatedExecutionLease, error) {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	lease.acquires++
+	return &fakeElevatedExecutionLease{factory: lease}, nil
+}
+func (execution *fakeElevatedExecutionLease) IssueToken(account brokerAccountKind) (brokerIssuedToken, error) {
+	lease := execution.factory
 	lease.mu.Lock()
 	defer lease.mu.Unlock()
 	lease.issues++
 	lease.account = account
-	return win.Token(123), lease.issueErr
+	return brokerIssuedToken{Handle: 123, Desktop: `Sandbox-123\Default`}, lease.issueErr
+}
+func (execution *fakeElevatedExecutionLease) Release() error {
+	lease := execution.factory
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	lease.executionReleases++
+	return lease.releaseError
 }
 func (lease *fakeElevatedLease) Narrowings() []string {
 	return append([]string(nil), lease.narrowings...)
 }
 func (lease *fakeElevatedLease) Release() error {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
 	lease.releases++
 	return lease.releaseError
 }
@@ -139,11 +160,11 @@ func TestInspectElevatedSetupDistinguishesAbsentCorruptAndVerified(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.PrivateDesktopReady {
-		t.Fatal("caller-side inspection claimed broker-created private desktop readiness")
+	if !snapshot.PrivateDesktopReady {
+		t.Fatal("verified v1 broker installation omitted private desktop readiness")
 	}
-	if err := validateElevatedSnapshot(snapshot); err == nil || !strings.Contains(err.Error(), "private desktop") {
-		t.Fatalf("snapshot validation = %v, want private desktop blocker", err)
+	if err := validateElevatedSnapshot(snapshot); err != nil {
+		t.Fatalf("verified snapshot validation = %v", err)
 	}
 	if snapshot.HostPath != manifest.HostPath || snapshot.HostSHA256 != manifest.HostSHA256 {
 		t.Fatalf("snapshot = %#v, want manifest host identity", snapshot)
@@ -189,16 +210,6 @@ func TestAcquireElevatedLeaseRejectsIncompleteVerifiedConfiguration(t *testing.T
 	}
 }
 
-func TestAcquireElevatedLeaseFailsClosedWithoutBrokerDesktopCapability(t *testing.T) {
-	_, err := acquireElevatedLease(readyElevatedSnapshot(), policy.Effective{
-		FS:               []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess}},
-		RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
-	})
-	if !errors.Is(err, errElevatedBrokerDesktopAPI) || !errors.Is(err, enforce.ErrUnavailable) {
-		t.Fatalf("activation error = %v", err)
-	}
-}
-
 func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -217,13 +228,16 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
-				launch: func(request enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, account brokerAccountKind) (int, error) {
-					if token != 123 || account != test.account || request.Dir != `C:\work` ||
+				launch: func(request enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+					if issued.Handle != 123 || issued.Desktop == "" || request.Dir != `C:\work` ||
 						!slices.Equal(request.Argv, []string{`C:\tool.exe`, "arg"}) ||
 						!slices.Equal(request.Env, []string{"A=B"}) {
-						t.Fatalf("launch request = %#v token=%d account=%d", request, token, account)
+						t.Fatalf("launch request = %#v issued=%#v", request, issued)
 					}
 					_, _ = io.WriteString(request.Stdout, "output")
+					if err := release(); err != nil {
+						return -1, err
+					}
 					return 7, nil
 				},
 			}}
@@ -271,10 +285,12 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 	}
 }
 
-func TestElevatedCompiledLeaseSurvivesConcurrentLaunchesUntilSpecRelease(t *testing.T) {
+func TestElevatedConcurrentExecutionsOwnIndependentLeasesAndSpecReleaseDrains(t *testing.T) {
 	lease := &fakeElevatedLease{}
 	started := make(chan struct{}, 2)
-	finish := make(chan struct{})
+	finish := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var launchMu sync.Mutex
+	next := 0
 	backend := &elevatedBackend{deps: elevatedCompileDependencies{
 		inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) {
 			return readyElevatedSnapshot(), nil
@@ -282,10 +298,14 @@ func TestElevatedCompiledLeaseSurvivesConcurrentLaunchesUntilSpecRelease(t *test
 		acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 			return lease, nil
 		},
-		launch: func(enforce.LaunchRequest, elevatedSetupSnapshot, win.Token, policy.Limits, brokerAccountKind) (int, error) {
+		launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, _ brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+			launchMu.Lock()
+			index := next
+			next++
+			launchMu.Unlock()
 			started <- struct{}{}
-			<-finish
-			return 0, nil
+			<-finish[index]
+			return 0, release()
 		},
 	}}
 	spec, _, _, _, err := backend.Compile(policy.Effective{})
@@ -304,16 +324,37 @@ func TestElevatedCompiledLeaseSurvivesConcurrentLaunchesUntilSpecRelease(t *test
 	}
 	<-started
 	<-started
-	if lease.releases != 0 {
-		t.Fatalf("shared ACL lease released while siblings run: %d", lease.releases)
+	close(finish[0])
+	for {
+		lease.mu.Lock()
+		released := lease.executionReleases
+		factoryReleased := lease.releases
+		lease.mu.Unlock()
+		if released == 1 {
+			if factoryReleased != 0 {
+				t.Fatalf("first execution revoked retained factory: %d", factoryReleased)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	close(finish)
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- spec.Release() }()
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("spec release did not drain sibling execution: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(finish[1])
 	wg.Wait()
-	if lease.releases != 0 || lease.issues != 2 {
-		t.Fatalf("before spec close: issues=%d releases=%d", lease.issues, lease.releases)
+	if err := <-releaseDone; err != nil {
+		t.Fatal(err)
 	}
-	if err := spec.Release(); err != nil || lease.releases != 1 {
-		t.Fatalf("spec release: releases=%d err=%v", lease.releases, err)
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.releases != 1 || lease.issues != 2 || lease.executionReleases != 2 || lease.acquires != 2 {
+		t.Fatalf("lifecycle counts: acquires=%d issues=%d execution releases=%d factory releases=%d",
+			lease.acquires, lease.issues, lease.executionReleases, lease.releases)
 	}
 }
 

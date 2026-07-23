@@ -104,9 +104,9 @@ func (client *brokerClient) ReleaseLease(id ACLLeaseID) error {
 	return err
 }
 
-func (client *brokerClient) IssueRestrictedToken(id ACLLeaseID, account brokerAccountKind) (uint64, error) {
+func (client *brokerClient) IssueRestrictedToken(id ACLLeaseID, account brokerAccountKind) (brokerIssuedToken, error) {
 	response, err := client.call(brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: client.nonce, LeaseID: [brokerLeaseIDSize]byte(id), Account: account})
-	return response.TokenHandle, err
+	return brokerIssuedToken{Handle: response.TokenHandle, Desktop: response.Desktop}, err
 }
 
 func (client *brokerClient) Reconcile() (uint64, error) {

@@ -32,6 +32,7 @@ func TestBrokerClientExposesExactOperationFrames(t *testing.T) {
 			response.LeaseID = [brokerLeaseIDSize]byte(leaseID)
 		case brokerMessageIssueRestrictedToken:
 			response.TokenHandle = 81
+			response.Desktop = `Sandbox-81\Default`
 		}
 		return response, nil
 	}}
@@ -48,8 +49,8 @@ func TestBrokerClientExposesExactOperationFrames(t *testing.T) {
 	if id, err := client.AcquireLease([]brokerObjectReference{object}); err != nil || id != leaseID {
 		t.Fatalf("acquire = %v, %v", id, err)
 	}
-	if handle, err := client.IssueRestrictedToken(leaseID, brokerAccountOffline); err != nil || handle != 81 {
-		t.Fatalf("token = %d, %v", handle, err)
+	if issued, err := client.IssueRestrictedToken(leaseID, brokerAccountOffline); err != nil || issued.Handle != 81 || issued.Desktop != `Sandbox-81\Default` {
+		t.Fatalf("token = %#v, %v", issued, err)
 	}
 	if err := client.ReleaseLease(leaseID); err != nil {
 		t.Fatal(err)

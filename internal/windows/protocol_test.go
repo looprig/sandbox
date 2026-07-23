@@ -21,7 +21,7 @@ func TestBrokerProtocolRoundTripOperations(t *testing.T) {
 		{Kind: brokerMessageReconcile, Direction: brokerRequest, Nonce: nonce},
 		{Kind: brokerMessageStatus, Direction: brokerResponse, Nonce: nonce, Result: brokerResultOK, Generation: 4},
 		{Kind: brokerMessageAcquireLease, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, Result: brokerResultOK},
-		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 72, Result: brokerResultOK},
+		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 72, Desktop: `Sandbox-72\Default`, Result: brokerResultOK},
 	}
 	for _, original := range tests {
 		encoded, err := encodeBrokerFrame(original)
@@ -171,12 +171,35 @@ func TestBrokerProtocolResponseSchemaIsClosed(t *testing.T) {
 		{Kind: brokerMessageAcquireLease, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 1},
 		{Kind: brokerMessageReleaseLease, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 1},
 		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease},
+		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 1},
+		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, Desktop: `Sandbox-1\Default`},
+		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 1, Desktop: `WinSta0\Default`},
 		{Kind: brokerMessageReconcile, Direction: brokerResponse, Nonce: nonce, LeaseID: lease},
 	}
 	for index, frame := range invalid {
 		if _, err := encodeBrokerFrame(frame); err == nil {
 			t.Fatalf("invalid response schema %d accepted", index)
 		}
+	}
+}
+
+func TestBrokerProtocolDesktopNameIsBoundedCanonicalAndOpaque(t *testing.T) {
+	nonce := testBrokerNonce()
+	lease := [brokerLeaseIDSize]byte{1}
+	for _, name := range []string{
+		"", `WinSta0\Default`, `winsta0\other`, `one`, `one\two\three`,
+		`one/other\two`, `one:\two`, ` one\two`, `one\two `,
+		"one\\two\x00", `one\..`, `one\é`,
+	} {
+		frame := brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 9, Desktop: name}
+		if _, err := encodeBrokerFrame(frame); err == nil {
+			t.Fatalf("invalid desktop name %q accepted", name)
+		}
+	}
+	oversized := `S\` + strings.Repeat("x", maxBrokerDesktopUnits)
+	frame := brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 9, Desktop: oversized}
+	if _, err := encodeBrokerFrame(frame); err == nil {
+		t.Fatal("oversized desktop name accepted")
 	}
 }
 

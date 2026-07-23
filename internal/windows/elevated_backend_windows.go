@@ -19,9 +19,7 @@ import (
 	win "golang.org/x/sys/windows"
 )
 
-var errElevatedBrokerDesktopAPI = errors.New("sandbox: broker-created private desktop capability is unavailable")
-
-type elevatedRunnerLaunchFunc func(enforce.LaunchRequest, elevatedSetupSnapshot, win.Token, policy.Limits, brokerAccountKind) (int, error)
+type elevatedRunnerLaunchFunc func(enforce.LaunchRequest, elevatedSetupSnapshot, brokerIssuedToken, policy.Limits, func() error) (int, error)
 
 // elevatedSetupSnapshot is the compiler's immutable, already-verified view of
 // the installed tier. Individual mechanism checks remain explicit so a future
@@ -48,8 +46,13 @@ type elevatedSetupSnapshot struct {
 	OnlineSID            string
 }
 
+type elevatedExecutionLease interface {
+	IssueToken(brokerAccountKind) (brokerIssuedToken, error)
+	Release() error
+}
+
 type elevatedLease interface {
-	IssueToken(brokerAccountKind) (win.Token, error)
+	Acquire(context.Context) (elevatedExecutionLease, error)
 	Narrowings() []string
 	Release() error
 }
@@ -87,7 +90,7 @@ func newElevatedBackend(config Config) enforce.Backend {
 		inspect: inspectElevatedSetup,
 		acquire: acquireElevatedLease,
 		reserve: reserveElevatedProxyPorts,
-		launch:  launchElevatedRunner,
+		launch:  executeElevatedRunner,
 	}}
 }
 
@@ -196,9 +199,9 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		CredentialsReady: health.Credentials, FirewallReady: health.Firewall,
 		RuntimeBaselineReady: health.RuntimeBaseline, RunnerHashVerified: true,
 		// Job and handle-list properties are verified by the protected launcher.
-		// PrivateDesktopReady remains false until the broker protocol can create
-		// and ACL the desktop without granting the interactive owner access.
-		PrivateDesktopReady: false, JobReadbackReady: true, HandleListReady: true,
+		// The broker owns private desktop creation and returns only its opaque
+		// qualified name with the duplicated restricted token.
+		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
 		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
 		PipeName:   `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"),
 		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID,
@@ -283,14 +286,6 @@ func validateElevatedStateRoot(root string) (string, error) {
 	return filepath.Clean(absolute), nil
 }
 
-// acquireElevatedLease cannot safely manufacture the two capabilities that
-// the current lower-level APIs do not expose:
-//   - the service-selected authenticated connection nonce needed by brokerClient;
-//   - a caller-side launcher that consumes the duplicated restricted token into
-//     a suspended, Job-assigned, private-desktop installed runner process.
-//
-// Returning this typed activation error preserves stale-vs-absent setup
-// classification and, critically, cannot fall back to the interactive token.
 func acquireElevatedLease(snapshot elevatedSetupSnapshot, effective policy.Effective) (elevatedLease, error) {
 	if err := validateElevatedSnapshot(snapshot); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSetupStale, err)
@@ -298,14 +293,14 @@ func acquireElevatedLease(snapshot elevatedSetupSnapshot, effective policy.Effec
 	if len(effective.FS) == 0 || len(effective.RuntimeBaselines) == 0 {
 		return nil, fmt.Errorf("%w: elevated ACL policy is incomplete", enforce.ErrUnavailable)
 	}
-	return nil, fmt.Errorf("%w: %w", enforce.ErrUnavailable, errElevatedBrokerDesktopAPI)
-}
-
-func launchElevatedRunner(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, token win.Token, _ policy.Limits, _ brokerAccountKind) (int, error) {
-	if token != 0 {
-		_ = token.Close()
-	}
-	return -1, fmt.Errorf("%w: %w", enforce.ErrUnavailable, errElevatedBrokerDesktopAPI)
+	return acquireBrokerBackedElevatedLease(context.Background(), elevatedBrokerLeaseConfig{
+		InstallationID:       snapshot.InstallationID,
+		PipeName:             snapshot.PipeName,
+		HostPath:             snapshot.HostPath,
+		OfflineSID:           snapshot.OfflineSID,
+		OnlineSID:            snapshot.OnlineSID,
+		RuntimeBaselineReady: snapshot.RuntimeBaselineReady,
+	}, policy.Clone(effective), productionElevatedBrokerLeaseDependencies())
 }
 
 func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
@@ -353,12 +348,21 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	}
 	launch := backend.deps.launch
 	if launch == nil {
-		launch = launchElevatedRunner
+		launch = executeElevatedRunner
 	}
 	var releaseOnce sync.Once
 	var releaseErr error
+	var lifecycleMu sync.Mutex
+	var active sync.WaitGroup
+	closing := false
 	release := func() error {
-		releaseOnce.Do(func() { releaseErr = lease.Release() })
+		releaseOnce.Do(func() {
+			lifecycleMu.Lock()
+			closing = true
+			lifecycleMu.Unlock()
+			active.Wait()
+			releaseErr = lease.Release()
+		})
 		return releaseErr
 	}
 	spec := enforce.Spec{
@@ -369,11 +373,23 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 			if err := request.Context.Err(); err != nil {
 				return -1, err
 			}
-			token, err := lease.IssueToken(account)
-			if err != nil {
-				return -1, fmt.Errorf("issue per-spawn restricted token: %w", err)
+			lifecycleMu.Lock()
+			if closing {
+				lifecycleMu.Unlock()
+				return -1, errors.New("sandbox: elevated specification is released")
 			}
-			return launch(request, snapshot, token, p.Limits, account)
+			active.Add(1)
+			lifecycleMu.Unlock()
+			defer active.Done()
+			executionLease, err := lease.Acquire(request.Context)
+			if err != nil {
+				return -1, fmt.Errorf("acquire per-spawn Windows broker lease: %w", err)
+			}
+			issued, err := executionLease.IssueToken(account)
+			if err != nil {
+				return -1, errors.Join(fmt.Errorf("issue per-spawn restricted token: %w", err), executionLease.Release())
+			}
+			return launch(request, snapshot, issued, p.Limits, executionLease.Release)
 		},
 		Release: release,
 	}

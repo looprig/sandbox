@@ -40,13 +40,6 @@ func (api *fakeElevatedRunnerAPI) VerifyToken(token win.Token) error {
 	}
 	return nil
 }
-func (api *fakeElevatedRunnerAPI) CreateDesktop(spec privateDesktopSpec) (*privateDesktop, error) {
-	api.event("desktop")
-	return &privateDesktop{
-		Name: spec.WindowStation + `\` + spec.Desktop,
-		api:  fakeElevatedDesktopClose{api: api},
-	}, nil
-}
 func (api *fakeElevatedRunnerAPI) CreateJob(JobOptions) (*Job, error) {
 	api.event("job")
 	return &Job{}, nil
@@ -101,34 +94,13 @@ func (api *fakeElevatedRunnerAPI) CloseToken(win.Token) error {
 	return nil
 }
 
-type fakeElevatedDesktopClose struct{ api *fakeElevatedRunnerAPI }
-
-func (fakeElevatedDesktopClose) CreateWindowStation(string, *win.SECURITY_DESCRIPTOR) (desktopHandle, error) {
-	panic("not used")
-}
-func (fakeElevatedDesktopClose) CreateDesktop(string, desktopHandle, *win.SECURITY_DESCRIPTOR) (desktopHandle, error) {
-	panic("not used")
-}
-func (fakeElevatedDesktopClose) VerifyProtectedACL(desktopHandle, *win.SECURITY_DESCRIPTOR) error {
-	panic("not used")
-}
-func (close fakeElevatedDesktopClose) CloseWindowStation(desktopHandle) error {
-	close.api.event("close-station")
-	return nil
-}
-func (close fakeElevatedDesktopClose) CloseDesktop(desktopHandle) error {
-	close.api.event("close-desktop")
-	return nil
-}
-
 func validElevatedRunnerLaunchForTest(api *fakeElevatedRunnerAPI) elevatedRunnerLaunch {
 	return elevatedRunnerLaunch{
 		Token: 7, HostPath: `C:\ProgramData\Looprig\slots\one\sandbox-host.exe`,
 		HostSHA256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
 		Argv:       []string{`C:\work\tool.exe`, "arg"}, CWD: `C:\work`,
-		Desktop: privateDesktopSpec{WindowStation: "SandboxStation", Desktop: "SandboxDesktop",
-			SecurityDescriptor: &win.SECURITY_DESCRIPTOR{}},
-		Stdin: 11, Stdout: 12, Stderr: 13,
+		Desktop: `SandboxStation\SandboxDesktop`,
+		Stdin:   11, Stdout: 12, Stderr: 13,
 		Job:          JobOptions{MaxProcesses: 4, MaxMemoryBytes: 64 << 20, MaxCPUPct: 25},
 		ReleaseLease: func() error { api.event("release"); api.released = true; return nil },
 	}
@@ -145,7 +117,7 @@ func TestElevatedRunnerLaunchOrdersAllAuthorityBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantLaunch := []string{
-		"verify-host", "verify-token", "desktop", "job", "request",
+		"verify-host", "verify-token", "job", "request",
 		"create-suspended", "close-token", "close-inherited", "assign", "resume",
 		"close-thread",
 	}
@@ -166,7 +138,6 @@ func TestElevatedRunnerLaunchOrdersAllAuthorityBoundaries(t *testing.T) {
 	}
 	wantAll := append(wantLaunch,
 		"wait-process", "wait-job-empty", "release", "close-process",
-		"close-desktop", "close-station",
 	)
 	if !reflect.DeepEqual(api.events, wantAll) {
 		t.Fatalf("all events = %v, want %v", api.events, wantAll)

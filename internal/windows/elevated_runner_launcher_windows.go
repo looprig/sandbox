@@ -23,13 +23,16 @@ var errElevatedRunnerLaunch = errors.New("windows sandbox: elevated runner launc
 // compiler. Token is the restricted primary token duplicated into this process
 // by the authenticated broker; ownership transfers to Launch.
 type elevatedRunnerLaunch struct {
-	Token        win.Token
-	HostPath     string
-	HostSHA256   string
-	Argv         []string
-	CWD          string
-	Env          []string
-	Desktop      privateDesktopSpec
+	Token      win.Token
+	HostPath   string
+	HostSHA256 string
+	Argv       []string
+	CWD        string
+	Env        []string
+	// Desktop is the exact broker-created window-station\desktop name. The
+	// launcher may reference it but never creates, opens for mutation, or closes
+	// either object; their lifetime remains owned by the broker lease.
+	Desktop      string
 	Stdin        win.Handle
 	Stdout       win.Handle
 	Stderr       win.Handle
@@ -40,7 +43,6 @@ type elevatedRunnerLaunch struct {
 type elevatedRunnerProcessAPI interface {
 	VerifyHost(string, string) error
 	VerifyToken(win.Token) error
-	CreateDesktop(privateDesktopSpec) (*privateDesktop, error)
 	CreateJob(JobOptions) (*Job, error)
 	CreateRequest(runnerRequest, [3]win.Handle) (runnerInheritedHandles, error)
 	CreateSuspended(win.Token, string, string, []string, runnerInheritedHandles) (runnerProcessHandles, error)
@@ -87,7 +89,6 @@ type elevatedRunnerExecution struct {
 	api     elevatedRunnerProcessAPI
 	process win.Handle
 	job     *Job
-	desktop *privateDesktop
 	release func() error
 
 	once sync.Once
@@ -128,16 +129,9 @@ func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *el
 	if err := api.VerifyToken(token); err != nil {
 		return nil, fmt.Errorf("%w: verify broker token: %v", errElevatedRunnerLaunch, err)
 	}
-	desktop, err := api.CreateDesktop(spec.Desktop)
-	if err != nil {
-		return nil, fmt.Errorf("%w: create private desktop: %v", errElevatedRunnerLaunch, err)
+	if !validQualifiedDesktop(spec.Desktop) {
+		return nil, fmt.Errorf("%w: broker desktop name is invalid", errElevatedRunnerLaunch)
 	}
-	cleanupDesktop := true
-	defer func() {
-		if cleanupDesktop {
-			err = errors.Join(err, desktop.Close())
-		}
-	}()
 	spec.Job.Sandboxed = true
 	job, err := api.CreateJob(spec.Job)
 	if err != nil {
@@ -156,7 +150,7 @@ func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *el
 	}
 	request := runnerRequest{
 		Argv: append([]string(nil), spec.Argv...), CWD: spec.CWD,
-		Desktop: desktop.Name, Nonce: nonce,
+		Desktop: spec.Desktop, Nonce: nonce,
 	}
 	if _, err := marshalSealedRunnerRequest(request); err != nil {
 		return nil, fmt.Errorf("%w: seal runner request: %v", errElevatedRunnerLaunch, err)
@@ -166,7 +160,7 @@ func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *el
 		return nil, fmt.Errorf("%w: create sealed runner handles: %v", errElevatedRunnerLaunch, err)
 	}
 	defer func() { err = errors.Join(err, inherited.Close()) }()
-	process, err := api.CreateSuspended(token, spec.HostPath, desktop.Name, append([]string(nil), spec.Env...), inherited)
+	process, err := api.CreateSuspended(token, spec.HostPath, spec.Desktop, append([]string(nil), spec.Env...), inherited)
 	closeTokenErr := closeToken()
 	if err != nil || closeTokenErr != nil {
 		if process.Process != 0 {
@@ -209,12 +203,11 @@ func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *el
 	process.Thread = 0
 
 	execution := &elevatedRunnerExecution{
-		api: api, process: process.Process, job: job, desktop: desktop,
+		api: api, process: process.Process, job: job,
 		release: spec.ReleaseLease,
 	}
 	processOwned = false
 	cleanupJob = false
-	cleanupDesktop = false
 	return execution, nil
 }
 
@@ -242,7 +235,7 @@ func (execution *elevatedRunnerExecution) Wait(ctx context.Context) (uint32, err
 		}
 		execution.err = errors.Join(execution.err, firstProofErr, terminateErr, proofErr, releaseErr,
 			execution.api.CloseHandle(execution.process),
-			execution.job.Close(), execution.desktop.Close())
+			execution.job.Close())
 		execution.process = 0
 	})
 	return execution.code, execution.err

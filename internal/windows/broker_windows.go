@@ -56,12 +56,49 @@ type brokerRestrictedTokenIssuer interface {
 	IssueRestricted(brokerAccountKind, SID, SID) (brokerRestrictedToken, error)
 }
 
+// brokerDesktopContext is authority derived entirely by the broker after it
+// has authenticated the connection and validated the lease/account. It
+// deliberately contains no caller-selected name or security descriptor.
+type brokerDesktopContext struct {
+	LeaseID      ACLLeaseID
+	Binding      brokerLeaseBinding
+	Installation SID
+	Restricting  SID
+	Account      brokerAccountKind
+}
+
+type brokerManagedDesktop struct {
+	Name  string
+	close func() error
+}
+
+func (desktop *brokerManagedDesktop) Close() error {
+	if desktop == nil || desktop.close == nil {
+		return nil
+	}
+	err := desktop.close()
+	if err == nil {
+		desktop.close = nil
+	}
+	return err
+}
+
+type brokerDesktopManager interface {
+	Create(brokerDesktopContext) (brokerManagedDesktop, error)
+}
+
+type brokerIssuedToken struct {
+	Handle  uint64
+	Desktop string
+}
+
 type brokerLease struct {
 	id          ACLLeaseID
 	binding     brokerLeaseBinding
 	restricting SID
 	mutations   []brokerACLMutation
 	tokenIssued bool
+	desktop     *brokerManagedDesktop
 }
 
 type windowsBroker struct {
@@ -72,19 +109,20 @@ type windowsBroker struct {
 	journal         *brokerLeaseJournal
 	acl             brokerACLMechanism
 	tokens          brokerRestrictedTokenIssuer
+	desktops        brokerDesktopManager
 	leases          map[ACLLeaseID]*brokerLease
 	acquiredNonces  map[[brokerNonceSize]byte]struct{}
 	generation      uint64
 }
 
-func newWindowsBroker(installationSID SID, sids *OneShotSIDGenerator, journal *brokerLeaseJournal, acl brokerACLMechanism, tokens brokerRestrictedTokenIssuer, leaseEntropy io.Reader) (*windowsBroker, error) {
-	if installationSID.kind != sidKindInstallation || !installationSID.isModuleTrustee() || sids == nil || journal == nil || acl == nil || tokens == nil {
+func newWindowsBroker(installationSID SID, sids *OneShotSIDGenerator, journal *brokerLeaseJournal, acl brokerACLMechanism, tokens brokerRestrictedTokenIssuer, desktops brokerDesktopManager, leaseEntropy io.Reader) (*windowsBroker, error) {
+	if installationSID.kind != sidKindInstallation || !installationSID.isModuleTrustee() || sids == nil || journal == nil || acl == nil || tokens == nil || desktops == nil {
 		return nil, errors.New("windows sandbox: incomplete broker dependencies")
 	}
 	if leaseEntropy == nil {
 		leaseEntropy = rand.Reader
 	}
-	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, leases: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
+	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, desktops: desktops, leases: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
 	// Reconciliation is a constructor invariant: no status or token operation
 	// can be served by an instance that has not resolved its durable cleanup log.
 	if err := broker.reconcile(); err != nil {
@@ -119,7 +157,9 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 	case brokerMessageReleaseLease:
 		err = broker.release(binding, ACLLeaseID(request.LeaseID))
 	case brokerMessageIssueRestrictedToken:
-		response.TokenHandle, err = broker.issueToken(binding, ACLLeaseID(request.LeaseID), request.Account)
+		issued := brokerIssuedToken{}
+		issued, err = broker.issueToken(binding, ACLLeaseID(request.LeaseID), request.Account)
+		response.TokenHandle, response.Desktop = issued.Handle, issued.Desktop
 	case brokerMessageReconcile:
 		err = broker.reconcile()
 		broker.generation++
@@ -130,6 +170,7 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 	response.Result = brokerResultForError(err)
 	if response.Result != brokerResultOK {
 		response.TokenHandle = 0
+		response.Desktop = ""
 		if request.Kind == brokerMessageAcquireLease {
 			response.LeaseID = [brokerLeaseIDSize]byte{}
 		}
@@ -217,22 +258,36 @@ func (broker *windowsBroker) acquire(connection brokerConnection, references []b
 	return leaseID, nil
 }
 
-func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseID, account brokerAccountKind) (uint64, error) {
+func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseID, account brokerAccountKind) (brokerIssuedToken, error) {
 	lease := broker.leases[id]
 	if lease == nil {
-		return 0, errBrokerLeaseUnavailable
+		return brokerIssuedToken{}, errBrokerLeaseUnavailable
 	}
 	if !sameBrokerBinding(lease.binding, binding) || lease.tokenIssued || (account != brokerAccountOffline && account != brokerAccountOnline) {
-		return 0, errBrokerClientUnauthorized
+		return brokerIssuedToken{}, errBrokerClientUnauthorized
 	}
 	token, err := broker.tokens.IssueRestricted(account, broker.installationSID, lease.restricting)
 	if err != nil {
-		return 0, err
+		return brokerIssuedToken{}, err
+	}
+	desktop, desktopErr := broker.desktops.Create(brokerDesktopContext{
+		LeaseID: id, Binding: binding, Installation: broker.installationSID,
+		Restricting: lease.restricting, Account: account,
+	})
+	if desktopErr != nil || desktop.close == nil || !validBrokerDesktopName(desktop.Name) {
+		closeErr := token.Close()
+		if desktop.close != nil {
+			closeErr = errors.Join(closeErr, desktop.Close())
+		}
+		if desktopErr == nil {
+			desktopErr = errors.New("windows sandbox: desktop manager returned an invalid desktop")
+		}
+		return brokerIssuedToken{}, errors.Join(desktopErr, closeErr)
 	}
 	handle, duplicateErr := token.DuplicateTo(binding)
 	closeErr := token.Close()
 	if duplicateErr != nil || closeErr != nil || handle == 0 {
-		return 0, errors.Join(duplicateErr, closeErr, func() error {
+		return brokerIssuedToken{}, errors.Join(duplicateErr, closeErr, desktop.Close(), func() error {
 			if handle == 0 {
 				return errors.New("windows sandbox: invalid duplicated restricted token handle")
 			}
@@ -240,7 +295,8 @@ func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseI
 		}())
 	}
 	lease.tokenIssued = true
-	return handle, nil
+	lease.desktop = &desktop
+	return brokerIssuedToken{Handle: handle, Desktop: desktop.Name}, nil
 }
 
 func (broker *windowsBroker) release(binding brokerLeaseBinding, id ACLLeaseID) error {
@@ -267,7 +323,10 @@ func (broker *windowsBroker) reconcile() error {
 		return err
 	}
 	for id, record := range recovered {
-		lease := &brokerLease{id: id, binding: record.Binding, restricting: record.SID, mutations: record.Mutations}
+		lease := broker.leases[id]
+		if lease == nil {
+			lease = &brokerLease{id: id, binding: record.Binding, restricting: record.SID, mutations: record.Mutations}
+		}
 		if err := broker.rollback(lease); err != nil {
 			return err
 		}
@@ -316,6 +375,13 @@ func (broker *windowsBroker) abort(lease *brokerLease, cause error) error {
 
 func (broker *windowsBroker) rollback(lease *brokerLease) error {
 	var result error
+	if lease.desktop != nil {
+		if err := lease.desktop.Close(); err != nil {
+			result = errors.Join(result, err)
+		} else {
+			lease.desktop = nil
+		}
+	}
 	for index := len(lease.mutations) - 1; index >= 0; index-- {
 		result = errors.Join(result, broker.acl.Rollback(lease.mutations[index]))
 	}

@@ -144,6 +144,32 @@ func (token *brokerTestToken) DuplicateTo(binding brokerLeaseBinding) (uint64, e
 }
 func (token *brokerTestToken) Close() error { token.closed = true; return nil }
 
+type brokerTestDesktopManager struct {
+	created []brokerDesktopContext
+	closed  int
+	fail    error
+	name    string
+}
+
+func (manager *brokerTestDesktopManager) Create(context brokerDesktopContext) (brokerManagedDesktop, error) {
+	if manager.fail != nil {
+		return brokerManagedDesktop{}, manager.fail
+	}
+	manager.created = append(manager.created, context)
+	name := manager.name
+	if name == "" {
+		name = `Sandbox-4242\Default`
+	}
+	closed := false
+	return brokerManagedDesktop{Name: name, close: func() error {
+		if !closed {
+			closed = true
+			manager.closed++
+		}
+		return nil
+	}}, nil
+}
+
 type brokerTestRetirement struct{ seen map[string]bool }
 
 func (retirement *brokerTestRetirement) RetireSID(sid SID) (bool, error) {
@@ -171,7 +197,7 @@ func newBrokerTestRig(t *testing.T) (*windowsBroker, *brokerTestConnection, *bro
 	}
 	acl := &brokerTestACL{store: store, aces: make(map[ACLObjectIdentity][][]byte)}
 	tokens := &brokerTestTokenIssuer{}
-	broker, err := newWindowsBroker(installation, sids, journal, acl, tokens, bytes.NewReader(bytes.Repeat([]byte{0x42}, brokerLeaseIDSize)))
+	broker, err := newWindowsBroker(installation, sids, journal, acl, tokens, &brokerTestDesktopManager{}, bytes.NewReader(bytes.Repeat([]byte{0x42}, brokerLeaseIDSize)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +225,7 @@ func TestBrokerAcquireIssueReleasePreservesUnrelatedACLChanges(t *testing.T) {
 		}
 	}
 	token := broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOffline})
-	if token.Result != brokerResultOK || token.TokenHandle != 77 || tokens.issued != 1 || !tokens.token.closed {
+	if token.Result != brokerResultOK || token.TokenHandle != 77 || token.Desktop != `Sandbox-4242\Default` || tokens.issued != 1 || !tokens.token.closed {
 		t.Fatalf("token response = %#v issuer = %#v", token, tokens)
 	}
 	identity := connection.authorized[reference.Handle].Identity
@@ -208,6 +234,9 @@ func TestBrokerAcquireIssueReleasePreservesUnrelatedACLChanges(t *testing.T) {
 	release := broker.Handle(connection, brokerFrame{Kind: brokerMessageReleaseLease, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID})
 	if release.Result != brokerResultOK {
 		t.Fatalf("release = %#v", release)
+	}
+	if desktops := broker.desktops.(*brokerTestDesktopManager); desktops.closed != 1 {
+		t.Fatalf("release closed %d desktops", desktops.closed)
 	}
 	if got := acl.aces[identity]; len(got) != 1 || !bytes.Equal(got[0], unrelated) {
 		t.Fatalf("rollback altered unrelated ACEs: %x", got)
@@ -309,19 +338,64 @@ func TestBrokerDisconnectCleansOnlyExactBoundClientLeases(t *testing.T) {
 	if acquire.Result != brokerResultOK {
 		t.Fatalf("acquire = %v", acquire.Result)
 	}
+	issued := broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOffline})
+	if issued.Result != brokerResultOK {
+		t.Fatalf("issue = %#v", issued)
+	}
+	desktops := broker.desktops.(*brokerTestDesktopManager)
 	wrong := connection.binding
 	wrong.CreationTime++
 	if err := broker.Disconnect(wrong); err != nil {
 		t.Fatal(err)
 	}
-	if len(broker.leases) != 1 {
+	if len(broker.leases) != 1 || desktops.closed != 0 {
 		t.Fatal("PID-only disconnect cleaned the lease")
 	}
 	if err := broker.Disconnect(connection.binding); err != nil {
 		t.Fatal(err)
 	}
-	if len(broker.leases) != 0 || len(acl.aces[connection.authorized[reference.Handle].Identity]) != 0 {
+	if len(broker.leases) != 0 || len(acl.aces[connection.authorized[reference.Handle].Identity]) != 0 || desktops.closed != 1 {
 		t.Fatal("exact client disconnect retained lease authority")
+	}
+}
+
+func TestBrokerDesktopCreationUsesOnlyValidatedLeaseAuthorityAndRollsBack(t *testing.T) {
+	broker, connection, _, _, tokens, reference := newBrokerTestRig(t)
+	acquire := broker.Handle(connection, brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: connection.binding.Nonce, Objects: []brokerObjectReference{reference}})
+	manager := broker.desktops.(*brokerTestDesktopManager)
+	manager.fail = errors.New("desktop unavailable")
+	response := broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOffline})
+	if response.Result != brokerResultUnavailable || response.TokenHandle != 0 || response.Desktop != "" {
+		t.Fatalf("failed desktop response = %#v", response)
+	}
+	if len(manager.created) != 0 || tokens.issued != 1 || tokens.token == nil || !tokens.token.closed || broker.leases[ACLLeaseID(acquire.LeaseID)].tokenIssued {
+		t.Fatalf("desktop failure leaked authority: manager=%#v tokens=%#v", manager, tokens)
+	}
+
+	manager.fail = nil
+	response = broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOnline})
+	if response.Result != brokerResultOK || len(manager.created) != 1 {
+		t.Fatalf("retry response=%#v contexts=%#v", response, manager.created)
+	}
+	context := manager.created[0]
+	if context.LeaseID != ACLLeaseID(acquire.LeaseID) || !sameBrokerBinding(context.Binding, connection.binding) ||
+		context.Installation != broker.installationSID || context.Restricting != broker.leases[context.LeaseID].restricting ||
+		context.Account != brokerAccountOnline {
+		t.Fatalf("desktop context not bound to exact validated lease: %#v", context)
+	}
+}
+
+func TestBrokerReconcileClosesLiveDesktop(t *testing.T) {
+	broker, connection, _, _, _, reference := newBrokerTestRig(t)
+	acquire := broker.Handle(connection, brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: connection.binding.Nonce, Objects: []brokerObjectReference{reference}})
+	issued := broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOffline})
+	if issued.Result != brokerResultOK {
+		t.Fatalf("issue = %#v", issued)
+	}
+	response := broker.Handle(connection, brokerFrame{Kind: brokerMessageReconcile, Direction: brokerRequest, Nonce: connection.binding.Nonce})
+	manager := broker.desktops.(*brokerTestDesktopManager)
+	if response.Result != brokerResultOK || manager.closed != 1 || len(broker.leases) != 0 {
+		t.Fatalf("reconcile=%#v desktops=%#v leases=%d", response, manager, len(broker.leases))
 	}
 }
 
@@ -345,7 +419,7 @@ func TestBrokerNeverReusesSIDAndNeverMutatesBeforeJournalFlush(t *testing.T) {
 	emptyStore := &brokerTestJournalStore{}
 	acl.store = emptyStore
 	journal, _ := newBrokerLeaseJournal(emptyStore)
-	first, err := newWindowsBroker(installation, makeGenerator(), journal, acl, &brokerTestTokenIssuer{}, bytes.NewReader(bytes.Repeat([]byte{1}, brokerLeaseIDSize)))
+	first, err := newWindowsBroker(installation, makeGenerator(), journal, acl, &brokerTestTokenIssuer{}, &brokerTestDesktopManager{}, bytes.NewReader(bytes.Repeat([]byte{1}, brokerLeaseIDSize)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +427,7 @@ func TestBrokerNeverReusesSIDAndNeverMutatesBeforeJournalFlush(t *testing.T) {
 	if got := first.Handle(connection, brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: connection.binding.Nonce, Objects: []brokerObjectReference{reference}}); got.Result != brokerResultOK {
 		t.Fatalf("first SID result = %v", got.Result)
 	}
-	second, err := newWindowsBroker(installation, makeGenerator(), journal, acl, &brokerTestTokenIssuer{}, bytes.NewReader(bytes.Repeat([]byte{2}, brokerLeaseIDSize)))
+	second, err := newWindowsBroker(installation, makeGenerator(), journal, acl, &brokerTestTokenIssuer{}, &brokerTestDesktopManager{}, bytes.NewReader(bytes.Repeat([]byte{2}, brokerLeaseIDSize)))
 	if err != nil {
 		t.Fatal(err)
 	}
