@@ -4,6 +4,7 @@ package windows
 
 import (
 	"errors"
+	"net"
 	"reflect"
 	"sync"
 	"testing"
@@ -138,8 +139,10 @@ type fakePortBinding struct {
 	once   sync.Once
 }
 
-func (b *fakePortBinding) Port() uint16         { return b.port }
-func (b *fakePortBinding) ActivateProxy() error { return nil }
+func (b *fakePortBinding) Port() uint16              { return b.port }
+func (b *fakePortBinding) ActivateProxy() error      { return nil }
+func (b *fakePortBinding) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (b *fakePortBinding) Addr() net.Addr            { return &net.TCPAddr{Port: int(b.port)} }
 func (b *fakePortBinding) Close() error {
 	b.once.Do(func() { b.parent.closed = append(b.parent.closed, b.port) })
 	return nil

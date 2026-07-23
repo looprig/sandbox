@@ -5,6 +5,7 @@ package windows
 import (
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -31,9 +32,9 @@ func (e *proxyPortInUseError) Unwrap() error { return e.Err }
 // one-way transition for exactly one endpoint; all other endpoints continue to
 // accept-and-reject traffic for the reservation lifetime.
 type proxyPortBinding interface {
+	net.Listener
 	Port() uint16
 	ActivateProxy() error
-	Close() error
 }
 
 type proxyPortBinder interface {
