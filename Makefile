@@ -1,4 +1,4 @@
-.PHONY: test test-os test-linux-build test-windows-build fmt fmt-check vet staticcheck lint vuln secure fuzz
+.PHONY: test test-os test-linux-build test-windows-build test-windows-restricted test-windows-elevated fmt fmt-check vet staticcheck lint vuln secure fuzz
 
 GO ?= go
 GOOS := $(shell go env GOOS)
@@ -24,8 +24,11 @@ ifeq ($(GOOS),darwin)
 else ifeq ($(GOOS),linux)
 	@echo "==> Linux enforcement suite (GOOS=linux): rung-1 user/mount/net namespaces + nftables, rung-2 Landlock-v4/seccomp"
 	go test -race -count=1 . ./internal/...
+else ifeq ($(GOOS),windows)
+	@echo "==> Windows pure suite; use test-windows-restricted/elevated for disposable live gates"
+	go test -race -count=1 ./...
 else
-	@echo "sandbox OS confinement is implemented only on darwin and linux (GOOS=$(GOOS)); nothing to run" >&2
+	@echo "sandbox OS confinement is unavailable on GOOS=$(GOOS)" >&2
 	@exit 1
 endif
 
@@ -41,6 +44,27 @@ test-linux-build:
 test-windows-build:
 	@./scripts/test-windows-build_test.sh
 	@GO="$(GO)" ./scripts/test-windows-build.sh
+
+# These live gates intentionally set the destructive-test opt-ins. Run them
+# only on disposable workers with the privilege posture named by the target.
+test-windows-restricted:
+ifeq ($(GOOS),windows)
+	powershell -NoProfile -Command 'if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "restricted gate requires a standard-user token" }'
+	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST="1"; $$env:SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST="1"; go test -race -count=1 ./internal/windows ./internal/exec -run "RestrictedDisposable|RestrictedBrokerEscape|WindowsRestricted"'
+else
+	@echo "test-windows-restricted requires a disposable Windows standard-user worker" >&2
+	@exit 1
+endif
+
+test-windows-elevated:
+ifeq ($(GOOS),windows)
+	powershell -NoProfile -Command 'if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "elevated gate requires an elevated disposable worker" }'
+	powershell -NoProfile -Command '$$env:SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST="1"; $$env:SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST="1"; go test -race -count=1 ./...'
+	powershell -NoProfile -Command 'go test -count=100 ./internal/windows -run "Race|Recovery|BrokerEscape"'
+else
+	@echo "test-windows-elevated requires a disposable elevated Windows worker" >&2
+	@exit 1
+endif
 
 # Format the whole module in place.
 fmt:

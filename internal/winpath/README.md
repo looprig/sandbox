@@ -6,9 +6,24 @@ following the leaf reparse point, and derives the canonical DOS name and stable
 identity from the resulting handle.
 
 The package deliberately rejects UNC, object-manager/device, `GLOBALROOT`,
-volume-GUID, drive-relative, alternate-stream, and non-NTFS/ReFS targets. It
-does not reinterpret an unsupported spelling as a broader path. `Object` owns
-its handle; callers must call `Close`.
+named-pipe, raw-device, volume-GUID, drive-relative, alternate-stream, and
+non-NTFS/ReFS targets. It does not reinterpret an unsupported spelling as a
+broader path.
+
+## Handle ownership
+
+`Open` returns an `Object` that exclusively owns its no-follow Windows handle.
+The handle pins the opened identity while callers compare the canonical DOS
+path, volume serial, 128-bit file ID, type, reparse tag, and link count. Copying
+an `Object` does not duplicate the kernel handle. The owner must call `Close`
+exactly once and must keep the object alive for the entire authorization or ACL
+mutation. Callers that need independent lifetimes must open independent
+objects.
+
+Path strings never substitute for the retained handle. Revalidation fails when
+the final name, stable ID, type, or any ancestor/reparse transition changes.
+Unsupported namespace syntax is rejected before it can be normalized into a
+different authority class.
 
 ## Live verification status
 

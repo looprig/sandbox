@@ -71,3 +71,167 @@ jobs:
           sudo modprobe nf_tables || true
       - name: go test -race (rung 1 enforcement)
         run: go test -race -count=1 ./...
+
+  # Compile every package's test binary independently. This catches
+  # architecture-specific Windows files even when the live worker is x64.
+  windows-cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: windows amd64 + arm64 package/test binaries
+        run: make test-windows-build
+
+  # The standard-user runner must not have an installed broker. Labels are
+  # intentionally deployment-specific: absence of this worker fails/queues the
+  # required check rather than silently replacing live evidence.
+  windows-restricted:
+    runs-on: [self-hosted, Windows, X64, sandbox-standard, sandbox-disposable]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: require standard-user token and no installed broker
+        shell: powershell
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "windows-restricted requires a non-administrator standard-user token"
+          }
+          $owned = Get-Service -Name 'lsb-svc-*' -ErrorAction SilentlyContinue
+          if ($owned) {
+            throw "windows-restricted requires no installed sandbox broker: $($owned.Name -join ', ')"
+          }
+      - name: conformance and broker-escape suite (skip is failure)
+        shell: powershell
+        env:
+          SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST: "1"
+          SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST: "1"
+        run: |
+          $lines = @(& go test -json -race -count=1 ./internal/windows ./internal/exec `
+            -run 'RestrictedDisposable|RestrictedBrokerEscape|WindowsRestricted')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object {
+            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "requested Windows restricted mechanism did not execute"
+          }
+
+  # This worker is destroyed/reimaged after each job. The cleanup step runs for
+  # success, failure, and cancellation, and residue makes the job fail.
+  windows-elevated:
+    runs-on: [self-hosted, Windows, X64, sandbox-elevated, sandbox-disposable]
+    timeout-minutes: 120
+    env:
+      SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST: "1"
+      SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST: "1"
+      SANDBOX_WINDOWS_ELEVATED_TEST: "1"
+      SANDBOX_WINDOWS_INSTALLATION_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+      SANDBOX_WINDOWS_STATE_ROOT: '${{ runner.temp }}\looprig-sandbox-state'
+      SANDBOX_WINDOWS_PROXY_PORTS: "43191,43192"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: require elevated disposable Windows 11/Server worker
+        shell: powershell
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "windows-elevated requires an elevated token"
+          }
+          $caption = (Get-CimInstance Win32_OperatingSystem).Caption
+          if ($caption -notmatch 'Windows 11|Windows Server') {
+            throw "unsupported elevated evidence image: $caption"
+          }
+      - name: build protected host
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force '${{ runner.temp }}\looprig-bin' | Out-Null
+          go build -trimpath -o '${{ runner.temp }}\looprig-bin\sandbox-host.exe' ./cmd/sandbox-host
+          "SANDBOX_WINDOWS_HOST_BINARY=${{ runner.temp }}\looprig-bin\sandbox-host.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: setup and full adversarial suite (skip is failure)
+        shell: powershell
+        run: |
+          $lines = @(& go test -json -race -count=1 ./...)
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object {
+            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "requested Windows elevated mechanism did not execute"
+          }
+          go test -count=100 ./internal/windows -run 'Race|Recovery|BrokerEscape'
+      - name: unconditional cleanup and empty residue verification
+        if: always()
+        shell: powershell
+        run: |
+          $cleanupFailed = $false
+          $cleanupSource = @'
+          package main
+
+          import (
+              "context"
+              "fmt"
+              "os"
+              "strconv"
+              "strings"
+
+              "github.com/looprig/sandbox"
+          )
+
+          func main() {
+              var ports []uint16
+              for _, raw := range strings.Split(os.Getenv("SANDBOX_WINDOWS_PROXY_PORTS"), ",") {
+                  value, err := strconv.ParseUint(raw, 10, 16)
+                  if err != nil {
+                      panic(err)
+                  }
+                  ports = append(ports, uint16(value))
+              }
+              config := sandbox.WindowsSetupConfig{
+                  InstallationID: os.Getenv("SANDBOX_WINDOWS_INSTALLATION_ID"),
+                  StateRoot: os.Getenv("SANDBOX_WINDOWS_STATE_ROOT"),
+                  HostBinary: os.Getenv("SANDBOX_WINDOWS_HOST_BINARY"),
+                  ProxyPorts: ports,
+              }
+              if err := sandbox.RemoveWindowsSandbox(context.Background(), config); err != nil {
+                  panic(err)
+              }
+              status, err := sandbox.InspectWindowsSandbox(context.Background(), config)
+              if err != nil || status.Ready {
+                  panic(fmt.Sprintf("post-remove status=%+v err=%v", status, err))
+              }
+          }
+          '@
+          $cleanupProgram = Join-Path $env:RUNNER_TEMP 'looprig-windows-cleanup.go'
+          Set-Content -LiteralPath $cleanupProgram -Value $cleanupSource -Encoding utf8
+          go run $cleanupProgram
+          if ($LASTEXITCODE -ne 0) { $cleanupFailed = $true }
+
+          $services = @(Get-Service -Name 'lsb-svc-*' -ErrorAction SilentlyContinue)
+          $accounts = @(Get-LocalUser -Name 'lsb-*' -ErrorAction SilentlyContinue)
+          $rules = @(Get-NetFirewallRule -DisplayName 'Looprig Sandbox *' -ErrorAction SilentlyContinue)
+          $processes = @(Get-Process sandbox-host -ErrorAction SilentlyContinue)
+          $journal = Join-Path $env:SANDBOX_WINDOWS_STATE_ROOT 'broker-leases.journal'
+          $journalBytes = if (Test-Path -LiteralPath $journal) { (Get-Item -LiteralPath $journal).Length } else { 0 }
+
+          Write-Output "residue services=$($services.Count) accounts=$($accounts.Count) rules=$($rules.Count) processes=$($processes.Count) journalBytes=$journalBytes"
+          if ($services.Count -or $accounts.Count -or $rules.Count -or $processes.Count -or $journalBytes) {
+            $cleanupFailed = $true
+          }
+          if ($cleanupFailed) { throw "Windows elevated cleanup/residue verification failed" }

@@ -85,8 +85,38 @@ Work is on branch `feat/windows-sandbox`.
   Windows host.
   This approval does not convert any outstanding disposable-worker gate into a
   pass.
-- Tasks 13-23 have not started. Tasks 13-19 remain hard-gated on the reviewed
-  Task 5 runtime-baseline result.
+- Tasks 13-20 are implemented at code level. The installed host, protected
+  configuration, account/service/firewall lifecycle, authenticated broker,
+  exact ACL leases, restricted token issuance, broker-owned private desktops,
+  protected runner, per-launch isolation, and target-scoped proxy integration
+  are present. Focused tests and vet pass; the Phase 4 independent specification
+  and code/security reviews are pending at the phase boundary.
+- Task 21 is in progress. Hermetic elevated acceptance/recovery coverage and
+  explicit supported-worker live gates are being completed without converting
+  missing Windows 11/Server evidence into a pass.
+- Task 22 is implemented at code level. Windows amd64/arm64 cross-build,
+  standard-user no-broker, and disposable elevated CI gates plus package/host
+  documentation are present. Final consolidated validation remains pending.
+- Task 23 has not started. It is the final Phase 5 security review and release
+  gate.
+
+### Task completion ledger
+
+- [x] Tasks 1-4 — Phase 1 implementation and phase-boundary reviews complete.
+- [x] Tasks 5-8 — Phase 2 code/static reviews complete; supported-worker live
+  evidence remains explicitly outstanding.
+- [x] Tasks 9-12 — Phase 3 implementation and phase-boundary reviews complete.
+- [x] Task 13 — strict, fuzzed broker protocol.
+- [x] Task 14 — protected transactional host installation.
+- [x] Task 15 — accounts, credentials, service, and owned removal.
+- [x] Task 16 — account-scoped firewall installation and verification.
+- [x] Task 17 — authenticated broker leases and restricted tokens.
+- [x] Task 18 — protected runner and broker-owned private desktop.
+- [x] Task 19 — elevated filesystem/process compiler and per-launch lifecycle.
+- [x] Task 20 — reserved proxy networking and target-scoped grant leases.
+- [ ] Task 21 — elevated adversarial and recovery coverage (in progress).
+- [x] Task 22 — CI gates and package documentation (validation pending).
+- [ ] Task 23 — final security review and release gate.
 
 Run these gates on the Windows handoff branch:
 

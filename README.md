@@ -26,16 +26,22 @@ internal/               implementation; not importable outside this module
   darwin/               Seatbelt: SBPL generation and the darwin backend
   linux/                the enforcement ladder: namespaces, Landlock, seccomp,
                         nftables, cgroups, capability probing, stage-2 re-exec
-  platform/             backend selection; the only importer of darwin/ and linux/
+  windows/              restricted-token and installed-broker Windows tiers
+  winpath/              handle-owned Windows path identity and namespace rejection
+  platform/             backend selection; the only importer of OS backends
   exec/                 Executor, ExecutorSet, process tree, and the grant tokens
   safetext/             the shared untrusted-identifier predicate
   testsupport/          fixtures shared across the suites
+
+cmd/
+  sandbox-host/          protected Windows broker service and restricted runner
 ```
 
-Dependencies point one way: `pkg/*` ← `policy` ← `enforce` ← `{darwin,linux}` ←
-`platform` ← `exec` ← the facade. Nothing under `internal/` imports the root
-package, which is why the executor's own tests live beside it in
-`internal/exec` rather than at the root.
+Dependencies point one way: `pkg/*` ← `policy` ← `enforce` ← OS backends ←
+`platform` ← `exec` ← the facade. `winpath` is a Windows leaf used by policy
+and enforcement code. Nothing under `internal/` imports the root package, which
+is why the executor's own tests live beside it in `internal/exec` rather than
+at the root.
 
 ## Profile contract
 
@@ -290,6 +296,83 @@ Deferred v2 work includes a Linux rung-1 bridge from the private network
 namespace to the parent proxy, address-aware rung-2 enforcement, SOCKS5,
 complete SSH proxy integration, transparent TCP interception, opt-in TLS
 termination with a managed CA, and stronger TLS destination binding.
+
+## Windows modes and setup
+
+Windows exposes three selection modes:
+
+- `WindowsRestrictedToken` applies a restricted interactive-user token, a Job,
+  UI restrictions, an explicit handle list, and temporary ACL restrictions.
+  Because same-session Windows brokers can retain the user's full authority, v1
+  honestly reports only `GuaranteeEnvScrub` and `LevelNone`.
+- `WindowsElevated` requires a verified installation-owned LocalSystem broker
+  and restricted local accounts. It never falls back to the interactive tier.
+- `WindowsAuto` uses elevated setup when the profile requires its guarantees
+  and falls back to restricted mode only when setup is absent, not stale.
+
+Setup is an explicit elevated lifecycle operation. A product normally builds
+`cmd/sandbox-host` and passes its immutable output to a small privileged setup
+helper:
+
+```go
+cfg := sandbox.WindowsSetupConfig{
+	InstallationID: "my-product",
+	StateRoot:      `C:\ProgramData\MyProduct\Sandbox`,
+	HostBinary:     `C:\build\sandbox-host.exe`,
+	ProxyPorts:     []uint16{43191, 43192},
+}
+if err := sandbox.SetupWindowsSandbox(ctx, cfg); err != nil {
+	return err
+}
+status, err := sandbox.InspectWindowsSandbox(ctx, cfg)
+if err != nil || !status.Ready {
+	return fmt.Errorf("Windows sandbox is not ready: status=%+v err=%w", status, err)
+}
+
+set, err := sandbox.NewExecutorSet(profile,
+	sandbox.WithScratchRoot(scratch),
+	sandbox.WithMaxExecutors(4),
+	sandbox.WithWindowsSandboxMode(sandbox.WindowsElevated),
+	sandbox.WithWindowsSandboxStateRoot(cfg.StateRoot),
+)
+```
+
+Cleanup is also explicit and must run elevated:
+
+```go
+if err := sandbox.RemoveWindowsSandbox(ctx, cfg); err != nil {
+	return err
+}
+status, err := sandbox.InspectWindowsSandbox(ctx, cfg)
+if err != nil || status.Ready {
+	return fmt.Errorf("Windows sandbox residue: status=%+v err=%w", status, err)
+}
+```
+
+Windows v1 supports canonical local DOS-drive roots on NTFS or ReFS. UNC/SMB,
+FAT/exFAT, drive-relative paths, alternate streams, object-manager/device
+namespaces, `GLOBALROOT`, named pipes, and raw devices fail closed. Broad
+host-wide filesystem grants are not supported.
+
+| Guarantee | Restricted token v1 | Elevated v1 |
+| --- | --- | --- |
+| process boundary | no | yes |
+| write boundary | no | yes when ACL projection succeeds |
+| read boundary | no | yes for supported roots and runtime baseline |
+| environment scrub | yes | yes |
+| network boundary | no | yes for the offline account |
+| address network | no | when the configured route earns it |
+| resource limits | no | when every requested Job limit reads back |
+| target network | no | yes through the authenticated proxy |
+
+V1 uses one installed host process per installation. It does not support
+service sharding or multiple independent proxy owners for one installation.
+
+Important current status: the Windows implementation and cross-build coverage
+exist, but production elevated readiness remains deliberately unavailable until
+the exact restricted-token/runtime matrix passes and is reviewed on supported
+disposable Windows 11 and Windows Server workers. Setup inspection therefore
+must not be treated as ready based on compile-only or Windows 10 evidence.
 
 ## Honest guarantees
 
