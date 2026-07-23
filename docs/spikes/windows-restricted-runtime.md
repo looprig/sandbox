@@ -145,8 +145,14 @@ contexts.
 First, in an **elevated collector PowerShell**, verify and start ProcMon:
 
 ```powershell
-(Get-Item .\procmon64.exe).VersionInfo.FileVersion
-Get-AuthenticodeSignature .\procmon64.exe
+$version = (Get-Item .\procmon64.exe).VersionInfo
+if ($version.FileVersion -ne '4.04' -or $version.ProductVersion -ne '4.04') {
+    throw "unexpected ProcMon version: file=$($version.FileVersion) product=$($version.ProductVersion)"
+}
+$signature = Get-AuthenticodeSignature .\procmon64.exe
+if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike 'CN=Microsoft Corporation,*') {
+    throw "untrusted ProcMon signature: status=$($signature.Status) signer=$($signature.SignerCertificate.Subject)"
+}
 .\procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\runtime-baseline.pml
 ```
 
