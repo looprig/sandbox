@@ -102,6 +102,27 @@ func TestPendingSetupDependenciesNeverReportReady(t *testing.T) {
 	}
 }
 
+func TestInitializeSetupIdentitiesUsesOnlyOwnedStagingGeneration(t *testing.T) {
+	setup := validatedSetup{config: SetupConfig{InstallationID: "install"}, stateRoot: `C:\ProgramData\Looprig`}
+	manifest := setupManifest{State: setupStateStaging, InstallationID: "install", HostPath: `C:\ProgramData\Looprig\slots\one\sandbox-host.exe`}
+	desired, err := desiredBrokerState("install", manifest.HostPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initializer := &fakeServiceInitializer{health: brokerIdentityHealth{InstallationID: "install", OfflineAccount: desired.OfflineAccount, OfflineSID: "S-1-5-21-1", OnlineAccount: desired.OnlineAccount, OnlineSID: "S-1-5-21-2", CredentialsProtected: true}}
+	if _, err := initializeSetupIdentities(context.Background(), setup, manifest, initializer); err != nil {
+		t.Fatal(err)
+	}
+	manifest.State = setupStateReady
+	if _, err := initializeSetupIdentities(context.Background(), setup, manifest, initializer); err == nil {
+		t.Fatal("ready generation was accepted for identity initialization")
+	}
+	manifest.State, manifest.InstallationID = setupStateStaging, "foreign"
+	if _, err := initializeSetupIdentities(context.Background(), setup, manifest, initializer); err == nil {
+		t.Fatal("foreign generation was accepted for identity initialization")
+	}
+}
+
 func TestInstalledHostPathMustBeExactProtectedSlot(t *testing.T) {
 	root := `C:\ProgramData\Looprig`
 	tests := []struct {

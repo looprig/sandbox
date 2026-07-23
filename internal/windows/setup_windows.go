@@ -133,6 +133,27 @@ func Setup(ctx context.Context, config SetupConfig) error {
 	return nil
 }
 
+// initializeSetupIdentities is the Task 15 boundary between elevated setup and
+// the LocalSystem broker. The request contains desired names/configuration but
+// no password. Task 17 supplies the authenticated service client and calls this
+// before a generation is promoted to ready.
+func initializeSetupIdentities(ctx context.Context, setup validatedSetup, manifest setupManifest, initializer serviceInitializer) (brokerIdentityHealth, error) {
+	if initializer == nil {
+		return brokerIdentityHealth{}, errors.New("sandbox: Windows broker initializer is unavailable")
+	}
+	if manifest.InstallationID != setup.config.InstallationID || manifest.State != setupStateStaging {
+		return brokerIdentityHealth{}, errors.New("sandbox: Windows identity initialization requires the owned staging generation")
+	}
+	if err := validateInstalledHostPath(setup.stateRoot, manifest.HostPath); err != nil {
+		return brokerIdentityHealth{}, err
+	}
+	desired, err := desiredBrokerState(setup.config.InstallationID, manifest.HostPath)
+	if err != nil {
+		return brokerIdentityHealth{}, err
+	}
+	return initializeBrokerIdentities(ctx, initializer, desired)
+}
+
 func Remove(context.Context, SetupConfig) error { return enforce.ErrUnavailable }
 
 type validatedSetup struct {
