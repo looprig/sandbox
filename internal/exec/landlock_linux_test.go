@@ -364,6 +364,85 @@ func TestLinuxFSDeniedPathCannotBeReplacedThroughWritableParent(t *testing.T) {
 	}
 }
 
+func TestLinuxFSRecursiveDenyBlocksRestoredAliasReplacement(t *testing.T) {
+	requireLandlockV4(t)
+	tests := []struct {
+		name      string
+		directory bool
+		command   func(string, string) string
+	}{
+		{
+			name: "restored exact file hard-link to denied sibling",
+			command: func(source, replacement string) string {
+				return "ln -- " + shq(source) + " " + shq(replacement) +
+					" && cat " + shq(replacement)
+			},
+		},
+		{
+			name: "restored exact file rename to denied sibling",
+			command: func(source, replacement string) string {
+				return "mv -- " + shq(source) + " " + shq(replacement) +
+					" && cat " + shq(replacement)
+			},
+		},
+		{
+			name:      "restored directory rename to denied sibling",
+			directory: true,
+			command: func(source, replacement string) string {
+				return "mv -T -- " + shq(source) + " " + shq(replacement) +
+					" && cat " + shq(filepath.Join(replacement, "marker"))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ws := t.TempDir()
+			denied := filepath.Join(ws, "denied")
+			if err := os.Mkdir(denied, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(denied, "source")
+			if test.directory {
+				if err := os.Mkdir(source, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(source, "marker"), []byte("restored"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(source, []byte("restored"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			replacement := filepath.Join(denied, "replacement")
+
+			effective := backendFixturePolicy(
+				fixtureWorkspaceWrite, ws,
+				fixtureWithoutSecretDenials(),
+			)
+			effective.FS = append(effective.FS,
+				policy.FSEntry{Path: denied, Denied: policy.ReadAccess | policy.ExecAccess},
+				policy.FSEntry{
+					Path: source, Access: policy.ReadAccess | policy.ExecAccess,
+					Exact: !test.directory,
+				},
+			)
+			e := newFSExecutor(t, effective)
+			_, code, err := e.RunCommand(context.Background(), ws, test.command(source, replacement))
+			if err != nil {
+				t.Fatalf("RunCommand(alias replacement): %v", err)
+			}
+			if code == 0 {
+				t.Fatal("alias replacement succeeded — FAIL-OPEN: restored inode became readable at denied sibling")
+			}
+			if _, err := os.Stat(source); err != nil {
+				t.Fatalf("restored source disappeared after denied replacement: %v", err)
+			}
+			if _, err := os.Lstat(replacement); !os.IsNotExist(err) {
+				t.Fatalf("denied replacement exists after failed attack: %v", err)
+			}
+		})
+	}
+}
+
 // TestLinuxFSSnapshotSemantics asserts the documented §7.5 snapshot behavior: a
 // carved workspace (its writable root is enumerated, not granted whole) permits
 // writes to a PRE-EXISTING subdirectory but denies a NEW top-level file — the

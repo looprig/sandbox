@@ -295,7 +295,7 @@ func filesystemAxisSnapshotEntry(cfs policy.CompiledFS) (profile.ReportEntry, bo
 	detail := "protected path scopes within a recursive allow require shared Landlock child enumeration on denied axes: " +
 		strings.Join(names, ", ") + "; pre-existing unaffected children retain policy-allowed access"
 	if axes&policy.WriteAccess != 0 {
-		detail += ", while withholding write blocks new entries directly beneath the covering root and prevents rename/link pathname replacement (§7.5)"
+		detail += ", while withholding directory write at snapshot boundaries and throughout recursive read/execute-denied scopes blocks new entries and prevents rename/link pathname replacement (§7.5)"
 	} else {
 		detail += "; write authority is not withheld, so creation may remain permitted, but new entries lack denied-axis authority (§7.5)"
 	}

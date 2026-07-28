@@ -90,6 +90,14 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 			want: WriteAccess,
 		},
 		{
+			name: "nested write allow under ancestor read deny is derived denied",
+			entries: []FSEntry{
+				{Path: root, Denied: ReadAccess},
+				{Path: protected, Access: WriteAccess},
+			},
+			want: WriteAccess,
+		},
+		{
 			name: "equal-path tie is not sibling enumeration",
 			entries: []FSEntry{
 				{Path: root, Access: AllAccess},
@@ -184,6 +192,63 @@ func TestEnumerateFSRulesWithholdsSplitAxisWriteTopology(t *testing.T) {
 	}
 }
 
+func TestEnumerateFSRulesDerivesWriteDenyAcrossRecursiveReadDeny(t *testing.T) {
+	root := t.TempDir()
+	denied := filepath.Join(root, "denied")
+	restored := filepath.Join(denied, "source")
+	secret := filepath.Join(denied, "secret")
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(denied, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{restored, secret, outside} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: denied, Denied: ReadAccess | ExecAccess},
+		{Path: restored, Access: ReadAccess | ExecAccess, Exact: true},
+	})
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, restored); got != ReadAccess|ExecAccess {
+		t.Fatalf("restored exact source access = %#x, want read+execute without write; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, secret); got != DenyAccess {
+		t.Fatalf("denied sibling access = %#x, want deny; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, outside); got != AllAccess {
+		t.Fatalf("unaffected sibling access = %#x, want full; rules=%+v", got, rules)
+	}
+}
+
+func TestEnumerateFSRulesSuppressesNestedWriteAllowUnderRecursiveReadDeny(t *testing.T) {
+	root := t.TempDir()
+	denied := filepath.Join(root, "denied")
+	writable := filepath.Join(denied, "writable")
+	restored := filepath.Join(writable, "source")
+	if err := os.MkdirAll(writable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(restored, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: denied, Denied: ReadAccess | ExecAccess},
+		{Path: writable, Access: WriteAccess},
+		{Path: restored, Access: ReadAccess | ExecAccess, Exact: true},
+	})
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, writable); got&WriteAccess != 0 {
+		t.Fatalf("nested recursive write allow survived ancestor read deny: %#x; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, restored); got != ReadAccess|ExecAccess {
+		t.Fatalf("restored source access = %#x, want read+execute without write; rules=%+v", got, rules)
+	}
+}
+
 func TestEnumerateFSRulesPreservesDescendantsOfEqualPathExactDeny(t *testing.T) {
 	root := t.TempDir()
 	child := filepath.Join(root, "child")
@@ -226,8 +291,8 @@ func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 		{Path: workspace, Access: WriteAccess, Denied: ReadAccess | ExecAccess},
 	})
 	rules := EnumerateFSRules(compiled)
-	if got := resolveEnumeratedRules(rules, filepath.Join(workspace, "file")); got != WriteAccess {
-		t.Fatalf("workspace enumerated access = %#x, want write-only", got)
+	if got := resolveEnumeratedRules(rules, filepath.Join(workspace, "file")); got != DenyAccess {
+		t.Fatalf("recursively read/execute-denied workspace access = %#x, want derived write deny", got)
 	}
 	if got := resolveEnumeratedRules(rules, filepath.Join(outside, "file")); got != AllAccess {
 		t.Fatalf("outside enumerated access = %#x, want full root access", got)

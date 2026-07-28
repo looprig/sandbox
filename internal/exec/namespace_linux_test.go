@@ -515,7 +515,7 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	if snapshot.Status != "narrowed" {
 		t.Fatalf("filesystem-axis-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
 	}
-	for _, phrase := range []string{"shared Landlock child enumeration", "denied axes: execute, write", "pre-existing unaffected children", "blocks new entries directly beneath"} {
+	for _, phrase := range []string{"shared Landlock child enumeration", "denied axes: execute, write", "pre-existing unaffected children", "withholding directory write"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
 			t.Errorf("filesystem-axis-snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
@@ -537,7 +537,7 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	if snapshot == nil || snapshot.Status != "narrowed" {
 		t.Fatalf("nested read deny snapshot = %+v, want narrowed entry; report=%+v", snapshot, report.Entries)
 	}
-	for _, phrase := range []string{"denied axes: read, write", "blocks new entries directly beneath", "prevents rename/link pathname replacement"} {
+	for _, phrase := range []string{"denied axes: read, write", "throughout recursive read/execute-denied scopes", "prevents rename/link pathname replacement"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
 			t.Errorf("read-only snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
@@ -571,7 +571,7 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 			policy: backendFixturePolicy(fixtureWorkspaceWrite, ws),
 			wantDetail: []string{
 				"denied axes: execute, write",
-				"blocks new entries directly beneath",
+				"withholding directory write",
 			},
 			wantLegacy: [][2]string{
 				{"fixed-path-deny", linuxReportStatusEnforced},
@@ -587,7 +587,7 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 			}},
 			wantDetail: []string{
 				"denied axes: read, write",
-				"blocks new entries directly beneath",
+				"throughout recursive read/execute-denied scopes",
 				"prevents rename/link pathname replacement",
 			},
 			wantLegacy: [][2]string{
@@ -604,7 +604,7 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 			wantDetail: []string{
 				"denied axes: read, execute, write",
 				"pre-existing unaffected children retain policy-allowed access",
-				"blocks new entries directly beneath",
+				"withholding directory write",
 			},
 			wantLegacy: [][2]string{
 				{"fixed-path-deny", linuxReportStatusEnforced},

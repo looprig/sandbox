@@ -499,8 +499,11 @@ func TestLinuxPinnedTreeEnumerationUsesRelativeChildHandles(t *testing.T) {
 	if allowedRead == nil || allowedRead.ParentFD <= rootChildFD {
 		t.Fatalf("rules = %+v, want allowed read via direct child FD after the root grant FD", rules)
 	}
-	if !rootExec || !rootWrite {
-		t.Fatalf("rules = %+v, want independent exec and write axes to retain the pinned root FD", rules)
+	if !rootExec || rootWrite {
+		t.Fatalf("rules = %+v, want exec but no topology write on the pinned root FD", rules)
+	}
+	if allowedRead.Access&policy.WriteAccess == 0 {
+		t.Fatalf("rules = %+v, want unaffected pinned child to retain enumerated write", rules)
 	}
 	childIndex := allowedRead.ParentFD - policy.FirstPathHandleChildFD - 1
 	if childIndex < 0 || childIndex >= len(children) {
@@ -653,7 +656,11 @@ func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
 			target := filepath.Join(root, "target")
 			denied := filepath.Join(target, "denied")
 			restored := filepath.Join(denied, "restored")
+			safe := filepath.Join(target, "safe")
 			if err := os.MkdirAll(restored, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(safe, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(restored, "identity"), []byte("approved"), 0o600); err != nil {
@@ -694,8 +701,17 @@ func TestLinuxPinnedDescendantRestorationFeedsBothRungs(t *testing.T) {
 					rootAxes |= rule.Access
 				}
 			}
-			if rootAxes != policy.ExecAccess|policy.WriteAccess {
-				t.Fatalf("root unaffected axes = %#x, want exec|write", rootAxes)
+			if rootAxes != policy.ExecAccess {
+				t.Fatalf("root unaffected axes = %#x, want exec only", rootAxes)
+			}
+			var safeWrite bool
+			for _, rule := range spec.FSRules {
+				if rule.Target == safe && rule.Access&policy.WriteAccess != 0 {
+					safeWrite = true
+				}
+			}
+			if !safeWrite {
+				t.Fatalf("rules = %+v, want unaffected pinned child %q to retain enumerated write", spec.FSRules, safe)
 			}
 			cleanup()
 		})

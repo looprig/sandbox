@@ -145,10 +145,11 @@ func (compiled CompiledFS) Resolve(path string) FSAccess {
 func (compiled CompiledFS) HasLiteralDeny() bool { return len(compiled.Denies) > 0 }
 
 // SnapshotAxes reports the access axes for which a recursive allow contains a
-// narrower literal deny. It also includes write when read or execute is denied,
-// because granting write on the covering directory would permit pathname
-// replacement around the denied axis. Landlock must enumerate existing children
-// instead of granting the covering allow root on each returned axis.
+// narrower literal deny. It also includes write when read or execute is denied:
+// granting directory write would permit pathname replacement around the denied
+// axis, so recursive denied scopes derive write denial throughout their subtree.
+// Landlock must enumerate existing unaffected children instead of granting the
+// covering allow root on each returned axis.
 func (compiled CompiledFS) SnapshotAxes() FSAccess {
 	var axes FSAccess
 	for _, allow := range compiled.Allows {
@@ -159,12 +160,14 @@ func (compiled CompiledFS) SnapshotAxes() FSAccess {
 		for _, deny := range compiled.Denies {
 			nested := PathUnder(allow.Path, deny.Path)
 			equal := allow.Path == deny.Path
+			covered := !deny.Exact && PathUnder(deny.Path, allow.Path)
 			if nested || equal && deny.Exact {
 				axes |= allow.Access & deny.Access
 			}
 			if allow.Access&WriteAccess != 0 &&
-				overlappingAccess&deny.Access&(ReadAccess|ExecAccess) != 0 &&
-				(nested || equal && (deny.Exact || deny.Access&WriteAccess == 0)) {
+				((overlappingAccess&deny.Access&(ReadAccess|ExecAccess) != 0 &&
+					(nested || equal && (deny.Exact || deny.Access&WriteAccess == 0))) ||
+					covered && deny.Access&(ReadAccess|ExecAccess) != 0) {
 				axes |= WriteAccess
 			}
 		}
@@ -232,7 +235,8 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 	resolver := NewPinnedPathResolver(handles, FirstPathHandleChildFD+len(handles))
 	for _, allow := range compiled.Allows {
 		for _, bit := range []FSAccess{ReadAccess, ExecAccess, WriteAccess} {
-			if allow.Access&bit == 0 || deniedAtSamePath(allow, bit, compiled.Denies) {
+			if allow.Access&bit == 0 || deniedAtSamePath(allow, bit, compiled.Denies) ||
+				deniedByRecursiveTopology(allow, bit, compiled.Denies) {
 				continue
 			}
 			excludes := excludesForAllowAxis(allow, bit, compiled.Allows, compiled.Denies)
@@ -293,6 +297,19 @@ func deniedAtSamePath(allow FSAllow, bit FSAccess, denies []FSDeny) bool {
 	return false
 }
 
+func deniedByRecursiveTopology(allow FSAllow, bit FSAccess, denies []FSDeny) bool {
+	if bit != WriteAccess || allow.Exact {
+		return false
+	}
+	for _, deny := range denies {
+		if !deny.Exact && deny.Access&(ReadAccess|ExecAccess) != 0 &&
+			(deny.Path == allow.Path || PathUnder(deny.Path, allow.Path)) {
+			return true
+		}
+	}
+	return false
+}
+
 type fsExclude struct {
 	Path  string
 	Exact bool
@@ -311,7 +328,8 @@ func excludesForAllowAxis(allow FSAllow, bit FSAccess, allows []FSAllow, denies 
 			(nested || equal)
 		if deniesAxis || topologyBarrier {
 			excludes = append(excludes, fsExclude{
-				Path: deny.Path, Exact: deny.Exact, Deny: deniesAxis,
+				Path: deny.Path, Exact: deny.Exact,
+				Deny: deniesAxis || topologyBarrier && !deny.Exact,
 			})
 		}
 	}
