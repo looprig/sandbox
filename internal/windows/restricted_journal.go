@@ -56,7 +56,8 @@ type RestrictedJournalCleaner interface {
 
 // RestrictedPruner may opportunistically remove exact allow ACEs for retired SIDs
 // while it performs an independently safe, handle-bound tree enumeration.
-// Journal data is supplied only as removal authority.
+// Journal data is supplied only as removal authority. Implementations must not
+// re-enter or close the journal while PruneRestrictedACEs is active.
 type RestrictedPruner interface {
 	PruneRestrictedACEs(func(SID, ACERole, []byte) bool) error
 }
@@ -98,10 +99,18 @@ func OpenRestrictedJournal(stableScratchRoot string) (*RestrictedJournal, error)
 		recordsDir: filepath.Join(root, "records"),
 		retiredDir: filepath.Join(root, "retired-sids"),
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return nil, fmt.Errorf("create stable scratch root: %w", err)
+	}
+	scratch, err := os.OpenRoot(abs)
+	if err != nil {
+		return nil, fmt.Errorf("open stable scratch root: %w", err)
+	}
+	defer scratch.Close()
+	if err := scratch.Mkdir(restrictedJournalDirectory, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, fmt.Errorf("create restricted journal: %w", err)
 	}
-	outer, err := os.OpenRoot(root)
+	outer, err := openRestrictedJournalSubroot(scratch, restrictedJournalDirectory)
 	if err != nil {
 		return nil, fmt.Errorf("open restricted journal root: %w", err)
 	}
@@ -332,16 +341,15 @@ func (j *RestrictedJournal) Prune(pruner RestrictedPruner) error {
 		return errors.New("sandbox: restricted journal pruner is required")
 	}
 	j.mu.RLock()
+	defer j.mu.RUnlock()
 	if j.closed {
-		j.mu.RUnlock()
 		return errors.New("sandbox: restricted journal is closed")
 	}
-	j.mu.RUnlock()
 	return pruner.PruneRestrictedACEs(func(sid SID, role ACERole, ace []byte) bool {
 		if role != ACERoleRestrictingAllow || !retirableRestrictedSID(sid) || !recognizedRestrictingACE(sid, role, ace) {
 			return false
 		}
-		return j.isDurablyRetired(sid)
+		return j.isDurablyRetiredLocked(sid)
 	})
 }
 

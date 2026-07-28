@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func restrictedTestSID(label string) SID {
@@ -96,6 +97,25 @@ func TestOpenRestrictedJournalRejectsPreexistingSymlinkDirectory(t *testing.T) {
 	}
 	if _, err := OpenRestrictedJournal(stable); err == nil {
 		t.Fatal("preexisting symlink records directory was accepted")
+	}
+}
+
+func TestOpenRestrictedJournalRejectsPreexistingJournalRootSymlink(t *testing.T) {
+	stable := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(stable, restrictedJournalDirectory)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if journal, err := OpenRestrictedJournal(stable); err == nil {
+		_ = journal.Close()
+		t.Fatal("preexisting symlink journal root was accepted")
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("journal initialization escaped anchored scratch root: %v", entries)
 	}
 }
 
@@ -303,6 +323,48 @@ func TestRestrictedJournalDirectoryReplacementCannotRedirectOperations(t *testin
 	}
 }
 
+func TestRestrictedJournalRootReplacementCannotRedirectOperations(t *testing.T) {
+	stable := t.TempDir()
+	journal, err := OpenRestrictedJournal(stable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+
+	originalRoot := journal.root + "-original"
+	if err := os.Rename(journal.root, originalRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsideRecords := filepath.Join(journal.root, "records")
+	outsideRetired := filepath.Join(journal.root, "retired-sids")
+	for _, directory := range []string{outsideRecords, outsideRetired} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	record := restrictedTestRecord(t, "journal-root-replacement")
+	key := prepareRestrictedTestMutation(t, journal, record)
+	if _, err := os.Stat(filepath.Join(originalRoot, "records", key+".json")); err != nil {
+		t.Fatalf("record did not stay below originally opened journal root: %v", err)
+	}
+	if entries, err := os.ReadDir(outsideRecords); err != nil || len(entries) != 0 {
+		t.Fatalf("record escaped into replacement journal root: entries=%v err=%v", entries, err)
+	}
+	if entries, err := os.ReadDir(outsideRetired); err != nil || len(entries) != 0 {
+		t.Fatalf("retirement escaped into replacement journal root: entries=%v err=%v", entries, err)
+	}
+	if err := journal.CompleteCleanup(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(originalRoot, "records", key+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleanup did not remove record from original root: %v", err)
+	}
+}
+
 func TestRestrictedJournalRetirementDirectoryReplacementCannotRedirectState(t *testing.T) {
 	root := t.TempDir()
 	journal, err := OpenRestrictedJournal(root)
@@ -461,6 +523,66 @@ type testPruner struct {
 func (pruner *testPruner) PruneRestrictedACEs(allow func(SID, ACERole, []byte) bool) error {
 	pruner.allow = allow
 	return nil
+}
+
+type blockingTestPruner struct {
+	entered chan struct{}
+	release chan struct{}
+	sid     SID
+	ace     []byte
+	allowed bool
+}
+
+func (pruner *blockingTestPruner) PruneRestrictedACEs(allow func(SID, ACERole, []byte) bool) error {
+	close(pruner.entered)
+	<-pruner.release
+	pruner.allowed = allow(pruner.sid, ACERoleRestrictingAllow, pruner.ace)
+	return nil
+}
+
+func TestRestrictedJournalCloseWaitsForPruneCallback(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := restrictedTestSID("blocking-prune")
+	if retired, err := journal.RetireSID(sid); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v)", retired, err)
+	}
+	pruner := &blockingTestPruner{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		sid:     sid,
+		ace:     encodeACE(sid, ACLObjectFile, ACLACE{Type: ACEAllow, Access: ACLRead}),
+	}
+	defer func() {
+		select {
+		case <-pruner.release:
+		default:
+			close(pruner.release)
+		}
+	}()
+	pruneDone := make(chan error, 1)
+	go func() { pruneDone <- journal.Prune(pruner) }()
+	<-pruner.entered
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- journal.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned while Prune callback remained active: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(pruner.release)
+	if err := <-pruneDone; err != nil {
+		t.Fatal(err)
+	}
+	if !pruner.allowed {
+		t.Fatal("active Prune lost anchored retirement state")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRestrictedJournalPrunesOnlyRecognizedInertACEs(t *testing.T) {
