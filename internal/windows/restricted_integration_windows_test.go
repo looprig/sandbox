@@ -287,6 +287,7 @@ func TestRestrictedDisposableJournalRecoveryAndSIDNonReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = journal.Close() })
 	makeExactProjection := func(name string) (string, SID, *ACLProjection) {
 		t.Helper()
 		target := filepath.Join(root, name)
@@ -340,6 +341,9 @@ func TestRestrictedDisposableJournalRecoveryAndSIDNonReuse(t *testing.T) {
 		}
 		if reopened == nil || report.Removed == 0 {
 			t.Fatalf("next construction did not recover live journaled allow: %+v", report)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
 		}
 		if err := projection.Close(); err != nil {
 			t.Fatalf("trusted close after recovery: %v", err)
@@ -396,8 +400,11 @@ func TestRestrictedDisposableJournalRecoveryAndSIDNonReuse(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(journal.recordsDir, strings.Repeat("a", 64)+".json"), []byte(`{"forged":true}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, report, err := OpenRestrictedJournalAndSweep(root, RestrictedACLCleaner{})
+		reopened, report, err := OpenRestrictedJournalAndSweep(root, RestrictedACLCleaner{})
 		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reopened.Close(); err != nil {
 			t.Fatal(err)
 		}
 		if report.Corrupt == 0 || report.Retained == 0 {

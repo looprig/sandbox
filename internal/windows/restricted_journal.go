@@ -8,14 +8,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
-const restrictedJournalDirectory = "restricted-journal-v1"
+const (
+	restrictedJournalDirectory      = "restricted-journal-v1"
+	restrictedJournalRecordMaxBytes = 64 << 10
+	restrictedJournalSIDMaxBytes    = 1 << 10
+)
+
+var (
+	errRestrictedJournalRecordTooLarge = errors.New("sandbox: restricted journal record is too large")
+	errRestrictedJournalNonRegular     = errors.New("sandbox: restricted journal entry is not a regular file")
+)
 
 // ErrRestrictedTargetChanged means cleanup found a different filesystem object
 // at the recorded path. The journal must never use a path alone as authority.
@@ -63,6 +74,11 @@ type RestrictedJournal struct {
 	root       string
 	recordsDir string
 	retiredDir string
+
+	mu          sync.RWMutex
+	recordsRoot *os.Root
+	retiredRoot *os.Root
+	closed      bool
 }
 
 // OpenRestrictedJournal creates the durable store below stableScratchRoot.
@@ -82,10 +98,27 @@ func OpenRestrictedJournal(stableScratchRoot string) (*RestrictedJournal, error)
 		recordsDir: filepath.Join(root, "records"),
 		retiredDir: filepath.Join(root, "retired-sids"),
 	}
-	for _, directory := range []string{j.recordsDir, j.retiredDir} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, fmt.Errorf("create restricted journal: %w", err)
+	}
+	outer, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("open restricted journal root: %w", err)
+	}
+	defer outer.Close()
+	for _, directory := range []string{"records", "retired-sids"} {
+		if err := outer.MkdirAll(directory, 0o700); err != nil {
 			return nil, fmt.Errorf("create restricted journal: %w", err)
 		}
+	}
+	j.recordsRoot, err = openRestrictedJournalSubroot(outer, "records")
+	if err != nil {
+		return nil, fmt.Errorf("open restricted journal records: %w", err)
+	}
+	j.retiredRoot, err = openRestrictedJournalSubroot(outer, "retired-sids")
+	if err != nil {
+		_ = j.recordsRoot.Close()
+		return nil, fmt.Errorf("open restricted journal retirements: %w", err)
 	}
 	return j, nil
 }
@@ -98,7 +131,35 @@ func OpenRestrictedJournalAndSweep(stableScratchRoot string, cleaner RestrictedJ
 		return nil, RestrictedSweepReport{}, err
 	}
 	report, err := j.Sweep(cleaner)
-	return j, report, err
+	if err != nil {
+		_ = j.Close()
+		return nil, report, err
+	}
+	return j, report, nil
+}
+
+// Close releases the retained directory handles. It is safe to call more than
+// once and waits for in-flight journal operations to finish.
+func (j *RestrictedJournal) Close() error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return nil
+	}
+	j.closed = true
+	var result error
+	if j.recordsRoot != nil {
+		result = errors.Join(result, j.recordsRoot.Close())
+		j.recordsRoot = nil
+	}
+	if j.retiredRoot != nil {
+		result = errors.Join(result, j.retiredRoot.Close())
+		j.retiredRoot = nil
+	}
+	return result
 }
 
 // PrepareMutation durably records cleanup before a caller changes a DACL. The
@@ -108,16 +169,21 @@ func (j *RestrictedJournal) PrepareMutation(record RestrictedCleanupRecord) (str
 	if j == nil {
 		return "", errors.New("sandbox: nil restricted journal")
 	}
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return "", errors.New("sandbox: restricted journal is closed")
+	}
 	encoded, err := encodeRestrictedRecord(record)
 	if err != nil {
 		return "", err
 	}
-	if !j.isDurablyRetired(record.Rollback.SID) {
+	if !j.isDurablyRetiredLocked(record.Rollback.SID) {
 		return "", errors.New("sandbox: cleanup SID was not durably retired before mutation")
 	}
 	digest := sha256.Sum256(encoded)
 	key := hex.EncodeToString(digest[:])
-	if err := createExclusiveDurable(filepath.Join(j.recordsDir, key+".json"), encoded); err != nil {
+	if err := createExclusiveDurable(j.recordsRoot, key+".json", encoded); err != nil {
 		return "", fmt.Errorf("prepare restricted ACL mutation: %w", err)
 	}
 	return key, nil
@@ -130,9 +196,19 @@ func (j *RestrictedJournal) CompleteCleanup(key string) error {
 	if j == nil || !validJournalKey(key) {
 		return errors.New("sandbox: invalid restricted journal record key")
 	}
-	err := os.Remove(filepath.Join(j.recordsDir, key+".json"))
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return errors.New("sandbox: restricted journal is closed")
+	}
+	err := j.recordsRoot.Remove(key + ".json")
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove restricted journal record: %w", err)
+	}
+	if err == nil {
+		if err := syncRestrictedJournalDirectory(j.recordsRoot); err != nil {
+			return fmt.Errorf("sync restricted journal records: %w", err)
+		}
 	}
 	return nil
 }
@@ -145,22 +221,37 @@ func (j *RestrictedJournal) Sweep(cleaner RestrictedJournalCleaner) (RestrictedS
 	if j == nil || cleaner == nil {
 		return report, errors.New("sandbox: restricted journal cleaner is required")
 	}
-	entries, err := os.ReadDir(j.recordsDir)
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return report, errors.New("sandbox: restricted journal is closed")
+	}
+	directory, err := j.recordsRoot.Open(".")
 	if err != nil {
 		return report, fmt.Errorf("read restricted journal: %w", err)
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err != nil {
+		return report, fmt.Errorf("read restricted journal: %w", err)
+	}
+	if closeErr != nil {
+		return report, fmt.Errorf("close restricted journal directory: %w", closeErr)
 	}
 	sort.Slice(entries, func(i, k int) bool { return entries[i].Name() < entries[k].Name() })
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		path := filepath.Join(j.recordsDir, entry.Name())
-		data, readErr := os.ReadFile(path)
+		data, readErr := readRestrictedJournalRegularFile(j.recordsRoot, entry.Name(), restrictedJournalRecordMaxBytes)
 		if errors.Is(readErr, fs.ErrNotExist) {
 			continue
 		}
 		if readErr != nil {
 			report.Retained++
+			if errors.Is(readErr, errRestrictedJournalRecordTooLarge) || errors.Is(readErr, errRestrictedJournalNonRegular) {
+				report.Corrupt++
+			}
 			continue
 		}
 		record, decodeErr := decodeRestrictedRecord(data)
@@ -169,7 +260,7 @@ func (j *RestrictedJournal) Sweep(cleaner RestrictedJournalCleaner) (RestrictedS
 			report.Retained++
 			continue
 		}
-		if !j.isDurablyRetired(record.Rollback.SID) {
+		if !j.isDurablyRetiredLocked(record.Rollback.SID) {
 			report.Corrupt++
 			report.Retained++
 			continue
@@ -195,8 +286,11 @@ func (j *RestrictedJournal) Sweep(cleaner RestrictedJournalCleaner) (RestrictedS
 			report.Retained++
 			continue
 		}
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		if removeErr := j.recordsRoot.Remove(entry.Name()); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
 			return report, fmt.Errorf("remove swept restricted journal record: %w", removeErr)
+		}
+		if err := syncRestrictedJournalDirectory(j.recordsRoot); err != nil {
+			return report, fmt.Errorf("sync swept restricted journal records: %w", err)
 		}
 		report.Removed++
 	}
@@ -210,12 +304,17 @@ func (j *RestrictedJournal) RetireSID(sid SID) (bool, error) {
 	if j == nil {
 		return false, errors.New("sandbox: nil restricted journal")
 	}
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return false, errors.New("sandbox: restricted journal is closed")
+	}
 	if !retirableRestrictedSID(sid) {
 		return false, errors.New("sandbox: only module-issued transient restricted SIDs may be retired")
 	}
 	digest := sha256.Sum256([]byte(sid.String()))
-	path := filepath.Join(j.retiredDir, hex.EncodeToString(digest[:])+".sid")
-	err := createExclusiveDurable(path, []byte(sid.String()+"\n"))
+	name := hex.EncodeToString(digest[:]) + ".sid"
+	err := createExclusiveDurable(j.retiredRoot, name, []byte(sid.String()+"\n"))
 	if errors.Is(err, fs.ErrExist) {
 		return false, nil
 	}
@@ -232,6 +331,12 @@ func (j *RestrictedJournal) Prune(pruner RestrictedPruner) error {
 	if j == nil || pruner == nil {
 		return errors.New("sandbox: restricted journal pruner is required")
 	}
+	j.mu.RLock()
+	if j.closed {
+		j.mu.RUnlock()
+		return errors.New("sandbox: restricted journal is closed")
+	}
+	j.mu.RUnlock()
 	return pruner.PruneRestrictedACEs(func(sid SID, role ACERole, ace []byte) bool {
 		if role != ACERoleRestrictingAllow || !retirableRestrictedSID(sid) || !recognizedRestrictingACE(sid, role, ace) {
 			return false
@@ -244,8 +349,20 @@ func (j *RestrictedJournal) isDurablyRetired(sid SID) bool {
 	if j == nil || !retirableRestrictedSID(sid) {
 		return false
 	}
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.closed {
+		return false
+	}
+	return j.isDurablyRetiredLocked(sid)
+}
+
+func (j *RestrictedJournal) isDurablyRetiredLocked(sid SID) bool {
+	if !retirableRestrictedSID(sid) {
+		return false
+	}
 	digest := sha256.Sum256([]byte(sid.String()))
-	data, err := os.ReadFile(filepath.Join(j.retiredDir, hex.EncodeToString(digest[:])+".sid"))
+	data, err := readRestrictedJournalRegularFile(j.retiredRoot, hex.EncodeToString(digest[:])+".sid", restrictedJournalSIDMaxBytes)
 	return err == nil && string(data) == sid.String()+"\n"
 }
 
@@ -331,8 +448,11 @@ func recognizedRestrictingACE(sid SID, role ACERole, ace []byte) bool {
 	return ace[0] == wantType && bytes.Equal(ace[8:], sid.binary())
 }
 
-func createExclusiveDurable(path string, data []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+func createExclusiveDurable(root *os.Root, name string, data []byte) error {
+	if root == nil || name == "" || name == "." || filepath.Base(name) != name {
+		return errors.New("sandbox: invalid restricted journal filename")
+	}
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -340,7 +460,7 @@ func createExclusiveDurable(path string, data []byte) error {
 	defer func() {
 		_ = file.Close()
 		if remove {
-			_ = os.Remove(path)
+			_ = root.Remove(name)
 		}
 	}()
 	if _, err = file.Write(data); err != nil {
@@ -352,8 +472,82 @@ func createExclusiveDurable(path string, data []byte) error {
 	if err = file.Close(); err != nil {
 		return err
 	}
+	if err = syncRestrictedJournalDirectory(root); err != nil {
+		return err
+	}
 	remove = false
 	return nil
+}
+
+func readRestrictedJournalRegularFile(root *os.Root, name string, maximum int64) ([]byte, error) {
+	if root == nil || name == "" || name == "." || filepath.Base(name) != name {
+		return nil, errors.New("sandbox: invalid restricted journal filename")
+	}
+	entryInfo, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.Mode().IsRegular() {
+		return nil, errRestrictedJournalNonRegular
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(entryInfo, info) || !restrictedJournalHandleIsSafe(file, info) {
+		return nil, errRestrictedJournalNonRegular
+	}
+	if info.Size() < 0 || info.Size() > maximum {
+		return nil, errRestrictedJournalRecordTooLarge
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maximum {
+		return nil, errRestrictedJournalRecordTooLarge
+	}
+	return data, nil
+}
+
+func openRestrictedJournalSubroot(outer *os.Root, name string) (*os.Root, error) {
+	entryInfo, err := outer.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.IsDir() {
+		return nil, errors.New("sandbox: restricted journal state directory is not a directory")
+	}
+	root, err := outer.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	info, statErr := directory.Stat()
+	safe := statErr == nil && info.IsDir() && os.SameFile(entryInfo, info) && restrictedJournalHandleIsSafe(directory, info)
+	closeErr := directory.Close()
+	if statErr != nil {
+		_ = root.Close()
+		return nil, statErr
+	}
+	if closeErr != nil {
+		_ = root.Close()
+		return nil, closeErr
+	}
+	if !safe {
+		_ = root.Close()
+		return nil, errors.New("sandbox: restricted journal state directory changed while opening")
+	}
+	return root, nil
 }
 
 func validJournalKey(key string) bool {

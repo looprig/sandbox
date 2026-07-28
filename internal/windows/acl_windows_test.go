@@ -571,6 +571,7 @@ func TestACLProjectionDisposableExactAndReadback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = journal.Close() })
 	generator, err := NewOneShotSIDGenerator(bytes.NewReader(bytes.Repeat([]byte{0x5a}, sidEntropyBytes)), journal)
 	if err != nil {
 		t.Fatal(err)
@@ -688,6 +689,7 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = journal.Close() })
 	generator, err := NewOneShotSIDGenerator(bytes.NewReader(bytes.Repeat([]byte{0x6b}, sidEntropyBytes)), journal)
 	if err != nil {
 		t.Fatal(err)

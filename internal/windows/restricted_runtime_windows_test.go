@@ -50,6 +50,9 @@ func TestRestrictedRuntimeSharesSweepAcrossLiveSetsAndRecoversAfterLastRelease(t
 	}
 	releaseSecond()
 	releaseThird()
+	if !first.state.journal.closed {
+		t.Fatal("last runtime release did not close the retained journal roots")
+	}
 
 	next, releaseNext := AcquireRestrictedRuntime(root)
 	t.Cleanup(releaseNext)

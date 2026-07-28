@@ -61,8 +61,21 @@ func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
 			entry.refs--
 			if entry.refs == 0 {
 				delete(restrictedRuntimeRegistry.entries, key)
+				entry.runtime.closeRestrictedJournal()
 			}
 		})
+	}
+}
+
+func (runtime *RestrictedRuntime) closeRestrictedJournal() {
+	if runtime == nil {
+		return
+	}
+	runtime.state.once.Do(func() {
+		runtime.state.err = errors.New("sandbox: restricted runtime is closed")
+	})
+	if runtime.state.journal != nil {
+		_ = runtime.state.journal.Close()
 	}
 }
 

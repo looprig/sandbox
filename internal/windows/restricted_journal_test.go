@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -42,6 +43,15 @@ func prepareRestrictedTestMutation(t *testing.T, journal *RestrictedJournal, rec
 	return key
 }
 
+func closeRestrictedTestJournal(t *testing.T, journal *RestrictedJournal) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Errorf("close restricted journal: %v", err)
+		}
+	})
+}
+
 type recordingCleaner struct {
 	called  int
 	record  RestrictedCleanupRecord
@@ -60,6 +70,7 @@ func TestRestrictedJournalPersistsBeforeMutationAndRemovesAfterCleanup(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	record := restrictedTestRecord(t, "ordered")
 	key := prepareRestrictedTestMutation(t, journal, record)
 	if _, err := os.Stat(filepath.Join(journal.recordsDir, key+".json")); err != nil {
@@ -73,12 +84,56 @@ func TestRestrictedJournalPersistsBeforeMutationAndRemovesAfterCleanup(t *testin
 	}
 }
 
+func TestOpenRestrictedJournalRejectsPreexistingSymlinkDirectory(t *testing.T) {
+	stable := t.TempDir()
+	root := filepath.Join(stable, restrictedJournalDirectory)
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "records")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := OpenRestrictedJournal(stable); err == nil {
+		t.Fatal("preexisting symlink records directory was accepted")
+	}
+}
+
+func TestRestrictedJournalCloseIsIdempotentAndRejectsFurtherUse(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if _, err := journal.RetireSID(restrictedTestSID("after-close")); err == nil {
+		t.Fatal("closed journal accepted a retirement")
+	}
+	if _, err := journal.PrepareMutation(restrictedTestRecord(t, "after-close")); err == nil {
+		t.Fatal("closed journal accepted a mutation")
+	}
+	if err := journal.CompleteCleanup(strings.Repeat("0", sha256.Size*2)); err == nil {
+		t.Fatal("closed journal accepted cleanup completion")
+	}
+	if _, err := journal.Sweep(&recordingCleaner{}); err == nil {
+		t.Fatal("closed journal accepted a sweep")
+	}
+	if err := journal.Prune(&testPruner{}); err == nil {
+		t.Fatal("closed journal accepted pruning")
+	}
+}
+
 func TestRestrictedJournalConstructionSweep(t *testing.T) {
 	root := t.TempDir()
 	first, err := OpenRestrictedJournal(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, first)
 	want := restrictedTestRecord(t, "sweep")
 	prepareRestrictedTestMutation(t, first, want)
 
@@ -87,6 +142,7 @@ func TestRestrictedJournalConstructionSweep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, reopened)
 	if reopened == nil {
 		t.Fatal("construction sweep returned nil journal")
 	}
@@ -103,6 +159,7 @@ func TestRestrictedJournalToleratesCorruptAndDeletedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	if err := os.WriteFile(filepath.Join(journal.recordsDir, "corrupt.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -121,11 +178,183 @@ func TestRestrictedJournalToleratesCorruptAndDeletedRecords(t *testing.T) {
 	}
 }
 
+func TestRestrictedJournalRetainsOversizedRecordWithoutReadingItAsAuthority(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	record := restrictedTestRecord(t, "oversized")
+	if retired, err := journal.RetireSID(record.Rollback.SID); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v)", retired, err)
+	}
+	data, err := encodeRestrictedRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, strings.Repeat(" ", 1<<20)...)
+	path := filepath.Join(journal.recordsDir, "oversized.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleaner := &recordingCleaner{removed: true}
+	report, err := journal.Sweep(cleaner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Corrupt != 1 || report.Retained != 1 || cleaner.called != 0 {
+		t.Fatalf("oversized record used as authority: report=%+v calls=%d", report, cleaner.called)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("oversized corrupt record was not retained: %v", err)
+	}
+}
+
+func TestRestrictedJournalDoesNotFollowSymlinkRecord(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	record := restrictedTestRecord(t, "symlink")
+	if retired, err := journal.RetireSID(record.Rollback.SID); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v)", retired, err)
+	}
+	data, err := encodeRestrictedRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target.json")
+	if err := os.WriteFile(target, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(journal.recordsDir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	cleaner := &recordingCleaner{removed: true}
+	report, err := journal.Sweep(cleaner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Corrupt != 1 || report.Retained != 1 || cleaner.called != 0 {
+		t.Fatalf("symlink record used as authority: report=%+v calls=%d", report, cleaner.called)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("symlink record was not retained: %v", err)
+	}
+}
+
+func TestRestrictedJournalDirectoryReplacementCannotRedirectOperations(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenRestrictedJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	first := restrictedTestRecord(t, "before-replacement")
+	firstKey := prepareRestrictedTestMutation(t, journal, first)
+
+	originalRecords := journal.recordsDir + "-original"
+	if err := os.Rename(journal.recordsDir, originalRecords); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal.recordsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	redirected := restrictedTestRecord(t, "redirected")
+	if retired, err := journal.RetireSID(redirected.Rollback.SID); err != nil || !retired {
+		t.Fatalf("retire redirected SID = (%v, %v)", retired, err)
+	}
+	redirectedData, err := encodeRestrictedRecord(redirected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(journal.recordsDir, "redirected.json"), redirectedData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second := restrictedTestRecord(t, "after-replacement")
+	secondKey := prepareRestrictedTestMutation(t, journal, second)
+	if _, err := os.Stat(filepath.Join(originalRecords, secondKey+".json")); err != nil {
+		t.Fatalf("create did not stay in originally opened directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(journal.recordsDir, secondKey+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("create was redirected into replacement directory: %v", err)
+	}
+
+	cleaner := &recordingCleaner{removed: true}
+	report, err := journal.Sweep(cleaner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleaner.called != 2 || report.Removed != 2 || report.Retained != 0 {
+		t.Fatalf("sweep escaped originally opened directory: calls=%d report=%+v", cleaner.called, report)
+	}
+	for _, key := range []string{firstKey, secondKey} {
+		if _, err := os.Stat(filepath.Join(originalRecords, key+".json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("original record %q remains after sweep: %v", key, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(journal.recordsDir, "redirected.json")); err != nil {
+		t.Fatalf("sweep modified replacement directory: %v", err)
+	}
+}
+
+func TestRestrictedJournalRetirementDirectoryReplacementCannotRedirectState(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenRestrictedJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	before := restrictedTestSID("retired-before-replacement")
+	if retired, err := journal.RetireSID(before); err != nil || !retired {
+		t.Fatalf("retire before replacement = (%v, %v)", retired, err)
+	}
+
+	originalRetired := journal.retiredDir + "-original"
+	if err := os.Rename(journal.retiredDir, originalRetired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal.retiredDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	forged := restrictedTestSID("forged-replacement-retirement")
+	forgedDigest := sha256.Sum256([]byte(forged.String()))
+	forgedName := hexString(forgedDigest[:]) + ".sid"
+	if err := os.WriteFile(filepath.Join(journal.retiredDir, forgedName), []byte(forged.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if journal.isDurablyRetired(forged) {
+		t.Fatal("replacement retirement directory became retirement authority")
+	}
+	if !journal.isDurablyRetired(before) {
+		t.Fatal("originally opened retirement state was lost after directory replacement")
+	}
+
+	after := restrictedTestSID("retired-after-replacement")
+	if retired, err := journal.RetireSID(after); err != nil || !retired {
+		t.Fatalf("retire after replacement = (%v, %v)", retired, err)
+	}
+	afterDigest := sha256.Sum256([]byte(after.String()))
+	afterName := hexString(afterDigest[:]) + ".sid"
+	if _, err := os.Stat(filepath.Join(originalRetired, afterName)); err != nil {
+		t.Fatalf("retirement did not stay in originally opened directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(journal.retiredDir, afterName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retirement was redirected into replacement directory: %v", err)
+	}
+}
+
 func TestRestrictedJournalRefusesIdentityMismatch(t *testing.T) {
 	journal, err := OpenRestrictedJournal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	prepareRestrictedTestMutation(t, journal, restrictedTestRecord(t, "mismatch"))
 	cleaner := &recordingCleaner{err: ErrRestrictedTargetChanged}
 	report, err := journal.Sweep(cleaner)
@@ -147,10 +376,12 @@ func TestRestrictedJournalRetiresSIDAtomicallyAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, first)
 	second, err := OpenRestrictedJournal(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, second)
 	sid := restrictedTestSID("never-reuse")
 	stores := []*RestrictedJournal{first, second}
 	results := make(chan bool, len(stores)*8)
@@ -186,6 +417,7 @@ func TestRestrictedJournalRetiresSIDAtomicallyAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, reopened)
 	if retired, err := reopened.RetireSID(sid); err != nil || retired {
 		t.Fatalf("reopened retirement = (%v, %v), want (false, nil)", retired, err)
 	}
@@ -201,6 +433,7 @@ func TestRestrictedJournalRetiresExecutorSIDAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, first)
 	if retired, err := first.RetireSID(sid); err != nil || !retired {
 		t.Fatalf("first executor retirement = (%v, %v), want (true, nil)", retired, err)
 	}
@@ -208,6 +441,7 @@ func TestRestrictedJournalRetiresExecutorSIDAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, reopened)
 	if retired, err := reopened.RetireSID(sid); err != nil || retired {
 		t.Fatalf("reopened executor retirement = (%v, %v), want (false, nil)", retired, err)
 	}
@@ -234,6 +468,7 @@ func TestRestrictedJournalPrunesOnlyRecognizedInertACEs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	retired := restrictedTestSID("retired")
 	if ok, err := journal.RetireSID(retired); err != nil || !ok {
 		t.Fatalf("retire = (%v, %v)", ok, err)
@@ -270,6 +505,7 @@ func TestRestrictedJournalForgedDenyCannotAuthorizeWideningCleanup(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	record := restrictedTestRecord(t, "forged-deny")
 	record.Rollback.Role = ACERoleRestrictingDeny
 	record.ACE = encodeACE(record.Rollback.SID, ACLObjectFile, ACLACE{Type: ACEDeny, Access: ACLWrite})
@@ -301,6 +537,7 @@ func TestRestrictedJournalCrashSweepNeverRemovesLeaseDeny(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	allow := restrictedTestRecord(t, "mixed-lease")
 	if retired, err := journal.RetireSID(allow.Rollback.SID); err != nil || !retired {
 		t.Fatalf("retire = (%v, %v)", retired, err)
@@ -344,6 +581,7 @@ func TestRestrictedJournalRejectsTamperedCleanupAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	record := restrictedTestRecord(t, "tampered")
 	if retired, err := journal.RetireSID(record.Rollback.SID); err != nil || !retired {
 		t.Fatalf("retire = (%v, %v)", retired, err)
@@ -367,6 +605,7 @@ func TestRestrictedJournalRequiresRetirementBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRestrictedTestJournal(t, journal)
 	if _, err := journal.PrepareMutation(restrictedTestRecord(t, "not-retired")); err == nil {
 		t.Fatal("mutation record accepted before durable SID retirement")
 	}

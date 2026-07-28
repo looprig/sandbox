@@ -937,6 +937,7 @@ func runBrokerService(ctx context.Context, config brokerRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
+	defer retirement.Close()
 	sids, err := NewOneShotSIDGenerator(rand.Reader, retirement)
 	if err != nil {
 		return err
