@@ -99,6 +99,10 @@ type MountViewPlan struct {
 	// grantBinds maps a granted canonical target to the inherited descriptor
 	// index and type captured atomically by the executor.
 	grantBinds map[string]grantMountSource
+	// exactDenyMasks preserves scope shape for literal denies. An exact file can
+	// be masked directly; an exact directory cannot, because overmounting the
+	// directory would also hide descendants that the policy may retain.
+	exactDenyMasks map[string]bool
 }
 
 type grantMountSource struct {
@@ -133,6 +137,7 @@ func CompileMountView(p policy.Effective) MountViewPlan {
 func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHandle) MountViewPlan {
 	var plan MountViewPlan
 	plan.grantBinds = make(map[string]grantMountSource)
+	plan.exactDenyMasks = make(map[string]bool)
 	var literalDenies []policy.FSEntry
 
 	// First pass: collect every full-path deny. Literal denies dominate allows at
@@ -150,6 +155,9 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 		e.Path = filepath.Clean(e.Path)
 		literalDenies = append(literalDenies, e)
 		plan.DenyMasks = appendUniquePath(plan.DenyMasks, e.Path)
+		if e.Exact {
+			plan.exactDenyMasks[e.Path] = true
+		}
 	}
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
@@ -249,11 +257,6 @@ func EnumerateMountView(plan MountViewPlan) (MountViewSpec, error) {
 	return enumerateMountViewWithGrantPaths(plan, nil, nil)
 }
 
-func enumerateMountViewWithGrantRules(plan MountViewPlan, grantRules []policy.FSRule) MountViewSpec {
-	spec, _ := enumerateMountViewWithGrantPaths(plan, grantRules, nil)
-	return spec
-}
-
 func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FSRule, handles []*policy.PathHandle) (MountViewSpec, error) {
 	var spec MountViewSpec
 	type absentProtectedPath struct {
@@ -313,6 +316,21 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 		}
 		spec.Binds = append(spec.Binds, bind)
 	}
+	for _, path := range plan.ROBinds {
+		if _, pinned := plan.grantBinds[path]; !pinned {
+			continue
+		}
+		protected := false
+		for _, bind := range spec.Binds {
+			if bind.ReadOnly && (bind.Target == path || policy.PathUnder(bind.Target, path)) {
+				protected = true
+				break
+			}
+		}
+		if !protected {
+			absentProtected = append(absentProtected, absentProtectedPath{path: path, err: fs.ErrNotExist})
+		}
+	}
 	// Parents-first: a lexical path sort places a parent before its children (the
 	// parent is a prefix), so a nested ro carveout is bound AFTER — re-masking —
 	// the rw root beneath it, and a rw root is bound after a broader ro root.
@@ -325,6 +343,12 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 				return MountViewSpec{}, err
 			}
 			if ok {
+				if plan.exactDenyMasks[d] && resolved.IsDir {
+					return MountViewSpec{}, fmt.Errorf(
+						"%s: exact directory deny %q cannot be represented without hiding descendants",
+						mountViewOp, d,
+					)
+				}
 				spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: resolved.IsDir})
 			} else {
 				absentProtected = append(absentProtected, absentProtectedPath{path: d, err: fs.ErrNotExist})
@@ -335,6 +359,12 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 		if err != nil {
 			absentProtected = append(absentProtected, absentProtectedPath{path: d, err: err})
 			continue
+		}
+		if plan.exactDenyMasks[d] && st.IsDir() {
+			return MountViewSpec{}, fmt.Errorf(
+				"%s: exact directory deny %q cannot be represented without hiding descendants",
+				mountViewOp, d,
+			)
 		}
 		spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: st.IsDir()})
 	}

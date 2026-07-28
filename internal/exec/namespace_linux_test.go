@@ -209,6 +209,32 @@ func TestEnumerateMountViewRejectsAbsentProtectedChildUnderWritableBind(t *testi
 	}
 }
 
+// TestEnumerateMountViewRejectsExactDirectoryDeny proves the mount compiler
+// never approximates an exact directory deny with a directory overmount. Such
+// an overmount would also hide a retained child allow and silently over-deny.
+func TestEnumerateMountViewRejectsExactDirectoryDeny(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	denied := filepath.Join(root, "exact-deny")
+	child := filepath.Join(denied, "allowed-child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
+		{Path: root, Access: policy.AllAccess},
+		{Path: denied, Denied: policy.AllAccess, Exact: true},
+		{Path: child, Access: policy.ReadAccess},
+	}})
+	if !containsStr(plan.ROBinds, child) {
+		t.Fatalf("ROBinds = %v, want retained exact-deny descendant %q", plan.ROBinds, child)
+	}
+	if _, err := linux.EnumerateMountView(plan); err == nil {
+		t.Fatal("EnumerateMountView succeeded, want unsupported exact-directory-deny error")
+	} else if !strings.Contains(err.Error(), "exact directory deny") || !strings.Contains(err.Error(), denied) {
+		t.Fatalf("EnumerateMountView error = %q, want explicit exact directory deny %q", err, denied)
+	}
+}
+
 // TestScanGlobDenies asserts the bounded glob-deny scan: nested .env* matches are
 // found, non-matching files are ignored, symlinks are not followed, and the depth
 // bound is honored. Runs on THIS host.

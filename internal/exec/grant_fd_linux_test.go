@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -938,6 +939,46 @@ func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestLinuxRung1PinnedWritableGrantRejectsAbsentProtectedDescendant(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := policy.CapturePathBinding(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := policy.AcquirePathHandle(&binding, target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.SetAccess(policy.AllAccess)
+	defer handle.Close()
+
+	absent := filepath.Join(target, "absent-protected")
+	pol := policy.Effective{FS: []policy.FSEntry{
+		{Path: target, Access: policy.AllAccess, Canonical: true},
+		{Path: absent, Access: policy.ReadAccess},
+	}}
+	backend := &linux.Backend{Rung: linux.RungOne}
+	spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, configure, cleanup := spawn.Wrap(root, []string{"/bin/true"})
+	defer cleanup()
+	cmd := exec.Command("/proc/self/exe")
+	cmd.Env = []string{}
+	err = configure(cmd)
+	if err == nil {
+		t.Fatal("configure succeeded, want absent protected descendant beneath pinned rw grant to fail closed")
+	}
+	if !strings.Contains(err.Error(), "protected path") || !strings.Contains(err.Error(), absent) {
+		t.Fatalf("configure error = %q, want explicit absent protected path %q", err, absent)
 	}
 }
 
