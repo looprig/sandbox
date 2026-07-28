@@ -3,6 +3,8 @@ package windows
 import (
 	"bytes"
 	"errors"
+	"math"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -48,6 +50,10 @@ func TestSIDNamespacesAreDeterministicAndSeparated(t *testing.T) {
 	if installation.String() != wantInstallation {
 		t.Fatalf("installation SID ABI changed: %q, want %q", installation, wantInstallation)
 	}
+	const wantExecutor = "S-1-5-32-2643307060-2313275912-3271447813-3792834996-3327059363-867895806-1381925209-3506755460"
+	if executor.String() != wantExecutor {
+		t.Fatalf("executor SID ABI changed: %q, want %q", executor, wantExecutor)
+	}
 	if installation == executor {
 		t.Fatalf("domain-separated SIDs collided: %q", installation)
 	}
@@ -62,6 +68,25 @@ func TestSIDNamespacesAreDeterministicAndSeparated(t *testing.T) {
 	}
 	if _, err := ExecutorSID("install-a", ""); err == nil {
 		t.Fatal("empty executor identity accepted")
+	}
+}
+
+func TestSIDHashFieldLengthBoundary(t *testing.T) {
+	got, err := checkedSIDHashFieldLength("executor identity", math.MaxUint32)
+	if err != nil {
+		t.Fatalf("exact maximum rejected: %v", err)
+	}
+	if got != math.MaxUint32 {
+		t.Fatalf("exact maximum = %d, want %d", got, uint32(math.MaxUint32))
+	}
+
+	_, err = checkedSIDHashFieldLength("executor identity", uint64(math.MaxUint32)+1)
+	if err == nil {
+		t.Fatal("identity larger than the persisted field accepted")
+	}
+	if got := err.Error(); !strings.Contains(got, "Windows executor identity") ||
+		!strings.Contains(got, "4294967295 bytes") {
+		t.Fatalf("oversized identity error = %q, want field and limit", got)
 	}
 }
 

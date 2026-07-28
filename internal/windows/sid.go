@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,9 @@ func InstallationSID(installationID string) (SID, error) {
 	if installationID == "" {
 		return SID{}, errors.New("sandbox: empty Windows installation identity")
 	}
+	if _, err := checkedSIDHashFieldLength("installation identity", uint64(len(installationID))); err != nil {
+		return SID{}, err
+	}
 	return deriveModuleTrusteeSID(sidKindInstallation, installationSIDDomain, installationID), nil
 }
 
@@ -58,7 +62,20 @@ func ExecutorSID(installationID, executorID string) (SID, error) {
 	if installationID == "" || executorID == "" {
 		return SID{}, errors.New("sandbox: empty Windows executor identity")
 	}
+	if _, err := checkedSIDHashFieldLength("installation identity", uint64(len(installationID))); err != nil {
+		return SID{}, err
+	}
+	if _, err := checkedSIDHashFieldLength("executor identity", uint64(len(executorID))); err != nil {
+		return SID{}, err
+	}
 	return deriveModuleTrusteeSID(sidKindExecutor, executorSIDDomain, installationID, executorID), nil
+}
+
+func checkedSIDHashFieldLength(field string, length uint64) (uint32, error) {
+	if length > math.MaxUint32 {
+		return 0, fmt.Errorf("sandbox: Windows %s exceeds %d bytes", field, uint64(math.MaxUint32))
+	}
+	return uint32(length), nil
 }
 
 func deriveModuleTrusteeSID(kind sidKind, domain string, fields ...string) SID {
@@ -76,7 +93,13 @@ func moduleTrusteeName(domain string, fields ...string) string {
 
 func writeHashField(writer io.Writer, value []byte) {
 	var length [4]byte
-	binary.LittleEndian.PutUint32(length[:], uint32(len(value)))
+	fieldLength, err := checkedSIDHashFieldLength("SID hash field", uint64(len(value)))
+	if err != nil {
+		// Public variable fields are validated before derivation, while the
+		// remaining domain and entropy fields have fixed sizes.
+		panic(err)
+	}
+	binary.LittleEndian.PutUint32(length[:], fieldLength)
 	_, _ = writer.Write(length[:])
 	_, _ = writer.Write(value)
 }
