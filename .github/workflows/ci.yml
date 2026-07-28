@@ -18,7 +18,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: files above need formatting'; exit 1; }
+        run: |
+          test -z "$(gofmt -l .)" || {
+            gofmt -l .
+            echo 'gofmt: files above need formatting'
+            exit 1
+          }
       - name: go vet
         run: go vet ./...
       - name: build (cgo-free, -trimpath)
@@ -71,3 +76,235 @@ jobs:
           sudo modprobe nf_tables || true
       - name: go test -race (rung 1 enforcement)
         run: go test -race -count=1 ./...
+
+  # Compile every package's test binary independently. This catches
+  # architecture-specific Windows files even when the live worker is x64.
+  windows-cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: windows amd64 + arm64 package/test binaries
+        run: make test-windows-build
+
+  # The standard-user runner must not have an installed broker. Labels are
+  # intentionally deployment-specific: absence of this worker fails/queues the
+  # required check rather than silently replacing live evidence.
+  windows-restricted:
+    runs-on: [self-hosted, Windows, X64, sandbox-standard, sandbox-disposable]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: require standard-user token and no installed broker
+        shell: powershell
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "windows-restricted requires a non-administrator standard-user token"
+          }
+          $owned = Get-Service -Name 'lsb-svc-*' -ErrorAction SilentlyContinue
+          if ($owned) {
+            throw "windows-restricted requires no installed sandbox broker: $($owned.Name -join ', ')"
+          }
+          $current = (Get-Location).Path
+          $currentDrive = [IO.Path]::GetPathRoot($current)
+          $other = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+            Where-Object { "$($_.DeviceID)\" -ne $currentDrive } |
+            Select-Object -First 1
+          if (-not $other) { throw "windows-restricted requires a second disposable fixed volume" }
+          $otherRoot = Join-Path "$($other.DeviceID)\" "looprig-ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Force $otherRoot | Out-Null
+          "SANDBOX_WINDOWS_OTHER_DRIVE_ROOT=$otherRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Task 5 exact-token runtime spike (skip is failure)
+        shell: powershell
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP 'task5-run-manifest.json'
+          $evidence = Join-Path $env:RUNNER_TEMP 'runtime-evidence.json'
+          $env:LOOPRIG_RUNTIME_RUN_NONCE = ([Guid]::NewGuid().ToString('N'))
+          $env:LOOPRIG_RUNTIME_RUN_MANIFEST_OUT = $manifest
+          $lines = @(& go test -json -count=1 ./spikes/windows -run '^TestRestrictedRuntimeBaseline$')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($lines | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+              Where-Object { $_.Action -eq 'skip' }).Count -ne 0) {
+            throw "Task 5 runtime spike skipped on its required worker"
+          }
+          $run = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          $caption = (Get-CimInstance Win32_OperatingSystem).Caption
+          $image = if ($caption -match 'Windows Server') { 'windows-server' } else { 'windows-11' }
+          $wrapper = [ordered]@{
+            schema_version = 1
+            selection = 'exact-token'
+            supported_image = $image
+            go_version = (& go env GOVERSION).Trim()
+            run = $run
+          } | ConvertTo-Json -Depth 100 -Compress
+          [IO.File]::WriteAllText($evidence, $wrapper, (New-Object Text.UTF8Encoding($false)))
+      - name: publish approved Task 5 runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\runtime-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: winpath and disposable ACL matrices
+        shell: powershell
+        env:
+          SANDBOX_WINDOWS_DISPOSABLE_RESTRICTED_TEST: "1"
+          SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST: "1"
+        run: |
+          go test -race -count=1 ./internal/winpath ./internal/policy ./pkg/profile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lines = @(& go test -json -race -count=1 ./internal/windows ./internal/exec ./pkg/sandboxtest `
+            -run 'Disposable|RestrictedBrokerEscape|WindowsRestricted|WindowsPath|ACLProjection')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object {
+            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "requested Windows restricted mechanism did not execute"
+          }
+
+  # This worker is destroyed/reimaged after each job. The cleanup step runs for
+  # success, failure, and cancellation, and residue makes the job fail.
+  windows-elevated:
+    needs: windows-restricted
+    runs-on: [self-hosted, Windows, X64, sandbox-elevated, sandbox-disposable]
+    timeout-minutes: 120
+    env:
+      SANDBOX_WINDOWS_ELEVATED_TEST: "1"
+      SANDBOX_WINDOWS_INSTALLATION_ID: "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+      SANDBOX_WINDOWS_PROXY_PORTS: "43191,43192"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: download approved Task 5 runtime evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-runtime-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\looprig-runtime-evidence
+      - name: bind approved Task 5 evidence path
+        shell: powershell
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'looprig-runtime-evidence\runtime-evidence.json'
+          if (-not (Test-Path -LiteralPath $evidence -PathType Leaf)) {
+            throw "approved Task 5 runtime evidence artifact is missing"
+          }
+          "SANDBOX_WINDOWS_RUNTIME_EVIDENCE=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: require elevated disposable Windows 11/Server worker
+        shell: powershell
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "windows-elevated requires an elevated token"
+          }
+          $caption = (Get-CimInstance Win32_OperatingSystem).Caption
+          if ($caption -notmatch 'Windows 11|Windows Server') {
+            throw "unsupported elevated evidence image: $caption"
+          }
+          $stateRoot = Join-Path $env:ProgramData "Looprig\ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "SANDBOX_WINDOWS_STATE_ROOT=$stateRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: build protected host
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force '${{ runner.temp }}\looprig-bin' | Out-Null
+          go build -trimpath -o '${{ runner.temp }}\looprig-bin\sandbox-host.exe' ./cmd/sandbox-host
+          "SANDBOX_WINDOWS_HOST_BINARY=${{ runner.temp }}\looprig-bin\sandbox-host.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: elevated setup, configuration, and adversarial acceptance (skip is failure)
+        shell: powershell
+        run: |
+          $lines = @(& go test -json -race -count=1 ./internal/windows `
+            -run '^(TestElevatedDisposableAcceptance|TestSetupIntegration|TestRecoveryIntegration)')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object {
+            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "requested Windows elevated mechanism did not execute"
+          }
+          go test -count=100 ./internal/windows -run 'Elevated.*Race|RecoveryIntegration|Broker.*Recovery'
+      - name: unconditional cleanup and empty residue verification
+        if: always()
+        shell: powershell
+        run: |
+          $cleanupFailed = $false
+          $cleanupSource = @'
+          package main
+
+          import (
+              "context"
+              "fmt"
+              "os"
+              "strconv"
+              "strings"
+
+              "github.com/looprig/sandbox"
+          )
+
+          func main() {
+              var ports []uint16
+              for _, raw := range strings.Split(os.Getenv("SANDBOX_WINDOWS_PROXY_PORTS"), ",") {
+                  value, err := strconv.ParseUint(raw, 10, 16)
+                  if err != nil {
+                      panic(err)
+                  }
+                  ports = append(ports, uint16(value))
+              }
+              config := sandbox.WindowsSetupConfig{
+                  InstallationID: os.Getenv("SANDBOX_WINDOWS_INSTALLATION_ID"),
+                  StateRoot: os.Getenv("SANDBOX_WINDOWS_STATE_ROOT"),
+                  HostBinary: os.Getenv("SANDBOX_WINDOWS_HOST_BINARY"),
+                  ProxyPorts: ports,
+              }
+              if err := sandbox.RemoveWindowsSandbox(context.Background(), config); err != nil {
+                  panic(err)
+              }
+              status, err := sandbox.InspectWindowsSandbox(context.Background(), config)
+              if err != nil || status.Ready {
+                  panic(fmt.Sprintf("post-remove status=%+v err=%v", status, err))
+              }
+          }
+          '@
+          $cleanupProgram = Join-Path $env:RUNNER_TEMP 'looprig-windows-cleanup.go'
+          Set-Content -LiteralPath $cleanupProgram -Value $cleanupSource -Encoding utf8
+          go run $cleanupProgram
+          if ($LASTEXITCODE -ne 0) { $cleanupFailed = $true }
+
+          $services = @(Get-Service -Name 'lsb-svc-*' -ErrorAction SilentlyContinue)
+          $accounts = @(Get-LocalUser -Name 'lsb-*' -ErrorAction SilentlyContinue)
+          $rules = @(Get-NetFirewallRule -DisplayName 'Looprig Sandbox *' -ErrorAction SilentlyContinue)
+          $processes = @(Get-Process sandbox-host -ErrorAction SilentlyContinue)
+          $journal = Join-Path $env:SANDBOX_WINDOWS_STATE_ROOT 'broker-leases.journal'
+          $journalBytes = if (Test-Path -LiteralPath $journal) { (Get-Item -LiteralPath $journal).Length } else { 0 }
+          $stateRootExists = Test-Path -LiteralPath $env:SANDBOX_WINDOWS_STATE_ROOT
+          $generations = if ($stateRootExists) { @(Get-ChildItem -LiteralPath (Join-Path $env:SANDBOX_WINDOWS_STATE_ROOT 'slots') -Force -ErrorAction SilentlyContinue) } else { @() }
+          $credentials = if ($stateRootExists) { @(Get-ChildItem -LiteralPath (Join-Path $env:SANDBOX_WINDOWS_STATE_ROOT 'credentials') -Force -ErrorAction SilentlyContinue) } else { @() }
+          $staging = if ($stateRootExists) { @(Get-ChildItem -LiteralPath $env:SANDBOX_WINDOWS_STATE_ROOT -Force -ErrorAction SilentlyContinue | Where-Object Name -Like '.staging-*') } else { @() }
+          $leaseACEs = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Force -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              try { (Get-Acl -LiteralPath $_.FullName).Access } catch { @() }
+            } | Where-Object {
+              $_.IdentityReference.Value -match '^S-1-5-32-(?:\d+-){7}\d+$'
+            })
+
+          Write-Output "residue services=$($services.Count) accounts=$($accounts.Count) rules=$($rules.Count) processes=$($processes.Count) journalBytes=$journalBytes stateRoot=$stateRootExists generations=$($generations.Count) credentials=$($credentials.Count) staging=$($staging.Count) leaseACEs=$($leaseACEs.Count)"
+          if ($services.Count -or $accounts.Count -or $rules.Count -or $processes.Count -or $journalBytes -or
+              $stateRootExists -or $generations.Count -or $credentials.Count -or $staging.Count -or $leaseACEs.Count) {
+            $cleanupFailed = $true
+          }
+          if ($cleanupFailed) { throw "Windows elevated cleanup/residue verification failed" }

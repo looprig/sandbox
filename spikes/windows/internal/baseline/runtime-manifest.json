@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "supported_images": ["windows-11", "windows-server"],
+  "required": [
+    {"name":"installed-runner-go-helper","resolver":"probe","mode":"smoke"},
+    {"name":"go-subprocess","resolver":"probe","mode":"subprocess"},
+    {"name":"crt-and-dll-initializers","resolver":"probe","mode":"dll-initializer"},
+    {"name":"locale-and-console-startup","resolver":"probe","mode":"locale-console","new_console":true},
+    {"name":"pe-tls-callback-fixture","resolver":"tls-fixture"},
+    {"name":"canonical-system32-cmd","resolver":"system32","candidates":["cmd.exe"],"args":["/D","/S","/C","exit 0"]},
+    {"name":"windows-powershell","resolver":"system32","candidates":["WindowsPowerShell\\v1.0\\powershell.exe"],"args":["-NoLogo","-NoProfile","-NonInteractive","-Command","exit 0"]},
+    {"name":"python","resolver":"path","candidates":["python.exe","py.exe"],"args":["-c","pass"]}
+  ],
+  "inventory_only": [
+    {"name":"node","resolver":"path","candidates":["node.exe"],"args":["-e","process.exit(0)"]},
+    {"name":"dotnet","resolver":"path","candidates":["dotnet.exe"],"args":["--info"]},
+    {"name":"java","resolver":"path","candidates":["java.exe"],"args":["-version"]},
+    {"name":"ruby","resolver":"path","candidates":["ruby.exe"],"args":["-e","exit 0"]},
+    {"name":"perl","resolver":"path","candidates":["perl.exe"],"args":["-e","exit 0"]},
+    {"name":"powershell-core","resolver":"path","candidates":["pwsh.exe"],"args":["-NoLogo","-NoProfile","-NonInteractive","-Command","exit 0"]}
+  ]
+}

@@ -124,9 +124,14 @@ owner-only child beneath the caller-owned root and removes only that child on
 close. Each opaque key gets a separately keyed executor, HOME, and TMPDIR;
 concurrent requests for the same key return the same executor. Closing the set
 revokes all issued capabilities, cancels execution-scoped proxy activity, and
-releases owned resources. There is no public direct-executor constructor.
+releases owned resources, including every compiled enforcement spec. There is
+no public direct-executor constructor.
 `WithGrantTTL` configures the positive maximum lifetime of grants minted by
 every executor in the set; omission uses the fixed 15-minute default.
+
+`RunCommand` selects the platform command interpreter: Darwin and Linux use
+`/bin/sh -c`, while Windows uses the canonical System32
+`cmd.exe /D /S /C` and never trusts `%ComSpec%`. `RunArgv` remains shell-free.
 
 ## 5. Grant lifecycle
 
@@ -252,6 +257,19 @@ by a non-`Allow` filesystem or network field. `NewProfile` remains
 platform-independent. Narrower compilation is permitted only when reported;
 wider compilation is forbidden.
 
+A compiled `enforce.Spec` may own immutable enforcement resources and exposes
+an optional idempotent release operation. An executor owns its base compiled
+spec until set close. A grant-recompiled spec is transient and is released only
+after its spawn and process tree finish. Mutable per-spawn state remains owned
+by the configure and cleanup closures returned by `Wrap`; compiled ownership
+does not permit mutable state to be shared between concurrent spawns.
+
+Windows policy intent and compile reports use the exact named entry
+`windows.runtime-baseline` for the fixed operating-system runtime closure needed
+to start supported targets. The entry records whether that closure is enforced,
+narrowed, or unavailable; it is not general host-read authority and does not by
+itself earn a guarantee bit.
+
 macOS uses Seatbelt. Linux selects the strongest supported Landlock,
 namespace, seccomp, nftables, and cgroup mechanisms. Linux consumers call
 `Init()` first in `main` for confinement-helper dispatch; an executor requiring
@@ -303,3 +321,6 @@ bindings; filesystem traversal and symlink escape; unconfined acknowledgement;
 platform guarantee honesty; proxy authentication and direct-bypass denial;
 organization-proxy chaining and credential containment; and the Linux target
 grant failure behavior. Platform integration tests accompany each backend.
+Conformance assertions are one-way security claims: when a backend claims a
+boundary, every probe covered by that boundary must be denied. Withholding a
+guarantee never requires an otherwise honest backend to permit the operation.

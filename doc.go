@@ -6,8 +6,11 @@
 // enforcement is what makes approved authority meaningful. Concretely, it
 // provides immutable consumer-defined access profiles, single-spawn
 // post-decision grants, honest achieved guarantees, and per-platform enforcement
-// (Seatbelt on macOS; namespaces + Landlock + seccomp + nftables on Linux). It
-// does not import an approval system or read permission files.
+// (Seatbelt on macOS; namespaces + Landlock + seccomp + nftables on Linux;
+// restricted-token and installed-broker tiers on Windows). It does not import
+// an approval system or read permission files. The Windows elevated tier
+// remains unavailable until setup inspection can verify approved live runtime
+// evidence from supported Windows 11 and Windows Server workers.
 //
 // # Initialization
 //
@@ -25,6 +28,6 @@
 // portable. If it is not called, constructing an Executor with a Linux
 // enforcement backend fails closed with ErrInitNotCalled rather than running
 // commands unconfined. A sandboxed profile also fails closed with
-// ErrSandboxUnavailable on a host without a production backend; direct
+// enforce.ErrUnavailable on a host without a production backend; direct
 // execution exists only for an explicitly acknowledged Unconfined profile.
 package sandbox
