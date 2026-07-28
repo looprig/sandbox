@@ -221,8 +221,7 @@ func TestRestrictedJournalRetiresExecutorSIDAcrossReopen(t *testing.T) {
 }
 
 type testPruner struct {
-	wanted SID
-	allow  func(SID, ACERole, []byte) bool
+	allow func(SID, ACERole, []byte) bool
 }
 
 func (pruner *testPruner) PruneRestrictedACEs(allow func(SID, ACERole, []byte) bool) error {

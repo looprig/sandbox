@@ -18,7 +18,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'gofmt: files above need formatting'; exit 1; }
+        run: |
+          test -z "$(gofmt -l .)" || {
+            gofmt -l .
+            echo 'gofmt: files above need formatting'
+            exit 1
+          }
       - name: go vet
         run: go vet ./...
       - name: build (cgo-free, -trimpath)

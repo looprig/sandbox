@@ -19,8 +19,8 @@ var (
 	// than treating this as successful cleanup.
 	ErrJobCompletionWait = errors.New("sandbox: Windows Job completion wait failed")
 
-	errJobCompletionPollTimeout = errors.New("Windows Job completion poll timeout")
-	errJobCompletionPortClosed  = errors.New("Windows Job completion port closed")
+	errJobCompletionPollTimeout = errors.New("windows job completion poll timeout")
+	errJobCompletionPortClosed  = errors.New("windows job completion port closed")
 )
 
 type jobCompletionEvent struct {
