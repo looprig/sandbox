@@ -214,6 +214,42 @@ func TestBrokerProtocolCountLimit(t *testing.T) {
 	}
 }
 
+func TestEncodeBrokerObjectsEnforcesCountLimitDirectly(t *testing.T) {
+	objects := make([]brokerObjectReference, maxBrokerObjects+1)
+	for index := range objects {
+		objects[index] = testBrokerObject()
+	}
+	if _, err := encodeBrokerObjects(objects); !errors.Is(err, errBrokerFrameTooLarge) {
+		t.Fatalf("direct object encoding error = %v, want frame-too-large", err)
+	}
+}
+
+func TestEncodeBrokerObjectsEnforcesAggregateFrameLimit(t *testing.T) {
+	object := testBrokerObject()
+	object.Path = `C:\` + strings.Repeat("x", maxBrokerPathUnits-3)
+	objects := make([]brokerObjectReference, 17)
+	for index := range objects {
+		objects[index] = object
+	}
+	if _, err := encodeBrokerObjects(objects); !errors.Is(err, errBrokerFrameTooLarge) {
+		t.Fatalf("aggregate object encoding error = %v, want frame-too-large", err)
+	}
+}
+
+func TestWriteBrokerFieldEnforcesWireLengthBoundary(t *testing.T) {
+	payload := new(bytes.Buffer)
+	if err := writeBrokerField(payload, fieldObjects, make([]byte, maxBrokerFrameSize)); err != nil {
+		t.Fatalf("maximum bounded field rejected: %v", err)
+	}
+	payload.Reset()
+	if err := writeBrokerField(payload, fieldObjects, make([]byte, maxBrokerFrameSize+1)); !errors.Is(err, errBrokerFrameTooLarge) {
+		t.Fatalf("oversized field error = %v, want frame-too-large", err)
+	}
+	if payload.Len() != 0 {
+		t.Fatalf("oversized field wrote %d bytes before rejection", payload.Len())
+	}
+}
+
 func mustEncodeBrokerFrame(t *testing.T, frame brokerFrame) []byte {
 	t.Helper()
 	encoded, err := encodeBrokerFrame(frame)

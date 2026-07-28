@@ -19,6 +19,7 @@ const (
 	maxBrokerPathUnits           = 32767
 	maxBrokerObjects             = 4096
 	maxBrokerDesktopUnits        = 255
+	maxBrokerFields              = 8
 	brokerNonceSize              = 32
 	brokerLeaseIDSize            = 16
 	brokerHeaderSize             = 8
@@ -141,36 +142,47 @@ func encodeBrokerFrame(frame brokerFrame) ([]byte, error) {
 		return nil, err
 	}
 	payload := new(bytes.Buffer)
-	writeField := func(id uint16, value []byte) {
-		_ = binary.Write(payload, binary.LittleEndian, id)
-		_ = binary.Write(payload, binary.LittleEndian, uint32(len(value)))
-		_, _ = payload.Write(value)
+	if err := writeBrokerField(payload, fieldNonce, frame.Nonce[:]); err != nil {
+		return nil, err
 	}
-	writeField(fieldNonce, frame.Nonce[:])
 	if frame.LeaseID != ([brokerLeaseIDSize]byte{}) {
-		writeField(fieldLeaseID, frame.LeaseID[:])
+		if err := writeBrokerField(payload, fieldLeaseID, frame.LeaseID[:]); err != nil {
+			return nil, err
+		}
 	}
 	if frame.Account != brokerAccountUnspecified {
-		writeField(fieldAccount, []byte{byte(frame.Account)})
+		if err := writeBrokerField(payload, fieldAccount, []byte{byte(frame.Account)}); err != nil {
+			return nil, err
+		}
 	}
 	if len(frame.Objects) != 0 {
 		objects, err := encodeBrokerObjects(frame.Objects)
 		if err != nil {
 			return nil, err
 		}
-		writeField(fieldObjects, objects)
+		if err := writeBrokerField(payload, fieldObjects, objects); err != nil {
+			return nil, err
+		}
 	}
 	if frame.TokenHandle != 0 {
-		writeField(fieldTokenHandle, uint64Bytes(frame.TokenHandle))
+		if err := writeBrokerField(payload, fieldTokenHandle, uint64Bytes(frame.TokenHandle)); err != nil {
+			return nil, err
+		}
 	}
 	if frame.Desktop != "" {
-		writeField(fieldDesktop, encodeBrokerUTF16(frame.Desktop))
+		if err := writeBrokerField(payload, fieldDesktop, encodeBrokerUTF16(frame.Desktop)); err != nil {
+			return nil, err
+		}
 	}
 	if frame.Direction == brokerResponse {
-		writeField(fieldResult, uint16Bytes(uint16(frame.Result)))
+		if err := writeBrokerField(payload, fieldResult, uint16Bytes(uint16(frame.Result))); err != nil {
+			return nil, err
+		}
 	}
 	if frame.Generation != 0 {
-		writeField(fieldGeneration, uint64Bytes(frame.Generation))
+		if err := writeBrokerField(payload, fieldGeneration, uint64Bytes(frame.Generation)); err != nil {
+			return nil, err
+		}
 	}
 
 	frameSize := brokerHeaderSize + payload.Len()
@@ -178,14 +190,31 @@ func encodeBrokerFrame(frame brokerFrame) ([]byte, error) {
 		return nil, errBrokerFrameTooLarge
 	}
 	result := new(bytes.Buffer)
+	// #nosec G115 -- frameSize is checked against the 1 MiB protocol maximum above.
 	_ = binary.Write(result, binary.LittleEndian, uint32(frameSize))
 	_ = binary.Write(result, binary.LittleEndian, brokerProtocolVersion)
 	_ = result.WriteByte(byte(frame.Kind))
 	_ = result.WriteByte(byte(frame.Direction))
-	_ = binary.Write(result, binary.LittleEndian, uint16(payloadFieldCount(payload.Bytes())))
+	fieldCount := payloadFieldCount(payload.Bytes())
+	if fieldCount > maxBrokerFields {
+		return nil, errBrokerFrameMalformed
+	}
+	// #nosec G115 -- the closed v1 vocabulary is capped at maxBrokerFields.
+	_ = binary.Write(result, binary.LittleEndian, uint16(fieldCount))
 	_ = binary.Write(result, binary.LittleEndian, uint16(0))
 	_, _ = result.Write(payload.Bytes())
 	return result.Bytes(), nil
+}
+
+func writeBrokerField(payload *bytes.Buffer, id uint16, value []byte) error {
+	if len(value) > maxBrokerFrameSize {
+		return errBrokerFrameTooLarge
+	}
+	_ = binary.Write(payload, binary.LittleEndian, id)
+	// #nosec G115 -- value is explicitly capped at maxBrokerFrameSize above.
+	_ = binary.Write(payload, binary.LittleEndian, uint32(len(value)))
+	_, _ = payload.Write(value)
+	return nil
 }
 
 func decodeBrokerFrame(reader io.Reader) (brokerFrame, error) {
@@ -455,13 +484,21 @@ func canonicalBrokerPath(path string) bool {
 }
 
 func encodeBrokerObjects(objects []brokerObjectReference) ([]byte, error) {
+	if len(objects) > maxBrokerObjects {
+		return nil, errBrokerFrameTooLarge
+	}
 	buffer := new(bytes.Buffer)
+	// #nosec G115 -- object count is explicitly capped at maxBrokerObjects above.
 	_ = binary.Write(buffer, binary.LittleEndian, uint16(len(objects)))
 	for _, object := range objects {
 		if err := validateBrokerObject(object); err != nil {
 			return nil, err
 		}
 		units := utf16.Encode([]rune(object.Path))
+		encodedObjectSize := 38 + len(units)*2
+		if encodedObjectSize > maxBrokerFrameSize-buffer.Len() {
+			return nil, errBrokerFrameTooLarge
+		}
 		_ = binary.Write(buffer, binary.LittleEndian, object.Handle)
 		_ = binary.Write(buffer, binary.LittleEndian, object.VolumeSerial)
 		_, _ = buffer.Write(object.FileID[:])
@@ -469,6 +506,7 @@ func encodeBrokerObjects(objects []brokerObjectReference) ([]byte, error) {
 		_ = buffer.WriteByte(byte(object.Access))
 		_ = buffer.WriteByte(byte(object.Denied))
 		_ = buffer.WriteByte(byte(object.Scope))
+		// #nosec G115 -- validateBrokerObject caps the encoded path at maxBrokerPathUnits.
 		_ = binary.Write(buffer, binary.LittleEndian, uint16(len(units)))
 		for _, unit := range units {
 			_ = binary.Write(buffer, binary.LittleEndian, unit)

@@ -132,6 +132,7 @@ func LoadTraceEvidence(path string) (TraceEvidence, error) {
 }
 
 func loadJSON(path string, target any) error {
+	// #nosec G304 -- the operator explicitly selects this local manifest/evidence file.
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -155,6 +156,7 @@ func FinalizeRunManifest(invocation RunManifest, collector TraceCollector, rawTr
 	if err != nil {
 		return RunManifest{}, fmt.Errorf("absolute raw trace path: %w", err)
 	}
+	// #nosec G304 -- rawTracePath is the operator-selected trace evidence input.
 	contents, err := os.ReadFile(absolute)
 	if err != nil {
 		return RunManifest{}, fmt.Errorf("read raw trace: %w", err)

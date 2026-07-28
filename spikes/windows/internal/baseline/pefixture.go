@@ -159,9 +159,12 @@ func generateAMD64Text() ([]byte, uint32, error) {
 	code := make([]byte, 0, peSectionSize)
 	emit := func(values ...byte) { code = append(code, values...) }
 	disp32Trailing := func(targetRVA uint32, trailingBytes uint32) {
+		// #nosec G115 -- the fixed fixture text is capped at peSectionSize.
 		nextRVA := peTextRVA + uint32(len(code)) + 4 + trailingBytes
 		value := int64(targetRVA) - int64(nextRVA)
+		// #nosec G115 -- all fixed fixture sections are within one signed disp32.
 		binaryValue := uint32(int32(value))
+		// #nosec G115 -- these conversions intentionally emit the four low instruction bytes.
 		emit(byte(binaryValue), byte(binaryValue>>8), byte(binaryValue>>16), byte(binaryValue>>24))
 	}
 	disp32 := func(targetRVA uint32) { disp32Trailing(targetRVA, 0) }
@@ -188,11 +191,13 @@ func generateAMD64Text() ([]byte, uint32, error) {
 	emit(0x01, 0x48, 0x83, 0xc4, 0x38)
 	callbackReturn := len(code)
 	emit(0xc3)
+	// #nosec G115 -- this fixed short branch is generated within the 127-byte x86 range.
 	code[callbackJNE] = byte(callbackReturn - (callbackJNE + 1))
 
 	for len(code) < 0x100 {
 		emit(0x90)
 	}
+	// #nosec G115 -- the fixed fixture text is capped at peSectionSize.
 	entryOff := uint32(len(code))
 	emit(0x48, 0x83, 0xec, 0x38, 0x80, 0x3d)
 	disp32Trailing(peDataRVA+peCallbackFlagOff, 1)
@@ -205,6 +210,7 @@ func generateAMD64Text() ([]byte, uint32, error) {
 	emit(0xb9, 0x01, 0, 0, 0)
 	callIAT(0)
 	emit(0xcc)
+	// #nosec G115 -- this fixed short branch is generated within the 127-byte x86 range.
 	code[entryJNE] = byte(fail - (entryJNE + 1))
 	return code, entryOff, nil
 }
@@ -213,11 +219,15 @@ type arm64Builder struct {
 	words []uint32
 }
 
-func (b *arm64Builder) rva() uint32      { return peTextRVA + uint32(len(b.words)*4) }
+func (b *arm64Builder) rva() uint32 {
+	// #nosec G115 -- the fixed fixture text is capped at peSectionSize.
+	return peTextRVA + uint32(len(b.words)*4)
+}
 func (b *arm64Builder) emit(word uint32) { b.words = append(b.words, word) }
 func (b *arm64Builder) adrp(rd uint32, targetRVA uint32) {
 	delta := int64(targetRVA&^0xfff) - int64(b.rva()&^0xfff)
 	pages := delta >> 12
+	// #nosec G115 -- the mask intentionally encodes the signed delta in ADRP's 21-bit immediate.
 	imm := uint64(pages) & 0x1fffff
 	b.emit(0x90000000 | uint32((imm&3)<<29) | uint32(((imm>>2)&0x7ffff)<<5) | rd)
 }
@@ -235,7 +245,9 @@ func (b *arm64Builder) branchCond(condition uint32) int {
 	return index
 }
 func (b *arm64Builder) patchBranch(index, target int) {
+	// #nosec G115 -- fixed fixture branch indices are bounded by peSectionSize/4.
 	offsetWords := int32(target - index)
+	// #nosec G115 -- the mask intentionally encodes the signed offset in imm19.
 	b.words[index] = (b.words[index] & 0xff00001f) | (uint32(offsetWords)&0x7ffff)<<5
 }
 func (b *arm64Builder) address(rd uint32, target uint32) {
@@ -271,6 +283,7 @@ func generateARM64Text() ([]byte, uint32, error) {
 	for len(b.words) < 0x40 {
 		b.emit(0xd503201f) // nop
 	}
+	// #nosec G115 -- the fixed fixture text is capped at peSectionSize.
 	entryOff := uint32(len(b.words) * 4)
 	b.emit(0xa9bf7bfd)
 	b.emit(0x910003fd)
@@ -330,6 +343,7 @@ func InspectTLSFixture(file *pe.File) (TLSFixtureInfo, error) {
 	if callbackVA < optional.ImageBase || callbackVA-optional.ImageBase > math.MaxUint32 {
 		return TLSFixtureInfo{}, fmt.Errorf("invalid TLS callback VA %#x", callbackVA)
 	}
+	// #nosec G115 -- the subtraction is explicitly checked against MaxUint32 above.
 	if _, err := readRVA(file, uint32(callbackVA-optional.ImageBase), 1); err != nil {
 		return TLSFixtureInfo{}, fmt.Errorf("TLS callback does not point into the image: %w", err)
 	}

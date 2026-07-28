@@ -317,6 +317,7 @@ func checkReadBoundary(t *testing.T, newSUT Factory) {
 	if err := outside.Close(); err != nil {
 		t.Fatalf("close outside read positive control: %v", err)
 	}
+	// #nosec G304 -- outsidePath is returned by os.CreateTemp above and never accepts SUT input.
 	if data, err := os.ReadFile(outsidePath); err != nil || string(data) != "outside-read-control" {
 		t.Fatalf("outside read positive control failed: data=%q err=%v", data, err)
 	}

@@ -362,6 +362,7 @@ func encodeACE(sid SID, kind ACLObjectKind, ace ACLACE) []byte {
 	if ace.Inheritable {
 		result[1] = 0x01 | 0x02 // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
 	}
+	// #nosec G115 -- module SIDs encode to either 12 or 44 bytes, so this ACE is at most 52 bytes.
 	binary.LittleEndian.PutUint16(result[2:4], uint16(len(result)))
 	binary.LittleEndian.PutUint32(result[4:8], windowsFileAccessMask(ace.Access, kind))
 	copy(result[8:], sidBytes)
