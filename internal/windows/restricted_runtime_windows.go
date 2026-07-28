@@ -38,20 +38,31 @@ var restrictedRuntimeRegistry = struct {
 type restrictedRuntimeRegistryEntry struct {
 	runtime *RestrictedRuntime
 	refs    int
+	closing chan struct{}
 }
 
 // AcquireRestrictedRuntime shares one lazy sweep coordinator between every
 // live ExecutorSet in this process that uses the same stable root.
 func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func() error) {
 	key := strings.ToUpper(filepath.Clean(scratchRoot))
-	restrictedRuntimeRegistry.Lock()
-	entry := restrictedRuntimeRegistry.entries[key]
-	if entry == nil {
-		entry = &restrictedRuntimeRegistryEntry{runtime: NewRestrictedRuntime(scratchRoot)}
-		restrictedRuntimeRegistry.entries[key] = entry
+	var entry *restrictedRuntimeRegistryEntry
+	for {
+		restrictedRuntimeRegistry.Lock()
+		entry = restrictedRuntimeRegistry.entries[key]
+		if entry != nil && entry.closing != nil {
+			closed := entry.closing
+			restrictedRuntimeRegistry.Unlock()
+			<-closed
+			continue
+		}
+		if entry == nil {
+			entry = &restrictedRuntimeRegistryEntry{runtime: NewRestrictedRuntime(scratchRoot)}
+			restrictedRuntimeRegistry.entries[key] = entry
+		}
+		entry.refs++
+		restrictedRuntimeRegistry.Unlock()
+		break
 	}
-	entry.refs++
-	restrictedRuntimeRegistry.Unlock()
 
 	var once sync.Once
 	var releaseErr error
@@ -64,15 +75,22 @@ func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func() er
 				return
 			}
 			entry.refs--
-			if entry.refs == 0 {
+			if entry.refs != 0 {
+				restrictedRuntimeRegistry.Unlock()
+				return
+			}
+			entry.closing = make(chan struct{})
+			closing := entry.closing
+			runtime := entry.runtime
+			restrictedRuntimeRegistry.Unlock()
+			releaseErr = runtime.Close()
+
+			restrictedRuntimeRegistry.Lock()
+			if restrictedRuntimeRegistry.entries[key] == entry {
 				delete(restrictedRuntimeRegistry.entries, key)
 			}
-			runtime := entry.runtime
-			shouldClose := entry.refs == 0
+			close(closing)
 			restrictedRuntimeRegistry.Unlock()
-			if shouldClose {
-				releaseErr = runtime.Close()
-			}
 		})
 		return releaseErr
 	}

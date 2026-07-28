@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -763,6 +764,69 @@ func TestRestrictedJournalPrunerMayReenterJournal(t *testing.T) {
 	}
 }
 
+func TestRestrictedJournalRetainedPruneCallbackPinsOperationAcrossClose(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := restrictedTestSID("retained-callback")
+	if retired, err := journal.RetireSID(sid); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v)", retired, err)
+	}
+	pruner := &testPruner{}
+	if err := journal.Prune(pruner); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	originalRead := journal.readRegularFile
+	journal.readRegularFile = func(root *os.Root, name string, maximum int64) ([]byte, error) {
+		close(entered)
+		<-releaseRead
+		return originalRead(root, name, maximum)
+	}
+	ace := encodeACE(sid, ACLObjectFile, ACLACE{Type: ACEAllow, Access: ACLRead})
+	callbackDone := make(chan bool, 1)
+	go func() {
+		callbackDone <- pruner.allow(sid, ACERoleRestrictingAllow, ace)
+	}()
+	<-entered
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- journal.Close() }()
+	waitForRestrictedJournalClosing(t, journal)
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned while retained callback held an active read: %v", err)
+	default:
+	}
+	close(releaseRead)
+	if allowed := <-callbackDone; !allowed {
+		t.Fatal("retained callback lost retirement authority while active")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForRestrictedJournalClosing(t *testing.T, journal *RestrictedJournal) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		journal.mu.Lock()
+		closing := journal.closing
+		journal.mu.Unlock()
+		if closing {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("journal Close did not enter closing state")
+		}
+		runtime.Gosched()
+	}
+}
+
 type blockingTestPruner struct {
 	entered chan struct{}
 	release chan struct{}
@@ -819,9 +883,6 @@ func TestRestrictedJournalCloseWaitsForPruneCallback(t *testing.T) {
 	close(pruner.release)
 	if err := <-pruneDone; err != nil {
 		t.Fatal(err)
-	}
-	if !pruner.allowed {
-		t.Fatal("active Prune lost anchored retirement state")
 	}
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)

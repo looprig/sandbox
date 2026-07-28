@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 const (
@@ -79,16 +78,17 @@ type RestrictedJournal struct {
 	recordsDir string
 	retiredDir string
 
-	mu            sync.Mutex
-	cond          *sync.Cond
-	active        int
-	closing       bool
-	closed        bool
-	closeErr      error
-	recordsRoot   *os.Root
-	retiredRoot   *os.Root
-	syncDirectory func(*os.Root) error
-	closeRoots    func(*os.Root, *os.Root) error
+	mu              sync.Mutex
+	cond            *sync.Cond
+	active          int
+	closing         bool
+	closed          bool
+	closeErr        error
+	recordsRoot     *os.Root
+	retiredRoot     *os.Root
+	syncDirectory   func(*os.Root) error
+	closeRoots      func(*os.Root, *os.Root) error
+	readRegularFile func(*os.Root, string, int64) ([]byte, error)
 }
 
 // OpenRestrictedJournal creates the durable store below stableScratchRoot.
@@ -111,11 +111,12 @@ func openRestrictedJournalWithSync(stableScratchRoot string, syncDirectory func(
 	}
 	root := filepath.Join(abs, restrictedJournalDirectory)
 	j := &RestrictedJournal{
-		root:          root,
-		recordsDir:    filepath.Join(root, "records"),
-		retiredDir:    filepath.Join(root, "retired-sids"),
-		syncDirectory: syncDirectory,
-		closeRoots:    closeRestrictedJournalRoots,
+		root:            root,
+		recordsDir:      filepath.Join(root, "records"),
+		retiredDir:      filepath.Join(root, "retired-sids"),
+		syncDirectory:   syncDirectory,
+		closeRoots:      closeRestrictedJournalRoots,
+		readRegularFile: readRestrictedJournalRegularFile,
 	}
 	j.cond = sync.NewCond(&j.mu)
 	if err := os.MkdirAll(abs, 0o700); err != nil {
@@ -428,15 +429,9 @@ func (j *RestrictedJournal) Prune(pruner RestrictedPruner) error {
 		return err
 	}
 	defer j.endOperation()
-	var callbackActive atomic.Bool
-	callbackActive.Store(true)
-	defer callbackActive.Store(false)
 	return pruner.PruneRestrictedACEs(func(sid SID, role ACERole, ace []byte) bool {
 		if role != ACERoleRestrictingAllow || !retirableRestrictedSID(sid) || !recognizedRestrictingACE(sid, role, ace) {
 			return false
-		}
-		if callbackActive.Load() {
-			return j.isDurablyRetiredLocked(sid)
 		}
 		return j.isDurablyRetired(sid)
 	})
@@ -458,7 +453,11 @@ func (j *RestrictedJournal) isDurablyRetiredLocked(sid SID) bool {
 		return false
 	}
 	digest := sha256.Sum256([]byte(sid.String()))
-	data, err := readRestrictedJournalRegularFile(j.retiredRoot, hex.EncodeToString(digest[:])+".sid", restrictedJournalSIDMaxBytes)
+	readRegularFile := j.readRegularFile
+	if readRegularFile == nil {
+		readRegularFile = readRestrictedJournalRegularFile
+	}
+	data, err := readRegularFile(j.retiredRoot, hex.EncodeToString(digest[:])+".sid", restrictedJournalSIDMaxBytes)
 	return err == nil && string(data) == sid.String()+"\n"
 }
 

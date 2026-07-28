@@ -135,6 +135,67 @@ func TestRestrictedRuntimeRegistryDoesNotHoldGlobalLockWhileClosing(t *testing.T
 	}
 }
 
+func TestRestrictedRuntimeRegistryWaitsForSameRootClose(t *testing.T) {
+	root := t.TempDir()
+	first, releaseFirst := AcquireRestrictedRuntime(root)
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.state.open = func(string) (*RestrictedJournal, RestrictedSweepReport, error) {
+		return journal, RestrictedSweepReport{}, nil
+	}
+	if _, err := first.restrictedJournal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.beginOperation(); err != nil {
+		t.Fatal(err)
+	}
+	operationEnded := false
+	defer func() {
+		if !operationEnded {
+			journal.endOperation()
+		}
+		_ = journal.Close()
+	}()
+
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- releaseFirst() }()
+	waitForRestrictedJournalClosing(t, journal)
+
+	type acquiredRuntime struct {
+		runtime *RestrictedRuntime
+		release func() error
+	}
+	acquireStarted := make(chan struct{})
+	acquired := make(chan acquiredRuntime, 1)
+	go func() {
+		close(acquireStarted)
+		runtime, release := AcquireRestrictedRuntime(root)
+		acquired <- acquiredRuntime{runtime: runtime, release: release}
+	}()
+	<-acquireStarted
+	select {
+	case result := <-acquired:
+		_ = result.release()
+		t.Fatal("same-root Acquire returned before prior runtime Close completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	journal.endOperation()
+	operationEnded = true
+	if err := <-releaseDone; err != nil {
+		t.Fatal(err)
+	}
+	result := <-acquired
+	if result.runtime == first {
+		t.Fatal("same-root Acquire reused closed runtime")
+	}
+	if err := result.release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRestrictedRuntimeSharesSweepAcrossLiveSetsAndRecoversAfterLastRelease(t *testing.T) {
 	root := t.TempDir()
 	first, releaseFirst := AcquireRestrictedRuntime(root)
