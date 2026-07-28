@@ -3,6 +3,9 @@ package windows
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +69,20 @@ func (cleaner *recordingCleaner) RemoveRestrictedAllowACE(record RestrictedClean
 	return cleaner.removed, cleaner.err
 }
 
+type reentrantCleaner struct {
+	journal *RestrictedJournal
+	entered chan struct{}
+	proceed chan struct{}
+	err     error
+}
+
+func (cleaner *reentrantCleaner) RemoveRestrictedAllowACE(RestrictedCleanupRecord) (bool, error) {
+	close(cleaner.entered)
+	<-cleaner.proceed
+	_, cleaner.err = cleaner.journal.RetireSID(restrictedTestSID("cleaner-reentry"))
+	return false, nil
+}
+
 func TestRestrictedJournalPersistsBeforeMutationAndRemovesAfterCleanup(t *testing.T) {
 	journal, err := OpenRestrictedJournal(t.TempDir())
 	if err != nil {
@@ -116,6 +133,162 @@ func TestOpenRestrictedJournalRejectsPreexistingJournalRootSymlink(t *testing.T)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("journal initialization escaped anchored scratch root: %v", entries)
+	}
+}
+
+func TestRestrictedJournalCreationSyncsParentDirectoriesInOrder(t *testing.T) {
+	stable := t.TempDir()
+	var synced []string
+	journal, err := openRestrictedJournalWithSync(stable, func(root *os.Root) error {
+		synced = append(synced, root.Name())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	want := []string{stable, journal.root, journal.root}
+	if len(synced) != len(want) {
+		t.Fatalf("directory sync calls = %v, want %v", synced, want)
+	}
+	for index := range want {
+		if filepath.Clean(synced[index]) != filepath.Clean(want[index]) {
+			t.Fatalf("directory sync calls = %v, want %v", synced, want)
+		}
+	}
+}
+
+type recordingBatchDirectory struct {
+	calls     []int
+	remaining int
+}
+
+func (directory *recordingBatchDirectory) ReadDir(size int) ([]fs.DirEntry, error) {
+	directory.calls = append(directory.calls, size)
+	if directory.remaining == 0 {
+		return nil, io.EOF
+	}
+	count := min(size, directory.remaining)
+	directory.remaining -= count
+	return make([]fs.DirEntry, count), nil
+}
+
+func TestRestrictedJournalEnumerationUsesBoundedBatchesUntilEOF(t *testing.T) {
+	directory := &recordingBatchDirectory{remaining: restrictedJournalReadBatchSize*3 + 7}
+	visited := 0
+	if err := forEachRestrictedJournalEntry(directory, func(fs.DirEntry) error {
+		visited++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visited != restrictedJournalReadBatchSize*3+7 {
+		t.Fatalf("visited entries = %d, want all entries", visited)
+	}
+	if len(directory.calls) < 5 {
+		t.Fatalf("ReadDir calls = %v, want repeated batches through EOF", directory.calls)
+	}
+	for _, size := range directory.calls {
+		if size != restrictedJournalReadBatchSize || size <= 0 {
+			t.Fatalf("ReadDir batch size = %d, want fixed positive %d", size, restrictedJournalReadBatchSize)
+		}
+	}
+}
+
+func TestRestrictedJournalCreationStopsWhenParentSyncFails(t *testing.T) {
+	stable := t.TempDir()
+	fault := errors.New("injected directory sync failure")
+	calls := 0
+	journal, err := openRestrictedJournalWithSync(stable, func(*os.Root) error {
+		calls++
+		return fault
+	})
+	if journal != nil {
+		_ = journal.Close()
+		t.Fatal("journal returned after creation durability failure")
+	}
+	if !errors.Is(err, fault) {
+		t.Fatalf("creation error = %v, want injected sync failure", err)
+	}
+	if calls != 1 {
+		t.Fatalf("directory sync calls = %d, want stop after first failure", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stable, restrictedJournalDirectory, "records")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal children created after parent sync failure: %v", err)
+	}
+}
+
+func TestRestrictedJournalCreationPropagatesStateDirectorySyncFailure(t *testing.T) {
+	for _, failAt := range []int{2, 3} {
+		t.Run(fmt.Sprintf("sync-call-%d", failAt), func(t *testing.T) {
+			stable := t.TempDir()
+			fault := errors.New("injected state directory sync failure")
+			calls := 0
+			journal, err := openRestrictedJournalWithSync(stable, func(*os.Root) error {
+				calls++
+				if calls == failAt {
+					return fault
+				}
+				return nil
+			})
+			if journal != nil {
+				_ = journal.Close()
+				t.Fatal("journal returned after state directory durability failure")
+			}
+			if !errors.Is(err, fault) {
+				t.Fatalf("creation error = %v, want injected sync failure", err)
+			}
+			if calls != failAt {
+				t.Fatalf("directory sync calls = %d, want stop at %d", calls, failAt)
+			}
+		})
+	}
+}
+
+func TestRestrictedJournalCleanerReentryDoesNotDeadlockConcurrentClose(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := restrictedTestRecord(t, "cleaner-reentry-record")
+	prepareRestrictedTestMutation(t, journal, record)
+	cleaner := &reentrantCleaner{
+		journal: journal,
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+	sweepDone := make(chan error, 1)
+	go func() {
+		_, err := journal.Sweep(cleaner)
+		sweepDone <- err
+	}()
+	<-cleaner.entered
+
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- journal.Close()
+	}()
+	<-closeStarted
+	time.Sleep(25 * time.Millisecond)
+	close(cleaner.proceed)
+
+	select {
+	case err := <-sweepDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cleaner reentry deadlocked with concurrent Close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after Cleaner returned")
 	}
 }
 
@@ -525,6 +698,42 @@ func (pruner *testPruner) PruneRestrictedACEs(allow func(SID, ACERole, []byte) b
 	return nil
 }
 
+type reentrantTestPruner struct {
+	journal *RestrictedJournal
+	sid     SID
+	ace     []byte
+}
+
+func (pruner *reentrantTestPruner) PruneRestrictedACEs(allow func(SID, ACERole, []byte) bool) error {
+	if _, err := pruner.journal.RetireSID(restrictedTestSID("pruner-reentry")); err != nil {
+		return err
+	}
+	if !allow(pruner.sid, ACERoleRestrictingAllow, pruner.ace) {
+		return errors.New("retired SID rejected after pruner reentry")
+	}
+	return nil
+}
+
+func TestRestrictedJournalPrunerMayReenterJournal(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeRestrictedTestJournal(t, journal)
+	sid := restrictedTestSID("pruner-authority")
+	if retired, err := journal.RetireSID(sid); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v)", retired, err)
+	}
+	pruner := &reentrantTestPruner{
+		journal: journal,
+		sid:     sid,
+		ace:     encodeACE(sid, ACLObjectFile, ACLACE{Type: ACEAllow, Access: ACLRead}),
+	}
+	if err := journal.Prune(pruner); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type blockingTestPruner struct {
 	entered chan struct{}
 	release chan struct{}
@@ -567,7 +776,12 @@ func TestRestrictedJournalCloseWaitsForPruneCallback(t *testing.T) {
 	<-pruner.entered
 
 	closeDone := make(chan error, 1)
-	go func() { closeDone <- journal.Close() }()
+	closeStarted := make(chan struct{})
+	go func() {
+		close(closeStarted)
+		closeDone <- journal.Close()
+	}()
+	<-closeStarted
 	select {
 	case err := <-closeDone:
 		t.Fatalf("Close returned while Prune callback remained active: %v", err)
