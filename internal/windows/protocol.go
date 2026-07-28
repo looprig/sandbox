@@ -207,14 +207,31 @@ func encodeBrokerFrame(frame brokerFrame) ([]byte, error) {
 }
 
 func writeBrokerField(payload *bytes.Buffer, id uint16, value []byte) error {
-	if len(value) > maxBrokerFrameSize {
+	remaining := maxBrokerFrameSize - brokerHeaderSize - payload.Len()
+	if remaining < 6 || len(value) > remaining-6 {
 		return errBrokerFrameTooLarge
 	}
 	_ = binary.Write(payload, binary.LittleEndian, id)
-	// #nosec G115 -- value is explicitly capped at maxBrokerFrameSize above.
+	// #nosec G115 -- value is explicitly capped at the remaining frame capacity above.
 	_ = binary.Write(payload, binary.LittleEndian, uint32(len(value)))
 	_, _ = payload.Write(value)
 	return nil
+}
+
+func validateBrokerFieldCount(count int) error {
+	if count < 0 || count > maxBrokerFields {
+		return errBrokerFrameMalformed
+	}
+	return nil
+}
+
+func brokerUTF16BytesMayFit(value string, maxUnits int) bool {
+	if maxUnits < 0 || maxUnits > maxBrokerPathUnits || !utf8.ValidString(value) {
+		return false
+	}
+	// A valid UTF-8 encoding uses at most three bytes per UTF-16 code unit:
+	// three-byte BMP runes use one unit, while four-byte runes use two.
+	return len(value) <= maxUnits*3
 }
 
 func decodeBrokerFrame(reader io.Reader) (brokerFrame, error) {
@@ -245,6 +262,9 @@ func decodeBrokerFrameBody(data []byte) (brokerFrame, error) {
 		return brokerFrame{}, errBrokerFrameMalformed
 	}
 	fieldCount := int(binary.LittleEndian.Uint16(data[4:6]))
+	if err := validateBrokerFieldCount(fieldCount); err != nil {
+		return brokerFrame{}, err
+	}
 	offset := brokerHeaderSize
 	seen := make(map[uint16]struct{}, fieldCount)
 	for index := 0; index < fieldCount; index++ {
@@ -394,7 +414,7 @@ func validateBrokerFrame(frame brokerFrame) error {
 }
 
 func validBrokerDesktopName(value string) bool {
-	if value == "" || !utf8.ValidString(value) || strings.EqualFold(value, `WinSta0\Default`) {
+	if value == "" || !brokerUTF16BytesMayFit(value, maxBrokerDesktopUnits) || strings.EqualFold(value, `WinSta0\Default`) {
 		return false
 	}
 	units := utf16.Encode([]rune(value))
@@ -453,7 +473,13 @@ func validateBrokerObject(object brokerObjectReference) error {
 		(object.Kind == brokerObjectDirectory && object.Scope != brokerScopeExact && object.Scope != brokerScopeTree) {
 		return errBrokerFrameMalformed
 	}
-	if !canonicalBrokerPath(object.Path) || !utf8.ValidString(object.Path) {
+	if !utf8.ValidString(object.Path) {
+		return errBrokerFrameMalformed
+	}
+	if !brokerUTF16BytesMayFit(object.Path, maxBrokerPathUnits) {
+		return errBrokerFrameTooLarge
+	}
+	if !canonicalBrokerPath(object.Path) {
 		return errBrokerFrameMalformed
 	}
 	units := utf16.Encode([]rune(object.Path))

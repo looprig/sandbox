@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -94,6 +95,20 @@ func TestBrokerProtocolRejectsMalformedLengthsAndTrailingBytes(t *testing.T) {
 		if _, err := decodeBrokerFrame(bytes.NewReader(data)); err == nil {
 			t.Fatalf("malformed length case %d accepted", index)
 		}
+	}
+}
+
+func TestBrokerProtocolRejectsFieldCountBeforeAllocation(t *testing.T) {
+	if err := validateBrokerFieldCount(math.MaxUint16); !errors.Is(err, errBrokerFrameMalformed) {
+		t.Fatalf("max wire field count error = %v, want malformed", err)
+	}
+	body := make([]byte, brokerHeaderSize)
+	binary.LittleEndian.PutUint16(body[0:2], brokerProtocolVersion)
+	body[2] = byte(brokerMessageStatus)
+	body[3] = byte(brokerRequest)
+	binary.LittleEndian.PutUint16(body[4:6], math.MaxUint16)
+	if _, err := decodeBrokerFrameBody(body); !errors.Is(err, errBrokerFrameMalformed) {
+		t.Fatalf("hostile minimal field-count frame error = %v, want malformed", err)
 	}
 }
 
@@ -203,6 +218,40 @@ func TestBrokerProtocolDesktopNameIsBoundedCanonicalAndOpaque(t *testing.T) {
 	}
 }
 
+func TestBrokerUTF16BytePrecheckUsesSafeMaximum(t *testing.T) {
+	if !brokerUTF16BytesMayFit(strings.Repeat("\u0800", maxBrokerDesktopUnits), maxBrokerDesktopUnits) {
+		t.Fatal("valid UTF-8 using exactly three bytes per UTF-16 unit rejected")
+	}
+	if brokerUTF16BytesMayFit(strings.Repeat("x", maxBrokerDesktopUnits*3+1), maxBrokerDesktopUnits) {
+		t.Fatal("byte input exceeding safe UTF-16 maximum accepted")
+	}
+	if brokerUTF16BytesMayFit("\xff", maxBrokerDesktopUnits) {
+		t.Fatal("invalid UTF-8 accepted by byte precheck")
+	}
+}
+
+func TestBrokerProtocolRejectsOversizedByteInputsBeforeEncoding(t *testing.T) {
+	desktop := `S\` + strings.Repeat("x", maxBrokerDesktopUnits*3+1)
+	frame := brokerFrame{
+		Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse,
+		Nonce: testBrokerNonce(), LeaseID: [brokerLeaseIDSize]byte{1},
+		TokenHandle: 9, Desktop: desktop,
+	}
+	if _, err := encodeBrokerFrame(frame); err == nil {
+		t.Fatal("oversized desktop byte input accepted")
+	}
+
+	object := testBrokerObject()
+	object.Path = `C:\` + strings.Repeat("x", maxBrokerPathUnits*3+1)
+	frame = brokerFrame{
+		Kind: brokerMessageAcquireLease, Direction: brokerRequest,
+		Nonce: testBrokerNonce(), Objects: []brokerObjectReference{object},
+	}
+	if _, err := encodeBrokerFrame(frame); err == nil {
+		t.Fatal("oversized object-path byte input accepted")
+	}
+}
+
 func TestBrokerProtocolCountLimit(t *testing.T) {
 	objects := make([]brokerObjectReference, maxBrokerObjects+1)
 	for index := range objects {
@@ -238,15 +287,20 @@ func TestEncodeBrokerObjectsEnforcesAggregateFrameLimit(t *testing.T) {
 
 func TestWriteBrokerFieldEnforcesWireLengthBoundary(t *testing.T) {
 	payload := new(bytes.Buffer)
-	if err := writeBrokerField(payload, fieldObjects, make([]byte, maxBrokerFrameSize)); err != nil {
+	prefix := bytes.Repeat([]byte{0xaa}, 17)
+	_, _ = payload.Write(prefix)
+	maximumValue := maxBrokerFrameSize - brokerHeaderSize - payload.Len() - 6
+	if err := writeBrokerField(payload, fieldObjects, make([]byte, maximumValue)); err != nil {
 		t.Fatalf("maximum bounded field rejected: %v", err)
 	}
 	payload.Reset()
-	if err := writeBrokerField(payload, fieldObjects, make([]byte, maxBrokerFrameSize+1)); !errors.Is(err, errBrokerFrameTooLarge) {
+	_, _ = payload.Write(prefix)
+	before := append([]byte(nil), payload.Bytes()...)
+	if err := writeBrokerField(payload, fieldObjects, make([]byte, maximumValue+1)); !errors.Is(err, errBrokerFrameTooLarge) {
 		t.Fatalf("oversized field error = %v, want frame-too-large", err)
 	}
-	if payload.Len() != 0 {
-		t.Fatalf("oversized field wrote %d bytes before rejection", payload.Len())
+	if !bytes.Equal(payload.Bytes(), before) {
+		t.Fatalf("oversized field modified payload: got %d bytes, want unchanged %d", payload.Len(), len(before))
 	}
 }
 
