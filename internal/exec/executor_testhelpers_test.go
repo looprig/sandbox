@@ -49,7 +49,7 @@ func TestPortableShellFixtures(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(work, "portable-marker")
-	command := portableWriteCommand(marker, "started")
+	command := portableWriteCommandForOS(runtime.GOOS, workspace, marker, "started")
 	output, code, err := executor.RunCommand(context.Background(), workspace, command)
 	if err != nil || code != 0 {
 		t.Fatalf("portable write: workspace=%q command=%q code=%d err=%v output=%q", workspace, command, code, err, output)
@@ -81,20 +81,37 @@ func portableFailureCommand() string {
 }
 
 func portableShellQuote(value string) string {
-	if runtime.GOOS == "windows" {
+	return portableShellQuoteForOS(runtime.GOOS, value)
+}
+
+func portableShellQuoteForOS(goos, value string) string {
+	if goos == "windows" {
 		return `"` + strings.ReplaceAll(value, "%", "%%") + `"`
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func portableWriteCommand(path, value string) string {
-	if runtime.GOOS == "windows" {
-		// Every Windows marker fixture is created in cmd.Dir. Keeping the shell
-		// operand relative avoids cmd.exe's non-CommandLineToArgvW quote grammar;
-		// the absolute path is still used by the parent for verification.
-		return "> " + filepath.Base(path) + " echo " + value
+	return portableWriteCommandForOS(runtime.GOOS, "", path, value)
+}
+
+func portableWriteCommandForOS(goos, cwd, path, value string) string {
+	if goos == "windows" {
+		// Keep Windows marker operands relative to cmd.Dir to avoid cmd.exe's
+		// non-CommandLineToArgvW quote grammar. Callers that omit cwd retain the
+		// original root-marker basename contract.
+		operand := filepath.Base(path)
+		if cwd != "" {
+			relative, err := filepath.Rel(cwd, path)
+			if err == nil && relative != "." && !filepath.IsAbs(relative) &&
+				relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				operand = strings.ReplaceAll(filepath.ToSlash(relative), "/", `\`)
+				return "> " + portableShellQuoteForOS(goos, operand) + " echo " + value
+			}
+		}
+		return "> " + operand + " echo " + value
 	}
-	return "printf %s " + portableShellQuote(value) + " > " + portableShellQuote(path)
+	return "printf %s " + portableShellQuoteForOS(goos, value) + " > " + portableShellQuoteForOS(goos, path)
 }
 
 func portableSleepCommand(seconds int) string {
