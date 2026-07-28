@@ -306,22 +306,31 @@ Failure to select a usable Linux rung returns `ErrSandboxUnavailable` rather
 than a null backend. On other operating systems `Sandboxed` is unavailable;
 the null backend accepts only an acknowledged `Unconfined` profile.
 
-### 7.5 Linux Rung 2 filesystem snapshots
+### 7.5 Linux filesystem snapshots
 
-Rung 2 compiles fixed-path denies and protected carveouts into Landlock's
-additive allowlist by enumerating unaffected siblings at spawn. This applies
-even when the denied target does not yet exist: the covering directory is not
-granted as a whole, so the command cannot create a new entry directly beneath
-that directory during the spawn. Pre-existing unaffected children retain their
-compiled access, including write access when policy permits it. A denied target
-that exists at spawn is omitted from the enumerated rules for each denied axis.
+Both Linux rungs share Landlock's additive allowlist. When a writable root
+contains a fixed-path deny or protected carveout, they enumerate unaffected
+siblings at spawn instead of granting the covering directory as a whole. This
+applies even when the protected target does not yet exist: the command cannot
+create a new entry directly beneath that covering directory during the spawn.
+Pre-existing unaffected children retain their compiled access, including write
+access when policy permits it. A denied target that exists at spawn is omitted
+from the enumerated rules for each denied axis.
+
+Rung 1 additionally builds a mount view: read-only carveouts are mount
+re-masked, fixed denies without restorations use empty masks, and paths outside
+the explicit view remain invisible. Those mount mechanisms enforce the
+protected path itself, but they do not remove the shared Landlock sibling
+enumeration needed for defense in depth and restored literal precedence.
+Therefore Rung 1 has the same covering-root snapshot narrowing as Rung 2 even
+when its mount re-mask is fully enforced.
 
 This spawn snapshot is intentionally narrower than the requested writable root.
 It prevents a future `.git`, `.looprig`, or fixed secret path from becoming
 accessible on a denied axis after confinement, and preserves the rule-precedence
-contract in §3. Backends must record the narrowing in `CompileReport`; they must
-not restore whole-root authority merely because a literal deny or carveout is
-absent.
+contract in §3. Both rungs must record the narrowing in `CompileReport`; they
+must not restore whole-root authority merely because a literal deny or carveout
+is absent.
 
 ## 8. Security invariants
 

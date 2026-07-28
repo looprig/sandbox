@@ -7,6 +7,7 @@ import (
 	"context"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
 	"strings"
@@ -462,6 +463,50 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 				t.Errorf("report missing Enforced glob-deny: %+v", report.Entries)
 			}
 		})
+	}
+}
+
+func TestCompileRung1ReportsWriteRootSnapshotNarrowing(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+
+	_, report, _, _, err := linux.NewBackendRung1().Compile(backendFixturePolicy(fixtureWorkspaceWrite, ws))
+	if err != nil {
+		t.Fatalf("compile protected writable root: %v", err)
+	}
+	var snapshot *profile.ReportEntry
+	for i := range report.Entries {
+		if report.Entries[i].Feature == "write-root-snapshot" {
+			snapshot = &report.Entries[i]
+			break
+		}
+	}
+	if snapshot == nil {
+		t.Fatalf("report missing write-root-snapshot entry: %+v", report.Entries)
+	}
+	if snapshot.Status != "narrowed" {
+		t.Fatalf("write-root-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
+	}
+	for _, phrase := range []string{"shared Landlock sibling enumeration", "pre-existing unaffected children", "blocks new entries directly beneath"} {
+		if !strings.Contains(snapshot.Detail, phrase) {
+			t.Errorf("write-root-snapshot detail %q missing %q", snapshot.Detail, phrase)
+		}
+	}
+	if !reportHas(report, "carveout", linuxReportStatusEnforced) {
+		t.Errorf("mount re-mask carveout no longer reported Enforced: %+v", report.Entries)
+	}
+
+	withoutProtectedChild := policy.Effective{Workspace: ws, FS: []policy.FSEntry{{
+		Path: ws, Access: policy.AllAccess,
+	}}}
+	_, report, _, _, err = linux.NewBackendRung1().Compile(withoutProtectedChild)
+	if err != nil {
+		t.Fatalf("compile plain writable root: %v", err)
+	}
+	for _, entry := range report.Entries {
+		if entry.Feature == "write-root-snapshot" {
+			t.Fatalf("plain writable root unexpectedly reported snapshot narrowing: %+v", entry)
+		}
 	}
 }
 

@@ -218,9 +218,9 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 // rung1CompileReport records how the Rung-1 mechanisms compiled each policy
 // feature (SPEC §7.5). At Rung 1 the mount view + nftables enforce features Rung
 // 2 can only narrow or drop: restricted-read invisibility, glob denies, and
-// address-scoped network with the metadata hard-deny — all "Enforced". The one
-// recorded residual is the self-created-file glob-mask gap (§7.5), which does not
-// demote Level.
+// address-scoped network with the metadata hard-deny — all "Enforced". It also
+// discloses the shared Landlock writable-root snapshot narrowing and the
+// self-created-file glob-mask residual (§7.5); neither demotes Level.
 func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPlan) profile.CompileReport {
 	entries := []profile.ReportEntry{
 		{
@@ -239,6 +239,13 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the Rung-1 property Rung 2 cannot provide (§7.2, §7.5)",
 		},
 	}
+	if policy.CompileFS(p.FS).HasCarveout() {
+		entries = append(entries, profile.ReportEntry{
+			Feature: "write-root-snapshot",
+			Status:  "narrowed",
+			Detail:  "protected paths beneath writable roots require shared Landlock sibling enumeration: pre-existing unaffected children retain policy-allowed access, but the snapshot blocks new entries directly beneath the writable covering root (§7.5)",
+		})
+	}
 	if mvp.hasLiteralDeny {
 		entries = append(entries, profile.ReportEntry{
 			Feature: "fixed-path-deny",
@@ -246,7 +253,7 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "fixed-path denies without restorations use empty read-only mount masks; higher-precedence literal restorations compose through the enumerated Landlock rules without a coarse mask that would hide the restored path (§5.1, §7.5)",
 		})
 	}
-	if len(mvp.ROBinds) > 0 {
+	if mountPlanHasReadOnlyCarveout(mvp) {
 		entries = append(entries, profile.ReportEntry{
 			Feature: "carveout",
 			Status:  "Enforced",
@@ -269,6 +276,17 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 	}
 	entries = append(entries, rung1NetReport(nft)...)
 	return profile.CompileReport{Entries: entries}
+}
+
+func mountPlanHasReadOnlyCarveout(mvp MountViewPlan) bool {
+	for _, writable := range mvp.RWBinds {
+		for _, readOnly := range mvp.ROBinds {
+			if policy.PathUnder(writable, readOnly) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rung1NetReport records the Rung-1 network compilation (SPEC §5.2, §5.4, §7.5).
