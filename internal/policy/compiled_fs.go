@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -228,6 +229,7 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 				}
 				continue
 			}
+			excludes = existingPathExcludes(excludes)
 			if len(excludes) == 0 {
 				info, err := os.Stat(allow.Path)
 				if err == nil {
@@ -264,6 +266,18 @@ func excludesForAllowAxis(path string, bit FSAccess, denies []FSDeny) []string {
 		}
 	}
 	return excludes
+}
+
+func existingPathExcludes(excludes []string) []string {
+	return slices.DeleteFunc(excludes, func(path string) bool {
+		// Landlock is an allowlist, so a deny is represented by carving its
+		// existing object out of the covering allow at spawn time. A missing
+		// object contains nothing to protect and must not carve its nearest
+		// existing ancestor: doing so would remove authority to create any new
+		// sibling there. Errors other than nonexistence stay fail-closed.
+		_, err := os.Lstat(path)
+		return errors.Is(err, os.ErrNotExist)
+	})
 }
 
 func carveGrant(dir string, access FSAccess, excludes []string, emit func(FSRule)) {

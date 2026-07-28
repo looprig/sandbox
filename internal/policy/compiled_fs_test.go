@@ -62,6 +62,19 @@ func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 	}
 }
 
+func TestEnumerateFSRulesIgnoresDeepNonexistentDeny(t *testing.T) {
+	root := t.TempDir()
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: filepath.Join(root, ".git", "a", "b", "secret"), Denied: AllAccess},
+	})
+
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, filepath.Join(root, "future")); got != AllAccess {
+		t.Fatalf("nonexistent deny carved declared root: access=%#x rules=%+v", got, rules)
+	}
+}
+
 func TestCompiledFSPreservesExactScope(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "target")
 	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {

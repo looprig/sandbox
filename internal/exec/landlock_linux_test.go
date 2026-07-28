@@ -114,6 +114,24 @@ func TestLinuxFSTmpWritable(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFixtureKeepsDeclaredWritableRootsWhenCarveoutsAreAbsent(t *testing.T) {
+	ws := t.TempDir()
+	compiled := policy.CompileFS(backendFixturePolicy(fixtureWorkspaceWrite, ws).FS)
+	rules := policy.EnumerateFSRules(compiled)
+
+	assertWritableRoot := func(path string) {
+		t.Helper()
+		for _, rule := range rules {
+			if rule.Path == path && rule.Access&policy.WriteAccess != 0 {
+				return
+			}
+		}
+		t.Errorf("declared writable root %q was carved by an absent deny; rules=%+v", path, rules)
+	}
+	assertWritableRoot(ws)
+	assertWritableRoot("/tmp")
+}
+
 // TestLinuxFSGitCarveout proves the .git read-only carveout via ENUMERATED
 // SIBLING ALLOWS (§7.5): with a pre-existing .git, the workspace becomes
 // RW-except-.git. The command can READ .git/config but WRITING into .git is
