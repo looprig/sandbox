@@ -239,12 +239,8 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the Rung-1 property Rung 2 cannot provide (§7.2, §7.5)",
 		},
 	}
-	if axes := policy.CompileFS(p.FS).SnapshotAxes(); axes != 0 {
-		entries = append(entries, profile.ReportEntry{
-			Feature: "filesystem-axis-snapshot",
-			Status:  "narrowed",
-			Detail:  filesystemAxisSnapshotDetail(axes),
-		})
+	if snapshot, ok := filesystemAxisSnapshotEntry(policy.CompileFS(p.FS)); ok {
+		entries = append(entries, snapshot)
 	}
 	if mvp.hasLiteralDeny {
 		entries = append(entries, profile.ReportEntry{
@@ -278,7 +274,11 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 	return profile.CompileReport{Entries: entries}
 }
 
-func filesystemAxisSnapshotDetail(axes policy.FSAccess) string {
+func filesystemAxisSnapshotEntry(cfs policy.CompiledFS) (profile.ReportEntry, bool) {
+	axes := cfs.SnapshotAxes()
+	if axes == 0 {
+		return profile.ReportEntry{}, false
+	}
 	var names []string
 	for _, axis := range []struct {
 		bit  policy.FSAccess
@@ -295,9 +295,15 @@ func filesystemAxisSnapshotDetail(axes policy.FSAccess) string {
 	detail := "protected paths beneath a covering allow require shared Landlock sibling enumeration on denied axes: " +
 		strings.Join(names, ", ") + "; pre-existing unaffected children retain policy-allowed access"
 	if axes&policy.WriteAccess != 0 {
-		return detail + ", while withholding write blocks new entries directly beneath the covering root (§7.5)"
+		detail += ", while withholding write blocks new entries directly beneath the covering root (§7.5)"
+	} else {
+		detail += "; write authority is not withheld, so creation may remain permitted, but new entries lack denied-axis authority (§7.5)"
 	}
-	return detail + "; write authority is not withheld, so creation may remain permitted, but new entries lack denied-axis authority (§7.5)"
+	return profile.ReportEntry{
+		Feature: "filesystem-axis-snapshot",
+		Status:  "narrowed",
+		Detail:  detail,
+	}, true
 }
 
 func mountPlanHasReadOnlyCarveout(mvp MountViewPlan) bool {
@@ -344,10 +350,11 @@ func rung1NetReport(nft compiledNftPlan) []profile.ReportEntry {
 
 // fsCompileReport records how the Rung-2 FS compilation treated each policy
 // feature (SPEC §7.5): the write boundary and fixed-path denies are Enforced;
-// read-only carveouts are narrowed (snapshot semantics on their writable root);
-// glob denies are unenforced (inexpressible in Landlock's additive model, left
-// to the in-process ReadGuard for native tools). It also notes that nonexistent
-// allow paths are dropped at spawn (fail secure).
+// per-axis sibling enumeration and read-only carveouts are narrowed (snapshot
+// semantics on their covering allow); glob denies are unenforced (inexpressible
+// in Landlock's additive model, left to the in-process ReadGuard for native
+// tools). It also notes that nonexistent allow paths are dropped at spawn (fail
+// secure).
 func fsCompileReport(p policy.Effective, cfs policy.CompiledFS) profile.CompileReport {
 	entries := []profile.ReportEntry{{
 		Feature: "write-boundary",
@@ -367,6 +374,9 @@ func fsCompileReport(p policy.Effective, cfs policy.CompiledFS) profile.CompileR
 			Status:  "narrowed",
 			Detail:  "read-only carveouts (.git/.looprig) Enforced by enumerating a writable root's children at spawn; the root itself is not granted, so files created at the root after spawn are inaccessible (snapshot semantics, §7.5 — errs narrow)",
 		})
+	}
+	if snapshot, ok := filesystemAxisSnapshotEntry(cfs); ok {
+		entries = append(entries, snapshot)
 	}
 	if policyHasGlobDeny(p) {
 		entries = append(entries, profile.ReportEntry{

@@ -466,14 +466,23 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	}
 }
 
+func reportEntriesForFeature(report CompileReport, feature string) []profile.ReportEntry {
+	var matches []profile.ReportEntry
+	for _, entry := range report.Entries {
+		if entry.Feature == feature {
+			matches = append(matches, entry)
+		}
+	}
+	return matches
+}
+
 func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()
 	findSnapshot := func(report CompileReport) *profile.ReportEntry {
-		for i := range report.Entries {
-			if report.Entries[i].Feature == "filesystem-axis-snapshot" {
-				return &report.Entries[i]
-			}
+		entries := reportEntriesForFeature(report, "filesystem-axis-snapshot")
+		if len(entries) != 0 {
+			return &entries[0]
 		}
 		return nil
 	}
@@ -531,6 +540,95 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 		if entry.Feature == "filesystem-axis-snapshot" {
 			t.Fatalf("plain writable root unexpectedly reported snapshot narrowing: %+v", entry)
 		}
+	}
+}
+
+func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	tests := []struct {
+		name       string
+		policy     policy.Effective
+		wantDetail []string
+		wantLegacy [][2]string
+	}{
+		{
+			name:   "write and execute carveout",
+			policy: backendFixturePolicy(fixtureWorkspaceWrite, ws),
+			wantDetail: []string{
+				"denied axes: execute, write",
+				"blocks new entries directly beneath",
+			},
+			wantLegacy: [][2]string{
+				{"fixed-path-deny", linuxReportStatusEnforced},
+				{"carveout", "narrowed"},
+				{"allow-paths", "narrowed"},
+			},
+		},
+		{
+			name: "nested read-only deny",
+			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{
+				{Path: ws, Access: policy.AllAccess},
+				{Path: filepath.Join(ws, "read-denied"), Denied: policy.ReadAccess},
+			}},
+			wantDetail: []string{
+				"denied axes: read",
+				"creation may remain permitted",
+				"new entries lack denied-axis authority",
+			},
+			wantLegacy: [][2]string{
+				{"fixed-path-deny", linuxReportStatusEnforced},
+				{"allow-paths", "narrowed"},
+			},
+		},
+		{
+			name:   "plain writable root",
+			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{{Path: ws, Access: policy.AllAccess}}},
+			wantLegacy: [][2]string{
+				{"allow-paths", "narrowed"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, rung2Report, _, _, err := linux.NewBackend().Compile(test.policy)
+			if err != nil {
+				t.Fatalf("compile Rung 2: %v", err)
+			}
+			for _, legacy := range test.wantLegacy {
+				if !reportHas(rung2Report, legacy[0], legacy[1]) {
+					t.Errorf("Rung-2 report lost %s/%s: %+v", legacy[0], legacy[1], rung2Report.Entries)
+				}
+			}
+			entries := reportEntriesForFeature(rung2Report, "filesystem-axis-snapshot")
+			if len(test.wantDetail) == 0 {
+				if len(entries) != 0 {
+					t.Fatalf("plain writable root snapshot entries = %+v, want none", entries)
+				}
+				return
+			}
+			if len(entries) != 1 {
+				t.Fatalf("Rung-2 snapshot entries = %+v, want exactly one", entries)
+			}
+			if entries[0].Status != "narrowed" {
+				t.Fatalf("Rung-2 snapshot status = %q, want narrowed", entries[0].Status)
+			}
+			for _, phrase := range test.wantDetail {
+				if !strings.Contains(entries[0].Detail, phrase) {
+					t.Errorf("Rung-2 snapshot detail %q missing %q", entries[0].Detail, phrase)
+				}
+			}
+
+			_, rung1Report, _, _, err := linux.NewBackendRung1().Compile(test.policy)
+			if err != nil {
+				t.Fatalf("compile Rung 1: %v", err)
+			}
+			rung1Entries := reportEntriesForFeature(rung1Report, "filesystem-axis-snapshot")
+			if len(rung1Entries) != 1 || rung1Entries[0] != entries[0] {
+				t.Fatalf("snapshot disclosure drifted between rungs: Rung1=%+v Rung2=%+v", rung1Entries, entries)
+			}
+		})
 	}
 }
 
