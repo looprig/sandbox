@@ -75,6 +75,27 @@ func TestEnumerateFSRulesIgnoresDeepNonexistentDeny(t *testing.T) {
 	}
 }
 
+func TestEnumerateFSRulesKeepsNonENOENTDenyFailClosed(t *testing.T) {
+	root := t.TempDir()
+	notDirectory := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(notDirectory, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	denied := filepath.Join(notDirectory, "secret")
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: denied, Denied: AllAccess},
+	})
+
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, notDirectory); got != DenyAccess {
+		t.Fatalf("ENOTDIR deny failure granted covering leaf: access=%#x rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, denied); got != DenyAccess {
+		t.Fatalf("ENOTDIR deny failure granted denied subtree: access=%#x rules=%+v", got, rules)
+	}
+}
+
 func TestCompiledFSPreservesExactScope(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "target")
 	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
