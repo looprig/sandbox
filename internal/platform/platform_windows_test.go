@@ -24,6 +24,7 @@ func TestPlatformForwardsEveryWindowsMode(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Cleanup(func() { _ = test.runtime.Close() })
 			var got windows.Config
 			var gotRuntime *windows.RestrictedRuntime
 			calls := 0

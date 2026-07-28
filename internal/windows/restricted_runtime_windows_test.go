@@ -3,10 +3,97 @@
 package windows
 
 import (
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestDirectRestrictedRuntimeCloseOwnsOpenedJournal(t *testing.T) {
+	runtime := NewRestrictedRuntime(t.TempDir())
+	journal := &RestrictedJournal{}
+	runtime.state.open = func(string) (*RestrictedJournal, RestrictedSweepReport, error) {
+		return journal, RestrictedSweepReport{}, nil
+	}
+	if opened, err := runtime.restrictedJournal(); err != nil || opened != journal {
+		t.Fatalf("open direct runtime = (%p, %v), want journal", opened, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if !journal.closed {
+		t.Fatal("direct runtime did not close its journal")
+	}
+	if opened, err := runtime.restrictedJournal(); err == nil || opened != nil {
+		t.Fatalf("closed direct runtime reopened journal = (%p, %v)", opened, err)
+	}
+}
+
+func TestRestrictedRuntimeRegistryDoesNotHoldGlobalLockWhileClosing(t *testing.T) {
+	first, releaseFirst := AcquireRestrictedRuntime(filepath.Join(t.TempDir(), "first"))
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.state.open = func(string) (*RestrictedJournal, RestrictedSweepReport, error) {
+		return journal, RestrictedSweepReport{}, nil
+	}
+	if _, err := first.restrictedJournal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.beginOperation(); err != nil {
+		t.Fatal(err)
+	}
+	operationEnded := false
+	defer func() {
+		if !operationEnded {
+			journal.endOperation()
+		}
+		_ = journal.Close()
+	}()
+
+	releaseStarted := make(chan struct{})
+	releaseDone := make(chan struct{})
+	go func() {
+		close(releaseStarted)
+		releaseFirst()
+		close(releaseDone)
+	}()
+	<-releaseStarted
+	time.Sleep(25 * time.Millisecond)
+
+	type acquiredRuntime struct {
+		runtime *RestrictedRuntime
+		release func()
+	}
+	unrelatedRoot := filepath.Join(t.TempDir(), "unrelated")
+	acquired := make(chan acquiredRuntime, 1)
+	go func() {
+		runtime, release := AcquireRestrictedRuntime(unrelatedRoot)
+		acquired <- acquiredRuntime{runtime: runtime, release: release}
+	}()
+	select {
+	case result := <-acquired:
+		if result.runtime == nil {
+			t.Fatal("unrelated runtime acquisition returned nil")
+		}
+		result.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("unrelated runtime acquisition blocked behind another root's Close")
+	}
+
+	journal.endOperation()
+	operationEnded = true
+	select {
+	case <-releaseDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("last release did not finish after active operation ended")
+	}
+}
 
 func TestRestrictedRuntimeSharesSweepAcrossLiveSetsAndRecoversAfterLastRelease(t *testing.T) {
 	root := t.TempDir()

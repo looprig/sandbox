@@ -13,3 +13,5 @@ func newRestrictedRuntimeState() restrictedRuntimeState { return restrictedRunti
 func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
 	return NewRestrictedRuntime(scratchRoot), func() {}
 }
+
+func (*RestrictedRuntime) closeRestrictedJournal() error { return nil }

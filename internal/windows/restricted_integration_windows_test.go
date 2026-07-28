@@ -111,7 +111,13 @@ func TestRestrictedDisposableDirectAdversarialMatrix(t *testing.T) {
 		Isolation:          profile.Sandboxed,
 		RequiredGuarantees: profile.GuaranteeEnvScrub,
 	}
-	backend := newRestrictedBackend(Config{Mode: RestrictedToken}, NewRestrictedRuntime(stateRoot))
+	runtime := NewRestrictedRuntime(stateRoot)
+	t.Cleanup(func() {
+		if err := runtime.Close(); err != nil {
+			t.Errorf("close restricted runtime: %v", err)
+		}
+	})
+	backend := newRestrictedBackend(Config{Mode: RestrictedToken}, runtime)
 	spec, report, level, bits, err := backend.Compile(p)
 	if err != nil {
 		t.Fatalf("compile production restricted backend: %v", err)

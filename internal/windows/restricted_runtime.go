@@ -17,3 +17,13 @@ func NewRestrictedRuntime(scratchRoot string) *RestrictedRuntime {
 		state:       newRestrictedRuntimeState(),
 	}
 }
+
+// Close releases journal handles owned by a directly constructed runtime.
+// ExecutorSet callers normally use the idempotent release returned by
+// AcquireRestrictedRuntime instead.
+func (runtime *RestrictedRuntime) Close() error {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.closeRestrictedJournal()
+}
