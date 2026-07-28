@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"strconv"
 	"strings"
@@ -214,7 +215,7 @@ func TestLinuxNetDNSForcedOverTCP(t *testing.T) {
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws, fixtureWithNet(policy.NetPolicy{DNS: true})))
 
 	// The report must record DNS narrowed to TCP.
-	if !reportHas(e.Report(), "Dns", "narrowed") {
+	if !reportHas(e.Report(), "Dns", profile.StatusNarrowed) {
 		t.Errorf("CompileReport missing Dns/narrowed entry; report=%+v", e.Report())
 	}
 
@@ -252,7 +253,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 		if lvl := e.Level(); lvl != LevelDegraded {
 			t.Errorf("Level() = %d, want LevelDegraded (%d)", lvl, LevelDegraded)
 		}
-		if !reportHas(e.Report(), "network-boundary", "linux.Enforced") {
+		if !reportHas(e.Report(), "network-boundary", profile.StatusEnforced) {
 			t.Errorf("CompileReport missing network-boundary/linux.Enforced entry; report=%+v", e.Report())
 		}
 	})
@@ -266,7 +267,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 		if g.AddressNetwork {
 			t.Errorf("Guarantees().AddressNetwork = true, want false")
 		}
-		if !reportHas(e.Report(), "address-network", "unenforced") {
+		if !reportHas(e.Report(), "address-network", profile.StatusUnenforced) {
 			t.Errorf("CompileReport missing address-network/unenforced entry; report=%+v", e.Report())
 		}
 	})
@@ -278,7 +279,7 @@ func TestLinuxNetGuarantees(t *testing.T) {
 		if e.Guarantees().NetworkBoundary {
 			t.Errorf("Guarantees().NetworkBoundary = true for open egress, want false")
 		}
-		if !reportHas(e.Report(), "network", "unenforced") {
+		if !reportHas(e.Report(), "network", profile.StatusUnenforced) {
 			t.Errorf("CompileReport missing network/unenforced entry for open egress; report=%+v", e.Report())
 		}
 	})
@@ -397,16 +398,16 @@ func TestNetCompileReport(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			entries := linux.NetCompileReport(tt.in, linux.CompileNetPolicy(tt.in))
-			if has(entries, "network-boundary", "linux.Enforced") != tt.wantEnforced {
+			if has(entries, "network-boundary", profile.StatusEnforced) != tt.wantEnforced {
 				t.Errorf("network-boundary/linux.Enforced presence = %v, want %v; entries=%+v", !tt.wantEnforced, tt.wantEnforced, entries)
 			}
-			if has(entries, "network", "unenforced") != tt.wantOpen {
+			if has(entries, "network", profile.StatusUnenforced) != tt.wantOpen {
 				t.Errorf("network/unenforced presence = %v, want %v; entries=%+v", !tt.wantOpen, tt.wantOpen, entries)
 			}
-			if has(entries, "address-network", "unenforced") != tt.wantAddrUnenf {
+			if has(entries, "address-network", profile.StatusUnenforced) != tt.wantAddrUnenf {
 				t.Errorf("address-network/unenforced presence = %v, want %v; entries=%+v", !tt.wantAddrUnenf, tt.wantAddrUnenf, entries)
 			}
-			if has(entries, "Dns", "narrowed") != tt.wantDNS {
+			if has(entries, "Dns", profile.StatusNarrowed) != tt.wantDNS {
 				t.Errorf("Dns/narrowed presence = %v, want %v; entries=%+v", !tt.wantDNS, tt.wantDNS, entries)
 			}
 		})

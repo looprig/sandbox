@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"strings"
 	"syscall"
@@ -360,7 +361,7 @@ func TestLinuxSeccompReportEntry(t *testing.T) {
 	requireSeccomp(t)
 	ws := t.TempDir()
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
-	if !reportHas(e.Report(), "Seccomp-hardening", "linux.Enforced") {
+	if !reportHas(e.Report(), "Seccomp-hardening", profile.StatusEnforced) {
 		t.Errorf("CompileReport missing Seccomp-hardening/linux.Enforced entry; report=%+v", e.Report())
 	}
 }

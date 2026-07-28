@@ -7,6 +7,7 @@ import (
 	"context"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
+	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,13 +318,13 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 			}
 			// The report must record restricted-read and metadata-deny as enforced —
 			// the two rung-2 cannot claim.
-			if !reportHas(report, "restricted-read", "linux.Enforced") {
+			if !reportHas(report, "restricted-read", profile.StatusEnforced) {
 				t.Errorf("report missing linux.Enforced restricted-read: %+v", report.Entries)
 			}
-			if !reportHas(report, "metadata-deny", "linux.Enforced") {
+			if !reportHas(report, "metadata-deny", profile.StatusEnforced) {
 				t.Errorf("report missing linux.Enforced metadata-deny: %+v", report.Entries)
 			}
-			if !reportHas(report, "glob-deny", "linux.Enforced") {
+			if !reportHas(report, "glob-deny", profile.StatusEnforced) {
 				t.Errorf("report missing linux.Enforced glob-deny: %+v", report.Entries)
 			}
 		})
