@@ -320,14 +320,14 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 		if _, pinned := plan.grantBinds[path]; !pinned {
 			continue
 		}
-		protected := false
+		materialized := false
 		for _, bind := range spec.Binds {
-			if bind.ReadOnly && (bind.Target == path || policy.PathUnder(bind.Target, path)) {
-				protected = true
+			if bind.ReadOnly && bind.Target == path {
+				materialized = true
 				break
 			}
 		}
-		if !protected {
+		if !materialized {
 			absentProtected = append(absentProtected, absentProtectedPath{path: path, err: fs.ErrNotExist})
 		}
 	}

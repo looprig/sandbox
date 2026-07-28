@@ -942,7 +942,7 @@ func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T)
 	}
 }
 
-func TestLinuxRung1PinnedWritableGrantRejectsAbsentProtectedDescendant(t *testing.T) {
+func TestLinuxRung1PinnedWritableGrantRejectsAbsentCarveoutDespiteROAncestor(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
 	if err := os.Mkdir(target, 0o700); err != nil {
@@ -959,8 +959,9 @@ func TestLinuxRung1PinnedWritableGrantRejectsAbsentProtectedDescendant(t *testin
 	handle.SetAccess(policy.AllAccess)
 	defer handle.Close()
 
-	absent := filepath.Join(target, "absent-protected")
+	absent := filepath.Join(target, ".git")
 	pol := policy.Effective{FS: []policy.FSEntry{
+		{Path: "/", Access: policy.ReadAccess | policy.ExecAccess},
 		{Path: target, Access: policy.AllAccess, Canonical: true},
 		{Path: absent, Access: policy.ReadAccess},
 	}}
