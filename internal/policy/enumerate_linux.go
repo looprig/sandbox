@@ -22,17 +22,21 @@ type PinnedPathResolution struct {
 }
 
 type PinnedPathResolver struct {
-	handles []*PathHandle
-	firstFD int
-	files   []*os.File
-	paths   map[string]PinnedPathResolution
+	handles    []*PathHandle
+	firstFD    int
+	files      []*os.File
+	paths      map[string]PinnedPathResolution
+	direct     map[string]PinnedPathResolution
+	openDirect func(string) (*os.File, error)
 }
 
 func NewPinnedPathResolver(handles []*PathHandle, firstFD int) *PinnedPathResolver {
 	return &PinnedPathResolver{
-		handles: handles,
-		firstFD: firstFD,
-		paths:   make(map[string]PinnedPathResolution),
+		handles:    handles,
+		firstFD:    firstFD,
+		paths:      make(map[string]PinnedPathResolution),
+		direct:     make(map[string]PinnedPathResolution),
+		openDirect: openDirectRuleFile,
 	}
 }
 
@@ -136,6 +140,76 @@ func (resolver *PinnedPathResolver) addFile(file *os.File) int {
 	return childFD
 }
 
+func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo) (FSRule, bool, error) {
+	if info.IsDir() {
+		return FSRule{Path: target, Access: access, IsDir: true}, true, nil
+	}
+	if !info.Mode().IsRegular() {
+		return FSRule{}, false, nil
+	}
+	if cached, ok := resolver.direct[target]; ok {
+		checked, err := cached.File.Stat()
+		if err != nil {
+			return FSRule{}, false, fmt.Errorf("%w: stat retained Landlock file %q: %v", ErrUnsupportedClass, target, err)
+		}
+		if !os.SameFile(info, checked) {
+			return FSRule{}, false, fmt.Errorf("%w: Landlock file %q changed while its rule was compiled", ErrTargetChanged, target)
+		}
+		if !directRegularFileRuleSafe(checked) {
+			return FSRule{}, false, nil
+		}
+		return FSRule{
+			Target: target, ParentFD: cached.ChildFD,
+			Access: access, IsDir: false,
+		}, true, nil
+	}
+	file, err := resolver.openDirect(target)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
+		return FSRule{}, false, nil
+	}
+	if err != nil {
+		return FSRule{}, false, fmt.Errorf("%w: retain Landlock file %q: %v", ErrUnsupportedClass, target, err)
+	}
+	checked, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return FSRule{}, false, fmt.Errorf("%w: stat retained Landlock file %q: %v", ErrUnsupportedClass, target, err)
+	}
+	if !os.SameFile(info, checked) {
+		_ = file.Close()
+		return FSRule{}, false, fmt.Errorf("%w: Landlock file %q changed while its rule was compiled", ErrTargetChanged, target)
+	}
+	if !checked.Mode().IsRegular() || !directRegularFileRuleSafe(checked) {
+		_ = file.Close()
+		return FSRule{}, false, nil
+	}
+	resolved := PinnedPathResolution{
+		File: file, ChildFD: resolver.addFile(file),
+	}
+	resolver.direct[target] = resolved
+	return FSRule{
+		Target: target, ParentFD: resolved.ChildFD,
+		Access: access, IsDir: false,
+	}, true, nil
+}
+
+func openDirectRuleFile(target string) (*os.File, error) {
+	fd, err := unix.Openat2(unix.AT_FDCWD, target, &unix.OpenHow{
+		Flags: uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC),
+		Resolve: uint64(unix.RESOLVE_NO_SYMLINKS |
+			unix.RESOLVE_NO_MAGICLINKS),
+	})
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), "sandbox-landlock-direct-file")
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, ErrUnsupportedClass
+	}
+	return file, nil
+}
+
 func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes []fsExclude, addFile func(*os.File) int, resolver *PinnedPathResolver) ([]FSRule, error) {
 	var rules []FSRule
 	var walk func(int, string, []fsExclude) error
@@ -223,7 +297,7 @@ func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes
 				continue
 			}
 			if len(deeper) == 0 {
-				if !directRegularFileRuleSafe(info) {
+				if !info.IsDir() && (!info.Mode().IsRegular() || !directRegularFileRuleSafe(info)) {
 					if owned {
 						_ = child.Close()
 					}

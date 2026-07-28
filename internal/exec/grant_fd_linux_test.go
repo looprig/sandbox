@@ -350,8 +350,13 @@ func TestLinuxSameTargetMatchingIdentityCoalescesMergedAxes(t *testing.T) {
 				if backend.handles[0].Target() != target || backend.handles[0].Access() != policy.AllAccess {
 					t.Fatalf("coalesced handle = target %q access %#x, want %q all axes", backend.handles[0].Target(), backend.handles[0].Access(), target)
 				}
-				if got, want := backend.spec.GrantFDs, []int{policy.FirstPathHandleChildFD}; !slices.Equal(got, want) {
-					t.Fatalf("GrantFDs = %v, want canonical collision-free %v", got, want)
+				if len(backend.spec.GrantFDs) == 0 || backend.spec.GrantFDs[0] != policy.FirstPathHandleChildFD {
+					t.Fatalf("GrantFDs = %v, want coalesced grant handle first at fd %d", backend.spec.GrantFDs, policy.FirstPathHandleChildFD)
+				}
+				for index, fd := range backend.spec.GrantFDs {
+					if want := policy.FirstPathHandleChildFD + index; fd != want {
+						t.Fatalf("GrantFDs = %v, want unique contiguous transport; index %d fd=%d want=%d", backend.spec.GrantFDs, index, fd, want)
+					}
 				}
 				for _, rule := range backend.spec.FSRules {
 					if rule.Target == target && (rule.ParentFD == 0 || rule.ParentFD != policy.FirstPathHandleChildFD) {
@@ -1067,6 +1072,66 @@ func TestLinuxPinnedDescendantFDTransportAndCleanup(t *testing.T) {
 	cleanup()
 	if _, err := unix.FcntlInt(uintptr(actualDescendantFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("descendant transport fd %d remains open after cleanup: %v", actualDescendantFD, err)
+	}
+}
+
+func TestLinuxDirectFileFDTransportSurvivesSwapAndCleansUp(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	moved := filepath.Join(root, "moved")
+	if err := os.WriteFile(target, []byte("checked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pol := policy.Effective{FS: []policy.FSEntry{{
+		Path: target, Access: policy.ReadAccess, Exact: true, Canonical: true,
+	}}}
+	spec, cmd, cleanup := compilePinnedGrantSpec(t, linux.RungTwo, root, pol, nil)
+
+	var direct *policy.FSRule
+	for index := range spec.FSRules {
+		rule := &spec.FSRules[index]
+		if rule.Target == target {
+			direct = rule
+			break
+		}
+	}
+	if direct == nil {
+		cleanup()
+		t.Fatalf("FSRules = %+v, want descriptor-backed direct file", spec.FSRules)
+	}
+	if direct.Path != "" || direct.ParentFD <= linux.Stage2SpecFD ||
+		!slices.Contains(spec.GrantFDs, direct.ParentFD) {
+		cleanup()
+		t.Fatalf("direct rule = %+v GrantFDs=%v, want transported descriptor", *direct, spec.GrantFDs)
+	}
+	extraIndex := direct.ParentFD - linux.Stage2SpecFD
+	if extraIndex < 0 || extraIndex >= len(cmd.ExtraFiles) {
+		cleanup()
+		t.Fatalf("direct fd %d has no ExtraFiles entry in %d files", direct.ParentFD, len(cmd.ExtraFiles))
+	}
+	actualFD := int(cmd.ExtraFiles[extraIndex].Fd())
+
+	if err := os.Rename(target, moved); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("replacement"), 0o600); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile("/proc/self/fd/" + strconv.Itoa(actualFD))
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if string(contents) != "checked" {
+		cleanup()
+		t.Fatalf("transported descriptor contains %q, want checked inode", contents)
+	}
+
+	cleanup()
+	if _, err := unix.FcntlInt(uintptr(actualFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("direct transport fd %d remains open after cleanup: %v", actualFD, err)
 	}
 }
 

@@ -102,7 +102,7 @@ func addLandlockFSRule(ruleset int, rule policy.FSRule) error {
 	parentFD := rule.ParentFD
 	owned := false
 	if parentFD == 0 {
-		fd, err := unix.Open(rule.Path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		fd, err := openLandlockRulePath(rule.Path, rule.IsDir)
 		if errors.Is(err, unix.ENOENT) {
 			return nil
 		}
@@ -115,9 +115,51 @@ func addLandlockFSRule(ruleset int, rule policy.FSRule) error {
 	if owned {
 		defer unix.Close(parentFD)
 	}
+	retained := rule.ParentFD != 0
+	if retained {
+		if err := validateRetainedLandlockFD(parentFD, rule.IsDir); err != nil {
+			return fmt.Errorf("stat retained Landlock target=%q fd=%d: %w", rule.Target, rule.ParentFD, err)
+		}
+	}
 	attr := llsys.PathBeneathAttr{ParentFd: parentFD, AllowedAccess: access}
 	if err := llsys.LandlockAddPathBeneathRule(ruleset, &attr, 0); err != nil {
 		return fmt.Errorf("add Landlock rule path=%q fd=%d: %w", rule.Path, rule.ParentFD, err)
+	}
+	if retained {
+		if err := validateRetainedLandlockFD(parentFD, rule.IsDir); err != nil {
+			return fmt.Errorf("restat retained Landlock target=%q fd=%d: %w", rule.Target, rule.ParentFD, err)
+		}
+	}
+	return nil
+}
+
+func openLandlockRulePath(path string, isDir bool) (int, error) {
+	flags := unix.O_PATH | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	if isDir {
+		flags |= unix.O_DIRECTORY
+	}
+	return unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{
+		Flags:   uint64(flags),
+		Resolve: uint64(unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS),
+	})
+}
+
+func validateRetainedLandlockFD(fd int, isDir bool) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if isDir {
+		if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+			return fmt.Errorf("descriptor names a non-directory (mode=%#o)", stat.Mode&unix.S_IFMT)
+		}
+		return nil
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("descriptor names a non-regular file (mode=%#o)", stat.Mode&unix.S_IFMT)
+	}
+	if stat.Nlink != 1 {
+		return fmt.Errorf("descriptor names a multiply-linked file (nlink=%d)", stat.Nlink)
 	}
 	return nil
 }

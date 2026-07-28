@@ -38,6 +38,9 @@ func ValidateLandlockExactPaths(entries []FSEntry, handles []*PathHandle) error 
 		if info.Mode()&fs.ModeSymlink != 0 {
 			return fmt.Errorf("%w: Landlock exact path %q is a symlink", ErrUnsupportedClass, entry.Path)
 		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: Landlock exact path %q is not a regular file", ErrUnsupportedClass, entry.Path)
+		}
 		if !directRegularFileRuleSafe(info) {
 			return fmt.Errorf("%w: Landlock exact path %q has multiple hard links", ErrUnsupportedClass, entry.Path)
 		}
@@ -225,17 +228,29 @@ type FSRule struct {
 	IsDir          bool
 }
 
-// EnumerateFSRules compiles the rule set for a policy carrying no grant path
-// handles, closing the descriptors the enumeration opened.
+// EnumerateFSRules compiles only path-backed directory rules for callers that
+// cannot retain descriptors. Direct regular-file rules require
+// EnumerateFSRulesWithPathHandles so their checked inode remains bound until
+// stage 2. Other direct filesystem node classes are omitted fail-narrow.
 func EnumerateFSRules(compiled CompiledFS) []FSRule {
 	rules, files, _ := EnumerateFSRulesWithPathHandles(compiled, nil)
 	CloseRuleFiles(files)
-	return rules
+	kept := rules[:0]
+	for _, rule := range rules {
+		if rule.ParentFD == 0 {
+			kept = append(kept, rule)
+		}
+	}
+	return kept
 }
 
 func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle) ([]FSRule, []*os.File, error) {
-	accumulator := ruleAcc{seen: make(map[string]FSRule)}
 	resolver := NewPinnedPathResolver(handles, FirstPathHandleChildFD+len(handles))
+	return enumerateFSRulesWithResolver(compiled, handles, resolver)
+}
+
+func enumerateFSRulesWithResolver(compiled CompiledFS, handles []*PathHandle, resolver *PinnedPathResolver) ([]FSRule, []*os.File, error) {
+	accumulator := ruleAcc{seen: make(map[string]FSRule)}
 	for _, allow := range compiled.Allows {
 		for _, bit := range []FSAccess{ReadAccess, ExecAccess, WriteAccess} {
 			if allow.Access&bit == 0 || deniedAtSamePath(allow, bit, compiled.Denies) ||
@@ -284,13 +299,32 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 			}
 			if len(excludes) == 0 {
 				info, err := os.Lstat(allow.Path)
-				if err == nil && info.Mode()&fs.ModeSymlink == 0 &&
-					directRegularFileRuleSafe(info) {
-					accumulator.add(FSRule{Path: allow.Path, Access: bit, IsDir: info.IsDir()})
+				if err == nil && info.Mode()&fs.ModeSymlink == 0 {
+					rule, ok, err := resolver.directRule(allow.Path, bit, info)
+					if err != nil {
+						CloseRuleFiles(resolver.files)
+						return nil, nil, err
+					}
+					if ok {
+						accumulator.add(rule)
+					}
 				}
 				continue
 			}
-			carveGrant(allow.Path, bit, excludes, accumulator.add)
+			err = carveGrant(allow.Path, bit, excludes, func(path string, access FSAccess, info os.FileInfo) error {
+				rule, ok, err := resolver.directRule(path, access, info)
+				if err != nil {
+					return err
+				}
+				if ok {
+					accumulator.add(rule)
+				}
+				return nil
+			})
+			if err != nil {
+				CloseRuleFiles(resolver.files)
+				return nil, nil, err
+			}
 		}
 	}
 	return accumulator.sorted(), resolver.files, nil
@@ -350,10 +384,10 @@ func excludesForAllowAxis(allow FSAllow, bit FSAccess, allows []FSAllow, denies 
 	return excludes
 }
 
-func carveGrant(dir string, access FSAccess, excludes []fsExclude, emit func(FSRule)) {
+func carveGrant(dir string, access FSAccess, excludes []fsExclude, emit func(string, FSAccess, os.FileInfo) error) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return nil
 	}
 	for _, entry := range entries {
 		child := filepath.Join(dir, entry.Name())
@@ -368,21 +402,25 @@ func carveGrant(dir string, access FSAccess, excludes []fsExclude, emit func(FSR
 		nested := excludesUnder(excludes, child)
 		if denyExact {
 			if info.IsDir() {
-				carveGrant(child, access, nested, emit)
+				if err := carveGrant(child, access, nested, emit); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 		if len(nested) == 0 {
-			if !directRegularFileRuleSafe(info) {
-				continue
+			if err := emit(child, access, info); err != nil {
+				return err
 			}
-			emit(FSRule{Path: child, Access: access, IsDir: info.IsDir()})
 			continue
 		}
 		if info.IsDir() {
-			carveGrant(child, access, nested, emit)
+			if err := carveGrant(child, access, nested, emit); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func exclusionAt(excludes []fsExclude, path string) (recursive, exact bool) {

@@ -157,7 +157,7 @@ func TestEnumerateFSRulesWithholdsWriteTopologyAroundReadDeny(t *testing.T) {
 		{Path: root, Access: AllAccess},
 		{Path: denied, Denied: ReadAccess, Exact: true},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, root); got&WriteAccess != 0 {
 		t.Fatalf("covering root retained topology write access: %#x; rules=%+v", got, rules)
 	}
@@ -183,7 +183,7 @@ func TestEnumerateFSRulesWithholdsSplitAxisWriteTopology(t *testing.T) {
 		{Path: readable, Access: ReadAccess, Exact: true},
 		{Path: denied, Denied: ReadAccess, Exact: true},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, root); got&WriteAccess != 0 {
 		t.Fatalf("split-axis covering root retained topology write: %#x; rules=%+v", got, rules)
 	}
@@ -211,7 +211,7 @@ func TestEnumerateFSRulesDerivesWriteDenyAcrossRecursiveReadDeny(t *testing.T) {
 		{Path: denied, Denied: ReadAccess | ExecAccess},
 		{Path: restored, Access: ReadAccess | ExecAccess, Exact: true},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, restored); got != ReadAccess|ExecAccess {
 		t.Fatalf("restored exact source access = %#x, want read+execute without write; rules=%+v", got, rules)
 	}
@@ -240,7 +240,7 @@ func TestEnumerateFSRulesSuppressesNestedWriteAllowUnderRecursiveReadDeny(t *tes
 		{Path: writable, Access: WriteAccess},
 		{Path: restored, Access: ReadAccess | ExecAccess, Exact: true},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, writable); got&WriteAccess != 0 {
 		t.Fatalf("nested recursive write allow survived ancestor read deny: %#x; rules=%+v", got, rules)
 	}
@@ -263,14 +263,14 @@ func TestEnumerateFSRulesOmitsDirectHardlinkedFiles(t *testing.T) {
 		{Path: root, Access: AllAccess},
 		{Path: secret, Denied: ReadAccess | ExecAccess},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	for _, path := range []string{public, secret} {
 		if got := resolveEnumeratedRules(rules, path); got != DenyAccess {
 			t.Fatalf("hardlinked path %q access = %#x, want fail-narrow deny; rules=%+v", path, got, rules)
 		}
 	}
 
-	exact := EnumerateFSRules(CompileFS([]FSEntry{{
+	exact := enumerateFSRulesForTest(t, CompileFS([]FSEntry{{
 		Path: public, Access: ReadAccess, Exact: true,
 	}}))
 	if got := resolveEnumeratedRules(exact, public); got != DenyAccess {
@@ -292,7 +292,7 @@ func TestEnumerateFSRulesPreservesDescendantsOfEqualPathExactDeny(t *testing.T) 
 		{Path: root, Access: AllAccess},
 		{Path: root, Denied: AllAccess, Exact: true},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, root); got != DenyAccess {
 		t.Fatalf("exactly denied root access = %#x, want deny; rules=%+v", got, rules)
 	}
@@ -319,7 +319,7 @@ func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 		{Path: root, Access: AllAccess},
 		{Path: workspace, Access: WriteAccess, Denied: ReadAccess | ExecAccess},
 	})
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, filepath.Join(workspace, "file")); got != DenyAccess {
 		t.Fatalf("recursively read/execute-denied workspace access = %#x, want derived write deny", got)
 	}
@@ -340,7 +340,7 @@ func TestEnumerateFSRulesKeepsDeepNonexistentDenyFailNarrow(t *testing.T) {
 		{Path: denied, Denied: AllAccess},
 	})
 
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, filepath.Join(sibling, "future")); got != AllAccess {
 		t.Fatalf("unaffected pre-existing sibling access = %#x, want full access; rules=%+v", got, rules)
 	}
@@ -364,7 +364,7 @@ func TestEnumerateFSRulesKeepsNonENOENTDenyFailClosed(t *testing.T) {
 		{Path: denied, Denied: AllAccess},
 	})
 
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, notDirectory); got != DenyAccess {
 		t.Fatalf("ENOTDIR deny failure granted covering leaf: access=%#x rules=%+v", got, rules)
 	}
@@ -385,7 +385,7 @@ func TestCompiledFSPreservesExactScope(t *testing.T) {
 	if got := compiled.Resolve(filepath.Join(target, "child")); got != DenyAccess {
 		t.Fatalf("exact target widened recursively after compilation: %#x", got)
 	}
-	rules := EnumerateFSRules(compiled)
+	rules := enumerateFSRulesForTest(t, compiled)
 	if got := resolveEnumeratedRules(rules, target); got != WriteAccess {
 		t.Fatalf("exact target enumerated access = %#x, want write", got)
 	}
@@ -431,9 +431,23 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 func resolveEnumeratedRules(rules []FSRule, path string) FSAccess {
 	var access FSAccess
 	for _, rule := range rules {
-		if rule.Path == path || rule.IsDir && profile.PathWithin(path, rule.Path) {
+		rulePath := rule.Path
+		if rule.Target != "" {
+			rulePath = rule.Target
+		}
+		if rulePath == path || rule.IsDir && profile.PathWithin(path, rulePath) {
 			access |= rule.Access
 		}
 	}
 	return access
+}
+
+func enumerateFSRulesForTest(t *testing.T, compiled CompiledFS) []FSRule {
+	t.Helper()
+	rules, files, err := EnumerateFSRulesWithPathHandles(compiled, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { CloseRuleFiles(files) })
+	return rules
 }

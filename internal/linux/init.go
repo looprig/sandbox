@@ -204,6 +204,9 @@ func stage2Setup() error {
 	if len(spec.Argv) == 0 {
 		return &Stage2Error{Op: "spec argv", Err: errEmptyStage2Argv}
 	}
+	if err := validateStage2GrantFDs(spec); err != nil {
+		return &Stage2Error{Op: "grant fd", Err: err}
+	}
 
 	// Apply confinement HERE, before chdir/execve, from the confinement fields on
 	// the sealed spec. Each step fails CLOSED via a Stage2Error so a confinement
@@ -292,6 +295,32 @@ func stage2Setup() error {
 		return &Stage2Error{Op: "exec " + spec.Argv[0], Err: err}
 	}
 	return nil // unreachable: a successful syscall.Exec replaces this process
+}
+
+func validateStage2GrantFDs(spec Stage2Spec) error {
+	transported := make(map[int]struct{}, len(spec.GrantFDs))
+	for index, fd := range spec.GrantFDs {
+		want := Stage2SpecFD + 1 + index
+		if fd != want {
+			return fmt.Errorf("descriptor list is not unique and contiguous: index=%d fd=%d want=%d: %w", index, fd, want, syscall.EBADF)
+		}
+		transported[fd] = struct{}{}
+	}
+	for _, rule := range spec.FSRules {
+		if rule.ParentFD == 0 {
+			if rule.Path == "" {
+				return fmt.Errorf("path-backed rule has no path: %w", syscall.EINVAL)
+			}
+			continue
+		}
+		if rule.Path != "" || rule.Target == "" {
+			return fmt.Errorf("descriptor-backed rule has invalid path metadata: fd=%d: %w", rule.ParentFD, syscall.EINVAL)
+		}
+		if _, ok := transported[rule.ParentFD]; !ok {
+			return fmt.Errorf("rule references untransported descriptor %d: %w", rule.ParentFD, syscall.EBADF)
+		}
+	}
+	return nil
 }
 
 // errNoPathInEnv is the leaf error when a bare argv[0] must be PATH-resolved but

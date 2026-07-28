@@ -136,12 +136,13 @@ func TestWorkspaceFixtureKeepsPreexistingChildrenWritableAndFutureDeniesClosed(t
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(tmpWork) })
 	compiled := policy.CompileFS(backendFixturePolicy(fixtureWorkspaceWrite, ws).FS)
-	rules := policy.EnumerateFSRules(compiled)
+	rules := enumeratePolicyFSRules(t, compiled)
 
 	access := func(path string) policy.FSAccess {
 		var got policy.FSAccess
 		for _, rule := range rules {
-			if rule.Path == path || rule.IsDir && policy.PathUnder(rule.Path, path) {
+			target := fsRuleTarget(rule)
+			if target == path || rule.IsDir && policy.PathUnder(target, path) {
 				got |= rule.Access
 			}
 		}
@@ -604,6 +605,23 @@ func reportHas(r CompileReport, feature, status string) bool {
 	return false
 }
 
+func enumeratePolicyFSRules(t *testing.T, compiled policy.CompiledFS) []policy.FSRule {
+	t.Helper()
+	rules, files, err := policy.EnumerateFSRulesWithPathHandles(compiled, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { policy.CloseRuleFiles(files) })
+	return rules
+}
+
+func fsRuleTarget(rule policy.FSRule) string {
+	if rule.Target != "" {
+		return rule.Target
+	}
+	return rule.Path
+}
+
 // --- Pure enumeration unit tests (no Landlock; fast) ------------------------
 // These directly exercise the security-critical carve logic — an off-by-one here
 // that grants a deny's parent is a secret-leak fail-open, so it is tested in
@@ -655,7 +673,7 @@ func TestEnumerateFSRules(t *testing.T) {
 
 	access := func(rules []policy.FSRule, path string) (policy.FSAccess, bool) {
 		for _, r := range rules {
-			if r.Path == path {
+			if fsRuleTarget(r) == path {
 				return r.Access, true
 			}
 		}
@@ -664,7 +682,7 @@ func TestEnumerateFSRules(t *testing.T) {
 
 	t.Run("no excludes grants the root whole", func(t *testing.T) {
 		cfs := policy.CompiledFS{Allows: []policy.FSAllow{{Path: root, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}}}
-		rules := policy.EnumerateFSRules(cfs)
+		rules := enumeratePolicyFSRules(t, cfs)
 		if acc, ok := access(rules, root); !ok || acc&policy.WriteAccess == 0 {
 			t.Errorf("root should be granted RW whole when nothing is carved; rules=%+v", rules)
 		}
@@ -676,7 +694,7 @@ func TestEnumerateFSRules(t *testing.T) {
 			Allows: []policy.FSAllow{{Path: root, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}},
 			Denies: []policy.FSDeny{{Path: secret, Access: policy.AllAccess}},
 		}
-		rules := policy.EnumerateFSRules(cfs)
+		rules := enumeratePolicyFSRules(t, cfs)
 		if _, ok := access(rules, secret); ok {
 			t.Errorf("FAIL-OPEN: denied path %q was granted; rules=%+v", secret, rules)
 		}
@@ -697,7 +715,7 @@ func TestEnumerateFSRules(t *testing.T) {
 			{Path: root, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess},
 			{Path: gitDir, Access: policy.ReadAccess},
 		}, Denies: []policy.FSDeny{{Path: gitDir, Access: policy.WriteAccess}}}
-		rules := policy.EnumerateFSRules(cfs)
+		rules := enumeratePolicyFSRules(t, cfs)
 		// .git present as a read-only rule (from its own allow), never writable.
 		if acc, ok := access(rules, gitDir); !ok {
 			t.Errorf(".git should be granted read-only; rules=%+v", rules)
@@ -723,7 +741,7 @@ func TestEnumerateFSRules(t *testing.T) {
 			Allows: []policy.FSAllow{{Path: root, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}},
 			Denies: []policy.FSDeny{{Path: denied, Access: policy.AllAccess}},
 		}
-		rules := policy.EnumerateFSRules(cfs)
+		rules := enumeratePolicyFSRules(t, cfs)
 		if _, ok := access(rules, root); ok {
 			t.Errorf("covering root must stay ungranted while nested deny is absent; rules=%+v", rules)
 		}
@@ -774,10 +792,11 @@ func TestEnumerateUsesLongestSpecificAxisRule(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rules := policy.EnumerateFSRules(tt.cfs)
+			rules := enumeratePolicyFSRules(t, tt.cfs)
 			allowed := false
 			for _, r := range rules {
-				allowed = allowed || r.Path == tt.target || r.IsDir && policy.PathUnder(r.Path, tt.target)
+				target := fsRuleTarget(r)
+				allowed = allowed || target == tt.target || r.IsDir && policy.PathUnder(target, tt.target)
 			}
 			if allowed != tt.wantAllowed {
 				t.Errorf("enumerated target %q allowed=%v, want %v; rules=%+v", tt.target, allowed, tt.wantAllowed, rules)

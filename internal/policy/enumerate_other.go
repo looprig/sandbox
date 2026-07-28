@@ -31,6 +31,13 @@ func (*PinnedPathResolver) ResolveAny(string) (PinnedPathResolution, bool, error
 
 func (*PinnedPathResolver) addFile(*os.File) int { return 0 }
 
+func (*PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo) (FSRule, bool, error) {
+	if !info.IsDir() && (!info.Mode().IsRegular() || !directRegularFileRuleSafe(info)) {
+		return FSRule{}, false, nil
+	}
+	return FSRule{Path: target, Access: access, IsDir: info.IsDir()}, true, nil
+}
+
 func enumeratePinnedTree(*os.File, string, FSAccess, []fsExclude, func(*os.File) int, *PinnedPathResolver) ([]FSRule, error) {
 	return nil, ErrUnsupportedClass
 }
