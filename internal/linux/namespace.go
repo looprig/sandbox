@@ -86,9 +86,9 @@ type MountViewPlan struct {
 	// are ordinary ROBinds; nesting is resolved by applying binds parents-first so
 	// the ro carveout re-masks the rw root it sits under.
 	ROBinds []string
-	// DenyMasks are the literal (non-glob) fixed-path secret denies — each masked
-	// by an empty read-only bind so a deny beats any covering allow (deny-inside-
-	// allow via mount, §7.5). Applied AFTER all binds so the mask always wins.
+	// DenyMasks are literal (non-glob) fixed-path denies that have no
+	// higher-precedence restoration and can therefore use a coarse empty
+	// read-only mask. Restored literal precedence composes through Landlock.
 	DenyMasks []string
 	// GlobDenies are the glob deny patterns (e.g. **/.env*), Enforced by spawn-time
 	// bounded enumeration (ScanGlobDenies) into empty read-only masks.
@@ -103,6 +103,7 @@ type MountViewPlan struct {
 	// be masked directly; an exact directory cannot, because overmounting the
 	// directory would also hide descendants that the policy may retain.
 	exactDenyMasks map[string]bool
+	hasLiteralDeny bool
 }
 
 type grantMountSource struct {
@@ -110,10 +111,10 @@ type grantMountSource struct {
 	isDir bool
 }
 
-// hasDenies reports whether the plan carries any read-deny (fixed or glob) the
-// mount masks enforce — the condition for the ReadBoundary guarantee at Rung 1.
+// hasDenies reports whether the plan carries any fixed or glob read-deny,
+// including restored literal precedence enforced by composed Landlock rules.
 func (p MountViewPlan) hasDenies() bool {
-	return len(p.DenyMasks) > 0 || len(p.GlobDenies) > 0
+	return p.hasLiteralDeny || len(p.GlobDenies) > 0
 }
 
 // rung1Plan is the compiled Rung-1 confinement beyond the shared Landlock/Seccomp
@@ -138,12 +139,16 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 	var plan MountViewPlan
 	plan.grantBinds = make(map[string]grantMountSource)
 	plan.exactDenyMasks = make(map[string]bool)
-	var literalDenies []policy.FSEntry
+	type literalDeny struct {
+		path      string
+		exactOnly bool
+	}
+	var literalDenies []literalDeny
+	denyIndex := make(map[string]int)
 
-	// First pass: collect every full-path deny. Literal denies dominate allows at
-	// the same path and below it, and remain in the plan even when no current
-	// writable root covers them. Partial-axis denies are Enforced by Landlock,
-	// which composes on top of this view.
+	// First pass: aggregate full-path denies by path. Duplicate exact + recursive
+	// denies have recursive scope; only an all-exact group retains exact scope.
+	// Partial-axis denies are Enforced by Landlock, which composes on top.
 	for _, e := range p.FS {
 		if policy.NormalizedDenied(e) != policy.AllAccess || e.Access != 0 {
 			continue
@@ -152,18 +157,21 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 			plan.GlobDenies = append(plan.GlobDenies, e.Path)
 			continue
 		}
-		e.Path = filepath.Clean(e.Path)
-		literalDenies = append(literalDenies, e)
-		plan.DenyMasks = appendUniquePath(plan.DenyMasks, e.Path)
-		if e.Exact {
-			plan.exactDenyMasks[e.Path] = true
+		path := filepath.Clean(e.Path)
+		plan.hasLiteralDeny = true
+		if index, ok := denyIndex[path]; ok {
+			literalDenies[index].exactOnly = literalDenies[index].exactOnly && e.Exact
+			continue
 		}
+		denyIndex[path] = len(literalDenies)
+		literalDenies = append(literalDenies, literalDeny{path: path, exactOnly: e.Exact})
 	}
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
-	// seen order, so a path granted read then write is bound rw exactly once.
-	// Apply literal-deny dominance first so an allow at or below a denied tree is
-	// never reintroduced as either an rw or ro bind.
+	// seen order, so a path granted read then write is bound rw exactly once. A
+	// deny removes bits only at the same path AND scope shape: a strict descendant
+	// allow is more specific, and an exact allow outranks a recursive deny at the
+	// same spelling. Glob denies remain hard overrides enforced by masks/Landlock.
 	merged := make(map[string]policy.FSAccess)
 	var order []string
 	for _, e := range p.FS {
@@ -171,22 +179,24 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 			continue
 		}
 		clean := filepath.Clean(e.Path)
-		denied := false
-		for _, deny := range literalDenies {
-			if policy.LiteralMatches(deny.Path, clean, deny.Exact) {
-				denied = true
-				break
-			}
-		}
-		if denied {
+		access := survivingAllowAccess(p.FS, e)
+		if access == 0 {
 			continue
 		}
 		if _, ok := merged[clean]; !ok {
 			order = append(order, clean)
 		}
-		merged[clean] |= e.Access
+		merged[clean] |= access
 		if index := policy.MatchingPathHandleAncestor(handles, clean, e.Exact); index >= 0 {
 			plan.grantBinds[clean] = grantMountSource{index: index, isDir: handles[index].IsDir()}
+		}
+	}
+	for _, deny := range literalDenies {
+		if !denyHasRestoration(p.FS, deny.path, deny.exactOnly) {
+			plan.DenyMasks = append(plan.DenyMasks, deny.path)
+			if deny.exactOnly {
+				plan.exactDenyMasks[deny.path] = true
+			}
 		}
 	}
 	for _, path := range order {
@@ -207,6 +217,34 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 	}
 	plan.scanRoots = roots
 	return plan
+}
+
+func survivingAllowAccess(entries []policy.FSEntry, allow policy.FSEntry) policy.FSAccess {
+	access := allow.Access
+	path := filepath.Clean(allow.Path)
+	for _, entry := range entries {
+		if filepath.Clean(entry.Path) == path && entry.Exact == allow.Exact {
+			access &^= policy.NormalizedDenied(entry)
+		}
+	}
+	return access
+}
+
+func denyHasRestoration(entries []policy.FSEntry, denyPath string, exactOnly bool) bool {
+	if exactOnly {
+		return false
+	}
+	for _, allow := range entries {
+		if allow.Access == 0 || strings.ContainsAny(allow.Path, policy.GlobMeta) {
+			continue
+		}
+		allowPath := filepath.Clean(allow.Path)
+		higherPrecedence := policy.PathUnder(denyPath, allowPath) || allowPath == denyPath && allow.Exact
+		if higherPrecedence && survivingAllowAccess(entries, allow) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // appendUniquePath appends p to list if not already present (both cleaned).
@@ -337,6 +375,9 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 	slices.SortFunc(spec.Binds, func(a, b BindSpec) int { return strings.Compare(a.Target, b.Target) })
 
 	for _, d := range plan.DenyMasks {
+		if plan.exactDenyMasks[d] && !mountPathVisible(spec.Binds, d) {
+			continue
+		}
 		if policy.MatchingPathHandleIdentityAncestor(handles, d) >= 0 {
 			resolved, ok, err := resolver.ResolveAny(d)
 			if err != nil {
@@ -381,6 +422,15 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 	spec.Masks = append(spec.Masks, scanGlobDeniesWithGrantPaths(plan.scanRoots, plan.GlobDenies, GlobScanMaxDepth, handles, resolver)...)
 	slices.SortFunc(spec.Masks, func(a, b MaskSpec) int { return strings.Compare(a.Target, b.Target) })
 	return spec, nil
+}
+
+func mountPathVisible(binds []BindSpec, path string) bool {
+	for _, bind := range binds {
+		if bind.Target == path || policy.PathUnder(bind.Target, path) || policy.PathUnder(path, bind.Target) {
+			return true
+		}
+	}
+	return false
 }
 
 func procFDNumber(path string) int {

@@ -239,11 +239,11 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the Rung-1 property Rung 2 cannot provide (§7.2, §7.5)",
 		},
 	}
-	if len(mvp.DenyMasks) > 0 {
+	if mvp.hasLiteralDeny {
 		entries = append(entries, profile.ReportEntry{
 			Feature: "fixed-path-deny",
 			Status:  "Enforced",
-			Detail:  "fixed-path secret denies masked by empty read-only bind mounts on top of any covering allow (deny-inside-allow via mount re-masking, §7.5 — no sibling enumeration, unlike Rung 2)",
+			Detail:  "fixed-path denies without restorations use empty read-only mount masks; higher-precedence literal restorations compose through the enumerated Landlock rules without a coarse mask that would hide the restored path (§5.1, §7.5)",
 		})
 	}
 	if len(mvp.ROBinds) > 0 {

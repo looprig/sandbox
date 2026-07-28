@@ -531,10 +531,9 @@ func TestEnumerateFSRules(t *testing.T) {
 	})
 }
 
-// TestEnumerateDenyOverridesAllow proves the review's Finding 1 fix: an ALLOW
-// whose path is at-or-under a literal DENY is dropped (deny is a hard override,
-// SPEC §5.1) — no emitted rule covers the denied subtree. Covers both deny==allow
-// and deny-is-Ancestor-of-allow.
+// TestEnumerateUsesLongestSpecificAxisRule proves canonical literal precedence:
+// deny wins an equal-scope tie, while a narrower allow beneath a broader deny
+// survives and is enumerated. Glob denies remain the hard-override case.
 func TestEnumerateUsesLongestSpecificAxisRule(t *testing.T) {
 	root := t.TempDir()
 	mk := func(p string) string {

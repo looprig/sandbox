@@ -100,6 +100,14 @@ grant permits. Fixed runtime support paths are a small, tested backend allowlist
 and never imply general host access. Environment scrubbing and resource limits
 are fixed executor safety behavior and cannot widen authority.
 
+Filesystem rules resolve read, execute, and write independently. For literal
+rules, the most-specific matching path wins; an explicit deny wins only a true
+precedence tie. Exact scope outranks recursive scope at the same path, so an
+exact allow can restore that object beneath a recursive deny without opening
+its descendants. Glob denies are hard overrides regardless of literal
+specificity. Backends must preserve this precedence or fail/narrow explicitly
+under their documented compilation contract.
+
 `IsolatedHome` points `HOME` at executor-owned owner-only storage. Every
 executor has a separate owner-only TMPDIR beneath the set-owned root; the base
 profile neither selects nor grants shared `/tmp`. `RealHome`

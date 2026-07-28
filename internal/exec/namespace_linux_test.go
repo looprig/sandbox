@@ -31,8 +31,8 @@ func requireRung1Caps(t *testing.T) {
 // TestCompileMountView asserts the pure policy -> mount-view plan compilation:
 // writable roots become rw binds, read roots + carveouts become ro binds, literal
 // secret denies become masks, glob denies are carried for the spawn scan, and a
-// deny that is an Ancestor-or-equal of an allow drops that allow (deny is a hard
-// override). This runs on THIS host — no namespaces.
+// equal-precedence deny drops an allow while a more-specific literal allow is
+// retained. This runs on THIS host — no namespaces.
 func TestCompileMountView(t *testing.T) {
 	t.Parallel()
 	ws := "/work/repo"
@@ -50,6 +50,7 @@ func TestCompileMountView(t *testing.T) {
 		wantNotBound []string // must NOT appear in rw or ro binds
 		wantGlob     []string // must be present in GlobDenies
 		wantMasks    []string // must be present in DenyMasks
+		wantNotMasks []string // must NOT appear in DenyMasks
 	}{
 		{
 			name:      "write mode: workspace+tmp rw, / ro, carveouts ro, secrets masked",
@@ -69,19 +70,45 @@ func TestCompileMountView(t *testing.T) {
 			wantMasks:    []string{homeSSH},
 		},
 		{
-			name: "deny hard-override: an allow at-or-under a deny is dropped",
+			name: "literal precedence: equal tie denied and narrower allow restored",
 			policy: policy.Effective{
 				Workspace: ws,
 				FS: []policy.FSEntry{
 					{Path: ws, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess},
-					{Path: filepath.Join(ws, "secret"), Access: policy.ReadAccess}, // under the deny below
+					{Path: filepath.Join(ws, "secret"), Access: policy.ReadAccess},
 					{Path: filepath.Join(ws, "secret", "restored"), Access: policy.ReadAccess},
 					{Path: filepath.Join(ws, "secret"), Access: policy.DenyAccess},
 				},
 			},
 			wantRW:       []string{ws},
-			wantNotBound: []string{filepath.Join(ws, "secret"), filepath.Join(ws, "secret", "restored")},
-			wantMasks:    []string{filepath.Join(ws, "secret")},
+			wantRO:       []string{filepath.Join(ws, "secret", "restored")},
+			wantNotBound: []string{filepath.Join(ws, "secret")},
+			wantNotMasks: []string{filepath.Join(ws, "secret")},
+		},
+		{
+			name: "production root deny retains narrower runtime and workspace allows",
+			policy: policy.Effective{
+				Workspace: ws,
+				FS: []policy.FSEntry{
+					{Path: "/", Access: policy.DenyAccess},
+					{Path: "/usr/bin", Access: policy.ReadAccess | policy.ExecAccess},
+					{Path: ws, Access: policy.AllAccess},
+				},
+			},
+			wantRW:       []string{ws},
+			wantRO:       []string{"/usr/bin"},
+			wantNotMasks: []string{"/"},
+		},
+		{
+			name: "same-path exact allow outranks recursive deny",
+			policy: policy.Effective{
+				FS: []policy.FSEntry{
+					{Path: "/work/tool", Access: policy.DenyAccess},
+					{Path: "/work/tool", Access: policy.ReadAccess, Exact: true},
+				},
+			},
+			wantRO:       []string{"/work/tool"},
+			wantNotMasks: []string{"/work/tool"},
 		},
 		{
 			name:   "open/full policy: single rw bind, no denies",
@@ -116,6 +143,11 @@ func TestCompileMountView(t *testing.T) {
 			for _, w := range tt.wantMasks {
 				if !containsStr(plan.DenyMasks, w) {
 					t.Errorf("DenyMasks %v missing %q", plan.DenyMasks, w)
+				}
+			}
+			for _, w := range tt.wantNotMasks {
+				if containsStr(plan.DenyMasks, w) {
+					t.Errorf("DenyMasks %v unexpectedly contains %q", plan.DenyMasks, w)
 				}
 			}
 		})
@@ -209,30 +241,58 @@ func TestEnumerateMountViewRejectsAbsentProtectedChildUnderWritableBind(t *testi
 	}
 }
 
-// TestEnumerateMountViewRejectsExactDirectoryDeny proves the mount compiler
-// never approximates an exact directory deny with a directory overmount. Such
-// an overmount would also hide a retained child allow and silently over-deny.
-func TestEnumerateMountViewRejectsExactDirectoryDeny(t *testing.T) {
+// TestEnumerateMountViewExactDirectoryDenyDependsOnVisibility proves the mount
+// compiler never approximates a visible exact directory deny with a directory
+// overmount, while an exact deny outside the view is already enforced by
+// invisibility. A recursive duplicate safely selects recursive mask semantics.
+func TestEnumerateMountViewExactDirectoryDenyDependsOnVisibility(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	denied := filepath.Join(root, "exact-deny")
-	child := filepath.Join(denied, "allowed-child")
-	if err := os.MkdirAll(child, 0o700); err != nil {
+	if err := os.MkdirAll(denied, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
-		{Path: root, Access: policy.AllAccess},
-		{Path: denied, Denied: policy.AllAccess, Exact: true},
-		{Path: child, Access: policy.ReadAccess},
-	}})
-	if !containsStr(plan.ROBinds, child) {
-		t.Fatalf("ROBinds = %v, want retained exact-deny descendant %q", plan.ROBinds, child)
-	}
-	if _, err := linux.EnumerateMountView(plan); err == nil {
-		t.Fatal("EnumerateMountView succeeded, want unsupported exact-directory-deny error")
-	} else if !strings.Contains(err.Error(), "exact directory deny") || !strings.Contains(err.Error(), denied) {
-		t.Fatalf("EnumerateMountView error = %q, want explicit exact directory deny %q", err, denied)
-	}
+	t.Run("outside mount view is already invisible", func(t *testing.T) {
+		visible := t.TempDir()
+		plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
+			{Path: visible, Access: policy.ReadAccess},
+			{Path: denied, Denied: policy.AllAccess, Exact: true},
+		}})
+		spec, err := linux.EnumerateMountView(plan)
+		if err != nil {
+			t.Fatalf("EnumerateMountView: %v", err)
+		}
+		for _, mask := range spec.Masks {
+			if mask.Target == denied {
+				t.Fatalf("outside exact deny unexpectedly materialized in view: %+v", mask)
+			}
+		}
+	})
+	t.Run("inside mount view is unsupported", func(t *testing.T) {
+		plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
+			{Path: root, Access: policy.AllAccess},
+			{Path: denied, Denied: policy.AllAccess, Exact: true},
+		}})
+		if _, err := linux.EnumerateMountView(plan); err == nil {
+			t.Fatal("EnumerateMountView succeeded, want unsupported exact-directory-deny error")
+		} else if !strings.Contains(err.Error(), "exact directory deny") || !strings.Contains(err.Error(), denied) {
+			t.Fatalf("EnumerateMountView error = %q, want explicit exact directory deny %q", err, denied)
+		}
+	})
+	t.Run("recursive duplicate permits coarse directory mask", func(t *testing.T) {
+		plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
+			{Path: root, Access: policy.AllAccess},
+			{Path: denied, Denied: policy.AllAccess, Exact: true},
+			{Path: denied, Denied: policy.AllAccess},
+		}})
+		spec, err := linux.EnumerateMountView(plan)
+		if err != nil {
+			t.Fatalf("EnumerateMountView: %v", err)
+		}
+		if len(spec.Masks) != 1 || spec.Masks[0].Target != denied || !spec.Masks[0].IsDir {
+			t.Fatalf("Masks = %+v, want recursive directory mask for %q", spec.Masks, denied)
+		}
+	})
 }
 
 // TestScanGlobDenies asserts the bounded glob-deny scan: nested .env* matches are
