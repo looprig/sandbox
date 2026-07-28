@@ -48,8 +48,6 @@ type FSAllow struct {
 	Exact  bool
 }
 
-func (a FSAllow) writable() bool { return a.Access&WriteAccess != 0 }
-
 type FSDeny struct {
 	Path   string
 	Access FSAccess
