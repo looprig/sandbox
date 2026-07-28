@@ -133,10 +133,12 @@ func CompileMountView(p policy.Effective) MountViewPlan {
 func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHandle) MountViewPlan {
 	var plan MountViewPlan
 	plan.grantBinds = make(map[string]grantMountSource)
+	var literalDenies []policy.FSEntry
 
-	// First pass: collect full-path deny intent that the mount view can hide
-	// without swallowing a more-specific allow. Partial-axis denies are Enforced
-	// by Landlock, which composes on top of this view.
+	// First pass: collect every full-path deny. Literal denies dominate allows at
+	// the same path and below it, and remain in the plan even when no current
+	// writable root covers them. Partial-axis denies are Enforced by Landlock,
+	// which composes on top of this view.
 	for _, e := range p.FS {
 		if policy.NormalizedDenied(e) != policy.AllAccess || e.Access != 0 {
 			continue
@@ -145,23 +147,15 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 			plan.GlobDenies = append(plan.GlobDenies, e.Path)
 			continue
 		}
-		denyPath := filepath.Clean(e.Path)
-		var covered, restored bool
-		for _, candidate := range p.FS {
-			if candidate.Access == 0 {
-				continue
-			}
-			allowPath := filepath.Clean(candidate.Path)
-			covered = covered || policy.PathUnder(allowPath, denyPath)
-			restored = restored || policy.PathUnder(denyPath, allowPath)
-		}
-		if covered && !restored {
-			plan.DenyMasks = append(plan.DenyMasks, denyPath)
-		}
+		e.Path = filepath.Clean(e.Path)
+		literalDenies = append(literalDenies, e)
+		plan.DenyMasks = appendUniquePath(plan.DenyMasks, e.Path)
 	}
 
 	// Second pass: merge allow entries by path (OR access bits) preserving first-
 	// seen order, so a path granted read then write is bound rw exactly once.
+	// Apply literal-deny dominance first so an allow at or below a denied tree is
+	// never reintroduced as either an rw or ro bind.
 	merged := make(map[string]policy.FSAccess)
 	var order []string
 	for _, e := range p.FS {
@@ -169,6 +163,16 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 			continue
 		}
 		clean := filepath.Clean(e.Path)
+		denied := false
+		for _, deny := range literalDenies {
+			if policy.LiteralMatches(deny.Path, clean, deny.Exact) {
+				denied = true
+				break
+			}
+		}
+		if denied {
+			continue
+		}
 		if _, ok := merged[clean]; !ok {
 			order = append(order, clean)
 		}
@@ -235,13 +239,14 @@ type MountViewSpec struct {
 }
 
 // EnumerateMountView turns a compile-time MountViewPlan into a spawn-time
-// MountViewSpec: it stats each bind root (classifying dir vs file, DROPPING a
-// nonexistent root — fail secure, never bind what is not there), sorts the binds
-// parents-first so nesting re-masks correctly, and re-runs the glob scan for a
-// fresh mask snapshot. It walks the live filesystem but touches no namespaces,
-// so it runs on every host and is unit-testable.
-func EnumerateMountView(plan MountViewPlan) MountViewSpec {
-	return enumerateMountViewWithGrantRules(plan, nil)
+// MountViewSpec: it stats each bind root (classifying dir vs file), sorts the
+// binds parents-first so nesting re-masks correctly, and re-runs the glob scan
+// for a fresh mask snapshot. An absent protected child under an active writable
+// bind is an error: silently dropping its ro bind or mask would let the target
+// create and reach it after launch. It walks the live filesystem but touches no
+// namespaces, so it runs on every host and is unit-testable.
+func EnumerateMountView(plan MountViewPlan) (MountViewSpec, error) {
+	return enumerateMountViewWithGrantPaths(plan, nil, nil)
 }
 
 func enumerateMountViewWithGrantRules(plan MountViewPlan, grantRules []policy.FSRule) MountViewSpec {
@@ -251,6 +256,11 @@ func enumerateMountViewWithGrantRules(plan MountViewPlan, grantRules []policy.FS
 
 func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FSRule, handles []*policy.PathHandle) (MountViewSpec, error) {
 	var spec MountViewSpec
+	type absentProtectedPath struct {
+		path string
+		err  error
+	}
+	var absentProtected []absentProtectedPath
 	resolver := policy.NewPinnedPathResolver(handles, policy.FirstPathHandleChildFD+len(handles))
 	defer policy.CloseRuleFiles(resolver.Files())
 	add := func(path string, ro bool) {
@@ -259,7 +269,10 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 		}
 		st, err := os.Stat(path)
 		if err != nil {
-			return // nonexistent root: drop (fail secure — never bind what is absent)
+			if ro {
+				absentProtected = append(absentProtected, absentProtectedPath{path: path, err: err})
+			}
+			return
 		}
 		spec.Binds = append(spec.Binds, BindSpec{
 			Source:   path,
@@ -313,14 +326,27 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 			}
 			if ok {
 				spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: resolved.IsDir})
+			} else {
+				absentProtected = append(absentProtected, absentProtectedPath{path: d, err: fs.ErrNotExist})
 			}
 			continue
 		}
 		st, err := os.Lstat(d)
 		if err != nil {
-			continue // deny target absent: nothing to mask (already invisible)
+			absentProtected = append(absentProtected, absentProtectedPath{path: d, err: err})
+			continue
 		}
 		spec.Masks = append(spec.Masks, MaskSpec{Target: d, IsDir: st.IsDir()})
+	}
+	for _, absent := range absentProtected {
+		for _, bind := range spec.Binds {
+			if !bind.ReadOnly && (bind.Target == absent.path || policy.PathUnder(bind.Target, absent.path)) {
+				return MountViewSpec{}, fmt.Errorf(
+					"%s: protected path %q unavailable beneath writable bind %q: %w",
+					mountViewOp, absent.path, bind.Target, absent.err,
+				)
+			}
+		}
 	}
 	spec.Masks = append(spec.Masks, scanGlobDeniesWithGrantPaths(plan.scanRoots, plan.GlobDenies, GlobScanMaxDepth, handles, resolver)...)
 	slices.SortFunc(spec.Masks, func(a, b MaskSpec) int { return strings.Compare(a.Target, b.Target) })

@@ -36,6 +36,11 @@ func requireRung1Caps(t *testing.T) {
 func TestCompileMountView(t *testing.T) {
 	t.Parallel()
 	ws := "/work/repo"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	homeSSH := filepath.Join(home, ".ssh")
 
 	tests := []struct {
 		name         string
@@ -44,15 +49,15 @@ func TestCompileMountView(t *testing.T) {
 		wantRO       []string // must be present in ROBinds
 		wantNotBound []string // must NOT appear in rw or ro binds
 		wantGlob     []string // must be present in GlobDenies
-		wantMaskAny  bool     // DenyMasks must be non-empty
+		wantMasks    []string // must be present in DenyMasks
 	}{
 		{
-			name:        "write mode: workspace+tmp rw, / ro, carveouts ro, secrets masked",
-			policy:      backendFixturePolicy(fixtureWorkspaceWrite, ws),
-			wantRW:      []string{ws, fixtureSharedTmpRoot},
-			wantRO:      []string{"/", filepath.Join(ws, ".git"), filepath.Join(ws, ".looprig")},
-			wantGlob:    []string{"**/.env*"},
-			wantMaskAny: true,
+			name:      "write mode: workspace+tmp rw, / ro, carveouts ro, secrets masked",
+			policy:    backendFixturePolicy(fixtureWorkspaceWrite, ws),
+			wantRW:    []string{ws, fixtureSharedTmpRoot},
+			wantRO:    []string{"/", filepath.Join(ws, ".git"), filepath.Join(ws, ".looprig")},
+			wantGlob:  []string{"**/.env*"},
+			wantMasks: []string{homeSSH},
 		},
 		{
 			name:   "zerotrust: workspace read-only bind, no rw roots",
@@ -61,7 +66,7 @@ func TestCompileMountView(t *testing.T) {
 			// zerotrust grants no writable root at all.
 			wantNotBound: []string{fixtureSharedTmpRoot},
 			wantGlob:     []string{"**/.env*"},
-			wantMaskAny:  true,
+			wantMasks:    []string{homeSSH},
 		},
 		{
 			name: "deny hard-override: an allow at-or-under a deny is dropped",
@@ -70,12 +75,13 @@ func TestCompileMountView(t *testing.T) {
 				FS: []policy.FSEntry{
 					{Path: ws, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess},
 					{Path: filepath.Join(ws, "secret"), Access: policy.ReadAccess}, // under the deny below
+					{Path: filepath.Join(ws, "secret", "restored"), Access: policy.ReadAccess},
 					{Path: filepath.Join(ws, "secret"), Access: policy.DenyAccess},
 				},
 			},
 			wantRW:       []string{ws},
-			wantNotBound: []string{filepath.Join(ws, "secret")},
-			wantMaskAny:  true,
+			wantNotBound: []string{filepath.Join(ws, "secret"), filepath.Join(ws, "secret", "restored")},
+			wantMasks:    []string{filepath.Join(ws, "secret")},
 		},
 		{
 			name:   "open/full policy: single rw bind, no denies",
@@ -107,8 +113,10 @@ func TestCompileMountView(t *testing.T) {
 					t.Errorf("GlobDenies %v missing %q", plan.GlobDenies, g)
 				}
 			}
-			if tt.wantMaskAny && len(plan.DenyMasks) == 0 {
-				t.Errorf("DenyMasks empty, want at least one literal secret deny")
+			for _, w := range tt.wantMasks {
+				if !containsStr(plan.DenyMasks, w) {
+					t.Errorf("DenyMasks %v missing %q", plan.DenyMasks, w)
+				}
 			}
 		})
 	}
@@ -129,14 +137,18 @@ func TestEnumerateMountView(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	missing := filepath.Join(root, "does-not-exist")
+	missingBind := filepath.Join(root, "does-not-exist")
+	missingDeny := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-absent-deny")
 
 	plan := linux.MountViewPlan{
-		RWBinds:   []string{root, missing}, // missing must be dropped
+		RWBinds:   []string{root, missingBind}, // missing bind must be dropped
 		ROBinds:   []string{sub},
-		DenyMasks: []string{file, missing}, // missing deny must be skipped
+		DenyMasks: []string{file, missingDeny}, // absent deny outside the rw view is already invisible
 	}
-	spec := linux.EnumerateMountView(plan)
+	spec, err := linux.EnumerateMountView(plan)
+	if err != nil {
+		t.Fatalf("EnumerateMountView: %v", err)
+	}
 
 	// Binds: root (rw, dir) and sub (ro, dir); missing dropped; sorted parents-first.
 	if len(spec.Binds) != 2 {
@@ -157,6 +169,43 @@ func TestEnumerateMountView(t *testing.T) {
 	// Masks: only the existing file; the missing deny is skipped.
 	if len(spec.Masks) != 1 || spec.Masks[0].Target != file || spec.Masks[0].IsDir {
 		t.Errorf("Masks = %+v, want single file mask for %q", spec.Masks, file)
+	}
+}
+
+// TestEnumerateMountViewRejectsAbsentProtectedChildUnderWritableBind proves that
+// a protected child cannot be silently skipped while its writable parent remains
+// active. Otherwise the target could create the absent path after launch and
+// reach it through the parent's rw bind with no read-only carveout or deny mask.
+func TestEnumerateMountViewRejectsAbsentProtectedChildUnderWritableBind(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	tests := []struct {
+		name string
+		plan linux.MountViewPlan
+	}{
+		{
+			name: "read-only carveout",
+			plan: linux.MountViewPlan{
+				RWBinds: []string{root},
+				ROBinds: []string{filepath.Join(root, "absent-carveout")},
+			},
+		},
+		{
+			name: "literal deny mask",
+			plan: linux.MountViewPlan{
+				RWBinds:   []string{root},
+				DenyMasks: []string{filepath.Join(root, "absent-secret")},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := linux.EnumerateMountView(tt.plan); err == nil {
+				t.Fatal("EnumerateMountView succeeded, want fail-closed error for absent protected child under rw bind")
+			}
+		})
 	}
 }
 
