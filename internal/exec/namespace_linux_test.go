@@ -526,8 +526,19 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 	requireRung1Caps(t)
 
 	ws := t.TempDir()
+	writable := filepath.Join(ws, "work")
+	for _, dir := range []string{writable, filepath.Join(ws, ".git"), filepath.Join(ws, ".looprig")} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
 	if err := os.WriteFile(filepath.Join(ws, "hello.txt"), []byte("hi"), 0o644); err != nil {
 		t.Fatalf("write hello: %v", err)
+	}
+	for _, path := range []string{filepath.Join(ws, ".git", "config"), filepath.Join(ws, ".looprig", "config")} {
+		if err := os.WriteFile(path, []byte("protected"), 0o644); err != nil {
+			t.Fatalf("write protected fixture %s: %v", path, err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=leak"), 0o600); err != nil {
 		t.Fatalf("write .env: %v", err)
@@ -548,7 +559,11 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 	}
 	script := strings.Join([]string{
 		`cat hello.txt`, // POSITIVE: workspace read
-		`echo written > newfile.txt && echo WROTE`,           // POSITIVE: workspace write
+		`echo written > work/newfile.txt && echo WROTE`, // POSITIVE: create beneath a pre-existing writable child
+		`cat .git/config >/dev/null && echo GIT_VISIBLE`,
+		`if echo blocked > .git/blocked 2>/dev/null; then echo GIT_WRITE_ALLOWED; else echo GIT_WRITE_DENIED; fi`,
+		`cat .looprig/config >/dev/null && echo LOOPRIG_VISIBLE`,
+		`if echo blocked > .looprig/blocked 2>/dev/null; then echo LOOPRIG_WRITE_ALLOWED; else echo LOOPRIG_WRITE_DENIED; fi`,
 		`printf 'ENV=[%s]\n' "$(cat .env 2>/dev/null)"`,      // .env masked -> empty
 		`cat ` + outsideFile + ` 2>/dev/null || echo HIDDEN`, // NEGATIVE: invisible host path
 	}, "; ")
@@ -562,6 +577,12 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 	}
 	if !strings.Contains(s, "WROTE") {
 		t.Errorf("workspace not writable; out=%q", s)
+	}
+	if !strings.Contains(s, "GIT_VISIBLE") || strings.Contains(s, "GIT_WRITE_ALLOWED") || !strings.Contains(s, "GIT_WRITE_DENIED") {
+		t.Errorf(".git carveout was not readable and read-only; out=%q", s)
+	}
+	if !strings.Contains(s, "LOOPRIG_VISIBLE") || strings.Contains(s, "LOOPRIG_WRITE_ALLOWED") || !strings.Contains(s, "LOOPRIG_WRITE_DENIED") {
+		t.Errorf(".looprig carveout was not readable and read-only; out=%q", s)
 	}
 	if strings.Contains(s, "SECRET=leak") || !strings.Contains(s, "ENV=[]") {
 		t.Errorf("glob-masked .env leaked (want ENV=[]); out=%q", s)

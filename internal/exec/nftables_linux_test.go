@@ -7,6 +7,8 @@ import (
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -257,6 +259,11 @@ func TestRung1NftEnforcement(t *testing.T) {
 	requireRung1Caps(t)
 
 	ws := t.TempDir()
+	for _, carveout := range []string{".git", ".looprig"} {
+		if err := os.Mkdir(filepath.Join(ws, carveout), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", carveout, err)
+		}
+	}
 	// This fixture grants Loopback+Private+443+Dns, so the rung-1 nftables ruleset is
 	// installed with the metadata hard-deny ahead of the Private accept.
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureBroadNetwork, ws), withBackend(linux.NewBackendRung1()))
