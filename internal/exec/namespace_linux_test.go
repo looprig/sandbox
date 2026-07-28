@@ -112,6 +112,17 @@ func TestCompileMountView(t *testing.T) {
 			wantNotMasks: []string{"/work/tool"},
 		},
 		{
+			name: "same-path exact deny preserves recursive descendants through Landlock snapshot",
+			policy: policy.Effective{
+				FS: []policy.FSEntry{
+					{Path: ws, Access: policy.AllAccess},
+					{Path: ws, Denied: policy.AllAccess, Exact: true},
+				},
+			},
+			wantRW:       []string{ws},
+			wantNotMasks: []string{ws},
+		},
+		{
 			name:   "open/full policy: single rw bind, no denies",
 			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{{Path: "/", Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}}},
 			wantRW: []string{"/"},
@@ -244,8 +255,10 @@ func TestEnumerateMountViewRejectsAbsentProtectedChildUnderWritableBind(t *testi
 
 // TestEnumerateMountViewExactDirectoryDenyDependsOnVisibility proves the mount
 // compiler never approximates a visible exact directory deny with a directory
-// overmount, while an exact deny outside the view is already enforced by
-// invisibility. A recursive duplicate safely selects recursive mask semantics.
+// overmount. Descendants restored by a covering recursive allow are preserved
+// by the shared Landlock snapshot; an exact deny outside the view is already
+// enforced by invisibility. A recursive duplicate safely selects recursive mask
+// semantics.
 func TestEnumerateMountViewExactDirectoryDenyDependsOnVisibility(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -269,15 +282,19 @@ func TestEnumerateMountViewExactDirectoryDenyDependsOnVisibility(t *testing.T) {
 			}
 		}
 	})
-	t.Run("inside mount view is unsupported", func(t *testing.T) {
+	t.Run("inside mount view delegates exact scope to Landlock snapshot", func(t *testing.T) {
 		plan := linux.CompileMountView(policy.Effective{FS: []policy.FSEntry{
 			{Path: root, Access: policy.AllAccess},
 			{Path: denied, Denied: policy.AllAccess, Exact: true},
 		}})
-		if _, err := linux.EnumerateMountView(plan); err == nil {
-			t.Fatal("EnumerateMountView succeeded, want unsupported exact-directory-deny error")
-		} else if !strings.Contains(err.Error(), "exact directory deny") || !strings.Contains(err.Error(), denied) {
-			t.Fatalf("EnumerateMountView error = %q, want explicit exact directory deny %q", err, denied)
+		spec, err := linux.EnumerateMountView(plan)
+		if err != nil {
+			t.Fatalf("EnumerateMountView: %v", err)
+		}
+		for _, mask := range spec.Masks {
+			if mask.Target == denied {
+				t.Fatalf("exact directory deny received descendant-hiding mount mask: %+v", mask)
+			}
 		}
 	})
 	t.Run("recursive duplicate permits coarse directory mask", func(t *testing.T) {
@@ -498,7 +515,7 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	if snapshot.Status != "narrowed" {
 		t.Fatalf("filesystem-axis-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
 	}
-	for _, phrase := range []string{"shared Landlock sibling enumeration", "denied axes: execute, write", "pre-existing unaffected children", "blocks new entries directly beneath"} {
+	for _, phrase := range []string{"shared Landlock child enumeration", "denied axes: execute, write", "pre-existing unaffected children", "blocks new entries directly beneath"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
 			t.Errorf("filesystem-axis-snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
@@ -520,13 +537,10 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	if snapshot == nil || snapshot.Status != "narrowed" {
 		t.Fatalf("nested read deny snapshot = %+v, want narrowed entry; report=%+v", snapshot, report.Entries)
 	}
-	for _, phrase := range []string{"denied axes: read", "creation may remain permitted", "new entries lack denied-axis authority"} {
+	for _, phrase := range []string{"denied axes: read, write", "blocks new entries directly beneath", "prevents rename/link pathname replacement"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
 			t.Errorf("read-only snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
-	}
-	if strings.Contains(snapshot.Detail, "blocks new entries directly beneath") {
-		t.Errorf("read-only snapshot falsely claims creation is blocked: %q", snapshot.Detail)
 	}
 
 	withoutProtectedChild := policy.Effective{Workspace: ws, FS: []policy.FSEntry{{
@@ -572,9 +586,25 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 				{Path: filepath.Join(ws, "read-denied"), Denied: policy.ReadAccess},
 			}},
 			wantDetail: []string{
-				"denied axes: read",
-				"creation may remain permitted",
-				"new entries lack denied-axis authority",
+				"denied axes: read, write",
+				"blocks new entries directly beneath",
+				"prevents rename/link pathname replacement",
+			},
+			wantLegacy: [][2]string{
+				{"fixed-path-deny", linuxReportStatusEnforced},
+				{"allow-paths", "narrowed"},
+			},
+		},
+		{
+			name: "equal-path exact deny",
+			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{
+				{Path: ws, Access: policy.AllAccess},
+				{Path: ws, Denied: policy.AllAccess, Exact: true},
+			}},
+			wantDetail: []string{
+				"denied axes: read, execute, write",
+				"pre-existing unaffected children retain policy-allowed access",
+				"blocks new entries directly beneath",
 			},
 			wantLegacy: [][2]string{
 				{"fixed-path-deny", linuxReportStatusEnforced},

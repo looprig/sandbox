@@ -232,6 +232,16 @@ func survivingAllowAccess(entries []policy.FSEntry, allow policy.FSEntry) policy
 
 func denyHasRestoration(entries []policy.FSEntry, denyPath string, exactOnly bool) bool {
 	if exactOnly {
+		for _, allow := range entries {
+			if allow.Access == 0 || allow.Exact || strings.ContainsAny(allow.Path, policy.GlobMeta) {
+				continue
+			}
+			allowPath := filepath.Clean(allow.Path)
+			if (allowPath == denyPath || policy.PathUnder(allowPath, denyPath)) &&
+				survivingAllowAccess(entries, allow) != 0 {
+				return true
+			}
+		}
 		return false
 	}
 	for _, allow := range entries {

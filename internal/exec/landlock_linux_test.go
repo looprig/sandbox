@@ -259,6 +259,111 @@ func TestLinuxFSSecretDeny(t *testing.T) {
 	}
 }
 
+func TestLinuxFSDeniedPathCannotBeReplacedThroughWritableParent(t *testing.T) {
+	requireLandlockV4(t)
+	tests := []struct {
+		name    string
+		setup   func(*testing.T, string) (string, string)
+		command func(string, string) string
+		verify  func(*testing.T, string, string)
+	}{
+		{
+			name: "same-parent rename over denied file",
+			setup: func(t *testing.T, root string) (string, string) {
+				source := filepath.Join(root, "source")
+				denied := filepath.Join(root, "denied")
+				if err := os.WriteFile(source, []byte("public"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(denied, []byte("secret"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return source, denied
+			},
+			command: func(source, denied string) string {
+				return "mv -f -- " + shq(source) + " " + shq(denied)
+			},
+			verify: func(t *testing.T, source, denied string) {
+				if got, err := os.ReadFile(denied); err != nil || string(got) != "secret" {
+					t.Fatalf("denied file changed: contents=%q err=%v", got, err)
+				}
+				if _, err := os.Stat(source); err != nil {
+					t.Fatalf("rename source disappeared: %v", err)
+				}
+			},
+		},
+		{
+			name: "same-parent hard-link over denied file",
+			setup: func(t *testing.T, root string) (string, string) {
+				source := filepath.Join(root, "source")
+				denied := filepath.Join(root, "denied")
+				if err := os.WriteFile(source, []byte("public"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(denied, []byte("secret"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return source, denied
+			},
+			command: func(source, denied string) string {
+				return "ln -f -- " + shq(source) + " " + shq(denied)
+			},
+			verify: func(t *testing.T, _, denied string) {
+				if got, err := os.ReadFile(denied); err != nil || string(got) != "secret" {
+					t.Fatalf("denied hard-link target changed: contents=%q err=%v", got, err)
+				}
+			},
+		},
+		{
+			name: "same-parent rename over denied directory",
+			setup: func(t *testing.T, root string) (string, string) {
+				source := filepath.Join(root, "source-dir")
+				denied := filepath.Join(root, "denied-dir")
+				for _, path := range []string{source, denied} {
+					if err := os.Mkdir(path, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(source, "marker"), []byte("public"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return source, denied
+			},
+			command: func(source, denied string) string {
+				return "mv -T -- " + shq(source) + " " + shq(denied)
+			},
+			verify: func(t *testing.T, source, denied string) {
+				if _, err := os.Stat(source); err != nil {
+					t.Fatalf("rename source directory disappeared: %v", err)
+				}
+				entries, err := os.ReadDir(denied)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("denied directory changed: entries=%v err=%v", entries, err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ws := t.TempDir()
+			source, denied := test.setup(t, ws)
+			e := newFSExecutor(t, backendFixturePolicy(
+				fixtureWorkspaceWrite, ws,
+				fixtureWithoutSecretDenials(),
+				fixtureWithDenyRead(denied),
+			))
+			_, code, err := e.RunCommand(context.Background(), ws, test.command(source, denied))
+			if err != nil {
+				t.Fatalf("RunCommand(replacement): %v", err)
+			}
+			if code == 0 {
+				t.Fatalf("replacement command succeeded — FAIL-OPEN: denied pathname was mutable through parent topology")
+			}
+			test.verify(t, source, denied)
+		})
+	}
+}
+
 // TestLinuxFSSnapshotSemantics asserts the documented §7.5 snapshot behavior: a
 // carved workspace (its writable root is enumerated, not granted whole) permits
 // writes to a PRE-EXISTING subdirectory but denies a NEW top-level file — the

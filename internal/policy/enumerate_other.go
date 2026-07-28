@@ -31,6 +31,6 @@ func (*PinnedPathResolver) ResolveAny(string) (PinnedPathResolution, bool, error
 
 func (*PinnedPathResolver) addFile(*os.File) int { return 0 }
 
-func enumeratePinnedTree(*os.File, string, FSAccess, []string, func(*os.File) int, *PinnedPathResolver) ([]FSRule, error) {
+func enumeratePinnedTree(*os.File, string, FSAccess, []fsExclude, func(*os.File) int, *PinnedPathResolver) ([]FSRule, error) {
 	return nil, ErrUnsupportedClass
 }

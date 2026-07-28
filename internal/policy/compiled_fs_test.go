@@ -58,12 +58,20 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 			want: WriteAccess | ExecAccess,
 		},
 		{
-			name: "nested read deny snapshots only read axis",
+			name: "nested read deny snapshots read and covering write topology",
 			entries: []FSEntry{
 				{Path: root, Access: AllAccess},
 				{Path: protected, Denied: ReadAccess},
 			},
-			want: ReadAccess,
+			want: ReadAccess | WriteAccess,
+		},
+		{
+			name: "nested execute deny snapshots execute and covering write topology",
+			entries: []FSEntry{
+				{Path: root, Access: AllAccess},
+				{Path: protected, Denied: ExecAccess},
+			},
+			want: ExecAccess | WriteAccess,
 		},
 		{
 			name: "deny outside covering allow axes does not carve",
@@ -73,11 +81,28 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 			},
 		},
 		{
+			name: "split read and write allows still protect topology",
+			entries: []FSEntry{
+				{Path: root, Access: WriteAccess},
+				{Path: filepath.Join(root, "readable"), Access: ReadAccess},
+				{Path: protected, Denied: ReadAccess},
+			},
+			want: WriteAccess,
+		},
+		{
 			name: "equal-path tie is not sibling enumeration",
 			entries: []FSEntry{
 				{Path: root, Access: AllAccess},
 				{Path: root, Denied: AllAccess},
 			},
+		},
+		{
+			name: "equal-path exact deny snapshots recursive descendants",
+			entries: []FSEntry{
+				{Path: root, Access: AllAccess},
+				{Path: root, Denied: AllAccess, Exact: true},
+			},
+			want: AllAccess,
 		},
 		{
 			name:    "plain writable root has no snapshot",
@@ -91,6 +116,99 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 				t.Fatalf("SnapshotAxes() = %#x, want %#x", got, test.want)
 			}
 		})
+	}
+}
+
+func TestCompiledFSCarveoutExcludesTopologyOnlyWriteSnapshot(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "workspace")
+	protected := filepath.Join(root, "protected")
+	if CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: protected, Denied: ReadAccess},
+	}).HasCarveout() {
+		t.Fatal("read deny topology barrier reported as a read-only carveout")
+	}
+	if !CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: protected, Denied: WriteAccess},
+	}).HasCarveout() {
+		t.Fatal("nested write deny not reported as a carveout")
+	}
+}
+
+func TestEnumerateFSRulesWithholdsWriteTopologyAroundReadDeny(t *testing.T) {
+	root := t.TempDir()
+	denied := filepath.Join(root, "denied")
+	allowed := filepath.Join(root, "allowed")
+	for _, path := range []string{denied, allowed} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: denied, Denied: ReadAccess, Exact: true},
+	})
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, root); got&WriteAccess != 0 {
+		t.Fatalf("covering root retained topology write access: %#x; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, denied); got != WriteAccess|ExecAccess {
+		t.Fatalf("denied object access = %#x, want write+execute; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, allowed); got != AllAccess {
+		t.Fatalf("unaffected sibling access = %#x, want full access; rules=%+v", got, rules)
+	}
+}
+
+func TestEnumerateFSRulesWithholdsSplitAxisWriteTopology(t *testing.T) {
+	root := t.TempDir()
+	readable := filepath.Join(root, "readable")
+	denied := filepath.Join(root, "denied")
+	for _, path := range []string{readable, denied} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: WriteAccess},
+		{Path: readable, Access: ReadAccess, Exact: true},
+		{Path: denied, Denied: ReadAccess, Exact: true},
+	})
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, root); got&WriteAccess != 0 {
+		t.Fatalf("split-axis covering root retained topology write: %#x; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, readable); got != ReadAccess|WriteAccess {
+		t.Fatalf("readable source access = %#x, want read+write; rules=%+v", got, rules)
+	}
+}
+
+func TestEnumerateFSRulesPreservesDescendantsOfEqualPathExactDeny(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leaf := filepath.Join(child, "leaf")
+	if err := os.WriteFile(leaf, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compiled := CompileFS([]FSEntry{
+		{Path: root, Access: AllAccess},
+		{Path: root, Denied: AllAccess, Exact: true},
+	})
+	rules := EnumerateFSRules(compiled)
+	if got := resolveEnumeratedRules(rules, root); got != DenyAccess {
+		t.Fatalf("exactly denied root access = %#x, want deny; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, leaf); got != AllAccess {
+		t.Fatalf("descendant access = %#x, want full access; rules=%+v", got, rules)
+	}
+	for _, rule := range rules {
+		if rule.Path == root {
+			t.Fatalf("exactly denied root received rule: %+v", rule)
+		}
 	}
 }
 

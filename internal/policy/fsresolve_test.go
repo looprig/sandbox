@@ -187,6 +187,19 @@ func TestResolveTieUnion(t *testing.T) {
 	}
 }
 
+func TestResolveExactDenyNarrowsRecursiveAllowOnlyAtDirectoryObject(t *testing.T) {
+	entries := []FSEntry{
+		{Path: "/work", Access: AllAccess},
+		{Path: "/work", Denied: AllAccess, Exact: true},
+	}
+	if got := ResolveFS(entries, "/work"); got != DenyAccess {
+		t.Fatalf("exactly denied directory access = %s, want Deny", accessString(got))
+	}
+	if got := ResolveFS(entries, "/work/child"); got != AllAccess {
+		t.Fatalf("recursive descendant access = %s, want RWX", accessString(got))
+	}
+}
+
 // TestResolveCanonicalizesTarget confirms the target path is cleaned before
 // matching, so lexical noise resolves the same as its canonical form.
 func TestResolveCanonicalizesTarget(t *testing.T) {

@@ -145,26 +145,57 @@ func (compiled CompiledFS) Resolve(path string) FSAccess {
 func (compiled CompiledFS) HasLiteralDeny() bool { return len(compiled.Denies) > 0 }
 
 // SnapshotAxes reports the access axes for which a recursive allow contains a
-// nested literal deny. Landlock must enumerate unaffected siblings instead of
-// granting the covering allow root on each returned axis.
+// narrower literal deny. It also includes write when read or execute is denied,
+// because granting write on the covering directory would permit pathname
+// replacement around the denied axis. Landlock must enumerate existing children
+// instead of granting the covering allow root on each returned axis.
 func (compiled CompiledFS) SnapshotAxes() FSAccess {
 	var axes FSAccess
 	for _, allow := range compiled.Allows {
 		if allow.Exact {
 			continue
 		}
+		overlappingAccess := allowedAccessOverlappingTree(compiled.Allows, allow.Path)
 		for _, deny := range compiled.Denies {
-			if PathUnder(allow.Path, deny.Path) {
+			nested := PathUnder(allow.Path, deny.Path)
+			equal := allow.Path == deny.Path
+			if nested || equal && deny.Exact {
 				axes |= allow.Access & deny.Access
+			}
+			if allow.Access&WriteAccess != 0 &&
+				overlappingAccess&deny.Access&(ReadAccess|ExecAccess) != 0 &&
+				(nested || equal && (deny.Exact || deny.Access&WriteAccess == 0)) {
+				axes |= WriteAccess
 			}
 		}
 	}
 	return axes
 }
 
+func allowedAccessOverlappingTree(allows []FSAllow, path string) FSAccess {
+	var access FSAccess
+	for _, allow := range allows {
+		if allow.Path == path || PathUnder(path, allow.Path) ||
+			!allow.Exact && PathUnder(allow.Path, path) {
+			access |= allow.Access
+		}
+	}
+	return access
+}
+
 // HasCarveout reports whether a writable allow contains a nested write deny.
 func (compiled CompiledFS) HasCarveout() bool {
-	return compiled.SnapshotAxes()&WriteAccess != 0
+	for _, allow := range compiled.Allows {
+		if allow.Exact || allow.Access&WriteAccess == 0 {
+			continue
+		}
+		for _, deny := range compiled.Denies {
+			if deny.Access&WriteAccess != 0 && PathUnder(allow.Path, deny.Path) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func PathUnder(parent, path string) bool {
@@ -204,7 +235,7 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 			if allow.Access&bit == 0 || deniedAtSamePath(allow, bit, compiled.Denies) {
 				continue
 			}
-			excludes := excludesForAllowAxis(allow.Path, bit, compiled.Denies)
+			excludes := excludesForAllowAxis(allow, bit, compiled.Allows, compiled.Denies)
 			pinnedAncestor := MatchingPathHandleAncestor(handles, allow.Path, allow.Exact) >= 0
 			resolved, pinned, err := resolver.resolve(allow.Path, allow.Exact)
 			if err != nil {
@@ -255,31 +286,47 @@ func CloseRuleFiles(files []*os.File) {
 
 func deniedAtSamePath(allow FSAllow, bit FSAccess, denies []FSDeny) bool {
 	for _, deny := range denies {
-		if deny.Path == allow.Path && deny.Access&bit != 0 && (!allow.Exact || deny.Exact) {
+		if deny.Path == allow.Path && deny.Exact == allow.Exact && deny.Access&bit != 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func excludesForAllowAxis(path string, bit FSAccess, denies []FSDeny) []string {
-	var excludes []string
+type fsExclude struct {
+	Path  string
+	Exact bool
+	Deny  bool
+}
+
+func excludesForAllowAxis(allow FSAllow, bit FSAccess, allows []FSAllow, denies []FSDeny) []fsExclude {
+	var excludes []fsExclude
+	overlappingAccess := allowedAccessOverlappingTree(allows, allow.Path)
 	for _, deny := range denies {
-		if deny.Access&bit != 0 && PathUnder(path, deny.Path) {
-			excludes = append(excludes, deny.Path)
+		nested := PathUnder(allow.Path, deny.Path)
+		equal := allow.Path == deny.Path
+		deniesAxis := deny.Access&bit != 0 && (nested || equal && !allow.Exact && deny.Exact)
+		topologyBarrier := bit == WriteAccess && !allow.Exact &&
+			overlappingAccess&deny.Access&(ReadAccess|ExecAccess) != 0 &&
+			(nested || equal)
+		if deniesAxis || topologyBarrier {
+			excludes = append(excludes, fsExclude{
+				Path: deny.Path, Exact: deny.Exact, Deny: deniesAxis,
+			})
 		}
 	}
 	return excludes
 }
 
-func carveGrant(dir string, access FSAccess, excludes []string, emit func(FSRule)) {
+func carveGrant(dir string, access FSAccess, excludes []fsExclude, emit func(FSRule)) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
 		child := filepath.Join(dir, entry.Name())
-		if slices.Contains(excludes, child) {
+		denyRecursive, denyExact := exclusionAt(excludes, child)
+		if denyRecursive {
 			continue
 		}
 		info, err := os.Lstat(child)
@@ -287,6 +334,12 @@ func carveGrant(dir string, access FSAccess, excludes []string, emit func(FSRule
 			continue
 		}
 		nested := excludesUnder(excludes, child)
+		if denyExact {
+			if info.IsDir() {
+				carveGrant(child, access, nested, emit)
+			}
+			continue
+		}
 		if len(nested) == 0 {
 			emit(FSRule{Path: child, Access: access, IsDir: info.IsDir()})
 			continue
@@ -297,10 +350,24 @@ func carveGrant(dir string, access FSAccess, excludes []string, emit func(FSRule
 	}
 }
 
-func excludesUnder(excludes []string, parent string) []string {
-	var nested []string
+func exclusionAt(excludes []fsExclude, path string) (recursive, exact bool) {
 	for _, exclude := range excludes {
-		if PathUnder(parent, exclude) {
+		if exclude.Path != path || !exclude.Deny {
+			continue
+		}
+		if exclude.Exact {
+			exact = true
+		} else {
+			recursive = true
+		}
+	}
+	return recursive, exact
+}
+
+func excludesUnder(excludes []fsExclude, parent string) []fsExclude {
+	var nested []fsExclude
+	for _, exclude := range excludes {
+		if PathUnder(parent, exclude.Path) {
 			nested = append(nested, exclude)
 		}
 	}

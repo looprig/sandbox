@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -137,10 +136,10 @@ func (resolver *PinnedPathResolver) addFile(file *os.File) int {
 	return childFD
 }
 
-func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes []string, addFile func(*os.File) int, resolver *PinnedPathResolver) ([]FSRule, error) {
+func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes []fsExclude, addFile func(*os.File) int, resolver *PinnedPathResolver) ([]FSRule, error) {
 	var rules []FSRule
-	var walk func(int, string, []string) error
-	walk = func(dirFD int, dirTarget string, nestedExcludes []string) error {
+	var walk func(int, string, []fsExclude) error
+	walk = func(dirFD int, dirTarget string, nestedExcludes []fsExclude) error {
 		readFD, err := unix.Openat2(dirFD, ".", &unix.OpenHow{
 			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC),
 			Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS |
@@ -161,7 +160,8 @@ func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes
 		}
 		for _, entry := range entries {
 			childTarget := filepath.Join(dirTarget, entry.Name())
-			if slices.Contains(nestedExcludes, childTarget) {
+			denyRecursive, denyExact := exclusionAt(nestedExcludes, childTarget)
+			if denyRecursive {
 				continue
 			}
 			var child *os.File
@@ -210,6 +210,18 @@ func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes
 				continue
 			}
 			deeper := excludesUnder(nestedExcludes, childTarget)
+			if denyExact {
+				if info.IsDir() {
+					err = walk(int(child.Fd()), childTarget, deeper)
+				}
+				if owned {
+					_ = child.Close()
+				}
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			if len(deeper) == 0 {
 				if owned {
 					ruleFD = addFile(child)
