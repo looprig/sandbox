@@ -320,6 +320,35 @@ func TestRestrictedJournalCloseIsIdempotentAndRejectsFurtherUse(t *testing.T) {
 	}
 }
 
+func TestBrokerJournalOwnershipJoinsCloseFailure(t *testing.T) {
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationFault := errors.New("broker operation failure")
+	closeFault := errors.New("injected broker journal close failure")
+	originalClose := journal.closeRoots
+	closeCalls := 0
+	journal.closeRoots = func(records, retired *os.Root) error {
+		closeCalls++
+		return errors.Join(originalClose(records, retired), closeFault)
+	}
+	result := error(operationFault)
+	joinRestrictedJournalClose(&result, journal)
+	if !errors.Is(result, operationFault) || !errors.Is(result, closeFault) {
+		t.Fatalf("joined broker result = %v, want operation and close failures", result)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("journal close calls = %d, want 1", closeCalls)
+	}
+	if err := journal.Close(); !errors.Is(err, closeFault) {
+		t.Fatalf("idempotent Close = %v, want preserved close failure", err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("idempotent journal close calls = %d, want 1", closeCalls)
+	}
+}
+
 func TestRestrictedJournalConstructionSweep(t *testing.T) {
 	root := t.TempDir()
 	first, err := OpenRestrictedJournal(root)

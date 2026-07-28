@@ -155,7 +155,7 @@ func TestWindowsOptionSnapshotIsPassedToExecutors(t *testing.T) {
 	WithWindowsSandboxStateRoot(want.StateRoot)(&config)
 
 	snapshotWindowsOptions(&config, wantScratch)
-	t.Cleanup(config.windowsRuntimeRelease)
+	t.Cleanup(func() { _ = config.windowsRuntimeRelease() })
 	config.windows = windows.Config{}
 
 	got := config.executor.platform
@@ -197,6 +197,30 @@ func TestExecutorSetCloseReleasesCompiledSpecOnce(t *testing.T) {
 	}
 	if got := releases.Load(); got != 1 {
 		t.Fatalf("release count after two closes = %d, want 1", got)
+	}
+}
+
+func TestExecutorSetCloseReturnsWindowsRuntimeReleaseErrorOnce(t *testing.T) {
+	fault := errors.New("injected Windows runtime release failure")
+	releaseCalls := 0
+	set := &ExecutorSet{
+		ownedRoot: t.TempDir(),
+		executors: make(map[string]*Executor),
+		lifecycle: newExecutorLifecycle(),
+		closeDone: make(chan struct{}),
+		windowsRuntimeRelease: func() error {
+			releaseCalls++
+			return fault
+		},
+	}
+	if err := set.Close(); !errors.Is(err, fault) {
+		t.Fatalf("Close = %v, want Windows runtime release failure", err)
+	}
+	if err := set.Close(); !errors.Is(err, fault) {
+		t.Fatalf("second Close = %v, want preserved release failure", err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("runtime release calls = %d, want 1", releaseCalls)
 	}
 }
 

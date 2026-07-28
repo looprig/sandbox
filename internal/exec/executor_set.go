@@ -29,7 +29,7 @@ type executorSetConfig struct {
 	grantTTLSet           bool
 	route                 *EgressRoute
 	windows               windows.Config
-	windowsRuntimeRelease func()
+	windowsRuntimeRelease func() error
 }
 
 // ExecutorSetOption configures executor ownership and resource limits.
@@ -83,7 +83,7 @@ type ExecutorSet struct {
 	closed                bool
 	closeErr              error
 	closeDone             chan struct{}
-	windowsRuntimeRelease func()
+	windowsRuntimeRelease func() error
 	sharedProxy           *network.Proxy
 	sharedProxyRelease    func() error
 	sharedProxyAttempted  bool
@@ -124,25 +124,24 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: executor set scratch root: %w", err)
 	}
-	snapshotWindowsOptions(&config, scratch)
+	if err := snapshotWindowsOptions(&config, scratch); err != nil {
+		return nil, errors.Join(err, callRelease(config.windowsRuntimeRelease))
+	}
 	backend, err := selectExecutorBackend(prof, prof.Settings(), config.executor)
 	if err != nil {
-		config.windowsRuntimeRelease()
-		return nil, err
+		return nil, errors.Join(err, callRelease(config.windowsRuntimeRelease))
 	}
 	config.executor.backend = backend
 	owned, err := os.MkdirTemp(scratch, "sandbox-executors-")
 	if err != nil {
-		config.windowsRuntimeRelease()
-		return nil, fmt.Errorf("sandbox: create executor set root: %w", err)
+		return nil, errors.Join(fmt.Errorf("sandbox: create executor set root: %w", err), callRelease(config.windowsRuntimeRelease))
 	}
 	// #nosec G302 -- 0700 is correct for a DIRECTORY: G302 assumes a regular
 	// file, but stripping the owner execute bit here would make the directory
 	// non-traversable and unusable. 0700 is already owner-only.
 	if err := os.Chmod(owned, 0o700); err != nil {
-		_ = os.RemoveAll(owned)
-		config.windowsRuntimeRelease()
-		return nil, fmt.Errorf("sandbox: secure executor set root: %w", err)
+		removeErr := os.RemoveAll(owned)
+		return nil, errors.Join(fmt.Errorf("sandbox: secure executor set root: %w", err), removeErr, callRelease(config.windowsRuntimeRelease))
 	}
 	return &ExecutorSet{
 		profile: prof, settings: prof.Settings(), ownedRoot: owned, max: config.max,
@@ -155,16 +154,15 @@ func NewExecutorSet(prof *Profile, options ...ExecutorSetOption) (*ExecutorSet, 
 	}, nil
 }
 
-func snapshotWindowsOptions(config *executorSetConfig, scratchRoot string) {
-	if config.windowsRuntimeRelease != nil {
-		config.windowsRuntimeRelease()
-	}
+func snapshotWindowsOptions(config *executorSetConfig, scratchRoot string) error {
+	releaseErr := callRelease(config.windowsRuntimeRelease)
 	runtime, release := windows.AcquireRestrictedRuntime(scratchRoot)
 	config.executor.platform = platform.Options{
 		Windows:                  config.windows,
 		WindowsRestrictedRuntime: runtime,
 	}
 	config.windowsRuntimeRelease = release
+	return releaseErr
 }
 
 // For memoizes an executor with a distinct grant key and child HOME per key.
@@ -326,7 +324,7 @@ func (set *ExecutorSet) Close() error {
 	}
 	releaseErr = errors.Join(releaseErr, set.closeSharedProxy())
 	if set.windowsRuntimeRelease != nil {
-		set.windowsRuntimeRelease()
+		releaseErr = errors.Join(releaseErr, set.windowsRuntimeRelease())
 	}
 	err := errors.Join(releaseErr, os.RemoveAll(set.ownedRoot))
 

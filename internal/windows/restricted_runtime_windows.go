@@ -42,7 +42,7 @@ type restrictedRuntimeRegistryEntry struct {
 
 // AcquireRestrictedRuntime shares one lazy sweep coordinator between every
 // live ExecutorSet in this process that uses the same stable root.
-func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
+func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func() error) {
 	key := strings.ToUpper(filepath.Clean(scratchRoot))
 	restrictedRuntimeRegistry.Lock()
 	entry := restrictedRuntimeRegistry.entries[key]
@@ -54,7 +54,8 @@ func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
 	restrictedRuntimeRegistry.Unlock()
 
 	var once sync.Once
-	return entry.runtime, func() {
+	var releaseErr error
+	return entry.runtime, func() error {
 		once.Do(func() {
 			restrictedRuntimeRegistry.Lock()
 			current := restrictedRuntimeRegistry.entries[key]
@@ -70,9 +71,10 @@ func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
 			shouldClose := entry.refs == 0
 			restrictedRuntimeRegistry.Unlock()
 			if shouldClose {
-				_ = runtime.Close()
+				releaseErr = runtime.Close()
 			}
 		})
+		return releaseErr
 	}
 }
 

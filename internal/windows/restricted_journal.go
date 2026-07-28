@@ -88,6 +88,7 @@ type RestrictedJournal struct {
 	recordsRoot   *os.Root
 	retiredRoot   *os.Root
 	syncDirectory func(*os.Root) error
+	closeRoots    func(*os.Root, *os.Root) error
 }
 
 // OpenRestrictedJournal creates the durable store below stableScratchRoot.
@@ -114,6 +115,7 @@ func openRestrictedJournalWithSync(stableScratchRoot string, syncDirectory func(
 		recordsDir:    filepath.Join(root, "records"),
 		retiredDir:    filepath.Join(root, "retired-sids"),
 		syncDirectory: syncDirectory,
+		closeRoots:    closeRestrictedJournalRoots,
 	}
 	j.cond = sync.NewCond(&j.mu)
 	if err := os.MkdirAll(abs, 0o700); err != nil {
@@ -203,13 +205,11 @@ func (j *RestrictedJournal) Close() error {
 	j.recordsRoot, j.retiredRoot = nil, nil
 	j.mu.Unlock()
 
-	var result error
-	if recordsRoot != nil {
-		result = errors.Join(result, recordsRoot.Close())
+	closeRoots := j.closeRoots
+	if closeRoots == nil {
+		closeRoots = closeRestrictedJournalRoots
 	}
-	if retiredRoot != nil {
-		result = errors.Join(result, retiredRoot.Close())
-	}
+	result := closeRoots(recordsRoot, retiredRoot)
 
 	j.mu.Lock()
 	j.closeErr = result
@@ -217,6 +217,24 @@ func (j *RestrictedJournal) Close() error {
 	j.cond.Broadcast()
 	j.mu.Unlock()
 	return result
+}
+
+func closeRestrictedJournalRoots(recordsRoot, retiredRoot *os.Root) error {
+	var result error
+	if recordsRoot != nil {
+		result = errors.Join(result, recordsRoot.Close())
+	}
+	if retiredRoot != nil {
+		result = errors.Join(result, retiredRoot.Close())
+	}
+	return result
+}
+
+func joinRestrictedJournalClose(result *error, journal *RestrictedJournal) {
+	if result == nil {
+		return
+	}
+	*result = errors.Join(*result, journal.Close())
 }
 
 func (j *RestrictedJournal) ensureCondLocked() {

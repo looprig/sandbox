@@ -10,8 +10,8 @@ func newRestrictedRuntimeState() restrictedRuntimeState { return restrictedRunti
 
 // AcquireRestrictedRuntime is a side-effect-free portability stub. Non-Windows
 // platform selection rejects Windows mechanisms before the runtime is used.
-func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func()) {
-	return NewRestrictedRuntime(scratchRoot), func() {}
+func AcquireRestrictedRuntime(scratchRoot string) (*RestrictedRuntime, func() error) {
+	return NewRestrictedRuntime(scratchRoot), func() error { return nil }
 }
 
 func (*RestrictedRuntime) closeRestrictedJournal() error { return nil }

@@ -908,7 +908,7 @@ func RunInstalledBrokerService(ctx context.Context) error {
 	return runBrokerService(ctx, config)
 }
 
-func runBrokerService(ctx context.Context, config brokerRuntimeConfig) error {
+func runBrokerService(ctx context.Context, config brokerRuntimeConfig) (result error) {
 	if config.Protocol != brokerProtocolVersion || config.InstallationID == "" || config.OwnerSID == "" || config.PipeName == "" || !filepath.IsAbs(config.JournalPath) {
 		return errors.New("windows sandbox: invalid installed broker runtime configuration")
 	}
@@ -937,7 +937,7 @@ func runBrokerService(ctx context.Context, config brokerRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	defer retirement.Close()
+	defer joinRestrictedJournalClose(&result, retirement)
 	sids, err := NewOneShotSIDGenerator(rand.Reader, retirement)
 	if err != nil {
 		return err

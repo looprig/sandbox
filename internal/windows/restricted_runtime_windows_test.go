@@ -3,6 +3,8 @@
 package windows
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -30,6 +32,44 @@ func TestDirectRestrictedRuntimeCloseOwnsOpenedJournal(t *testing.T) {
 	}
 	if opened, err := runtime.restrictedJournal(); err == nil || opened != nil {
 		t.Fatalf("closed direct runtime reopened journal = (%p, %v)", opened, err)
+	}
+}
+
+func TestRestrictedRuntimeFinalReleaseReturnsCloseErrorOnce(t *testing.T) {
+	root := t.TempDir()
+	first, releaseFirst := AcquireRestrictedRuntime(root)
+	second, releaseSecond := AcquireRestrictedRuntime(root)
+	if first != second {
+		t.Fatal("same root did not share runtime")
+	}
+	journal, err := OpenRestrictedJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fault := errors.New("injected journal close failure")
+	originalClose := journal.closeRoots
+	closeCalls := 0
+	journal.closeRoots = func(records, retired *os.Root) error {
+		closeCalls++
+		return errors.Join(originalClose(records, retired), fault)
+	}
+	first.state.open = func(string) (*RestrictedJournal, RestrictedSweepReport, error) {
+		return journal, RestrictedSweepReport{}, nil
+	}
+	if _, err := first.restrictedJournal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseFirst(); err != nil {
+		t.Fatalf("nonfinal release = %v, want nil", err)
+	}
+	if err := releaseSecond(); !errors.Is(err, fault) {
+		t.Fatalf("final release = %v, want injected close failure", err)
+	}
+	if err := releaseSecond(); !errors.Is(err, fault) {
+		t.Fatalf("repeated final release = %v, want same close failure", err)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("journal close calls = %d, want 1", closeCalls)
 	}
 }
 
@@ -68,7 +108,7 @@ func TestRestrictedRuntimeRegistryDoesNotHoldGlobalLockWhileClosing(t *testing.T
 
 	type acquiredRuntime struct {
 		runtime *RestrictedRuntime
-		release func()
+		release func() error
 	}
 	unrelatedRoot := filepath.Join(t.TempDir(), "unrelated")
 	acquired := make(chan acquiredRuntime, 1)
@@ -142,7 +182,7 @@ func TestRestrictedRuntimeSharesSweepAcrossLiveSetsAndRecoversAfterLastRelease(t
 	}
 
 	next, releaseNext := AcquireRestrictedRuntime(root)
-	t.Cleanup(releaseNext)
+	t.Cleanup(func() { _ = releaseNext() })
 	if next == first {
 		t.Fatal("new set after final release reused the retired coordinator")
 	}
@@ -163,7 +203,7 @@ func TestRestrictedRuntimeConcurrentAcquireUsesOneCoordinator(t *testing.T) {
 	root := t.TempDir()
 	const count = 16
 	runtimes := make(chan *RestrictedRuntime, count)
-	releases := make(chan func(), count)
+	releases := make(chan func() error, count)
 	var group sync.WaitGroup
 	for range count {
 		group.Add(1)
