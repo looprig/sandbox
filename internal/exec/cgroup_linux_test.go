@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
-	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -282,8 +281,8 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 	if !limited.Guarantees().ResourceLimits {
 		t.Errorf("ResourceLimits guarantee = false; want true on a host with cgroup v2 pids delegation")
 	}
-	if !reportHas(limited.Report(), "resource-limits", profile.StatusEnforced) {
-		t.Errorf("missing resource-limits/linux.Enforced report entry; report=%+v", limited.Report())
+	if !reportHas(limited.Report(), "resource-limits", linuxReportStatusEnforced) {
+		t.Errorf("missing resource-limits/Enforced report entry; report=%+v", limited.Report())
 	}
 
 	// A limits-Disabled executor: no scope, no guarantee, an unenforced entry — but
@@ -292,7 +291,7 @@ func TestLinuxCgroupGuaranteeAndLevel(t *testing.T) {
 	if Disabled.Guarantees().ResourceLimits {
 		t.Errorf("Disabled policy reports ResourceLimits guarantee; want false")
 	}
-	if !reportHas(Disabled.Report(), "resource-limits", profile.StatusUnenforced) {
+	if !reportHas(Disabled.Report(), "resource-limits", "unenforced") {
 		t.Errorf("Disabled policy missing resource-limits/unenforced report entry; report=%+v", Disabled.Report())
 	}
 	if limited.Level() != Disabled.Level() {
@@ -317,7 +316,7 @@ func TestLinuxCgroupUnavailablePathFailSecure(t *testing.T) {
 	if e.Guarantees().ResourceLimits {
 		t.Errorf("ResourceLimits guarantee set with no delegation; want false (fail-secure)")
 	}
-	if !reportHas(e.Report(), "resource-limits", profile.StatusUnenforced) {
+	if !reportHas(e.Report(), "resource-limits", "unenforced") {
 		t.Errorf("missing resource-limits/unenforced report entry; report=%+v", e.Report())
 	}
 
@@ -409,7 +408,7 @@ func TestCompileCgroupPolicy(t *testing.T) {
 			t.Parallel()
 			cg := linux.CompileCgroupPolicy(tt.limits, tt.Ancestor)
 			if cg.Enforced() != tt.wantEnforced {
-				t.Errorf("linux.Enforced() = %v, want %v", cg.Enforced(), tt.wantEnforced)
+				t.Errorf("Enforced() = %v, want %v", cg.Enforced(), tt.wantEnforced)
 			}
 			if cg.PidsMax != tt.wantPids {
 				t.Errorf("PidsMax = %d, want %d", cg.PidsMax, tt.wantPids)
@@ -463,9 +462,9 @@ func TestCgroupCompileReport(t *testing.T) {
 		wantStatus string
 		wantDetail string // substring the detail must contain
 	}{
-		{"linux.Enforced", linux.CompiledCgroup{Ancestor: "/x", PidsMax: 512}, profile.StatusEnforced, "pids.max=512"},
-		{"Disabled unenforced", linux.CompiledCgroup{Disabled: true}, profile.StatusUnenforced, "Disabled by policy"},
-		{"absent unenforced", linux.CompiledCgroup{}, profile.StatusUnenforced, "delegation absent"},
+		{"Enforced", linux.CompiledCgroup{Ancestor: "/x", PidsMax: 512}, linuxReportStatusEnforced, "pids.max=512"},
+		{"Disabled unenforced", linux.CompiledCgroup{Disabled: true}, "unenforced", "Disabled by policy"},
+		{"absent unenforced", linux.CompiledCgroup{}, "unenforced", "delegation absent"},
 	}
 	for _, tt := range tests {
 		tt := tt

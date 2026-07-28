@@ -12,13 +12,6 @@ type CompileReport struct {
 	Entries []ReportEntry
 }
 
-// Compile report status values are stable public display and wire vocabulary.
-const (
-	StatusEnforced   = "Enforced"
-	StatusNarrowed   = "narrowed"
-	StatusUnenforced = "unenforced"
-)
-
 const (
 	LevelNone uint8 = iota
 	LevelDegraded
