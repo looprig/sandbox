@@ -308,24 +308,30 @@ the null backend accepts only an acknowledged `Unconfined` profile.
 
 ### 7.5 Linux filesystem snapshots
 
-Both Linux rungs share Landlock's additive allowlist. When a writable root
-contains a fixed-path deny or protected carveout, they enumerate unaffected
-siblings at spawn instead of granting the covering directory as a whole. This
-applies even when the protected target does not yet exist: the command cannot
-create a new entry directly beneath that covering directory during the spawn.
-Pre-existing unaffected children retain their compiled access, including write
-access when policy permits it. A denied target that exists at spawn is omitted
-from the enumerated rules for each denied axis.
+Both Linux rungs share Landlock's additive allowlist. On each read, execute, or
+write axis where a recursive allow contains a nested literal deny, they
+enumerate unaffected siblings at spawn instead of granting the covering
+directory as a whole on that axis. Pre-existing unaffected children retain
+their compiled authority. A denied target that exists at spawn is omitted from
+the enumerated rules for each denied axis.
+
+The consequence is axis-specific. Withholding write blocks creation of new
+entries directly beneath the covering directory. A read- or execute-only deny
+does not remove separately retained write authority, so creation may remain
+permitted; a newly created entry still receives no authority on the denied
+read/execute axis. The same rules apply when the protected target does not yet
+exist at spawn.
 
 Rung 1 additionally builds a mount view: read-only carveouts are mount
 re-masked, fixed denies without restorations use empty masks, and paths outside
 the explicit view remain invisible. Those mount mechanisms enforce the
 protected path itself, but they do not remove the shared Landlock sibling
 enumeration needed for defense in depth and restored literal precedence.
-Therefore Rung 1 has the same covering-root snapshot narrowing as Rung 2 even
-when its mount re-mask is fully enforced.
+Therefore Rung 1 has the same per-axis snapshot narrowing as Rung 2 even when
+its mount re-mask is fully enforced.
 
-This spawn snapshot is intentionally narrower than the requested writable root.
+This spawn snapshot is intentionally narrower than the requested covering allow
+on each affected axis.
 It prevents a future `.git`, `.looprig`, or fixed secret path from becoming
 accessible on a denied axis after confinement, and preserves the rule-precedence
 contract in §3. Both rungs must record the narrowing in `CompileReport`; they

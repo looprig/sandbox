@@ -146,19 +146,27 @@ func (compiled CompiledFS) Resolve(path string) FSAccess {
 // HasLiteralDeny reports whether any literal deny rule survived compilation.
 func (compiled CompiledFS) HasLiteralDeny() bool { return len(compiled.Denies) > 0 }
 
-// HasCarveout reports whether a writable allow contains a nested write deny.
-func (compiled CompiledFS) HasCarveout() bool {
+// SnapshotAxes reports the access axes for which a recursive allow contains a
+// nested literal deny. Landlock must enumerate unaffected siblings instead of
+// granting the covering allow root on each returned axis.
+func (compiled CompiledFS) SnapshotAxes() FSAccess {
+	var axes FSAccess
 	for _, allow := range compiled.Allows {
-		if !allow.writable() {
+		if allow.Exact {
 			continue
 		}
 		for _, deny := range compiled.Denies {
-			if !allow.Exact && deny.Access&WriteAccess != 0 && PathUnder(allow.Path, deny.Path) {
-				return true
+			if PathUnder(allow.Path, deny.Path) {
+				axes |= allow.Access & deny.Access
 			}
 		}
 	}
-	return false
+	return axes
+}
+
+// HasCarveout reports whether a writable allow contains a nested write deny.
+func (compiled CompiledFS) HasCarveout() bool {
+	return compiled.SnapshotAxes()&WriteAccess != 0
 }
 
 func PathUnder(parent, path string) bool {

@@ -219,7 +219,7 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 // feature (SPEC §7.5). At Rung 1 the mount view + nftables enforce features Rung
 // 2 can only narrow or drop: restricted-read invisibility, glob denies, and
 // address-scoped network with the metadata hard-deny — all "Enforced". It also
-// discloses the shared Landlock writable-root snapshot narrowing and the
+// discloses the shared per-axis Landlock snapshot narrowing and the
 // self-created-file glob-mask residual (§7.5); neither demotes Level.
 func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPlan) profile.CompileReport {
 	entries := []profile.ReportEntry{
@@ -239,11 +239,11 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the Rung-1 property Rung 2 cannot provide (§7.2, §7.5)",
 		},
 	}
-	if policy.CompileFS(p.FS).HasCarveout() {
+	if axes := policy.CompileFS(p.FS).SnapshotAxes(); axes != 0 {
 		entries = append(entries, profile.ReportEntry{
-			Feature: "write-root-snapshot",
+			Feature: "filesystem-axis-snapshot",
 			Status:  "narrowed",
-			Detail:  "protected paths beneath writable roots require shared Landlock sibling enumeration: pre-existing unaffected children retain policy-allowed access, but the snapshot blocks new entries directly beneath the writable covering root (§7.5)",
+			Detail:  filesystemAxisSnapshotDetail(axes),
 		})
 	}
 	if mvp.hasLiteralDeny {
@@ -276,6 +276,28 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 	}
 	entries = append(entries, rung1NetReport(nft)...)
 	return profile.CompileReport{Entries: entries}
+}
+
+func filesystemAxisSnapshotDetail(axes policy.FSAccess) string {
+	var names []string
+	for _, axis := range []struct {
+		bit  policy.FSAccess
+		name string
+	}{
+		{policy.ReadAccess, "read"},
+		{policy.ExecAccess, "execute"},
+		{policy.WriteAccess, "write"},
+	} {
+		if axes&axis.bit != 0 {
+			names = append(names, axis.name)
+		}
+	}
+	detail := "protected paths beneath a covering allow require shared Landlock sibling enumeration on denied axes: " +
+		strings.Join(names, ", ") + "; pre-existing unaffected children retain policy-allowed access"
+	if axes&policy.WriteAccess != 0 {
+		return detail + ", while withholding write blocks new entries directly beneath the covering root (§7.5)"
+	}
+	return detail + "; write authority is not withheld, so creation may remain permitted, but new entries lack denied-axis authority (§7.5)"
 }
 
 func mountPlanHasReadOnlyCarveout(mvp MountViewPlan) bool {

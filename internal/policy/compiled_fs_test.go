@@ -40,6 +40,60 @@ func TestCompiledFSPreservesRealProfileAxisPrecedence(t *testing.T) {
 	}
 }
 
+func TestCompiledFSSnapshotAxes(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(string(filepath.Separator), "workspace")
+	protected := filepath.Join(root, "protected")
+	tests := []struct {
+		name    string
+		entries []FSEntry
+		want    FSAccess
+	}{
+		{
+			name: "write carveout withholds write and execute",
+			entries: []FSEntry{
+				{Path: root, Access: AllAccess},
+				{Path: protected, Access: ReadAccess, Denied: WriteAccess | ExecAccess},
+			},
+			want: WriteAccess | ExecAccess,
+		},
+		{
+			name: "nested read deny snapshots only read axis",
+			entries: []FSEntry{
+				{Path: root, Access: AllAccess},
+				{Path: protected, Denied: ReadAccess},
+			},
+			want: ReadAccess,
+		},
+		{
+			name: "deny outside covering allow axes does not carve",
+			entries: []FSEntry{
+				{Path: root, Access: WriteAccess},
+				{Path: protected, Denied: ReadAccess},
+			},
+		},
+		{
+			name: "equal-path tie is not sibling enumeration",
+			entries: []FSEntry{
+				{Path: root, Access: AllAccess},
+				{Path: root, Denied: AllAccess},
+			},
+		},
+		{
+			name:    "plain writable root has no snapshot",
+			entries: []FSEntry{{Path: root, Access: AllAccess}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := CompileFS(test.entries).SnapshotAxes(); got != test.want {
+				t.Fatalf("SnapshotAxes() = %#x, want %#x", got, test.want)
+			}
+		})
+	}
+}
+
 func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "workspace")

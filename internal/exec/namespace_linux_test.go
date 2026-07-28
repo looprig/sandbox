@@ -466,34 +466,58 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 	}
 }
 
-func TestCompileRung1ReportsWriteRootSnapshotNarrowing(t *testing.T) {
+func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()
+	findSnapshot := func(report CompileReport) *profile.ReportEntry {
+		for i := range report.Entries {
+			if report.Entries[i].Feature == "filesystem-axis-snapshot" {
+				return &report.Entries[i]
+			}
+		}
+		return nil
+	}
 
 	_, report, _, _, err := linux.NewBackendRung1().Compile(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("compile protected writable root: %v", err)
 	}
-	var snapshot *profile.ReportEntry
-	for i := range report.Entries {
-		if report.Entries[i].Feature == "write-root-snapshot" {
-			snapshot = &report.Entries[i]
-			break
-		}
-	}
+	snapshot := findSnapshot(report)
 	if snapshot == nil {
-		t.Fatalf("report missing write-root-snapshot entry: %+v", report.Entries)
+		t.Fatalf("report missing filesystem-axis-snapshot entry: %+v", report.Entries)
 	}
 	if snapshot.Status != "narrowed" {
-		t.Fatalf("write-root-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
+		t.Fatalf("filesystem-axis-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
 	}
-	for _, phrase := range []string{"shared Landlock sibling enumeration", "pre-existing unaffected children", "blocks new entries directly beneath"} {
+	for _, phrase := range []string{"shared Landlock sibling enumeration", "denied axes: execute, write", "pre-existing unaffected children", "blocks new entries directly beneath"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
-			t.Errorf("write-root-snapshot detail %q missing %q", snapshot.Detail, phrase)
+			t.Errorf("filesystem-axis-snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
 	}
 	if !reportHas(report, "carveout", linuxReportStatusEnforced) {
 		t.Errorf("mount re-mask carveout no longer reported Enforced: %+v", report.Entries)
+	}
+
+	readDenied := filepath.Join(ws, "read-denied")
+	readOnlySnapshot := policy.Effective{Workspace: ws, FS: []policy.FSEntry{
+		{Path: ws, Access: policy.AllAccess},
+		{Path: readDenied, Denied: policy.ReadAccess},
+	}}
+	_, report, _, _, err = linux.NewBackendRung1().Compile(readOnlySnapshot)
+	if err != nil {
+		t.Fatalf("compile nested read deny: %v", err)
+	}
+	snapshot = findSnapshot(report)
+	if snapshot == nil || snapshot.Status != "narrowed" {
+		t.Fatalf("nested read deny snapshot = %+v, want narrowed entry; report=%+v", snapshot, report.Entries)
+	}
+	for _, phrase := range []string{"denied axes: read", "creation may remain permitted", "new entries lack denied-axis authority"} {
+		if !strings.Contains(snapshot.Detail, phrase) {
+			t.Errorf("read-only snapshot detail %q missing %q", snapshot.Detail, phrase)
+		}
+	}
+	if strings.Contains(snapshot.Detail, "blocks new entries directly beneath") {
+		t.Errorf("read-only snapshot falsely claims creation is blocked: %q", snapshot.Detail)
 	}
 
 	withoutProtectedChild := policy.Effective{Workspace: ws, FS: []policy.FSEntry{{
@@ -504,7 +528,7 @@ func TestCompileRung1ReportsWriteRootSnapshotNarrowing(t *testing.T) {
 		t.Fatalf("compile plain writable root: %v", err)
 	}
 	for _, entry := range report.Entries {
-		if entry.Feature == "write-root-snapshot" {
+		if entry.Feature == "filesystem-axis-snapshot" {
 			t.Fatalf("plain writable root unexpectedly reported snapshot narrowing: %+v", entry)
 		}
 	}
