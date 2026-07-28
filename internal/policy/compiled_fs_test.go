@@ -62,16 +62,27 @@ func TestEnumerateFSRulesEnforcesIndependentAxes(t *testing.T) {
 	}
 }
 
-func TestEnumerateFSRulesIgnoresDeepNonexistentDeny(t *testing.T) {
+func TestEnumerateFSRulesKeepsDeepNonexistentDenyFailNarrow(t *testing.T) {
 	root := t.TempDir()
+	sibling := filepath.Join(root, "work")
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	denied := filepath.Join(root, ".git", "a", "b", "secret")
 	compiled := CompileFS([]FSEntry{
 		{Path: root, Access: AllAccess},
-		{Path: filepath.Join(root, ".git", "a", "b", "secret"), Denied: AllAccess},
+		{Path: denied, Denied: AllAccess},
 	})
 
 	rules := EnumerateFSRules(compiled)
-	if got := resolveEnumeratedRules(rules, filepath.Join(root, "future")); got != AllAccess {
-		t.Fatalf("nonexistent deny carved declared root: access=%#x rules=%+v", got, rules)
+	if got := resolveEnumeratedRules(rules, filepath.Join(sibling, "future")); got != AllAccess {
+		t.Fatalf("unaffected pre-existing sibling access = %#x, want full access; rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, filepath.Join(root, "future")); got != DenyAccess {
+		t.Fatalf("nonexistent deny failed to keep covering root narrow: access=%#x rules=%+v", got, rules)
+	}
+	if got := resolveEnumeratedRules(rules, denied); got != DenyAccess {
+		t.Fatalf("nonexistent denied subtree received access=%#x rules=%+v", got, rules)
 	}
 }
 

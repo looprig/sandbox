@@ -69,6 +69,10 @@ func tryRead(t *testing.T, e *Executor, ws, path string) int {
 func TestLinuxFSWriteBoundary(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
+	work := filepath.Join(ws, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("UserHomeDir: %v", err)
@@ -81,7 +85,7 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
-	inside := filepath.Join(ws, "inside.txt")
+	inside := filepath.Join(work, "inside.txt")
 	if code := tryWrite(t, e, ws, inside); code != 0 {
 		t.Errorf("write INSIDE workspace denied (exit %d), want permitted — write boundary too tight", code)
 	}
@@ -97,15 +101,21 @@ func TestLinuxFSWriteBoundary(t *testing.T) {
 	}
 }
 
-// TestLinuxFSTmpWritable proves /tmp is writable under the Write policy (TMPDIR
-// is forced to /tmp, so tools must be able to write there).
+// TestLinuxFSTmpWritable proves a pre-existing child of /tmp is writable under
+// the fixture policy. The parent is carved because the workspace and its
+// protected paths also live below /tmp, so §7.5 snapshot semantics deliberately
+// keep creation at the shared root unavailable.
 func TestLinuxFSTmpWritable(t *testing.T) {
 	requireLandlockV4(t)
 	ws := t.TempDir()
+	tmpWork, err := os.MkdirTemp("/tmp", ".lrsandbox-tmp-writable-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpWork) })
 	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
 
-	tmpFile := filepath.Join("/tmp", ".lrsandbox-tmp-writable-test")
-	t.Cleanup(func() { _ = os.Remove(tmpFile) })
+	tmpFile := filepath.Join(tmpWork, "created-by-sandbox")
 	if code := tryWrite(t, e, ws, tmpFile); code != 0 {
 		t.Errorf("write under /tmp denied (exit %d), want permitted", code)
 	}
@@ -114,22 +124,64 @@ func TestLinuxFSTmpWritable(t *testing.T) {
 	}
 }
 
-func TestWorkspaceFixtureKeepsDeclaredWritableRootsWhenCarveoutsAreAbsent(t *testing.T) {
+func TestWorkspaceFixtureKeepsPreexistingChildrenWritableAndFutureDeniesClosed(t *testing.T) {
 	ws := t.TempDir()
+	work := filepath.Join(ws, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmpWork, err := os.MkdirTemp("/tmp", ".lrsandbox-rules-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpWork) })
 	compiled := policy.CompileFS(backendFixturePolicy(fixtureWorkspaceWrite, ws).FS)
 	rules := policy.EnumerateFSRules(compiled)
 
-	assertWritableRoot := func(path string) {
-		t.Helper()
+	access := func(path string) policy.FSAccess {
+		var got policy.FSAccess
 		for _, rule := range rules {
-			if rule.Path == path && rule.Access&policy.WriteAccess != 0 {
-				return
+			if rule.Path == path || rule.IsDir && policy.PathUnder(rule.Path, path) {
+				got |= rule.Access
 			}
 		}
-		t.Errorf("declared writable root %q was carved by an absent deny; rules=%+v", path, rules)
+		return got
 	}
-	assertWritableRoot(ws)
-	assertWritableRoot("/tmp")
+	for _, path := range []string{filepath.Join(work, "future"), filepath.Join(tmpWork, "future")} {
+		if got := access(path); got&policy.WriteAccess == 0 {
+			t.Errorf("pre-existing writable child %q lacks write access; access=%#x rules=%+v", path, got, rules)
+		}
+	}
+	for _, path := range []string{filepath.Join(ws, "future"), filepath.Join(ws, ".git")} {
+		if got := access(path); got&policy.WriteAccess != 0 {
+			t.Errorf("future path %q received write access despite absent carveout; access=%#x rules=%+v", path, got, rules)
+		}
+	}
+}
+
+func TestLinuxFSAbsentGitCarveoutCannotBeCreated(t *testing.T) {
+	requireLandlockV4(t)
+	ws := t.TempDir()
+	work := filepath.Join(ws, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	e := newFSExecutor(t, backendFixturePolicy(fixtureWorkspaceWrite, ws))
+
+	if code := tryWrite(t, e, ws, filepath.Join(work, "allowed")); code != 0 {
+		t.Fatalf("write in unaffected pre-existing sibling denied (exit %d)", code)
+	}
+	gitDir := filepath.Join(ws, ".git")
+	_, code, err := e.RunCommand(context.Background(), ws, "mkdir "+shq(gitDir))
+	if err != nil {
+		t.Fatalf("RunCommand(mkdir absent .git): %v", err)
+	}
+	if code == 0 {
+		t.Fatal("creating absent .git succeeded — FAIL-OPEN: future carveout became writable")
+	}
+	if _, err := os.Stat(gitDir); !os.IsNotExist(err) {
+		t.Fatalf("absent .git exists after denied creation: %v", err)
+	}
 }
 
 // TestLinuxFSGitCarveout proves the .git read-only carveout via ENUMERATED
@@ -457,14 +509,24 @@ func TestEnumerateFSRules(t *testing.T) {
 		}
 	})
 
-	t.Run("nonexistent deny does not carve (existence-gated)", func(t *testing.T) {
+	t.Run("nonexistent deny keeps covering root fail-narrow", func(t *testing.T) {
+		denied := filepath.Join(root, "does-not-exist")
 		cfs := policy.CompiledFS{
 			Allows: []policy.FSAllow{{Path: root, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess}},
-			Denies: []policy.FSDeny{{Path: filepath.Join(root, "does-not-exist"), Access: policy.AllAccess}},
+			Denies: []policy.FSDeny{{Path: denied, Access: policy.AllAccess}},
 		}
 		rules := policy.EnumerateFSRules(cfs)
-		if acc, ok := access(rules, root); !ok || acc&policy.WriteAccess == 0 {
-			t.Errorf("a nonexistent deny must not force carving; root should be granted whole; rules=%+v", rules)
+		if _, ok := access(rules, root); ok {
+			t.Errorf("covering root must stay ungranted while nested deny is absent; rules=%+v", rules)
+		}
+		if _, ok := access(rules, denied); ok {
+			t.Errorf("nonexistent denied subtree received a rule; rules=%+v", rules)
+		}
+		for _, sibling := range []string{"a", "b", "secret", ".git"} {
+			path := filepath.Join(root, sibling)
+			if acc, ok := access(rules, path); !ok || acc&policy.WriteAccess == 0 {
+				t.Errorf("unaffected pre-existing sibling %q should remain writable; rules=%+v", path, rules)
+			}
 		}
 	})
 }

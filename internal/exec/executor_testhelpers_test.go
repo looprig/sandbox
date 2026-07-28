@@ -40,11 +40,15 @@ func portableEchoArgv(t *testing.T, values ...string) []string {
 
 func TestPortableShellFixtures(t *testing.T) {
 	workspace := t.TempDir()
+	work := filepath.Join(workspace, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	executor, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, workspace))
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(workspace, "portable-marker")
+	marker := filepath.Join(work, "portable-marker")
 	command := portableWriteCommand(marker, "started")
 	output, code, err := executor.RunCommand(context.Background(), workspace, command)
 	if err != nil || code != 0 {
