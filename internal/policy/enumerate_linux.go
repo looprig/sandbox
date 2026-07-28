@@ -223,6 +223,12 @@ func enumeratePinnedTree(root *os.File, target string, access FSAccess, excludes
 				continue
 			}
 			if len(deeper) == 0 {
+				if !directRegularFileRuleSafe(info) {
+					if owned {
+						_ = child.Close()
+					}
+					continue
+				}
 				if owned {
 					ruleFD = addFile(child)
 					owned = false

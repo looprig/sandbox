@@ -662,6 +662,34 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendsReportHardlinkAliasNarrowing(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	effective := policy.Effective{
+		Workspace: ws,
+		FS:        []policy.FSEntry{{Path: ws, Access: policy.AllAccess}},
+	}
+	for _, test := range []struct {
+		name    string
+		backend *linux.Backend
+	}{
+		{name: "rung-2", backend: linux.NewBackend()},
+		{name: "rung-1", backend: linux.NewBackendRung1()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, report, _, _, err := test.backend.Compile(effective)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries := reportEntriesForFeature(report, "allow-paths")
+			if len(entries) != 1 || entries[0].Status != "narrowed" ||
+				!strings.Contains(entries[0].Detail, "multiple hard links") {
+				t.Fatalf("allow-paths hardlink narrowing disclosure = %+v, want one narrowed entry", entries)
+			}
+		})
+	}
+}
+
 // TestMountViewSpecGobRoundTrip asserts the rung-1 mount-view and nftables specs
 // survive the gob re-exec codec unchanged (they cross the pipe to the stage-2
 // child). Runs on THIS host.

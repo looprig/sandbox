@@ -52,6 +52,10 @@ func AcquirePathHandle(binding *PathBinding, target string, exact bool) (*PathHa
 			_ = file.Close()
 			return nil, ErrUnsupportedClass
 		}
+		if !directRegularFileRuleSafe(info) {
+			_ = file.Close()
+			return nil, ErrUnsupportedClass
+		}
 	} else if !info.IsDir() {
 		_ = file.Close()
 		return nil, ErrUnsupportedClass

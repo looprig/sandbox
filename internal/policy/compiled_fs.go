@@ -38,6 +38,9 @@ func ValidateLandlockExactPaths(entries []FSEntry, handles []*PathHandle) error 
 		if info.Mode()&fs.ModeSymlink != 0 {
 			return fmt.Errorf("%w: Landlock exact path %q is a symlink", ErrUnsupportedClass, entry.Path)
 		}
+		if !directRegularFileRuleSafe(info) {
+			return fmt.Errorf("%w: Landlock exact path %q has multiple hard links", ErrUnsupportedClass, entry.Path)
+		}
 	}
 	return nil
 }
@@ -251,6 +254,16 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 					continue
 				}
 				if len(excludes) == 0 {
+					if !resolved.IsDir {
+						info, err := resolved.File.Stat()
+						if err != nil {
+							CloseRuleFiles(resolver.files)
+							return nil, nil, fmt.Errorf("%w: stat pinned file %q: %v", ErrUnsupportedClass, allow.Path, err)
+						}
+						if !directRegularFileRuleSafe(info) {
+							continue
+						}
+					}
 					accumulator.add(FSRule{
 						Target:   allow.Path,
 						ParentFD: resolved.ChildFD,
@@ -270,8 +283,9 @@ func EnumerateFSRulesWithPathHandles(compiled CompiledFS, handles []*PathHandle)
 				continue
 			}
 			if len(excludes) == 0 {
-				info, err := os.Stat(allow.Path)
-				if err == nil {
+				info, err := os.Lstat(allow.Path)
+				if err == nil && info.Mode()&fs.ModeSymlink == 0 &&
+					directRegularFileRuleSafe(info) {
 					accumulator.add(FSRule{Path: allow.Path, Access: bit, IsDir: info.IsDir()})
 				}
 				continue
@@ -359,6 +373,9 @@ func carveGrant(dir string, access FSAccess, excludes []fsExclude, emit func(FSR
 			continue
 		}
 		if len(nested) == 0 {
+			if !directRegularFileRuleSafe(info) {
+				continue
+			}
 			emit(FSRule{Path: child, Access: access, IsDir: info.IsDir()})
 			continue
 		}

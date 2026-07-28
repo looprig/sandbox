@@ -270,6 +270,7 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "target execve'd with the policy.EnvPolicy baseline; the harness process environment (secrets) is absent (§5.5)",
 		})
 	}
+	entries = append(entries, allowPathsReportEntry())
 	entries = append(entries, rung1NetReport(nft)...)
 	return profile.CompileReport{Entries: entries}
 }
@@ -385,12 +386,17 @@ func fsCompileReport(p policy.Effective, cfs policy.CompiledFS) profile.CompileR
 			Detail:  "glob deny-reads (e.g. **/.env*) are not expressible in Landlock's additive model at Rung 2; the in-process ReadGuard still enforces them for native tools — subprocess reads are the gap (§7.5)",
 		})
 	}
-	entries = append(entries, profile.ReportEntry{
+	entries = append(entries, allowPathsReportEntry())
+	return profile.CompileReport{Entries: entries}
+}
+
+func allowPathsReportEntry() profile.ReportEntry {
+	return profile.ReportEntry{
 		Feature: "allow-paths",
 		Status:  "narrowed",
-		Detail:  "allow paths are stat'd at spawn; a nonexistent path or a symlink out of an enumerated tree is dropped rather than granted (fail secure)",
-	})
-	return profile.CompileReport{Entries: entries}
+		Detail: "allow paths are stat'd at spawn; a nonexistent path, a symlink out of an enumerated tree, or a direct regular-file rule with multiple hard links is dropped rather than granted " +
+			"(fail secure; directory ancestor rules are unaffected)",
+	}
 }
 
 // policyHasGlobDeny reports whether the policy carries any glob DENY entry, which

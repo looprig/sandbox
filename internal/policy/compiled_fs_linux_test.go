@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,5 +96,65 @@ func TestEnumeratePinnedFSRulesDerivesWriteDenyAcrossRecursiveReadDeny(t *testin
 	}
 	if restoredAccess != ReadAccess|ExecAccess {
 		t.Fatalf("pinned restored source access = %#x, want read+execute without write; rules=%+v", restoredAccess, rules)
+	}
+}
+
+func TestEnumeratePinnedFSRulesOmitsDirectHardlinkedFiles(t *testing.T) {
+	root := t.TempDir()
+	public := filepath.Join(root, "public")
+	secret := filepath.Join(root, "secret")
+	if err := os.WriteFile(public, []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(public, secret); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	binding, err := CapturePathBinding(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := AcquirePathHandle(&binding, root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+
+	compiled := CompileFSWithPathHandles([]FSEntry{
+		{Path: root, Access: AllAccess, Canonical: true},
+		{Path: secret, Denied: ReadAccess | ExecAccess},
+	}, []*PathHandle{handle})
+	rules, files, err := EnumerateFSRulesWithPathHandles(compiled, []*PathHandle{handle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseRuleFiles(files)
+	for _, rule := range rules {
+		if rule.Target == public || rule.Target == secret {
+			t.Fatalf("multiply-linked pinned file received direct rule: %+v; rules=%+v", rule, rules)
+		}
+	}
+}
+
+func TestAcquireExactPathHandleRejectsHardlinkedFile(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	alias := filepath.Join(root, "alias")
+	if err := os.WriteFile(target, []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	binding, err := CapturePathBinding(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := AcquirePathHandle(&binding, target, true)
+	if handle != nil {
+		_ = handle.Close()
+		t.Fatal("exact hardlinked file returned a path handle")
+	}
+	if !errors.Is(err, ErrUnsupportedClass) {
+		t.Fatalf("AcquirePathHandle error = %v, want ErrUnsupportedClass", err)
 	}
 }

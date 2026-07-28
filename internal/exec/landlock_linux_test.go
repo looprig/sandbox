@@ -443,6 +443,30 @@ func TestLinuxFSRecursiveDenyBlocksRestoredAliasReplacement(t *testing.T) {
 	}
 }
 
+func TestLinuxFSPreexistingHardlinkAliasFailsNarrow(t *testing.T) {
+	requireLandlockV4(t)
+	ws := t.TempDir()
+	public := filepath.Join(ws, "public")
+	secret := filepath.Join(ws, "secret")
+	if err := os.WriteFile(public, []byte("shared-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(public, secret); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	e := newFSExecutor(t, backendFixturePolicy(
+		fixtureWorkspaceWrite, ws,
+		fixtureWithoutSecretDenials(),
+		fixtureWithDenyRead(secret),
+	))
+	if code := tryRead(t, e, ws, secret); code == 0 {
+		t.Fatal("denied hardlink alias was readable — FAIL-OPEN: sibling rule authorized the shared inode")
+	}
+	if code := tryRead(t, e, ws, public); code == 0 {
+		t.Fatal("multiply-linked public alias remained readable, want disclosed fail-narrow omission")
+	}
+}
+
 // TestLinuxFSSnapshotSemantics asserts the documented §7.5 snapshot behavior: a
 // carved workspace (its writable root is enumerated, not granted whole) permits
 // writes to a PRE-EXISTING subdirectory but denies a NEW top-level file — the
