@@ -306,6 +306,23 @@ Failure to select a usable Linux rung returns `ErrSandboxUnavailable` rather
 than a null backend. On other operating systems `Sandboxed` is unavailable;
 the null backend accepts only an acknowledged `Unconfined` profile.
 
+### 7.5 Linux Rung 2 filesystem snapshots
+
+Rung 2 compiles fixed-path denies and protected carveouts into Landlock's
+additive allowlist by enumerating unaffected siblings at spawn. This applies
+even when the denied target does not yet exist: the covering directory is not
+granted as a whole, so the command cannot create a new entry directly beneath
+that directory during the spawn. Pre-existing unaffected children retain their
+compiled access, including write access when policy permits it. A denied target
+that exists at spawn is omitted from the enumerated rules for each denied axis.
+
+This spawn snapshot is intentionally narrower than the requested writable root.
+It prevents a future `.git`, `.looprig`, or fixed secret path from becoming
+accessible on a denied axis after confinement, and preserves the rule-precedence
+contract in §3. Backends must record the narrowing in `CompileReport`; they must
+not restore whole-root authority merely because a literal deny or carveout is
+absent.
+
 ## 8. Security invariants
 
 - Sandbox never prompts, reads permission files, or imports Harness.
