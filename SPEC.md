@@ -13,6 +13,14 @@ knowledge of tools, permission files, interactive approvals, sessions, roles,
 or product profile names. A consumer may connect its primitive structural seams
 to any approval system without introducing a reverse dependency.
 
+The sandbox threat actor is the spawned target and its descendants. The
+executor, harness, and unrelated processes outside the target's enforcement
+domain are trusted not to adversarially mutate the target filesystem
+concurrently. In particular, an unsandboxed process running as the same host
+UID is outside scope: it already has ambient same-user file and process
+authority, and this module does not provide mutual isolation between such
+processes.
+
 ## 2. Profile vocabulary
 
 ```go
@@ -183,9 +191,11 @@ approval time to remain missing until spawn-policy compilation.
 
 `filesystem.path.*` applies only to the exact canonical object;
 `filesystem.tree.*` applies recursively. Seatbelt compiles those as `literal`
-and `subpath`, respectively. Landlock accepts an exact existing non-directory
-grant; an exact directory or nonexistent target is not representable and fails
-with `ErrGrantUnsupported` rather than widening to a tree.
+and `subpath`, respectively. Landlock accepts an exact grant only for an
+existing regular file whose identity remains bound by the acquired descriptor
+and whose link count is exactly one. An exact directory, non-regular file,
+nonexistent target, or multiply-linked file is not representable and fails with
+`ErrGrantUnsupported` rather than widening to a tree.
 
 Verification alone is insufficient: the executor must use `command.start.v1`
 to authorize the exact start and apply filesystem/network classes while
@@ -315,12 +325,25 @@ directory as a whole on that axis. Pre-existing unaffected children retain
 their compiled authority. A denied target that exists at spawn is omitted from
 the enumerated rules for each denied axis.
 
-The consequence is axis-specific. Withholding write blocks creation of new
-entries directly beneath the covering directory. A read- or execute-only deny
-does not remove separately retained write authority, so creation may remain
-permitted; a newly created entry still receives no authority on the denied
-read/execute axis. The same rules apply when the protected target does not yet
-exist at spawn.
+Directory rules authorize hierarchies, but a directly enumerated regular-file
+rule is inode-scoped in Landlock. Enumeration therefore opens the inspected
+file without following symlinks, verifies that the opened descriptor names the
+inspected identity and a single-link regular file, transports that descriptor
+to stage 2, and validates its type and single-link count immediately before and
+after adding the Landlock rule. A mismatch, unsupported node type, or
+multiple-link inode is omitted or aborts setup in the fail-closed or
+fail-narrow direction; the pathname is never reopened to grant a different
+inode. Directory ancestor rules remain hierarchy-scoped.
+
+Write narrowing also protects denied read and execute topology. A recursive
+read or execute deny derives write denial throughout that denied subtree,
+preventing the target from moving, linking, or recreating an allowed inode
+under a protected pathname. An exact read or execute deny withholds
+directory-entry mutation at the enumerated boundary while preserving
+separately retained descendant authority according to exact-scope precedence.
+Pre-existing unaffected writable siblings may remain writable; newly created
+entries receive no authority on an axis whose covering directory rule was
+withheld. The same rules apply when the protected target is absent at spawn.
 
 Rung 1 additionally builds a mount view: read-only carveouts are mount
 re-masked, fixed denies without restorations use empty masks, and paths outside
@@ -331,12 +354,14 @@ Therefore Rung 1 has the same per-axis snapshot narrowing as Rung 2 even when
 its mount re-mask is fully enforced.
 
 This spawn snapshot is intentionally narrower than the requested covering allow
-on each affected axis.
-It prevents a future `.git`, `.looprig`, or fixed secret path from becoming
-accessible on a denied axis after confinement, and preserves the rule-precedence
-contract in §3. Both rungs must record the narrowing in `CompileReport`; they
-must not restore whole-root authority merely because a literal deny or carveout
-is absent.
+on each affected axis. Against the sandboxed target and its descendants, it
+prevents a future `.git`, `.looprig`, or fixed secret path from acquiring
+authority on a denied axis after confinement and preserves the rule-precedence
+contract in §3. It does not claim atomic protection against a process outside
+the Landlock domain later hardlinking or renaming an allowed inode to a denied
+pathname; that actor is outside §1's threat boundary. Both rungs record the
+narrowing in `CompileReport` and never restore whole-root authority merely
+because a literal deny or carveout is absent.
 
 ## 8. Security invariants
 
@@ -349,6 +374,10 @@ is absent.
 - Secret route credentials never cross into the child or durable metadata.
 - Executor and set closure revoke outstanding authority.
 - An execution release cancels only that execution's active proxy work.
+- On Linux, an exact file grant and every directly enumerated regular-file
+  allow are descriptor-bound and require a single-link regular inode through
+  Landlock rule installation; unsupported or changed identities fail closed or
+  narrow.
 - Missing enforcement fails closed; sandboxed execution never falls through to
   direct host execution.
 
@@ -360,7 +389,10 @@ per-key HOME/grant isolation, and close; command/cwd/profile/route/expiry grant
 bindings; filesystem traversal and symlink escape; unconfined acknowledgement;
 platform guarantee honesty; proxy authentication and direct-bypass denial;
 organization-proxy chaining and credential containment; and the Linux target
-grant failure behavior. Platform integration tests accompany each backend.
+grant failure behavior. Linux coverage includes direct-file descriptor
+transport and closure, inspect/open identity swaps, pre-installation link-count
+changes, pre-existing hardlink aliases, and target-attempted link and rename
+replacement. Platform integration tests accompany each backend.
 Conformance assertions are one-way security claims: when a backend claims a
 boundary, every probe covered by that boundary must be denied. Withholding a
 guarantee never requires an otherwise honest backend to permit the operation.
