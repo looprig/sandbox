@@ -354,10 +354,21 @@ func enumerateMountViewWithGrantPaths(plan MountViewPlan, grantRules []policy.FS
 			}
 		}
 	}
+	// A grant bind's own read-only-ness is decided by its OWN rule(s) only,
+	// never by an ancestor's write grant elsewhere in the same pinned-handle
+	// tree: the whole point of a nested carveout (mirrored from the plain,
+	// non-grant RWBinds/ROBinds path above, and the "parents-first...
+	// re-masking" bind-order design this file already documents) is that a
+	// narrower nested grant overrides a broader ancestor grant, not inherits
+	// its permissions. Security-relevant fix: a prior ancestor-inheritance
+	// disjunct here (`rule.IsDir && policy.PathUnder(rule.Target, target)`)
+	// silently bound a read-only nested grant (e.g. write root + read-only
+	// child carveout) as WRITABLE whenever an ancestor in the same grant tree
+	// had a write rule, defeating the narrower grant.
 	for target, bind := range grantBindByTarget {
 		bind.ReadOnly = true
 		for _, rule := range grantRules {
-			if rule.Access&policy.WriteAccess != 0 && (rule.Target == target || rule.IsDir && policy.PathUnder(rule.Target, target)) {
+			if rule.Access&policy.WriteAccess != 0 && rule.Target == target {
 				bind.ReadOnly = false
 				break
 			}
