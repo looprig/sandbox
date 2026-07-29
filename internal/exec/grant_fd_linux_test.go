@@ -947,17 +947,51 @@ func TestLinuxPinnedDescendantSymlinkAndMissingFailClosedBothRungs(t *testing.T)
 				{Path: symlink, Access: policy.ReadAccess},
 				{Path: missing, Access: policy.ReadAccess},
 			}}
-			spec, _, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{handle})
-			defer cleanup()
-			for _, rule := range spec.FSRules {
-				if rule.Target == symlink || rule.Target == missing || rule.Path == symlink || rule.Path == missing {
-					t.Fatalf("unresolvable pinned descendant received rule: %+v", rule)
+
+			// RungTwo (Landlock-only, no mount view): an unresolvable pinned
+			// descendant simply gets no Landlock rule -- fail closed by
+			// omission, and inherently safe, since Landlock enforces a
+			// per-file allowlist rather than exposing raw filesystem access.
+			// compilePinnedGrantSpec's own t.Fatal(err) enforces that this
+			// path compiles cleanly.
+			if rung == linux.RungTwo {
+				spec, _, cleanup := compilePinnedGrantSpec(t, rung, root, pol, []*policy.PathHandle{handle})
+				defer cleanup()
+				for _, rule := range spec.FSRules {
+					if rule.Target == symlink || rule.Target == missing || rule.Path == symlink || rule.Path == missing {
+						t.Fatalf("unresolvable pinned descendant received rule: %+v", rule)
+					}
 				}
+				return
 			}
-			for _, bind := range spec.MountView.Binds {
-				if bind.Target == symlink || bind.Target == missing {
-					t.Fatalf("unresolvable pinned descendant received bind: %+v", bind)
-				}
+
+			// RungOne (mount view): an unresolvable pinned descendant cannot
+			// materialize a read-only carveout bind, and the writable
+			// ancestor bind (target) would otherwise silently expose it with
+			// write access -- exactly the security concern
+			// TestLinuxRung1PinnedWritableGrantRejectsAbsentCarveoutDespiteROAncestor
+			// names. The mount view therefore fails closed with an explicit
+			// compile error instead of RungTwo's silent omission; this is a
+			// stricter, not weaker, guarantee than the old expectation this
+			// test previously encoded (which predated that fail-closed
+			// design and never actually inspected spec.MountView.Binds'
+			// ReadOnly field, so it never observed this compile error was
+			// possible).
+			backend := &linux.Backend{Rung: rung}
+			spawn, _, _, _, err := backend.CompileWithPathHandles(pol, []*policy.PathHandle{handle})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, configure, cleanup := spawn.Wrap(root, []string{"/bin/true"})
+			defer cleanup()
+			cmd := exec.Command("/proc/self/exe")
+			cmd.Env = []string{}
+			err = configure(cmd)
+			if err == nil {
+				t.Fatal("configure succeeded, want unresolvable pinned descendant beneath writable grant to fail closed")
+			}
+			if !strings.Contains(err.Error(), "protected path") {
+				t.Fatalf("configure error = %q, want explicit protected-path rejection", err)
 			}
 		})
 	}
