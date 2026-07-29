@@ -515,7 +515,7 @@ func TestCompileRung1ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 	if snapshot.Status != "narrowed" {
 		t.Fatalf("filesystem-axis-snapshot status = %q, want exact Linux status %q", snapshot.Status, "narrowed")
 	}
-	for _, phrase := range []string{"shared Landlock child enumeration", "denied axes: execute, write", "pre-existing unaffected children", "withholding directory write"} {
+	for _, phrase := range []string{"shared Landlock child enumeration", "denied axes: read, execute, write", "pre-existing unaffected children", "withholding directory write"} {
 		if !strings.Contains(snapshot.Detail, phrase) {
 			t.Errorf("filesystem-axis-snapshot detail %q missing %q", snapshot.Detail, phrase)
 		}
@@ -570,7 +570,7 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 			name:   "write and execute carveout",
 			policy: backendFixturePolicy(fixtureWorkspaceWrite, ws),
 			wantDetail: []string{
-				"denied axes: execute, write",
+				"denied axes: read, execute, write",
 				"withholding directory write",
 			},
 			wantLegacy: [][2]string{
