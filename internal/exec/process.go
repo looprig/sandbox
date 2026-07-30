@@ -757,6 +757,14 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	tree, err := e.processTree(cmd, processTreeOptions{
 		Sandboxed: s.policy.Isolation != Unconfined,
 		Limits:    s.policy.Limits,
+		// This is the pipe-backed asynchronous Process path: its lifetime is
+		// tracked independently of this call (Wait/Signal are driven by a
+		// caller, or by the background supervisor below, long after Start
+		// returns), so it requires the mandatory exact containment proof a
+		// Supervised spawn needs (SPEC Task 12b) rather than the synchronous
+		// RunCommand/RunArgv path's unchanged process-group behavior.
+		Supervised: true,
+		Backend:    e.backend,
 	})
 	if err != nil {
 		return nil, err
@@ -803,7 +811,17 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	if closeErr := errors.Join(outW.Close(), errW.Close(), inR.Close()); closeErr != nil {
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
 	}
-	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW), p.options.TerminateGrace), nil
+	proc := newPipeProcess(cmd, outR, errR, newProcessStdin(inW), p.options.TerminateGrace)
+	// Wires Process.Signal to real Unix signal delivery on this run's process
+	// tree (Task 12A left this seam nil/unwired). tree is a
+	// processTreeBoundary; on darwin/linux the concrete *processTree
+	// implements processSignalTarget (lifetime_unix.go) and attachSignaler
+	// sets it, so Signal actually delivers instead of failing closed with
+	// ErrProcessSignalUnsupported. On platforms with no such implementation
+	// yet (Windows/other), attachSignaler is a no-op and signaler stays nil,
+	// matching the pre-12B fail-closed default exactly.
+	attachSignaler(proc, tree)
+	return proc, nil
 }
 
 // startBackendOwned launches the process through the backend's own

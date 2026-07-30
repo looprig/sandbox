@@ -12,6 +12,23 @@ import (
 
 var ErrUnavailable = errors.New("sandbox: OS confinement unavailable")
 
+// ErrLifetimeContainmentUnavailable is the shared sentinel a backend-facing
+// caller returns when a SUPERVISED spawn (a long-running, asynchronously
+// monitored PreparedProcess/Process — SPEC's long-running-command-supervision
+// plan, Task 12) cannot be given an exact process-tree teardown proof before
+// it is ever started. A process-group signal plus best-effort polling is not
+// sufficient evidence for this contract (a descendant that calls setsid or
+// double-forks escapes it undetected); only a mechanism the kernel itself
+// enforces — a fresh PID namespace (namespace teardown on init exit) or a
+// delegated cgroup v2 scope (cgroup.kill plus a proven-empty cgroup.procs
+// read) — qualifies. Concrete callers: the Linux backend when Rung 2 is
+// selected and no delegated cgroup v2 pids ancestor exists (Task 12b), and
+// the Darwin backend unconditionally until a real containment primitive
+// exists (Task 12c). errors.Is matches this sentinel across both; the
+// external-facing string is stable ("lifetime_enforcement_unavailable") so a
+// caller can key on it without importing this package.
+var ErrLifetimeContainmentUnavailable = errors.New("sandbox: lifetime_enforcement_unavailable")
+
 // This file defines the internal backend seam: the shape every OS enforcement
 // backend (Seatbelt on darwin, the namespace/Landlock ladder on Linux) implements.
 // The seam is deliberately narrow. A backend never runs a process and

@@ -3,16 +3,19 @@
 package linux
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -267,13 +270,181 @@ func writeCgroupFile(dir, name, val string) error {
 }
 
 // cgroupProcsEmpty reports whether dir/cgroup.procs lists no pids. An unreadable
-// or absent file reads as empty — nothing left for us to kill.
+// or absent file reads as empty — nothing left for us to kill. This is the
+// pre-existing BEST-EFFORT reading used by Teardown (the optional
+// resource-limit cgroup, never a lifetime guarantee): losing the ability to
+// read cgroup.procs there must not wedge a throwaway scope's cleanup forever.
+// KillAndWait (below), by contrast, is the MANDATORY lifetime-containment
+// proof and never treats a read failure as empty — see cgroupProcsEmptyChecked.
 func cgroupProcsEmpty(dir string) bool {
 	b, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
 	if err != nil {
 		return true
 	}
 	return len(strings.Fields(string(b))) == 0
+}
+
+// cgroupProcsEmptyChecked is cgroupProcsEmpty's result-bearing counterpart for
+// KillAndWait's mandatory proof (SPEC Task 12b): unlike cgroupProcsEmpty, a
+// read failure is reported as an error, never coerced to "empty". Proving
+// zero descendants requires a SUCCESSFUL read that says so — an absent file
+// read as empty by omission would be exactly the fail-open bug this
+// microtask exists to close.
+func cgroupProcsEmptyChecked(dir string) (bool, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return false, err
+	}
+	return len(strings.Fields(string(b))) == 0, nil
+}
+
+// CgroupProofError is a typed, retryable lifetime-containment proof failure
+// (SPEC Task 12b): a cgroup.kill error, a cgroup.procs read/open error, a
+// context timeout while waiting for the scope to drain, or a removal error.
+// Op names the failing phase; Err wraps the underlying cause for
+// errors.Is/errors.As. It never fires for the pre-existing best-effort
+// resource-limit cgroup path (Teardown), which stays void/best-effort by
+// design.
+type CgroupProofError struct {
+	Op  string
+	Err error
+}
+
+func (e *CgroupProofError) Error() string {
+	return "sandbox: cgroup proof: " + e.Op + ": " + e.Err.Error()
+}
+func (e *CgroupProofError) Unwrap() error { return e.Err }
+
+// cgroupProofPollInterval bounds how often KillAndWait re-reads cgroup.procs
+// while waiting for the kernel to finish draining a killed scope.
+const cgroupProofPollInterval = 5 * time.Millisecond
+
+// KillAndWait is the MANDATORY, result-bearing lifetime-containment proof a
+// supervised spawn's teardown depends on (SPEC Task 12b) — the counterpart to
+// Teardown's void/best-effort resource-limit cleanup, which this method does
+// NOT replace (Teardown is unchanged and keeps its own callers). A nil return
+// means: cgroup.kill succeeded or the scope was already gone (ENOENT reads as
+// "nothing left to kill", not a failure — the scope cannot hold a descendant
+// it no longer has), a SUCCESSFUL read then proved cgroup.procs empty, and
+// this scope's owned cleanup (join fd close, rmdir) completed. Any other
+// outcome — a cgroup.kill error, ctx expiring before the scope drains, a
+// cgroup.procs read/open error, or a removal error — returns a
+// *CgroupProofError and leaves the scope's directory and join fd untouched
+// (retained) so a caller can retry the identical call later: the scope must
+// never be treated as torn down, and its resources must never be released,
+// until this returns nil. A read failure is never treated as empty.
+//
+// KillAndWait is idempotent and safe to call more than once (a caller that
+// retries after a failed/indeterminate proof, e.g. this module's process
+// quarantine, calls it again with the same receiver); calling it after a
+// successful return is a harmless no-op (tc.dir is already "").
+func (tc *transientCgroup) KillAndWait(ctx context.Context) error {
+	if tc == nil || tc.dir == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := writeCgroupFile(tc.dir, "cgroup.kill", "1"); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The scope itself is gone: there is nothing left it could hold, so
+			// this is the empty proof, not a failure.
+			return tc.finishRemoval()
+		}
+		return &CgroupProofError{Op: "cgroup.kill", Err: err}
+	}
+	for {
+		empty, err := cgroupProcsEmptyChecked(tc.dir)
+		switch {
+		case err != nil && errors.Is(err, os.ErrNotExist):
+			// Removed out from under us between the kill and this read (e.g. a
+			// concurrent Teardown/removal) — that is still an empty proof.
+			return tc.finishRemoval()
+		case err != nil:
+			return &CgroupProofError{Op: "read cgroup.procs", Err: err}
+		case empty:
+			return tc.finishRemoval()
+		}
+		select {
+		case <-ctx.Done():
+			return &CgroupProofError{Op: "timeout", Err: ctx.Err()}
+		case <-time.After(cgroupProofPollInterval):
+		}
+	}
+}
+
+// finishRemoval releases this scope's join fd and removes its directory. It
+// is reached only once KillAndWait has an EMPTY proof in hand (a successful
+// read of zero pids, or ENOENT — both mean nothing remains to hold the join
+// fd or occupy the directory), so it is the single place tc's retained state
+// is actually cleared; every failure branch above returns before reaching it,
+// leaving tc.dir/tc.fd exactly as they were for a later retry.
+func (tc *transientCgroup) finishRemoval() error {
+	if tc.fd >= 0 {
+		_ = unix.Close(tc.fd) // best-effort: our own fd, nothing else references it
+		tc.fd = -1
+	}
+	dir := tc.dir
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return &CgroupProofError{Op: "rmdir " + dir, Err: err}
+	}
+	tc.dir = ""
+	return nil
+}
+
+// Join wires this scope onto attr so the NEXT clone3(CLONE_INTO_CGROUP)
+// places the spawned child directly inside it — the same UseCgroupFD/CgroupFD
+// mechanism the optional resource-limit cgroup already uses (linuxWrap), but
+// this scope's own fd, taking priority over any resource-limit scope's fd
+// already set on attr: a supervised spawn's lifetime-containment join always
+// wins the single available join slot (SPEC Task 12b — resource limiting is
+// containment-of-cost, not a lifetime guarantee, and the two are mutually
+// exclusive at this one kernel join point for a given spawn).
+func (tc *transientCgroup) Join(attr *syscall.SysProcAttr) {
+	if tc == nil || attr == nil || tc.fd < 0 {
+		return
+	}
+	attr.UseCgroupFD = true
+	attr.CgroupFD = tc.fd
+}
+
+// LifetimeScope is a delegated cgroup v2 scope created purely for exact
+// process-tree containment (SPEC Task 12b) — independent of, and never
+// conflated with, any policy.Limits resource-limit configuration. Join wires
+// it onto a spawn's SysProcAttr before Start; KillAndWait is the mandatory,
+// result-bearing zero-proof a supervised spawn's confirmed teardown depends
+// on. It is the Rung-2 counterpart to Rung 1's PID-namespace containment
+// (which needs no cgroup at all: the kernel's own namespace-teardown-on-init-
+// exit guarantee is exact by construction).
+type LifetimeScope interface {
+	Join(attr *syscall.SysProcAttr)
+	KillAndWait(ctx context.Context) error
+}
+
+// NewLifetimeScope creates one supervised spawn's dedicated lifetime cgroup
+// under ancestor — the backend's already-probed delegated pids Ancestor
+// (Backend.CgroupPids). It applies only the load-bearing pids.max safety cap
+// (DefaultMaxPIDs), never a caller-tunable resource limit: this scope's sole
+// purpose is an exact cgroup.kill + cgroup.procs-empty containment proof, not
+// cost control (the separate, policy-driven, best-effort resource-limit
+// cgroup is CompiledCgroup/CreateTransientCgroup, unchanged by this
+// function). ancestor == "" (no delegation) fails closed with
+// enforce.ErrLifetimeContainmentUnavailable — there is no best-effort
+// fallback for a supervised Rung-2 spawn's containment (SPEC Task 12b).
+func NewLifetimeScope(ancestor string) (LifetimeScope, error) {
+	if ancestor == "" {
+		return nil, enforce.ErrLifetimeContainmentUnavailable
+	}
+	tc, err := CreateTransientCgroup(CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs})
+	if err != nil {
+		return nil, errors.Join(enforce.ErrLifetimeContainmentUnavailable, err)
+	}
+	if tc == nil {
+		// Unreachable given a non-empty Ancestor above (Enforced() is then
+		// always true), but guarded rather than assumed.
+		return nil, enforce.ErrLifetimeContainmentUnavailable
+	}
+	return tc, nil
 }
 
 // FormatCPUMax renders a MaxCPUPct as a cgroup v2 cpu.max value ("<quota>
