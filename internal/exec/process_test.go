@@ -283,7 +283,7 @@ func TestProcessNonzeroExitIsResult(t *testing.T) {
 // validation; this test isolates the distinct "the OS spawn itself failed"
 // failure surface that Start's contract also promises.
 func TestProcessSpawnFailureIsError(t *testing.T) {
-	proc, err := spawnProcess(ProcessOptions{
+	proc, err := spawnProcess(context.Background(), ProcessOptions{
 		Command:   portableSuccessCommand(),
 		Directory: filepath.Join(t.TempDir(), "does-not-exist"),
 	})
@@ -547,6 +547,127 @@ func TestProcessActivitiesClosesBeforeWaitReturns(t *testing.T) {
 		}
 	default:
 		t.Fatal("Activities channel not yet closed even though Wait already returned")
+	}
+}
+
+// TestPrepareCancellationPreventsHandoff is a queued Phase Gate 3 selector
+// test for 10B. PrepareProcess is entirely synchronous and does not itself
+// spawn anything, so the only real cancellation point is "ctx already done
+// before PrepareProcess does its work" — this proves that case fails closed
+// rather than silently ignoring ctx.
+func TestPrepareCancellationPreventsHandoff(t *testing.T) {
+	executor := newProcessTestExecutor(t, Allow)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	prepared, err := executor.PrepareProcess(ctx, ProcessOptions{
+		Directory:   dir,
+		Command:     portableWriteCommand(marker, "spawned"),
+		ExecutionID: "prepare-cancel",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("PrepareProcess error = %v, want context.Canceled", err)
+	}
+	if prepared != nil {
+		t.Fatalf("PrepareProcess returned a non-nil PreparedProcess alongside an error: %+v", prepared)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("canceled PrepareProcess appears to have spawned: marker stat err = %v, want IsNotExist", statErr)
+	}
+}
+
+// TestStartCancellationPreventsHandoff is a queued Phase Gate 3 selector test
+// for 10B. Canceling the ctx passed to Start before spawn must abort the
+// spawn rather than hand back a live Process.
+func TestStartCancellationPreventsHandoff(t *testing.T) {
+	executor := newProcessTestExecutor(t, Allow)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory:   dir,
+		Command:     portableWriteCommand(marker, "spawned"),
+		ExecutionID: "start-cancel",
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	t.Cleanup(func() { _ = prepared.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	proc, err := prepared.Start(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context.Canceled", err)
+	}
+	if proc != nil {
+		t.Fatalf("Start returned a non-nil Process alongside an error: %+v", proc)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("Start with an already-canceled ctx appears to have spawned: marker stat err = %v, want IsNotExist", statErr)
+	}
+}
+
+// TestCallerCancellationAfterHandoffDoesNotKill is a queued Phase Gate 3
+// selector test for 10B. It proves the returned Process's lifetime is
+// independent of the ctx passed to Start: once Start has handed back a live
+// Process, canceling that same ctx must not kill the process, must not make
+// Wait return early/with a cancellation error, and must not close its
+// stdout/stderr streams — mirroring Task 1's harness-contract precedent that
+// "the Start context governs setup through handoff only."
+func TestCallerCancellationAfterHandoffDoesNotKill(t *testing.T) {
+	executor := newProcessTestExecutor(t, Allow)
+	dir := t.TempDir()
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: dir, Command: portableStreamThenSleepCommand(2), ExecutionID: "caller-cancel-no-kill",
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	proc, err := prepared.Start(startCtx)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Close(context.Background()) })
+
+	reader := bufio.NewReader(proc.Stdout())
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString(first): %v", err)
+	}
+	if got := strings.TrimSpace(line); got != "first" {
+		t.Fatalf("first line = %q, want %q", got, "first")
+	}
+
+	// Cancel the ORIGINAL Start ctx now that the Process has already been
+	// handed off. Per the contract, this must have no effect on the process.
+	cancelStart()
+
+	// The process is still mid-sleep; if cancellation incorrectly killed it
+	// or closed its streams, this read would fail or return early instead of
+	// blocking for the remaining sleep duration and then succeeding.
+	line, err = reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString(second) after canceling the Start ctx: %v, want the process to keep streaming to completion", err)
+	}
+	if got := strings.TrimSpace(line); got != "second" {
+		t.Fatalf("second line = %q, want %q", got, "second")
+	}
+
+	// Wait with a fresh, never-canceled context: if the process's lifetime
+	// were still tied to startCtx, cmd.Wait could have returned early or with
+	// a cancellation error already by this point.
+	result, err := proc.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait after canceling the Start ctx = %v, want nil", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("Wait ExitCode = %d, want 0", result.ExitCode)
 	}
 }
 

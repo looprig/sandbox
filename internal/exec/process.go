@@ -263,7 +263,7 @@ func (p *PreparedProcess) Start(ctx context.Context) (*Process, error) {
 	p.started = true
 	p.mu.Unlock()
 
-	return spawnProcess(p.options)
+	return spawnProcess(ctx, p.options)
 }
 
 // Close releases an unstarted preparation's reservations and is idempotent.
@@ -299,16 +299,20 @@ func (p *PreparedProcess) releaseReservations() error {
 // can be exercised directly by tests that need to observe spawn-failure
 // behavior independent of PreparedProcess's single-use guard.
 //
-// Stdio is wired through plain os.Pipe pairs assigned directly to
-// cmd.Stdout/Stderr/Stdin (as *os.File, not via the cmd.StdoutPipe family) so
-// that cmd.Wait never takes ownership of the reader/writer ends returned to
-// the caller. The stdlib's convenience pipe methods register the caller's end
-// as a "parent I/O pipe" that Wait force-closes as soon as the child exits —
-// correct for callers who fully drain a pipe before calling Wait, but wrong
-// here, where a supervisor calls Wait independently of (and possibly before)
-// the caller finishing an incremental read. Managing the six descriptors by
-// hand keeps process exit and stream draining fully decoupled.
-func spawnProcess(opts ProcessOptions) (*Process, error) {
+// ctx governs only the brief setup window up to and including the decision to
+// call cmd.Start(): if ctx is already done, the spawn is aborted and no
+// Process is ever returned. ctx is deliberately NOT plumbed into cmd (e.g. via
+// exec.CommandContext) and is never consulted again once cmd.Start() has been
+// called — the returned Process's lifetime (Wait, stream I/O) is intentionally
+// independent of ctx, exactly as PreparedProcess.Start's contract promises: a
+// caller canceling the ctx it passed to Start after a Process has already been
+// handed back must not kill that process. A nil ctx is treated as
+// context.Background(), matching every other entry point in this file.
+func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	argv := enforce.ShellArgv(opts.Command)
 	if len(argv) == 0 {
 		return nil, errors.New("sandbox: process argv is empty")
@@ -337,6 +341,13 @@ func spawnProcess(opts ProcessOptions) (*Process, error) {
 	cmd.Stdout = outW
 	cmd.Stderr = errW
 	cmd.Stdin = inR
+
+	// Re-check as close to the actual OS spawn as this function gets, so a
+	// cancellation that lands after Start's own entry check but before the
+	// fork/exec syscall still aborts the handoff instead of racing it.
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+	}
 
 	startErr := cmd.Start()
 	// Whether or not Start succeeded, the parent must drop its own reference
