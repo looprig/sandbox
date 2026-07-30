@@ -143,6 +143,37 @@ func (async *elevatedAsyncExecution) Wait(ctx context.Context) (int, error) {
 	return code, errors.Join(async.bridgeCloseErr, waitErr, copyErr, closeErr)
 }
 
+// sendInterrupt, sendTerminate, and sendKill structurally satisfy the exec
+// package's processSignalTarget seam (internal/exec/process.go) — neither
+// package imports the other's signal vocabulary; exec's startBackendOwned
+// type-asserts its enforce.Execution value against its own unexported
+// interface, and this type's dynamic satisfaction of that shape is all a
+// Windows elevated async Process needs to make Signal real instead of
+// failing closed with ErrProcessSignalUnsupported (the default for every
+// backend-owned Process before Task 12D). Each simply forwards to the
+// underlying *elevatedRunnerExecution, which owns the actual Job/primitive
+// mapping; the stdio bridge has no signal-relevant state of its own.
+func (async *elevatedAsyncExecution) sendInterrupt() error {
+	if async == nil || async.execution == nil {
+		return nil
+	}
+	return async.execution.sendInterrupt()
+}
+
+func (async *elevatedAsyncExecution) sendTerminate() error {
+	if async == nil || async.execution == nil {
+		return nil
+	}
+	return async.execution.sendTerminate()
+}
+
+func (async *elevatedAsyncExecution) sendKill() error {
+	if async == nil || async.execution == nil {
+		return nil
+	}
+	return async.execution.sendKill()
+}
+
 type elevatedStdioBridge struct {
 	childStdin, childStdout, childStderr *os.File
 	stdinWriter                          *os.File

@@ -19,6 +19,22 @@ import (
 
 var errElevatedRunnerLaunch = errors.New("windows sandbox: elevated runner launch failed")
 
+// errElevatedRunnerInterruptUnsupported is sendInterrupt's fixed result
+// (below): the elevated runner path has no cooperative interrupt primitive
+// available today. GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) — the
+// primitive process_tree_windows.go's restricted-backend processTree uses
+// for the identical request — requires the target to have been created with
+// CREATE_NEW_PROCESS_GROUP and to share a console with the caller, and the
+// elevated runner's suspended-create call
+// (nativeElevatedRunnerProcessAPI.CreateSuspended,
+// elevated_runner_native_windows.go — outside this file's change) establishes
+// neither. Rather than silently mapping interrupt onto a forceful primitive
+// it does not mean — which would violate Signal's documented contract that an
+// interrupt never itself decides the process is terminal — this fails closed
+// exactly like Process.Signal's own nil-signaler default for an unsupported
+// request.
+var errElevatedRunnerInterruptUnsupported = errors.New("windows sandbox: elevated runner has no cooperative interrupt primitive")
+
 // elevatedRunnerLaunch contains data and handles already selected by the
 // compiler. Token is the restricted primary token duplicated into this process
 // by the authenticated broker; ownership transfers to Launch.
@@ -110,6 +126,14 @@ type elevatedRunnerExecution struct {
 	once sync.Once
 	code int
 	err  error
+
+	// mu guards job/process/release against a concurrent Signal-driven
+	// terminateJob call (below) racing Wait's own once-guarded clear of the
+	// same fields once Job-empty proof has retired every authority this
+	// execution owns. Wait itself remains single-writer (sync.Once already
+	// serializes its one real execution), so mu only ever needs to
+	// coordinate with a caller outside that Once — never with itself.
+	mu sync.Mutex
 }
 
 func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *elevatedRunnerExecution, err error) {
@@ -310,15 +334,57 @@ func (execution *elevatedRunnerExecution) Wait(ctx context.Context) (int, error)
 	execution.once.Do(func() {
 		code, waitErr := execution.api.WaitProcess(ctx, execution.process)
 		execution.code, execution.err = int(code), waitErr
+		execution.mu.Lock()
 		job, process, release := execution.job, execution.process, execution.release
+		execution.mu.Unlock()
 		terminateErr, settleErr := proveJobEmptyThenRetire(execution.api, job, process, release, func() error {
 			return execution.api.WaitJobEmpty(ctx, job)
 		})
 		execution.err = errors.Join(execution.err, terminateErr, settleErr)
+		execution.mu.Lock()
 		execution.job, execution.release, execution.process = nil, nil, 0
+		execution.mu.Unlock()
 	})
 	return execution.code, execution.err
 }
+
+// terminateJob force-terminates the Job this execution owns, if any
+// authority remains, via the identical TerminateJobObject primitive
+// settleFailedJobLaunch/proveJobEmptyThenRetire already use for every other
+// termination path in this file — never a second, independently-aimed
+// mechanism. Safe to call concurrently with Wait: mu guards the same job
+// field Wait itself clears once Job-empty proof has retired every authority
+// this execution owns, so a call arriving after that proof is a harmless
+// no-op rather than a use of a stale handle.
+func (execution *elevatedRunnerExecution) terminateJob() error {
+	if execution == nil {
+		return nil
+	}
+	execution.mu.Lock()
+	job := execution.job
+	execution.mu.Unlock()
+	if job == nil {
+		return nil
+	}
+	return job.Terminate(1)
+}
+
+// sendInterrupt always fails closed with
+// errElevatedRunnerInterruptUnsupported — see that error's doc comment for
+// why no cooperative interrupt primitive is available on this path today.
+func (execution *elevatedRunnerExecution) sendInterrupt() error {
+	return errElevatedRunnerInterruptUnsupported
+}
+
+// sendTerminate and sendKill both force-terminate the whole Job. Windows has
+// no distinct graceful-vs-forceful signal for a Job-confined process the way
+// Unix has SIGTERM vs SIGKILL, so — exactly like the restricted backend's own
+// processTree.sendTerminate/sendKill (internal/exec/process_tree_windows.go)
+// — both requests collapse onto the identical TerminateJobObject primitive
+// this file already uses everywhere else, never a second, independently-
+// aimed mechanism.
+func (execution *elevatedRunnerExecution) sendTerminate() error { return execution.terminateJob() }
+func (execution *elevatedRunnerExecution) sendKill() error      { return execution.terminateJob() }
 
 func reapUnprovedElevatedExecution(api elevatedRunnerProcessAPI, job *Job, release func() error) {
 	if api == nil || job == nil {

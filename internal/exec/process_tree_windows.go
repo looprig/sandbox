@@ -51,7 +51,14 @@ func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, er
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
+	// CREATE_NEW_PROCESS_GROUP makes the child's own PID its console process-
+	// group ID, distinct from this sandbox's own group: sendInterrupt (below)
+	// needs that so a targeted CTRL_BREAK_EVENT reaches only this run's tree,
+	// never this process's own console session. It also means a Ctrl+C
+	// delivered to the sandbox's own console no longer implicitly reaches a
+	// confined child — teardown for this tree is only ever the explicit
+	// Job/signal machinery below, exactly as intended.
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP
 	tree := &processTree{cmd: cmd, job: job}
 	cmd.Cancel = tree.terminate
 	return tree, nil
@@ -141,5 +148,65 @@ func (tree *processTree) close() {
 	tree.mu.Unlock()
 	if job != nil {
 		_ = job.Close()
+	}
+}
+
+// sendInterrupt requests cooperative interruption by delivering a
+// CTRL_BREAK_EVENT console control event to this run's own process group —
+// the closest cooperative-interrupt primitive Windows actually offers.
+// Windows has no POSIX-style per-process SIGINT, and CTRL_C_EVENT can only
+// ever be broadcast to the caller's own group (group ID 0, which would also
+// signal this sandbox process itself); CTRL_BREAK_EVENT against a distinct
+// target group ID is the one variant GenerateConsoleCtrlEvent lets a caller
+// aim at a specific child tree. newProcessTree creates the child with
+// CREATE_NEW_PROCESS_GROUP specifically so its own PID becomes that distinct
+// group ID. Like every ProcessSignalInterrupt dispatch, this never itself
+// decides the process is terminal — only Process.Wait's own confirmed exit
+// does that.
+func (tree *processTree) sendInterrupt() error {
+	if tree == nil || tree.cmd == nil || tree.cmd.Process == nil {
+		return nil
+	}
+	pid := tree.cmd.Process.Pid
+	if pid <= 0 {
+		return nil
+	}
+	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
+}
+
+// sendTerminate requests termination. Windows has no distinct graceful-vs-
+// forceful signal for a Job-confined process the way Unix has SIGTERM vs
+// SIGKILL: the only primitive this tree owns for actually stopping the
+// process tree is TerminateJobObject/TerminateProcess (see terminate,
+// above), which is unconditionally forceful. Rather than inventing a second,
+// weaker mechanism this platform cannot actually back, sendTerminate shares
+// the identical primitive sendKill and cmd.Cancel already use. The
+// process.go Signal state machine's terminate-then-grace-then-kill
+// escalation still behaves correctly on top of this: the process is simply
+// already gone well before the grace period elapses, so the eventual
+// escalation kill becomes a confirmedTerminal no-op instead of a second live
+// dispatch.
+func (tree *processTree) sendTerminate() error { return tree.terminate() }
+
+// sendKill force-terminates immediately — the identical primitive
+// sendTerminate (above) and cmd.Cancel/terminateAndWait's own defensive kill
+// already use, never a second, independently-aimed mechanism.
+func (tree *processTree) sendKill() error { return tree.terminate() }
+
+// attachSignaler is the Windows counterpart to lifetime_unix.go's own
+// attachSignaler: it wires a freshly constructed Process's Signal seam
+// (process.go) to tree, closing Task 12A's fail-closed gap
+// (ErrProcessSignalUnsupported) for the Windows restricted async path — the
+// last platform this seam needed wiring for. tree always implements
+// processSignalTarget (the three methods above), so this assignment is
+// unconditional once tree is non-nil. lifetime_other.go's build constraint
+// excludes windows so there is exactly one attachSignaler definition per
+// platform, never two competing for the same build.
+func attachSignaler(proc *Process, tree processTreeBoundary) {
+	if proc == nil || tree == nil {
+		return
+	}
+	if signaler, ok := tree.(processSignalTarget); ok {
+		proc.signaler = signaler
 	}
 }

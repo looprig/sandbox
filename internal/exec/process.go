@@ -889,7 +889,22 @@ func (p *PreparedProcess) startBackendOwned(ctx context.Context) (*Process, erro
 	spawn.spawnCleanup = append(spawn.spawnCleanup, func() error {
 		return errors.Join(outW.Close(), errW.Close(), inR.Close())
 	})
-	return newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW), p.options.TerminateGrace), nil
+	proc := newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW), p.options.TerminateGrace)
+	// Wires Process.Signal to real signal delivery when the backend's own
+	// Execution value implements processSignalTarget — e.g. the Windows
+	// elevated runner's *elevatedAsyncExecution (internal/windows), which
+	// structurally satisfies this package-local interface without either
+	// package importing the other's signal vocabulary: execution's static
+	// type here is only enforce.Execution, and the assertion below is
+	// against its dynamic (concrete backend) type, exactly like
+	// attachSignaler does for a processTreeBoundary on the confined path.
+	// A backend whose Execution does not implement all three methods
+	// leaves signaler nil, keeping Signal's pre-12D fail-closed default
+	// (ErrProcessSignalUnsupported) exactly as it was.
+	if signaler, ok := execution.(processSignalTarget); ok {
+		proc.signaler = signaler
+	}
+	return proc, nil
 }
 
 // supervise is the background goroutine Start hands ownership to on a
