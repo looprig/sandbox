@@ -479,7 +479,7 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		// No stdin is wired for the synchronous path (nil): cmd.Stdin is left
 		// exactly as set above (unset), so os/exec connects the child to the
 		// null device, matching this path's behavior before this refactor.
-		process := newPipeProcess(cmd, outR, errR, nil)
+		process := newPipeProcess(cmd, outR, errR, nil, 0)
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return process.Close(context.Background()) })
 		// Draining starts concurrently with the process running (not after
 		// Wait): a full pipe buffer would otherwise block the child from

@@ -28,4 +28,13 @@ var (
 	// ErrProcessStdinClosed reports a write attempted after the process's
 	// stdin was closed (explicitly or by a prior EOF).
 	ErrProcessStdinClosed = errors.New("sandbox: process stdin closed")
+
+	// ErrProcessSignalUnsupported reports that a not-yet-terminal Process has
+	// no real signal-delivery implementation wired in yet (see
+	// processSignalTarget in process.go): Signal fails closed with this
+	// error rather than silently succeeding. A later microtask (the Unix
+	// lifetime shim, the Windows Job signal mapping) wires production
+	// Process values to a real implementation; a Process already confirmed
+	// terminal never reaches this error regardless.
+	ErrProcessSignalUnsupported = errors.New("sandbox: process signal delivery is not yet supported")
 )

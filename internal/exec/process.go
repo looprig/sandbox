@@ -56,6 +56,11 @@ type ProcessOptions struct {
 	Grants      []string
 	TTY         bool
 	Deadline    time.Time
+	// TerminateGrace bounds how long a terminate signal (see
+	// ProcessSignalTerminate) is given to produce a natural exit before
+	// Process.Signal escalates to exactly one kill. Zero or negative selects
+	// defaultProcessTerminateGrace.
+	TerminateGrace time.Duration
 }
 
 // clone returns a deep copy sharing no slice backing storage with the
@@ -66,6 +71,20 @@ func (o ProcessOptions) clone() ProcessOptions {
 		out.Grants = append([]string(nil), o.Grants...)
 	}
 	return out
+}
+
+// defaultProcessTerminateGrace is the terminate-to-kill escalation window a
+// ProcessOptions with a zero or negative TerminateGrace resolves to.
+const defaultProcessTerminateGrace = 5 * time.Second
+
+// resolveProcessTerminateGrace normalizes a caller-specified terminate grace
+// period, substituting defaultProcessTerminateGrace for any non-positive
+// value so a Process always carries a usable escalation window.
+func resolveProcessTerminateGrace(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultProcessTerminateGrace
+	}
+	return d
 }
 
 // ProcessAccessKind classifies the authoritative workspace write access
@@ -784,7 +803,7 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	if closeErr := errors.Join(outW.Close(), errW.Close(), inR.Close()); closeErr != nil {
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
 	}
-	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW)), nil
+	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW), p.options.TerminateGrace), nil
 }
 
 // startBackendOwned launches the process through the backend's own
@@ -852,7 +871,7 @@ func (p *PreparedProcess) startBackendOwned(ctx context.Context) (*Process, erro
 	spawn.spawnCleanup = append(spawn.spawnCleanup, func() error {
 		return errors.Join(outW.Close(), errW.Close(), inR.Close())
 	})
-	return newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW)), nil
+	return newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW), p.options.TerminateGrace), nil
 }
 
 // supervise is the background goroutine Start hands ownership to on a
@@ -985,7 +1004,7 @@ func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
 		return nil, errors.Join(closeErr, outR.Close(), errR.Close(), inW.Close())
 	}
 
-	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW)), nil
+	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW), opts.TerminateGrace), nil
 }
 
 // wireOutputPipes creates dedicated stdout/stderr pipes and wires their write
@@ -1036,15 +1055,16 @@ func newStdoutStderrPipes() (outR, outW, errR, errW *os.File, err error) {
 // leaves cmd.Stdin exactly as it always has: unset, so os/exec connects the
 // child to the null device — in which case Process.Close and Process.Stdin
 // already treat a nil stdin as a no-op/harmless zero value.
-func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processStdin) *Process {
+func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processStdin, terminateGrace time.Duration) *Process {
 	return &Process{
-		cmd:        cmd,
-		stdout:     stdout,
-		stderr:     stderr,
-		stdin:      stdin,
-		startedAt:  time.Now(),
-		activities: make(chan ProcessActivity),
-		done:       make(chan struct{}),
+		cmd:            cmd,
+		stdout:         stdout,
+		stderr:         stderr,
+		stdin:          stdin,
+		startedAt:      time.Now(),
+		activities:     make(chan ProcessActivity),
+		done:           make(chan struct{}),
+		terminateGrace: resolveProcessTerminateGrace(terminateGrace),
 	}
 }
 
@@ -1065,15 +1085,16 @@ func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processS
 // supplies the terminal result in place of cmd.Wait/exec.ExitError; a
 // backend-owned Process has no *exec.Cmd for this package to reap, so
 // Process.cmd stays nil and runWait must not dereference it in that case.
-func newBackendOwnedProcess(execution enforce.Execution, stdout, stderr io.ReadCloser, stdin *processStdin) *Process {
+func newBackendOwnedProcess(execution enforce.Execution, stdout, stderr io.ReadCloser, stdin *processStdin, terminateGrace time.Duration) *Process {
 	return &Process{
-		execution:  execution,
-		stdout:     stdout,
-		stderr:     stderr,
-		stdin:      stdin,
-		startedAt:  time.Now(),
-		activities: make(chan ProcessActivity),
-		done:       make(chan struct{}),
+		execution:      execution,
+		stdout:         stdout,
+		stderr:         stderr,
+		stdin:          stdin,
+		startedAt:      time.Now(),
+		activities:     make(chan ProcessActivity),
+		done:           make(chan struct{}),
+		terminateGrace: resolveProcessTerminateGrace(terminateGrace),
 	}
 }
 
@@ -1112,6 +1133,25 @@ type Process struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	// Signal state machine (see Signal, below). signaler is the narrow seam
+	// a later microtask (the Unix lifetime shim, the Windows Job signal
+	// mapping) wires to a real OS/backend signal-delivery implementation;
+	// every Process this microtask constructs leaves it nil, so Signal fails
+	// closed with ErrProcessSignalUnsupported for a not-yet-terminal process
+	// instead of silently succeeding. terminateGrace is resolved (never
+	// zero/negative) once at construction from ProcessOptions.TerminateGrace.
+	// graceTimer, when non-nil, replaces the real time.Timer-backed wait a
+	// terminate escalation uses; only tests set it, to drive escalation
+	// deterministically without a real sleep.
+	signaler       processSignalTarget
+	terminateGrace time.Duration
+	graceTimer     func(time.Duration) (<-chan time.Time, func())
+
+	terminateOnce sync.Once
+	terminateErr  error
+	killOnce      sync.Once
+	killErr       error
 }
 
 // Stdout returns the process's live standard-output pipe.
@@ -1238,15 +1278,16 @@ func (p *Process) runWait() {
 }
 
 // Close closes the process's stream handles. It is idempotent. It does not
-// signal or wait for the OS process itself — process-tree teardown is a
-// later task's scope — so a caller that wants the process to actually exit
-// must still arrange that separately (e.g. by closing stdin or waiting for
-// natural completion) until that later task lands.
+// itself signal or wait for the OS process — use Signal to request
+// interrupt/terminate/kill, and Wait to observe the eventual exit — so a
+// caller that wants the process to actually stop must still arrange that
+// separately (e.g. via Signal, closing stdin, or waiting for natural
+// completion).
 func (p *Process) Close(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	_ = ctx // reserved for the later task that adds signal/teardown semantics
+	_ = ctx // reserved for the later task that adds confirmed teardown semantics
 	p.closeOnce.Do(func() {
 		var err error
 		if p.stdin != nil {
@@ -1261,6 +1302,183 @@ func (p *Process) Close(ctx context.Context) error {
 		p.closeErr = err
 	})
 	return p.closeErr
+}
+
+// ProcessSignal is a portable process-tree signal request. Mirrors,
+// structurally only, Harness's tool.ProcessSignal vocabulary
+// (ProcessSignalInterrupt/ProcessSignalTerminate/ProcessSignalKill) so a
+// later adapter can translate directly; Sandbox defines its own stdlib-only
+// type rather than importing Harness's.
+type ProcessSignal uint8
+
+const (
+	// ProcessSignalInterrupt requests cooperative interruption. It never by
+	// itself decides the process is terminal — only an actual exit, observed
+	// through Wait, does that.
+	ProcessSignalInterrupt ProcessSignal = iota + 1
+	// ProcessSignalTerminate requests cooperative termination, escalating to
+	// exactly one ProcessSignalKill if the process has not exited by the end
+	// of its resolved terminate grace period (ProcessOptions.TerminateGrace).
+	ProcessSignalTerminate
+	// ProcessSignalKill force-terminates immediately, with no grace period.
+	ProcessSignalKill
+)
+
+// Valid reports whether s is a recognized portable process signal.
+func (s ProcessSignal) Valid() bool {
+	return s >= ProcessSignalInterrupt && s <= ProcessSignalKill
+}
+
+// processSignalTarget is the narrow seam Process.Signal drives to actually
+// deliver a portable interrupt/terminate/kill request. It intentionally
+// exposes raw, fire-and-forget delivery only — never a wait/proof method —
+// so this microtask's state machine can be exercised deterministically
+// against a fake without any real OS process; a later microtask wires
+// production Process values to a real implementation built on the same
+// processTree/Job authority terminateAndWait already confines.
+type processSignalTarget interface {
+	// sendInterrupt asks the boundary to request cooperative interruption.
+	sendInterrupt() error
+	// sendTerminate asks the boundary to request cooperative termination.
+	sendTerminate() error
+	// sendKill asks the boundary to force-terminate immediately.
+	sendKill() error
+}
+
+// realGraceTimer is the production Process.graceTimer: a real time.Timer.
+func realGraceTimer(d time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(d)
+	return timer.C, func() { timer.Stop() }
+}
+
+// Signal delivers a portable interrupt/terminate/kill request. It is safe to
+// call concurrently with itself and with every other Process method.
+//
+// ProcessSignalInterrupt delivers immediately and never decides the process
+// is terminal by itself — only an actual exit, observed through Wait, does
+// that. ProcessSignalKill idempotently dispatches at most one kill for this
+// Process's entire lifetime, immediately, with no grace period.
+// ProcessSignalTerminate delivers at most one terminate signal — its first
+// call only; later Terminate calls are no-ops that return the identical
+// result — and, on that same first call, starts a background escalation that
+// dispatches at most one kill once the terminate grace period elapses
+// without a confirmed natural exit; it never re-sends terminate and never
+// escalates more than once, and the eventual kill (whether from escalation
+// or from a later explicit Signal(ProcessSignalKill) call) is the same
+// single dispatch either path can trigger.
+//
+// A concurrent natural exit — observed by Wait's runWait closing p.done,
+// which every PreparedProcess.Start spawn's background supervisor already
+// guarantees happens by calling Wait itself even if no other caller ever
+// does — always wins over a pending or in-flight signal: once the process is
+// confirmed terminal, Signal is a safe no-op for every kind, and a pending
+// terminate escalation is skipped rather than delivered to a process that is
+// already gone.
+//
+// ctx governs only this call's own validation; it is never consulted again
+// once delivery has started, so a ctx canceled after a Terminate call
+// returns does not stop that call's already-started background escalation.
+func (p *Process) Signal(ctx context.Context, kind ProcessSignal) error {
+	if p == nil {
+		return ErrProcessClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !kind.Valid() {
+		return fmt.Errorf("sandbox: invalid process signal: %d", kind)
+	}
+	if p.confirmedTerminal() {
+		return nil
+	}
+	switch kind {
+	case ProcessSignalInterrupt:
+		if p.signaler == nil {
+			return ErrProcessSignalUnsupported
+		}
+		return p.signaler.sendInterrupt()
+	case ProcessSignalKill:
+		return p.dispatchKill()
+	default: // ProcessSignalTerminate
+		return p.dispatchTerminate()
+	}
+}
+
+// confirmedTerminal reports whether this Process's terminal wait (runWait,
+// started by exactly one Wait caller — including the background supervisor
+// every PreparedProcess.Start spawn already starts) has already closed done.
+// It never itself starts that wait: Signal only ever observes a terminal
+// state some other caller already established, exactly like this method's
+// doc contract requires.
+func (p *Process) confirmedTerminal() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// dispatchKill idempotently sends at most one kill for this Process's entire
+// lifetime, regardless of whether it is reached through an explicit
+// Signal(ProcessSignalKill) call or a terminate escalation, and regardless of
+// how many times either path is entered concurrently. A process already
+// confirmed terminal is a no-op rather than a signal delivered to a reaped
+// process.
+func (p *Process) dispatchKill() error {
+	if p.confirmedTerminal() {
+		return nil
+	}
+	p.killOnce.Do(func() {
+		if p.signaler == nil {
+			p.killErr = ErrProcessSignalUnsupported
+			return
+		}
+		p.killErr = p.signaler.sendKill()
+	})
+	return p.killErr
+}
+
+// dispatchTerminate delivers at most one terminate signal for this Process's
+// entire lifetime and, on that same first call only, starts the background
+// escalation goroutine that dispatches at most one kill once the terminate
+// grace period elapses without a confirmed natural exit. Every later
+// Terminate call, concurrent or sequential, observes the identical result
+// without re-sending anything or starting a second escalation.
+func (p *Process) dispatchTerminate() error {
+	p.terminateOnce.Do(func() {
+		if p.signaler == nil {
+			p.terminateErr = ErrProcessSignalUnsupported
+			return
+		}
+		p.terminateErr = p.signaler.sendTerminate()
+		go p.escalateAfterGrace()
+	})
+	return p.terminateErr
+}
+
+// escalateAfterGrace waits for this Process's resolved terminate grace
+// period (or, in a test, whatever graceTimer substitutes for it), honoring a
+// concurrent natural exit over the timer: if done closes first, no kill is
+// ever dispatched. Otherwise it dispatches exactly one kill through the same
+// idempotent dispatchKill path an explicit Signal(ProcessSignalKill) call
+// uses, so the two can never race into a double send.
+func (p *Process) escalateAfterGrace() {
+	newTimer := p.graceTimer
+	if newTimer == nil {
+		newTimer = realGraceTimer
+	}
+	graceCh, stop := newTimer(p.terminateGrace)
+	defer stop()
+	select {
+	case <-p.done:
+		return
+	case <-graceCh:
+		_ = p.dispatchKill()
+	}
 }
 
 // processStdin wraps the exec.Cmd stdin pipe so Write and Close are safe to

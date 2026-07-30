@@ -734,7 +734,7 @@ func TestProcessActivityEffectiveKindIsConservativeForInvalidActivity(t *testing
 // without ever touching the (nil, for this construction) *exec.Cmd.
 func TestBackendOwnedProcessReportsExecutionResult(t *testing.T) {
 	execution := &fakeBackendExecution{code: 7, release: make(chan struct{})}
-	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil)
+	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil, 0)
 
 	done := make(chan ProcessResult, 1)
 	errCh := make(chan error, 1)
@@ -788,7 +788,7 @@ func TestBackendOwnedProcessReportsExecutionResult(t *testing.T) {
 func TestBackendOwnedProcessSurfacesExecutionError(t *testing.T) {
 	wantErr := errors.New("backend authority proof failed")
 	execution := &fakeBackendExecution{err: wantErr}
-	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil)
+	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil, 0)
 	if _, err := proc.Wait(context.Background()); !errors.Is(err, wantErr) {
 		t.Fatalf("Wait error = %v, want %v", err, wantErr)
 	}
