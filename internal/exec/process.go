@@ -318,19 +318,6 @@ func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
 		return nil, errors.New("sandbox: process argv is empty")
 	}
 
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		return nil, errors.Join(err, outR.Close(), outW.Close())
-	}
-	inR, inW, err := os.Pipe()
-	if err != nil {
-		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close())
-	}
-
 	// #nosec G204 -- launching a caller-supplied command IS this module's
 	// purpose; see the identical justification on Executor.run. This path is
 	// deliberately a plain, unconfined os/exec.Cmd: enforcement/confinement
@@ -338,8 +325,15 @@ func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
 	// scope, not this one's.
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = opts.Directory
-	cmd.Stdout = outW
-	cmd.Stderr = errW
+
+	outR, outW, errR, errW, err := wireOutputPipes(cmd)
+	if err != nil {
+		return nil, err
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close())
+	}
 	cmd.Stdin = inR
 
 	// Re-check as close to the actual OS spawn as this function gets, so a
@@ -371,15 +365,53 @@ func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
 		return nil, errors.Join(closeErr, outR.Close(), errR.Close(), inW.Close())
 	}
 
+	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW)), nil
+}
+
+// wireOutputPipes creates dedicated stdout/stderr pipes and wires their write
+// ends onto cmd (without starting anything), returning both ends of each pipe
+// so the caller can hand the read ends to a Process and later release its own
+// copies of the write ends once the child holds its inherited copies.
+//
+// It is the low-level OS-pipe-plumbing primitive shared by every process
+// spawn path in this package: spawnProcess above (the unconfined asynchronous
+// entry point, which additionally wires its own stdin pipe before starting)
+// and Executor.run's confined synchronous path (executor.go), which builds
+// and fully confines cmd itself — argv, working directory, environment,
+// SysProcAttr, and the backend's enforce.Spec confinement — before ever
+// reaching here, and starts it through its own confinement-aware start
+// function (recording a process-group id, etc.) rather than calling
+// cmd.Start() directly.
+func wireOutputPipes(cmd *exec.Cmd) (outR, outW, errR, errW *os.File, err error) {
+	outR, outW, err = os.Pipe()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	errR, errW, err = os.Pipe()
+	if err != nil {
+		return nil, nil, nil, nil, errors.Join(err, outR.Close(), outW.Close())
+	}
+	cmd.Stdout = outW
+	cmd.Stderr = errW
+	return outR, outW, errR, errW, nil
+}
+
+// newPipeProcess constructs a *Process around already-wired, already-started
+// stdout/stderr pipe read ends and an optional stdin. stdin is nil when the
+// caller has no stdin to offer — e.g. Executor.run's synchronous path, which
+// leaves cmd.Stdin exactly as it always has: unset, so os/exec connects the
+// child to the null device — in which case Process.Close and Process.Stdin
+// already treat a nil stdin as a no-op/harmless zero value.
+func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processStdin) *Process {
 	return &Process{
 		cmd:        cmd,
-		stdout:     outR,
-		stderr:     errR,
-		stdin:      newProcessStdin(inW),
+		stdout:     stdout,
+		stderr:     stderr,
+		stdin:      stdin,
 		startedAt:  time.Now(),
 		activities: make(chan ProcessActivity),
 		done:       make(chan struct{}),
-	}, nil
+	}
 }
 
 // Process is a running asynchronous process. Stdout/Stderr/Stdin are real,

@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/sandbox/internal/platform"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -29,17 +30,20 @@ import (
 // not supplied (15 minutes).
 const defaultGrantTTL = 15 * time.Minute
 
-// spawnWaitGrace bounds how long a spawn's Wait/CombinedOutput blocks for I/O
-// AFTER the context is cancelled and the child is killed (exec.Cmd.WaitDelay,
-// Go 1.20+). It exists because on Linux a shell may FORK the target (e.g. dash
-// runs `sh -c "sleep 5"` as a child, unlike macOS's exec-replacing /bin/sh): when
-// the immediate child is SIGKILLed on a deadline, the orphaned grandchild
-// inherits the stdout/stderr pipe and holds it open, so CombinedOutput would
-// otherwise block reading that pipe until the grandchild exits on its own — well
-// past the deadline. WaitDelay makes the deadline prompt by force-closing the
-// pipes and returning after the grace. It only ever fires after the context is
-// done or the process has exited, so a live command under a healthy context is
-// never truncated. The value trades a brief I/O-flush window against promptness.
+// spawnWaitGrace bounds cmd.WaitDelay (Go 1.20+): the time Wait spends, AFTER
+// the context is cancelled, waiting for a child that fails to actually exit
+// despite cmd.Cancel (tree.terminate, a process-group SIGKILL) having already
+// been invoked. It is a backstop only — a Kill-after-grace safety net for a
+// Cancel that somehow didn't work — not the mechanism that reaps an orphaned
+// grandchild descendant that forked away from the immediate child and kept
+// its own copy of the stdout/stderr pipe open: run's own tree.terminateAndWait
+// (below) unconditionally SIGKILLs and blocks until the ENTIRE process group is
+// confirmed gone before it ever reads the drained output, so that case never
+// depends on this grace period or on WaitDelay's own I/O-pipe management (which
+// does not apply here regardless, since run wires stdout/stderr through its own
+// os.Pipe rather than letting exec.Cmd own them). The value trades a brief
+// extra-kill window against promptness for the narrow "Cancel didn't work"
+// case.
 const spawnWaitGrace = time.Second
 
 // Init is defined per-platform (init_linux.go / init_other.go): it is THE
@@ -413,7 +417,7 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	// Whether the command may run at all was decided before this point.
 	cmd := exec.CommandContext(lease.ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	cmd.WaitDelay = spawnWaitGrace // bound deadline latency when a forked grandchild holds the output pipe
+	cmd.WaitDelay = spawnWaitGrace // backstop: force-kill if cmd.Cancel's group SIGKILL somehow doesn't stop the child
 	cmd.Env = s.env
 	// Belt-and-suspenders fail-closed guard: cmd.Env == nil makes exec.Cmd
 	// inherit the entire parent environment. assembleEnv never returns nil, but a
@@ -437,24 +441,87 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	spawn.prover = tree
 	spawn.cmd = cmd
 
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	handleCleanup, err := configureChildHandleList(cmd)
+	// Stdout/stderr are wired through the same pipe-plumbing primitive
+	// (wireOutputPipes, process.go) the pipe-backed asynchronous Process API
+	// uses, rather than exec.Cmd's own internal Writer-backed pipes: this is
+	// the shared "prepared process" spawning mechanics this run adopts.
+	// Everything above and below this block — grant verification, path handle
+	// resolution, quarantine, confinement (configure/tree) — is unchanged.
+	outR, outW, errR, errW, err := wireOutputPipes(cmd)
 	if err != nil {
 		return nil, -1, err
 	}
-	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
-	err = lease.start(cmd, tree)
-	if err == nil {
-		err = cmd.Wait()
+	handleCleanup, err := configureChildHandleList(cmd)
+	if err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
+		return nil, -1, err
 	}
+	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
+
+	var output bytes.Buffer
+	var outputMu sync.Mutex
+	var drainWG sync.WaitGroup
+	exitCode := -1
+
+	err = lease.start(cmd, tree)
+	if err != nil {
+		// Nothing was started: no child holds any of these descriptors, so the
+		// parent's copies of all four must be released here rather than
+		// leaking them.
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
+	} else {
+		// The parent must drop its own reference to the two child-side
+		// descriptors now that the child holds its inherited copies — the
+		// same fd-lifetime handling spawnProcess already requires for the
+		// asynchronous path (process.go) — otherwise a parent-side leak would
+		// keep the read ends from ever observing EOF.
+		closeErr := errors.Join(outW.Close(), errW.Close())
+		// No stdin is wired for the synchronous path (nil): cmd.Stdin is left
+		// exactly as set above (unset), so os/exec connects the child to the
+		// null device, matching this path's behavior before this refactor.
+		process := newPipeProcess(cmd, outR, errR, nil)
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return process.Close(context.Background()) })
+		// Draining starts concurrently with the process running (not after
+		// Wait): a full pipe buffer would otherwise block the child from
+		// exiting, which would block Wait from ever returning.
+		drainWG.Add(2)
+		go func() { defer drainWG.Done(); drainCombinedOutput(&outputMu, &output, process.Stdout()) }()
+		go func() { defer drainWG.Done(); drainCombinedOutput(&outputMu, &output, process.Stderr()) }()
+		// process.Wait reaps the OS process only; unlike the exec.Cmd-owned
+		// pipes this replaces, it does not itself wait for the drain
+		// goroutines above to observe EOF. That is deliberately provided by
+		// tree.terminateAndWait below instead: RunCommand no longer depends on
+		// exec.Cmd's own WaitDelay-bounded I/O grace to reap an orphaned
+		// grandchild descendant holding a pipe open (see spawnWaitGrace's
+		// updated doc comment).
+		if result, waitErr := process.Wait(context.Background()); waitErr != nil {
+			err = errors.Join(waitErr, closeErr)
+		} else {
+			exitCode = result.ExitCode
+			err = closeErr
+		}
+	}
+
 	terminateErr, proofErr := tree.terminateAndWait()
 	if proofErr != nil {
 		releaseOnReturn = false
 		spawn.transferTo(e.quarantine)
-		return output.Bytes(), -1, errors.Join(terminateErr, proofErr)
+		// Proof failure is not evidence the drain goroutines have finished (or
+		// ever will promptly): take a locked snapshot of whatever has been
+		// captured so far instead of joining them, so this return can never
+		// block on an unconfirmed descendant.
+		outputMu.Lock()
+		partial := append([]byte(nil), output.Bytes()...)
+		outputMu.Unlock()
+		return partial, -1, errors.Join(terminateErr, proofErr)
 	}
+	// tree.terminateAndWait has now confirmed the entire process group —
+	// including any descendant that forked away from the immediate child and
+	// inherited its pipe ends — is gone, so the drain goroutines are
+	// guaranteed to observe EOF promptly rather than blocking on an orphaned
+	// holder of the write end.
+	drainWG.Wait()
+
 	// Snapshot cancellation before releasing the execution lease: finish cancels
 	// lease.ctx as part of normal teardown and must not be mistaken for a caller
 	// cancellation or ExecutorSet close.
@@ -483,16 +550,34 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 
 	if err != nil {
-		// A ran-but-nonzero process is not an error under our convention: surface
-		// the real exit code and a nil error.
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return out, ee.ExitCode(), nil
-		}
-		// A genuine spawn/setup failure: dir missing, binary not found, etc.
+		// A genuine spawn/setup failure (dir missing, binary not found, a
+		// close failure, …); a ran-but-nonzero process was already normalized
+		// to (exitCode, nil error) above and never reaches this branch.
 		return out, -1, err
 	}
-	return out, 0, nil
+	return out, exitCode, nil
+}
+
+// drainCombinedOutput copies everything read from src into dst, serialized by
+// mu, until src returns a read error (io.EOF on a clean pipe close). mu lets
+// two goroutines — one draining stdout, one draining stderr — safely share
+// one destination buffer, mirroring the serialization exec.Cmd itself already
+// guaranteed when Stdout and Stderr were the identical writer ("If Stdout and
+// Stderr are the same writer... at most one goroutine at a time will call
+// Write").
+func drainCombinedOutput(mu *sync.Mutex, dst *bytes.Buffer, src io.Reader) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			mu.Lock()
+			dst.Write(buf[:n])
+			mu.Unlock()
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []string, s snapshot, observe func(), afterZero ...func() error) (out []byte, code int, runErr error) {
