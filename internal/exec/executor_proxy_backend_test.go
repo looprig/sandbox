@@ -1,9 +1,14 @@
 package exec
 
 import (
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/sandbox/pkg/network"
 )
@@ -177,5 +182,80 @@ func TestLaterCompilationFailureDoesNotRevokeSharedProxyFromExistingExecutor(t *
 	}
 	if got := backend.releases.Load(); got != 1 {
 		t.Fatalf("proxy reservation releases = %d, want 1", got)
+	}
+}
+
+// TestPreparedProcessProxyCredentialAndRouteSurviveAsyncSpawn proves
+// PrepareProcess wires a real route/proxy credential into the async two-phase
+// process exactly like RunCommandWithGrants already does for the synchronous
+// path (see TestAuthenticatedProxyDenialPrecedesProcessResultAndCredentialIsRevoked
+// in executor_proxy_test.go, whose grant/route recipe this mirrors): a
+// network.proxy-target.v1 grant redeemed during Prepare authorizes a
+// credential that is still live once the process actually runs under Start,
+// and the process observes the exact injected HTTP_PROXY URL.
+func TestPreparedProcessProxyCredentialAndRouteSurviveAsyncSpawn(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	route, err := NewDirectEgressRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
+		withExecutorSetConfig(
+			withBackend(&captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}),
+			withClock(func() time.Time { return now }),
+		))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("async-proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxyFile := filepath.Join(workspace, "proxy-url")
+	command := portableProxyExposureCommand(proxyFile)
+	token := issueTestGrant(t, executor, now, "async-proxy-exec", command, workspace,
+		"network", "", GrantClassNetworkProxyTarget, "tcp:allowed.test:80")
+
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: command, ExecutionID: "async-proxy-exec", Grants: []string{token},
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	proc, err := prepared.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Close(context.Background()) })
+
+	var rawProxy []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rawProxy, _ = os.ReadFile(proxyFile)
+		if len(rawProxy) != 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(rawProxy) == 0 {
+		t.Fatal("async process never exposed its scoped proxy URL")
+	}
+	if !strings.Contains(string(rawProxy), executor.proxy.Addr()) {
+		t.Fatalf("exposed proxy URL = %q, want it to reference the executor's proxy listener %q", rawProxy, executor.proxy.Addr())
+	}
+
+	result, err := proc.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if result.ExitCode != 7 {
+		t.Fatalf("Wait ExitCode = %d, want 7 (portableProxyExposureCommand's convention)", result.ExitCode)
 	}
 }

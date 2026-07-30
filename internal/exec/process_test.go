@@ -517,23 +517,31 @@ func TestPrepareProcessRejectsTTY(t *testing.T) {
 
 func TestPrepareProcessCommandAuthority(t *testing.T) {
 	tests := []struct {
-		name    string
-		command Access
-		grants  []string
-		wantErr error
+		name       string
+		command    Access
+		needsGrant bool
+		badGrant   bool
+		wantErr    error
 	}{
-		{name: "deny always refuses", command: Deny, grants: nil, wantErr: ErrGrantDenied},
-		{name: "deny refuses even with a grant", command: Deny, grants: []string{"g"}, wantErr: ErrGrantDenied},
-		{name: "gated without a grant is refused", command: Gated, grants: nil, wantErr: ErrGrantRequired},
-		{name: "gated with a grant is admitted", command: Gated, grants: []string{"g"}, wantErr: nil},
-		{name: "allow needs no grant", command: Allow, grants: nil, wantErr: nil},
+		{name: "deny always refuses", command: Deny, wantErr: ErrGrantDenied},
+		{name: "deny refuses even with a grant", command: Deny, badGrant: true, wantErr: ErrGrantDenied},
+		{name: "gated without a grant is refused", command: Gated, wantErr: ErrGrantRequired},
+		{name: "gated with a grant is admitted", command: Gated, needsGrant: true, wantErr: nil},
+		{name: "allow needs no grant", command: Allow, wantErr: nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			executor := newProcessTestExecutor(t, tt.command)
 			dir := t.TempDir()
+			var grants []string
+			switch {
+			case tt.needsGrant:
+				grants = []string{mustCommandStartGrant(t, executor, "command-authority", portableSuccessCommand(), dir)}
+			case tt.badGrant:
+				grants = []string{"g"}
+			}
 			prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
-				Directory: dir, Command: portableSuccessCommand(), ExecutionID: "command-authority", Grants: tt.grants,
+				Directory: dir, Command: portableSuccessCommand(), ExecutionID: "command-authority", Grants: grants,
 			})
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {

@@ -8,6 +8,14 @@ import (
 
 // PathHandle owns the identity-bound descriptor for one exact-file or
 // tree-directory grant between authentication and child confinement setup.
+// Once opened, the underlying descriptor's identity binding never needs
+// re-validation for as long as the handle stays open — a synchronous caller
+// (Executor.RunCommandWithGrants) closes it once its one spawn completes; the
+// asynchronous two-phase caller (PreparedProcess, exec.PrepareProcess/Start)
+// instead retains it across the whole prepare-through-Start-through-process-
+// exit window, closing it only once the eventual process's terminal cleanup
+// runs. Either caller's retention duration is opaque to this type: it simply
+// stays open, and therefore stays valid, until Close.
 type PathHandle struct {
 	file   *os.File
 	close  func() error

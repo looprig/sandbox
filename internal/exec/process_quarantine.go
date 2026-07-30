@@ -31,10 +31,18 @@ type quarantineSink interface {
 	quarantine(*quarantinedSpawn)
 }
 
-// quarantinedSpawn is the complete ownership capsule for one uncertain
-// Windows spawn. Keeping cmd reachable is intentional: exec.Cmd and its pipes,
-// the Job, per-spawn cleanup, transient spec/proxy releases, and the execution
-// lease must all outlive a failed zero proof.
+// quarantinedSpawn is the complete, platform-neutral ownership capsule for
+// one process spawn from prepare through terminal cleanup — synchronous
+// (executor.run/runBackendOwned) or asynchronous (PreparedProcess.Start).
+// prover is whatever platform authority a spawn's zero proof depends on: a
+// Unix process-group SIGKILL-and-wait, a Windows Job (uncertain proof), or
+// nil for a backend-owned execution whose own Launch/Execution already proves
+// and retires its authority internally (e.g. the Windows elevated broker
+// lease/Job). Keeping cmd reachable is intentional: exec.Cmd and its pipes,
+// the process-tree/Job authority, per-spawn cleanup, retained grant/path
+// handles, proxy credentials/routes, transient and compiled backend release
+// closures, and the execution lease must all outlive an uncertain zero proof
+// so a later retry can still release them, never before, never twice.
 type quarantinedSpawn struct {
 	prover  zeroProver
 	cmd     *exec.Cmd

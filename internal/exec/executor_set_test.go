@@ -482,6 +482,121 @@ func TestExecutorSetCloseCancelsAndWaitsForActiveCommand(t *testing.T) {
 	}
 }
 
+// TestExecutorSetCloseRejectsPrepareAndStartAfterCloseBegins proves close
+// admission for the async two-phase process API mirrors the already-covered
+// synchronous behavior (TestExecutorSetCloseBlocksCommandsBeforeStart): once
+// ExecutorSet.Close has begun, a new PrepareProcess call is refused outright,
+// and Start on a PreparedProcess obtained just before Close began is refused
+// without ever spawning, because Close's abandoned-handle sweep (or, in a
+// race, the lease's own lifecycle-closed check inside Start) always wins.
+func TestExecutorSetCloseRejectsPrepareAndStartAfterCloseBegins(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(&captureBackend{
+			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := set.For("close-admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(workspace, "marker")
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: portableWriteCommand(marker, "spawned"),
+		ExecutionID: "close-admission",
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess before Close: %v", err)
+	}
+
+	if err := set.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preparation abandoned across Close appears to have spawned: stat err = %v", err)
+	}
+	if proc, err := prepared.Start(context.Background()); !errors.Is(err, ErrProcessClosed) || proc != nil {
+		t.Fatalf("Start after ExecutorSet.Close = (%v, %v), want (nil, ErrProcessClosed)", proc, err)
+	}
+	if _, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: portableSuccessCommand(), ExecutionID: "close-admission-2",
+	}); !errors.Is(err, ErrExecutorClosed) {
+		t.Fatalf("PrepareProcess after ExecutorSet.Close error = %v, want ErrExecutorClosed", err)
+	}
+}
+
+// TestExecutorSetCloseWaitsForBothLivePreparedAndStartedHandles extends the
+// existing Close coverage (TestExecutorSetCloseBlocksCommandsBeforeStart,
+// TestExecutorSetCloseCancelsAndWaitsForActiveCommand) to the async API in a
+// single Close call carrying both shapes at once: one PreparedProcess that
+// was never started (released synchronously by Close's abandoned-handle
+// sweep) and one Process already running (terminated by lifecycle.ctx
+// cancellation and awaited before Close returns).
+func TestExecutorSetCloseWaitsForBothLivePreparedAndStartedHandles(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(&captureBackend{
+			bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub,
+		})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := set.For("mixed-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unstartedMarker := filepath.Join(workspace, "unstarted-marker")
+	if _, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: portableWriteCommand(unstartedMarker, "spawned"),
+		ExecutionID: "mixed-live-unstarted",
+	}); err != nil {
+		t.Fatalf("PrepareProcess (unstarted): %v", err)
+	}
+
+	started := filepath.Join(workspace, "started")
+	completed := filepath.Join(workspace, "completed")
+	runningPrepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: portableWriteSleepWriteCommand(started, completed, 30),
+		ExecutionID: "mixed-live-running",
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess (running): %v", err)
+	}
+	if _, err := runningPrepared.Start(context.Background()); err != nil {
+		t.Fatalf("Start (running): %v", err)
+	}
+	waitForPath(t, started)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- set.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ExecutorSet.Close did not return with one abandoned prepared handle and one live started process")
+	}
+	if _, err := os.Stat(unstartedMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned unstarted preparation appears to have spawned: stat err = %v", err)
+	}
+	if _, err := os.Stat(completed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("killed running process reached completion: stat err = %v", err)
+	}
+}
+
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

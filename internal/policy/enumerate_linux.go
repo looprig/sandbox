@@ -21,6 +21,13 @@ type PinnedPathResolution struct {
 	IsDir   bool
 }
 
+// PinnedPathResolver is constructed fresh for each spawn wrap (see
+// linuxWrapTransform/linuxWrap in internal/linux/backend.go) from the caller's
+// still-open handles slice; it never outlives that one Wrap call, regardless
+// of whether the handles it resolves against belong to a synchronous spawn or
+// to an asynchronous PreparedProcess/Start whose own handles are retained for
+// the whole process lifetime by the caller — this type itself holds nothing
+// beyond one wrap's resolution.
 type PinnedPathResolver struct {
 	handles    []*PathHandle
 	firstFD    int

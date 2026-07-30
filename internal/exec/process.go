@@ -5,18 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/policy"
 )
 
 // This file adds the module's pipe-backed asynchronous process API alongside
 // the existing synchronous, already-stabilized RunCommand/RunCommandWithGrants
-// machinery in executor.go. It does not replace or duplicate that machinery: a
-// later microtask refactors Executor.run onto the primitive defined here.
+// machinery in executor.go. PrepareProcess/Start reuse that machinery's
+// lower-level pieces directly (grant validation, path handle acquisition,
+// route/proxy authorization, backend compilation, the executionLease/
+// quarantinedSpawn ownership primitives, and processTree confinement) rather
+// than duplicating a second implementation of any of it; RunCommand/
+// RunCommandWithGrants themselves are untouched (their exact synchronous
+// behavior stays byte-for-byte the same, as characterized in Task 10C).
 //
 // Sandbox defines its own named types with method shapes that structurally
 // match Harness's tool.AsyncProcessRunner/tool.PreparedProcess/tool.Process
@@ -24,14 +33,16 @@ import (
 // separate consumer can adapt between the two without this module ever
 // importing Harness (SPEC's module-boundary rule).
 //
-// Scope note: this microtask implements the public types, immutable effective
-// access, live pipe streams, cached Wait, and the optional bounded activity
-// stream ONLY. It intentionally spawns via a plain, unconfined os/exec.Cmd —
-// no policy compilation, no grant/path resource retention (a later microtask
-// owns that), and no signal/tree teardown (a later task owns that). TTY
-// requests are rejected rather than silently downgraded, because pipe/PTY
-// stream-mode fallback must never be silent (mirrors the Harness reference's
-// documented contract).
+// PrepareProcess performs one complete grant-redemption-plus-resource-
+// reservation transaction (validating and consuming any supplied grants,
+// acquiring and retaining path handles, authorizing a route/proxy credential,
+// and compiling the confined backend spec) without spawning a child. Start
+// atomically transfers everything reserved into a process-owned background
+// goroutine that outlives the call, confining the actual spawn through the
+// same processTree/backend machinery executor.run already uses. TTY requests
+// are rejected rather than silently downgraded, because pipe/PTY stream-mode
+// fallback must never be silent (mirrors the Harness reference's documented
+// contract).
 
 // ProcessOptions describes one asynchronous process admission request.
 // Grants are opaque, execution-bound tokens; this microtask does not verify
@@ -68,8 +79,8 @@ const (
 	// ProcessAccessReadOnly permits reads but no writes.
 	ProcessAccessReadOnly ProcessAccessKind = iota + 1
 	// ProcessAccessScopedWrite permits writes only to the paths and trees
-	// reserved for this process. Real per-grant path reservation is a later
-	// microtask's job; today WritePaths/WriteTrees are always empty.
+	// reserved for this process: WritePaths/WriteTrees report the exact
+	// canonical filesystem write grants folded into this preparation.
 	ProcessAccessScopedWrite
 	// ProcessAccessBroadWrite permits writes anywhere the executor's
 	// workspace authority allows.
@@ -121,23 +132,53 @@ func cloneProcessStrings(values []string) []string {
 
 // PreparedProcess is a validated, single-use process start. Its effective
 // workspace access (EffectiveAccess) is authoritative and immutable for the
-// lifetime of the value. Start consumes the preparation at most once; Close
-// releases an unstarted preparation and is otherwise idempotent and safe to
-// call at any time, including after Start.
+// lifetime of the value. PrepareProcess performs the entire grant-redemption
+// and resource-reservation transaction (any supplied grants are validated,
+// authenticated, and consumed; retained path handles are borrowed and
+// re-acquired; a route/proxy credential is authorized; the confined backend
+// spec is compiled) before this value is ever returned, so by the time a
+// caller holds a *PreparedProcess every reservation it needs is already
+// final and a single-spawn grant can never become replayable regardless of
+// whether Start is ever called. Start consumes the preparation at most once,
+// atomically transferring every reservation to the spawned Process's
+// background supervisor. Close releases an unstarted preparation's
+// reservations and is otherwise idempotent and safe to call at any time,
+// including after Start (a no-op once Start has consumed it).
 type PreparedProcess struct {
 	options ProcessOptions
 	access  ProcessAccess
+
+	executor *Executor
+	lease    *executionLease
+	argv     []string
+	snapshot snapshot
+	// spawn is the single ownership capsule for this preparation, created
+	// once PrepareProcess succeeds and reused (never replaced) through Start
+	// and terminal cleanup — the same quarantinedSpawn primitive
+	// executor.run/runBackendOwned already use for the synchronous path, so
+	// there is exactly one cleanup system regardless of how a process was
+	// started. Its afterExecution list already carries every grant/path/
+	// proxy/compiled-backend release this preparation reserved; releasing it
+	// (spawn.release) or quarantining it (spawn.transferTo) is the only way
+	// any of that is ever torn down.
+	spawn *quarantinedSpawn
 
 	mu      sync.Mutex
 	started bool
 	closed  bool
 }
 
-// PrepareProcess validates opts and reserves this executor's effective
-// process access without spawning anything. The executor's command authority
-// is checked immediately (Deny always refuses; Gated refuses without at least
-// one supplied grant); real per-grant cryptographic verification and
-// filesystem-path reservation are a later microtask's job.
+// PrepareProcess validates opts and performs the complete grant-redemption
+// and resource-reservation transaction for this process without spawning
+// anything: the executor's command authority is checked (Deny always
+// refuses; Gated refuses without at least one supplied grant), any supplied
+// grants are cryptographically verified and consumed exactly like
+// Executor.RunCommandWithGrants, retained filesystem path handles are
+// borrowed and re-acquired, a route/proxy credential is authorized when a
+// network grant requires one, and the confined backend spec is compiled. A
+// failure at any point releases every partial reservation exactly once and
+// leaves nothing consumed that could later replay. Supplying no grants
+// resolves the same plain (non-grant) access RunCommand/RunArgv already use.
 func (e *Executor) PrepareProcess(ctx context.Context, opts ProcessOptions) (*PreparedProcess, error) {
 	if e == nil {
 		return nil, ErrExecutorClosed
@@ -168,10 +209,57 @@ func (e *Executor) PrepareProcess(ctx context.Context, opts ProcessOptions) (*Pr
 	prepared := opts.clone()
 	prepared.Directory = dir
 
-	return &PreparedProcess{
-		options: prepared,
-		access:  e.effectiveProcessAccess(),
-	}, nil
+	argv := enforce.ShellArgv(prepared.Command)
+	if len(argv) == 0 {
+		return nil, errors.New("sandbox: process argv is empty")
+	}
+
+	// lease is deliberately begun with context.Background() as its caller,
+	// not ctx: exactly like Start's own ctx, PrepareProcess's ctx must only
+	// ever govern this call's own setup window, never the eventual process's
+	// lifetime. The lease's ctx is instead cancelled only by explicit session/
+	// executor-set close (via the lifecycle.ctx AfterFunc hook) or by this
+	// preparation's own ProcessOptions.Deadline once a later task wires it.
+	lease, err := e.beginExecution(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			lease.finish()
+		}
+	}()
+
+	resolved, err := e.resolveProcessResources(ctx, prepared, argv)
+	if err != nil {
+		return nil, err
+	}
+
+	spawn := newQuarantinedSpawn(nil, nil, lease)
+	spawn.observe = resolved.observe
+	spawn.afterExecution = resolved.releases
+
+	proc := &PreparedProcess{
+		options:  prepared,
+		access:   resolved.access,
+		executor: e,
+		lease:    lease,
+		argv:     argv,
+		snapshot: resolved.snapshot,
+		spawn:    spawn,
+	}
+	transferred = true
+
+	if !lease.lifecycle.registerPrepared(proc) {
+		// The executor set began closing between beginExecution and here.
+		// Nothing has been handed back to any caller yet, so release the
+		// whole transaction immediately rather than returning a live handle
+		// admission has already closed against.
+		_ = proc.Close()
+		return nil, ErrExecutorClosed
+	}
+	return proc, nil
 }
 
 // processCommandAccess is PrepareProcess's authorization check. It mirrors
@@ -202,12 +290,12 @@ func (e *Executor) processCommandAccess(opts ProcessOptions) error {
 	}
 }
 
-// effectiveProcessAccess derives the authoritative ProcessAccess from the
-// same profile.Settings.WorkspaceWrite authority the synchronous path already
+// effectiveProcessAccess derives the base ProcessAccess from the same
+// profile.Settings.WorkspaceWrite authority the synchronous path already
 // reads for every other authorization decision (see Executor.commandAccess
-// and Executor.authorizeGrantScope). Write path/tree resolution from real
-// per-grant reservations is a later microtask's job; today the set is always
-// empty.
+// and Executor.authorizeGrantScope), with no per-grant deltas folded in. It
+// is the whole answer for a grant-free preparation, and the starting point
+// resolveGrantedProcessResources widens with approved deltas otherwise.
 func (e *Executor) effectiveProcessAccess() ProcessAccess {
 	kind := ProcessAccessReadOnly
 	if e != nil && e.profile != nil {
@@ -234,12 +322,318 @@ func (p *PreparedProcess) EffectiveAccess() ProcessAccess {
 	return newProcessAccess(p.access.Kind, p.access.writePaths, p.access.writeTrees)
 }
 
-// Start consumes the preparation and spawns the process. A second Start call
-// on the same PreparedProcess, or any Start call after Close, fails without
-// spawning. A spawn/setup failure (missing directory, binary not found) is
-// returned as an error and no Process is returned; a process that
-// subsequently runs to a non-zero exit is not an error and is reported
-// through Process.Wait's ProcessResult instead.
+// preparedResourceSet is everything PrepareProcess's grant-redemption and
+// resource-reservation transaction produces: the authoritative access, the
+// compiled spawn snapshot Start confines through, and the release closures
+// (spec release, retained path handle close, proxy credential release) that
+// must run exactly once when the eventual process reaches a terminal state —
+// on prepare failure, on an unstarted Close, or (transferred whole) after
+// Start's spawned process is confirmed gone.
+type preparedResourceSet struct {
+	access   ProcessAccess
+	snapshot snapshot
+	releases []func() error
+	// observe fires once, immediately after a successful zero proof and
+	// before the proxy credential is released, exactly like the synchronous
+	// path's denial-observation point (see executor.run/runCommandWithGrants).
+	observe func()
+}
+
+// resolveProcessResources dispatches PrepareProcess's transaction: a request
+// with no grants resolves the same plain (non-grant) access RunCommand/
+// RunArgv already use; PrepareProcess's own processCommandAccess check
+// already guarantees that reaching this branch with zero grants means the
+// executor's command authority is Allow (Gated demands at least one grant,
+// Deny always refuses before this point), matching RunCommand's authority
+// exactly.
+func (e *Executor) resolveProcessResources(ctx context.Context, opts ProcessOptions, argv []string) (preparedResourceSet, error) {
+	if len(opts.Grants) == 0 {
+		return e.resolvePlainProcessResources()
+	}
+	return e.resolveGrantedProcessResources(ctx, opts)
+}
+
+// resolvePlainProcessResources mirrors RunCommand/RunArgv's own resolve +
+// prepareAllowedRoute path: the executor's already-compiled base spec is
+// reused as-is (never released per spawn — its lifetime belongs to the
+// Executor as a whole, released once via Executor.releaseCompiledSpec), and
+// a Network:Allow route/proxy credential is authorized automatically exactly
+// like the synchronous path.
+func (e *Executor) resolvePlainProcessResources() (preparedResourceSet, error) {
+	s, err := e.resolve()
+	if err != nil {
+		return preparedResourceSet{}, err
+	}
+	s, executionID, err := e.prepareAllowedRoute(s)
+	if err != nil {
+		return preparedResourceSet{}, err
+	}
+	var releases []func() error
+	if executionID != "" {
+		releases = append(releases, func() error { e.proxy.Release(executionID); return nil })
+	}
+	return preparedResourceSet{
+		access:   e.effectiveProcessAccess(),
+		snapshot: s,
+		releases: releases,
+	}, nil
+}
+
+// resolveGrantedProcessResources performs the identical grant-verification,
+// path-handle-acquisition, guarantee-recomputation, route-authorization, and
+// backend-compilation transaction Executor.runCommandWithGrants already
+// performs — reusing the same package-private helpers (authenticateGrant,
+// verifyGrantBinding, validateGrantClass, compileBackendWithGrantPaths, the
+// retainedGrantPaths borrow/commit machinery, …) rather than a second
+// implementation of any of it — but stops short of ever spawning: it commits
+// the retained path handles and marks every consumed grant used (so the
+// preparation's single-spawn consumption is final regardless of whether
+// Start is ever called), then returns the compiled snapshot and every
+// release closure the eventual process must run exactly once, instead of
+// calling Executor.run.
+func (e *Executor) resolveGrantedProcessResources(ctx context.Context, opts ProcessOptions) (preparedResourceSet, error) {
+	if err := ctx.Err(); err != nil {
+		return preparedResourceSet{}, err
+	}
+	acquire := grantPathAcquirer(policy.AcquirePathHandle)
+	if backend, ok := e.backend.(grantACLPathAcquirer); ok {
+		acquire = backend.AcquireGrantPathHandle
+	}
+
+	e.grantMu.Lock()
+	defer e.grantMu.Unlock()
+	if e.closed {
+		return preparedResourceSet{}, ErrExecutorClosed
+	}
+	if e.profile == nil {
+		return preparedResourceSet{}, ErrInvalidProfile
+	}
+	pol := policy.Clone(e.policy)
+	now := e.clock()
+	e.pruneUsedGrantsLocked(now.UnixMilli())
+	e.retainedGrantPaths.prune(now.UnixMilli())
+	e.rescheduleRetainedGrantExpiryLocked()
+	seen := make(map[[32]byte]int64, len(opts.Grants))
+	commandGrant := e.settings.Command == Allow
+	expectedGuarantees := e.guaranteeBits
+	var proxyTargets []NetworkTarget
+	var pendingPaths []pendingGrantPath
+	var writePaths, writeTrees []string
+	broadWriteGranted := false
+	var pathHandles policy.PathHandleSet
+	releaseHandlesOnReturn := true
+	defer func() {
+		if releaseHandlesOnReturn {
+			pathHandles.Close()
+		}
+	}()
+
+	for _, token := range opts.Grants {
+		id := grantID(token)
+		if _, ok := e.usedGrants[id]; ok {
+			return preparedResourceSet{}, ErrGrantReplay
+		}
+		if _, ok := seen[id]; ok {
+			return preparedResourceSet{}, ErrGrantReplay
+		}
+		seen[id] = 0
+		payload, err := authenticateGrant(e.grantKey, token)
+		if err != nil {
+			return preparedResourceSet{}, err
+		}
+		if err := verifyGrantBinding(payload, now, opts.ExecutionID, opts.Command, opts.Directory, e.settings.Fingerprint, e.routeFingerprint, e.guaranteeBits); err != nil {
+			return preparedResourceSet{}, err
+		}
+		seen[id] = payload.ExpiryUnixMilli
+		delta, requiredBits, err := validateGrantClass(classKind(payload.Class), classScope(payload.Class, payload.Target), payload.Class, payload.Target)
+		if err != nil {
+			return preparedResourceSet{}, err
+		}
+		if !e.supportsGrantClass(payload.Class) {
+			return preparedResourceSet{}, ErrGrantUnsupported
+		}
+		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
+			return preparedResourceSet{}, ErrGrantGuaranteeMismatch
+		}
+		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
+			pendingPaths = append(pendingPaths, pendingGrantPath{
+				id: id, binding: payload.PathBinding, target: delta.entry.Path,
+				exact: delta.entry.Exact, access: delta.entry.Access,
+				expiryUnixMilli: payload.ExpiryUnixMilli,
+			})
+			if delta.entry.Access&policy.WriteAccess != 0 {
+				switch {
+				case delta.entry.Path == string(filepath.Separator) && !delta.entry.Exact:
+					// filesystem.host.write.v1: authority everywhere the
+					// executor's workspace authority allows, not one path.
+					broadWriteGranted = true
+				case delta.entry.Exact:
+					writePaths = append(writePaths, delta.entry.Path)
+				default:
+					writeTrees = append(writeTrees, delta.entry.Path)
+				}
+			}
+		}
+		if delta.class == GrantClassCommandStart {
+			if payload.Target != opts.Command {
+				return preparedResourceSet{}, ErrGrantWrongCommand
+			}
+			commandGrant = true
+		}
+		if delta.entry != nil {
+			pol.FS = applyFilesystemGrant(pol.FS, *delta.entry)
+		}
+		dropped := delta.droppedGuarantees
+		if dropped&GuaranteeReadBoundary != 0 && policy.IsAccessRestricted(pol.FS, policy.ReadAccess|policy.ExecAccess) {
+			dropped &^= GuaranteeReadBoundary
+		}
+		if dropped&GuaranteeWriteBoundary != 0 && policy.IsAccessRestricted(pol.FS, policy.WriteAccess) {
+			dropped &^= GuaranteeWriteBoundary
+		}
+		expectedGuarantees &^= dropped
+		if delta.port != 0 && !policy.ContainsPort(pol.Net.Ports, delta.port) {
+			pol.Net.Ports = append(pol.Net.Ports, delta.port)
+		}
+		pol.Net.DNS = pol.Net.DNS || delta.dns
+		if delta.target != nil {
+			proxyTargets = append(proxyTargets, *delta.target)
+		}
+	}
+	if e.settings.Command == Deny {
+		return preparedResourceSet{}, ErrGrantDenied
+	}
+	if !commandGrant {
+		return preparedResourceSet{}, ErrGrantRequired
+	}
+	if len(proxyTargets) != 0 {
+		if e.proxy == nil {
+			return preparedResourceSet{}, ErrGrantUnsupported
+		}
+		_, portText, err := net.SplitHostPort(e.proxy.Addr())
+		if err != nil {
+			return preparedResourceSet{}, ErrGrantUnsupported
+		}
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil || port == 0 {
+			return preparedResourceSet{}, ErrGrantUnsupported
+		}
+		pol.Net = policy.NetPolicy{ProxyPort: uint16(port)}
+	}
+	for _, pending := range pendingPaths {
+		retained, err := e.retainedGrantPaths.borrow(pending.id, pending.binding, pending.target, pending.exact, pending.expiryUnixMilli)
+		if err != nil {
+			return preparedResourceSet{}, err
+		}
+		validation, err := acquire(pending.binding, pending.target, pending.exact)
+		if err != nil {
+			return preparedResourceSet{}, err
+		}
+		retainedHandle, retainedIsPathHandle := retained.(*policy.PathHandle)
+		if retainedIsPathHandle != (validation != nil) ||
+			(retainedIsPathHandle && !policy.SamePathHandleIdentity(retainedHandle, validation)) {
+			if validation != nil {
+				_ = validation.Close()
+			}
+			return preparedResourceSet{}, ErrGrantTargetChanged
+		}
+		if validation != nil {
+			validation.SetAccess(pending.access)
+			if err := pathHandles.Add(validation); err != nil {
+				return preparedResourceSet{}, err
+			}
+		}
+	}
+	spec, _, _, bits, err := compileBackendWithGrantPaths(e.backend, e.spec.GrantAuthority, e.policy, pol, pathHandles.Sorted())
+	if err != nil {
+		return preparedResourceSet{}, err
+	}
+	bits = e.composeRouteGuarantees(bits)
+	if bits != expectedGuarantees {
+		return preparedResourceSet{}, errors.Join(ErrGrantGuaranteeMismatch, releaseSpec(spec))
+	}
+	var releases []func() error
+	releases = append(releases, func() error { return releaseSpec(spec) })
+	var observe func()
+	if len(proxyTargets) != 0 {
+		credential, err := e.proxy.Authorize(opts.ExecutionID, proxyTargets)
+		if err != nil {
+			return preparedResourceSet{}, errors.Join(err, releaseSpec(spec))
+		}
+		proxyURL := e.proxy.URL(opts.ExecutionID, credential)
+		applyChildProxyEnv(pol.Env.Set, proxyURL)
+		executionID := opts.ExecutionID
+		observe = func() { _ = e.proxy.Denial(executionID) }
+		releases = append(releases, func() error { e.proxy.Release(executionID); return nil })
+	}
+	pathIDs := make([][32]byte, len(pendingPaths))
+	for i := range pendingPaths {
+		pathIDs[i] = pendingPaths[i].id
+	}
+	retainedHandles, err := e.retainedGrantPaths.commit(pathIDs)
+	if err != nil {
+		return preparedResourceSet{}, errors.Join(err, releaseSpec(spec))
+	}
+	var retainedCloseErr error
+	for _, handle := range retainedHandles {
+		retainedCloseErr = errors.Join(retainedCloseErr, handle.Close())
+	}
+	if retainedCloseErr != nil {
+		return preparedResourceSet{}, errors.Join(retainedCloseErr, releaseSpec(spec))
+	}
+	for id, expiryUnixMilli := range seen {
+		e.usedGrants[id] = expiryUnixMilli
+	}
+	e.rescheduleRetainedGrantExpiryLocked()
+
+	// Everything below this point is final: the grants are marked used and
+	// the retained placeholders are already gone, so ownership of the fresh
+	// validation path handles transfers to the returned resource set
+	// regardless of what happens next in this function (there is nothing
+	// left that can fail).
+	releaseHandlesOnReturn = false
+	handles := pathHandles
+	releases = append(releases, func() error { handles.Close(); return nil })
+
+	access := e.effectiveProcessAccess()
+	kind := access.Kind
+	switch {
+	case broadWriteGranted:
+		kind = ProcessAccessBroadWrite
+		writePaths, writeTrees = nil, nil
+	case len(writePaths) != 0 || len(writeTrees) != 0:
+		if kind == ProcessAccessReadOnly {
+			kind = ProcessAccessScopedWrite
+		}
+		if kind != ProcessAccessScopedWrite {
+			// Base authority is already BroadWrite: the granular grant paths
+			// add nothing EffectiveAccess doesn't already cover.
+			writePaths, writeTrees = nil, nil
+		}
+	}
+
+	return preparedResourceSet{
+		access:   newProcessAccess(kind, writePaths, writeTrees),
+		snapshot: snapshot{spec: spec, env: assembleEnv(pol), policy: pol},
+		releases: releases,
+		observe:  observe,
+	}, nil
+}
+
+// Start consumes the preparation and spawns the process, confining it
+// through the identical processTree/backend machinery Executor.run and
+// Executor.runBackendOwned already use. A second Start call on the same
+// PreparedProcess, or any Start call after Close, fails without spawning. A
+// spawn/setup failure (missing directory, binary not found) is returned as
+// an error and no Process is returned; a process that subsequently runs to a
+// non-zero exit is not an error and is reported through Process.Wait's
+// ProcessResult instead. ctx governs only this call's own setup window
+// through the decision to hand off — exactly like PrepareProcess's own ctx,
+// it never governs the returned Process's lifetime, so a caller canceling
+// the ctx it passed to Start after a Process has already been handed back
+// must not kill that process. On success, ownership of every reservation
+// PrepareProcess made is transferred atomically to a background goroutine
+// that outlives this call and guarantees terminal cleanup runs even if the
+// caller never calls Process.Wait or Process.Close.
 func (p *PreparedProcess) Start(ctx context.Context) (*Process, error) {
 	if p == nil {
 		return nil, ErrProcessClosed
@@ -262,14 +656,239 @@ func (p *PreparedProcess) Start(ctx context.Context) (*Process, error) {
 	}
 	p.started = true
 	p.mu.Unlock()
+	p.lease.lifecycle.unregisterPrepared(p)
 
-	return spawnProcess(ctx, p.options)
+	proc, err := p.spawnAndSupervise(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return proc, nil
+}
+
+// spawnAndSupervise performs the actual confined spawn and, on success,
+// starts the background supervisor goroutine that owns terminal cleanup —
+// including the case where the caller never calls Process.Wait. On any
+// failure it releases the whole preparation's reservation capsule exactly
+// once through the same quarantinedSpawn.release the synchronous path uses,
+// so a failed Start leaks nothing.
+func (p *PreparedProcess) spawnAndSupervise(ctx context.Context) (*Process, error) {
+	if err := ctx.Err(); err != nil {
+		_ = p.spawn.release(false, false, nil)
+		return nil, err
+	}
+	var proc *Process
+	var err error
+	if p.snapshot.spec.Launch != nil {
+		proc, err = p.startBackendOwned(ctx)
+	} else {
+		proc, err = p.startConfined(ctx)
+	}
+	if err != nil {
+		_ = p.spawn.release(false, false, err)
+		return nil, err
+	}
+	go p.supervise(proc)
+	return proc, nil
+}
+
+// startConfined builds and spawns the process-tree-confined child exactly
+// like Executor.run does — the same enforce.Spec.Wrap/configure/cleanup,
+// processTree, executionLease, and pipe-plumbing machinery — except it
+// hands the live Process back to the caller immediately instead of blocking
+// for the process's lifetime; the eventual tree.terminateAndWait zero proof
+// and resource release happen later, in the background supervisor.
+func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
+	e := p.executor
+	lease := p.lease
+	s := p.snapshot
+	dir := p.options.Directory
+	argv := p.argv
+	spawn := p.spawn
+
+	if s.spec.Wrap == nil {
+		return nil, errors.New("sandbox: executor spawn spec not compiled")
+	}
+	if len(argv) == 0 {
+		return nil, errors.New("sandbox: empty argv")
+	}
+
+	wrapArgv, configure, cleanup := s.spec.Wrap(dir, argv)
+	if cleanup != nil {
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { cleanup(); return nil })
+	}
+	if len(wrapArgv) == 0 {
+		return nil, errors.New("sandbox: backend produced an empty argv")
+	}
+
+	// #nosec G204 -- wrapArgv is the argument list the selected enforce.Backend
+	// produced from the compiled policy, exactly like Executor.run; nothing
+	// here is word-split or expanded by a shell.
+	cmd := exec.CommandContext(lease.ctx, wrapArgv[0], wrapArgv[1:]...)
+	cmd.Dir = dir
+	cmd.WaitDelay = spawnWaitGrace
+	cmd.Env = s.env
+	if cmd.Env == nil {
+		cmd.Env = []string{}
+	}
+	if configure != nil {
+		if err := configure(cmd); err != nil {
+			return nil, err
+		}
+	}
+	tree, err := e.processTree(cmd, processTreeOptions{
+		Sandboxed: s.policy.Isolation != Unconfined,
+		Limits:    s.policy.Limits,
+	})
+	if err != nil {
+		return nil, err
+	}
+	spawn.prover = tree
+	spawn.cmd = cmd
+
+	outR, outW, errR, errW, err := wireOutputPipes(cmd)
+	if err != nil {
+		return nil, err
+	}
+	handleCleanup, err := configureChildHandleList(cmd)
+	if err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
+		return nil, err
+	}
+	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
+		return nil, err
+	}
+	cmd.Stdin = inR
+
+	// Re-check as close to the actual OS spawn as this function gets, so a
+	// cancellation that lands after Start's own entry check but before the
+	// fork/exec syscall still aborts the handoff instead of racing it.
+	if err := ctx.Err(); err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+		return nil, err
+	}
+
+	if err := lease.start(cmd, tree); err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+		return nil, err
+	}
+	// The child now holds its own inherited copies of the write ends and
+	// stdin's read end; the parent must drop its own copies so the read ends
+	// this Process exposes can ever observe EOF (the same fd-lifetime
+	// discipline spawnProcess already requires). A failure here is folded
+	// into terminal cleanup instead of failing Start: the process is already
+	// running under confinement, so it must not be abandoned mid-handoff.
+	if closeErr := errors.Join(outW.Close(), errW.Close(), inR.Close()); closeErr != nil {
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
+	}
+	return newPipeProcess(cmd, outR, errR, newProcessStdin(inW)), nil
+}
+
+// startBackendOwned launches the process through the backend's own
+// authority-establishing Launch (enforce.Spec.Launch) exactly like
+// Executor.runBackendOwned does, except it never calls Wait itself: Launch
+// already returns as soon as the launched process's OS-level authority is
+// established, and the backend's own Execution.Wait (invoked lazily by
+// Process.Wait, including from the background supervisor) is what proves
+// and retires that authority. Unlike runBackendOwned's single combined
+// output buffer (built for RunCommand's whole-output contract), this wires
+// real live pipes so Stdout/Stderr/Stdin behave identically to the
+// process-tree-confined path.
+func (p *PreparedProcess) startBackendOwned(ctx context.Context) (*Process, error) {
+	lease := p.lease
+	s := p.snapshot
+	dir := p.options.Directory
+	argv := p.argv
+	spawn := p.spawn
+
+	if len(argv) == 0 {
+		return nil, errors.New("sandbox: empty argv")
+	}
+	if err := lease.authorizeBackendStart(); err != nil {
+		return nil, err
+	}
+	env := append([]string(nil), s.env...)
+	if env == nil {
+		env = []string{}
+	}
+
+	outR, outW, errR, errW, err := newStdoutStderrPipes()
+	if err != nil {
+		return nil, err
+	}
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close())
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+	}
+
+	execution, err := s.spec.Launch(enforce.LaunchRequest{
+		Context: lease.ctx,
+		Dir:     dir,
+		Argv:    append([]string(nil), argv...),
+		Env:     env,
+		Stdin:   inR,
+		Stdout:  outW,
+		Stderr:  errW,
+	})
+	if err != nil {
+		return nil, errors.Join(err, outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+	}
+
+	// The backend's own bridge copies between (inR, outW, errW) and the real
+	// child for as long as the process runs; it never closes our copies, so
+	// they must stay open until the process's authority is fully retired
+	// (spawn.release, below, runs this once the background supervisor's
+	// Process.Wait confirms the backend's own Execution.Wait has returned) —
+	// closing them any earlier would sever the bridge mid-stream, and never
+	// closing them would leave every reader of this Process's Stdout/Stderr
+	// blocked forever instead of observing EOF.
+	spawn.spawnCleanup = append(spawn.spawnCleanup, func() error {
+		return errors.Join(outW.Close(), errW.Close(), inR.Close())
+	})
+	return newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW)), nil
+}
+
+// supervise is the background goroutine Start hands ownership to on a
+// successful spawn. It guarantees terminal cleanup runs exactly once
+// regardless of whether or when (or whether at all) the caller ever calls
+// Process.Wait: it always calls Wait itself, which is safe and cheap
+// because Process.Wait is cached and its real OS/backend wait happens
+// exactly once no matter how many callers (this goroutine included) invoke
+// it. For a process-tree-confined Process it then performs the identical
+// tree.terminateAndWait zero proof Executor.run performs after the process
+// exits, releasing the whole reservation capsule on success or transferring
+// it whole to the existing quarantine/retry path on an uncertain proof. For
+// a backend-owned Process, the backend's own Execution.Wait has already
+// proved and retired its own OS-level authority (e.g. the Windows elevated
+// broker lease, Job, and compiled spec's active-launch registration) by the
+// time Wait returns, so only the grant/path/proxy/compiled-backend release
+// closures and both executor lifecycle barriers remain to run here.
+func (p *PreparedProcess) supervise(proc *Process) {
+	_, _ = proc.Wait(context.Background())
+	spawn := p.spawn
+	if spawn.prover != nil {
+		terminateErr, proofErr := spawn.prover.terminateAndWait()
+		if proofErr != nil {
+			spawn.transferTo(p.executor.quarantine)
+			return
+		}
+		_ = spawn.release(true, false, terminateErr)
+		return
+	}
+	_ = spawn.release(true, false, nil)
 }
 
 // Close releases an unstarted preparation's reservations and is idempotent.
 // Once Start has consumed the preparation, ownership of anything reserved
-// has already transferred to the returned Process, so a later Close is a
-// harmless no-op rather than an error.
+// has already transferred to the returned Process's background supervisor,
+// so a later Close is a harmless no-op rather than an error.
 func (p *PreparedProcess) Close() error {
 	if p == nil {
 		return nil
@@ -283,15 +902,16 @@ func (p *PreparedProcess) Close() error {
 	if p.started {
 		return nil
 	}
-	return p.releaseReservations()
-}
-
-// releaseReservations is the seam a later microtask extends with real
-// grant/path resource release. PrepareProcess reserves nothing beyond
-// validating input and snapshotting effective access in this microtask, so
-// it is a no-op today.
-func (p *PreparedProcess) releaseReservations() error {
-	return nil
+	if p.lease != nil {
+		p.lease.lifecycle.unregisterPrepared(p)
+	}
+	if p.spawn == nil {
+		if p.lease != nil {
+			p.lease.finish()
+		}
+		return nil
+	}
+	return p.spawn.release(false, false, nil)
 }
 
 // spawnProcess performs the actual, unconfined OS spawn for one prepared
@@ -383,6 +1003,22 @@ func spawnProcess(ctx context.Context, opts ProcessOptions) (*Process, error) {
 // function (recording a process-group id, etc.) rather than calling
 // cmd.Start() directly.
 func wireOutputPipes(cmd *exec.Cmd) (outR, outW, errR, errW *os.File, err error) {
+	outR, outW, errR, errW, err = newStdoutStderrPipes()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	cmd.Stdout = outW
+	cmd.Stderr = errW
+	return outR, outW, errR, errW, nil
+}
+
+// newStdoutStderrPipes creates the two dedicated os.Pipe pairs every spawn
+// path in this package wires stdout/stderr through, without binding them to
+// an *exec.Cmd: wireOutputPipes (above) is the *exec.Cmd-wiring wrapper a
+// process-tree-confined spawn uses; startBackendOwned wires these same two
+// pairs directly into an enforce.LaunchRequest instead, since a backend-owned
+// spawn has no *exec.Cmd of its own.
+func newStdoutStderrPipes() (outR, outW, errR, errW *os.File, err error) {
 	outR, outW, err = os.Pipe()
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -391,8 +1027,6 @@ func wireOutputPipes(cmd *exec.Cmd) (outR, outW, errR, errW *os.File, err error)
 	if err != nil {
 		return nil, nil, nil, nil, errors.Join(err, outR.Close(), outW.Close())
 	}
-	cmd.Stdout = outW
-	cmd.Stderr = errW
 	return outR, outW, errR, errW, nil
 }
 

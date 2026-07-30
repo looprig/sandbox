@@ -9,6 +9,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// AcquirePathHandle opens an O_PATH descriptor pinned to target's identity at
+// the moment of the call. The returned handle carries no expiry of its own —
+// an O_PATH descriptor remains valid, and its captured identity remains an
+// honest anti-TOCTOU pin, for as long as the caller keeps it open, whether
+// that is the width of one synchronous spawn (Executor.run's Wrap/configure)
+// or the width of an entire asynchronous PreparedProcess/Start/terminal-
+// cleanup lifetime (exec.PrepareProcess): this function has no notion of
+// which.
 func AcquirePathHandle(binding *PathBinding, target string, exact bool) (*PathHandle, error) {
 	if binding == nil || binding.CanonicalPath != target {
 		return nil, ErrTargetChanged

@@ -170,13 +170,21 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 
 	// Pipe-backed asynchronous process API: prepare, start, stream, and wait
 	// on a single trivially-successful command. A Gated Command authority (set
-	// above) demands at least one grant be present; this microtask does not
-	// yet cryptographically verify it.
+	// above) demands at least one grant be present, and PrepareProcess
+	// cryptographically verifies and consumes it exactly like
+	// RunCommandWithGrants, so this must be a real, freshly-minted grant
+	// bound to this exact command/execution/cwd rather than a placeholder.
+	processGrant, err := executor.IssueGrant(context.Background(), "facade-process", facadeProcessSuccessCommand(), workspace,
+		"command.execute", "", sandbox.GrantClassCommandStart, facadeProcessSuccessCommand(),
+		time.Now().Add(time.Minute).UnixMilli())
+	if err != nil {
+		t.Fatalf("IssueGrant (process): %v", err)
+	}
 	prepared, err := executor.PrepareProcess(context.Background(), sandbox.ProcessOptions{
 		Directory:   workspace,
 		Command:     facadeProcessSuccessCommand(),
 		ExecutionID: "facade-process",
-		Grants:      []string{"facade-placeholder-grant"},
+		Grants:      []string{processGrant},
 	})
 	if err != nil {
 		t.Fatalf("PrepareProcess: %v", err)

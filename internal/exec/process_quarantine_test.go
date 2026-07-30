@@ -35,12 +35,29 @@ func (p *scriptedZeroProver) close() { p.closed.Add(1) }
 
 type captureQuarantine struct {
 	count atomic.Int32
-	item  *quarantinedSpawn
+	// item is written under mu so a concurrent goroutine (e.g. an async
+	// PreparedProcess's background supervisor, which transfers to quarantine
+	// from a goroutine distinct from the test's own) can safely observe it
+	// via Load after polling count; direct field access remains safe for
+	// every existing synchronous caller, which only ever reads item after a
+	// same-goroutine call that already transferred it.
+	mu   sync.Mutex
+	item *quarantinedSpawn
 }
 
 func (q *captureQuarantine) quarantine(item *quarantinedSpawn) {
-	q.count.Add(1)
+	q.mu.Lock()
 	q.item = item
+	q.mu.Unlock()
+	q.count.Add(1)
+}
+
+// Load returns the most recently quarantined item, safe to call from any
+// goroutine.
+func (q *captureQuarantine) Load() *quarantinedSpawn {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.item
 }
 
 func TestQuarantinedSpawnReleasesOnlyAfterLaterZeroProof(t *testing.T) {

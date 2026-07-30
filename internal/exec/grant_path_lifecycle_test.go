@@ -47,6 +47,60 @@ func TestIssueGrantRetainsPathUntilSuccessfulConsumption(t *testing.T) {
 	}
 }
 
+// TestIssueGrantRetainsPathUntilPrepareProcessConsumption is the async
+// two-phase counterpart of TestIssueGrantRetainsPathUntilSuccessfulConsumption
+// (above): PrepareProcess's grant-redemption transaction commits the retained
+// registry entry the same way RunCommandWithGrants does — during prepare,
+// not deferred to Start — so the registry entry is gone and the token is
+// burned by the time PrepareProcess returns, well before any spawn.
+func TestIssueGrantRetainsPathUntilPrepareProcessConsumption(t *testing.T) {
+	now := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	target := filepath.Join(workspace, "target.txt")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Gated, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Gated,
+	})
+	executor, err := newTestExecutor(profile,
+		withBackend(&captureBackend{bits: GuaranteeReadBoundary | GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}),
+		withClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := portableSuccessCommand()
+	commandToken := issueTestGrant(t, executor, now, "prepare-retained", command, workspace,
+		"command.execute", "", GrantClassCommandStart, command)
+	readToken, err := executor.IssueGrant(context.Background(), "prepare-retained", command, workspace,
+		"filesystem.read", target, GrantClassFilesystemPathRead, target, now.Add(time.Minute).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := grantID(readToken)
+	if _, ok := executor.retainedGrantPaths[id]; !ok {
+		t.Fatal("issued filesystem grant has no retained path handle")
+	}
+
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: command, ExecutionID: "prepare-retained",
+		Grants: []string{commandToken, readToken},
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	t.Cleanup(func() { _ = prepared.Close() })
+
+	if _, ok := executor.retainedGrantPaths[id]; ok {
+		t.Fatal("PrepareProcess did not consume the retained path registry entry")
+	}
+	if _, ok := executor.usedGrants[id]; !ok {
+		t.Fatal("PrepareProcess did not mark the filesystem grant used")
+	}
+}
+
 func TestRetainedGrantPathConcurrentConsumptionFailsClosed(t *testing.T) {
 	now := time.Date(2026, 7, 21, 18, 30, 0, 0, time.UTC)
 	workspace := mustCanonicalGrantRoot(t, t.TempDir())

@@ -111,10 +111,15 @@ func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetup
 // elevatedAsyncExecution adapts one successfully launched
 // *elevatedRunnerExecution* plus its owned stdio bridge into
 // enforce.Execution. Bridge child-end descriptors are already closed by the
-// time this is constructed (see executeElevatedRunner); Wait only needs to
-// reap the process/Job (which also retires the broker lease and the
-// compiled spec's active registration — see elevatedRunnerExecution.Wait)
-// and drain the remaining output-copy goroutines.
+// time this is constructed (see executeElevatedRunner); Wait reaps the
+// process/Job (which also retires the broker lease and the compiled spec's
+// active registration — see elevatedRunnerExecution.Wait), drains the
+// remaining output-copy goroutines, and then closes the bridge's own
+// internal relay descriptors (stdinWriter/stdoutReader/stderrReader) —
+// previously only ever closed on a launch-failure path, which leaked all
+// three on every successful execution. WaitOutput is guaranteed to have
+// observed EOF on both output copies by the time the process/Job reaps, so
+// closing here can never sever a copy still in flight.
 type elevatedAsyncExecution struct {
 	execution      *elevatedRunnerExecution
 	bridge         *elevatedStdioBridge
@@ -130,11 +135,12 @@ func (async *elevatedAsyncExecution) Wait(ctx context.Context) (int, error) {
 		return -1, fmt.Errorf("%w: execution is missing", errElevatedRunnerLaunch)
 	}
 	code, waitErr := async.execution.Wait(ctx)
-	var copyErr error
+	var copyErr, closeErr error
 	if async.bridge != nil {
 		copyErr = async.bridge.WaitOutput()
+		closeErr = async.bridge.Close()
 	}
-	return code, errors.Join(async.bridgeCloseErr, waitErr, copyErr)
+	return code, errors.Join(async.bridgeCloseErr, waitErr, copyErr, closeErr)
 }
 
 type elevatedStdioBridge struct {

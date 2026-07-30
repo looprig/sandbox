@@ -10,6 +10,17 @@ import (
 // executorLifecycle is shared by every Executor owned by one ExecutorSet. Its
 // mutex is the spawn/close linearization point: Start either completes before
 // close begins, or observes closing and fails without spawning.
+//
+// prepared additionally tracks every live PreparedProcess that has reserved a
+// lease (via beginExecution, inside PrepareProcess) but has not yet been
+// consumed by Start or released by Close. A started Process eventually
+// releases its lease because lifecycle.ctx cancellation reaches a real OS
+// process or backend authority (cmd.Cancel / the backend's own Launch
+// context); an UNSTARTED preparation has no such authority for a cancelled
+// context to reach, so beginClose must actively close every one of them
+// itself rather than merely waiting — otherwise an abandoned (never
+// Started, never Closed) PreparedProcess would keep lifecycle.wait blocked
+// forever.
 type executorLifecycle struct {
 	mu         sync.Mutex
 	ctx        context.Context
@@ -17,6 +28,7 @@ type executorLifecycle struct {
 	active     sync.WaitGroup
 	cleanup    sync.WaitGroup
 	closed     bool
+	prepared   map[*PreparedProcess]struct{}
 	errMu      sync.Mutex
 	cleanupErr error
 }
@@ -122,15 +134,64 @@ func (lease *executionLease) finish() {
 	lease.finishCleanup()
 }
 
-func (lifecycle *executorLifecycle) beginClose() {
+// beginClose marks the lifecycle closed, cancels lifecycle.ctx (which reaches
+// every live lease via the AfterFunc hook beginExecution installs), and
+// atomically snapshots-and-clears the set of prepared-but-not-yet-started
+// handles, returning them so the caller can release each one. Using the same
+// mutex registerPrepared contends on makes the handoff race-free: a
+// PrepareProcess call either registers before this snapshot (so it is
+// returned here) or observes lifecycle.closed afterward (so registerPrepared
+// itself refuses and the caller releases its own handle) — a handle can never
+// fall in the gap between the two.
+func (lifecycle *executorLifecycle) beginClose() []*PreparedProcess {
 	if lifecycle == nil {
-		return
+		return nil
 	}
 	lifecycle.mu.Lock()
+	var abandoned []*PreparedProcess
 	if !lifecycle.closed {
 		lifecycle.closed = true
 		lifecycle.cancel()
+		for p := range lifecycle.prepared {
+			abandoned = append(abandoned, p)
+		}
+		lifecycle.prepared = nil
 	}
+	lifecycle.mu.Unlock()
+	return abandoned
+}
+
+// registerPrepared records a live PreparedProcess so beginClose can find and
+// release it if its caller abandons it without ever calling Start or Close.
+// It reports false (and registers nothing) once the lifecycle has begun
+// closing; the caller must then release the handle itself instead of
+// returning it.
+func (lifecycle *executorLifecycle) registerPrepared(p *PreparedProcess) bool {
+	if lifecycle == nil || p == nil {
+		return false
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.closed {
+		return false
+	}
+	if lifecycle.prepared == nil {
+		lifecycle.prepared = make(map[*PreparedProcess]struct{})
+	}
+	lifecycle.prepared[p] = struct{}{}
+	return true
+}
+
+// unregisterPrepared removes a PreparedProcess from the abandoned-handle
+// registry once its caller has consumed it (Start) or released it (Close)
+// normally. It is always safe to call, including after beginClose has
+// already cleared the registry (delete on a nil map is a no-op).
+func (lifecycle *executorLifecycle) unregisterPrepared(p *PreparedProcess) {
+	if lifecycle == nil || p == nil {
+		return
+	}
+	lifecycle.mu.Lock()
+	delete(lifecycle.prepared, p)
 	lifecycle.mu.Unlock()
 }
 

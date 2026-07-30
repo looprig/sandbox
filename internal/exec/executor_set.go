@@ -308,13 +308,22 @@ func (set *ExecutorSet) Close() error {
 	}
 	set.mu.Unlock()
 
-	set.lifecycle.beginClose()
+	// beginClose closes admission (new PrepareProcess/Start calls observe
+	// lifecycle.closed and fail) and hands back every PreparedProcess that
+	// was prepared but never started or closed by its caller. Closing them
+	// here — before lifecycle.wait — releases their leases synchronously, so
+	// an abandoned handle can never leave lifecycle.wait blocked on a lease
+	// nothing will ever finish (see executorLifecycle's doc comment).
+	abandoned := set.lifecycle.beginClose()
+	var releaseErr error
+	for _, prepared := range abandoned {
+		releaseErr = errors.Join(releaseErr, prepared.Close())
+	}
 	for _, executor := range executors {
 		executor.markClosed()
 	}
 	set.lifecycle.wait()
 	set.lifecycle.waitCleanup()
-	var releaseErr error
 	releaseErr = errors.Join(releaseErr, set.lifecycle.delayedCleanupError())
 	for _, executor := range executors {
 		releaseErr = errors.Join(releaseErr, executor.releaseCompiledSpec())
