@@ -43,7 +43,7 @@ func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 	})
 	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1))
 	if err != nil {
-		t.Fatalf("NewExecutorSet: %v", err)
+		skipIfNoRealBackend(t, "NewExecutorSet", err)
 	}
 	t.Cleanup(func() { _ = set.Close() })
 	executor, err := set.For("integration-prepared-grant")
