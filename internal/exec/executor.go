@@ -604,7 +604,15 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 		env = []string{}
 	}
 	var output bytes.Buffer
-	exit, err := s.spec.Launch(enforce.LaunchRequest{
+	// Launch itself only establishes the backend's OS-level authority and
+	// returns promptly (see enforce.Spec.Launch's doc comment); this
+	// synchronous RunCommand/RunArgv path immediately calls Wait on the
+	// returned execution to reproduce the exact same blocking behavior this
+	// call site has always had — same total wall time, same error surfacing
+	// — so 10C's characterized RunCommand/RunArgv/Granted results remain
+	// byte-for-byte unchanged. A future microtask (Task 11) is what actually
+	// lets a caller observe the asynchronous handoff.
+	execution, err := s.spec.Launch(enforce.LaunchRequest{
 		Context: lease.ctx,
 		Dir:     dir,
 		Argv:    append([]string(nil), argv...),
@@ -613,6 +621,10 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 		Stdout:  &output,
 		Stderr:  &output,
 	})
+	var exit int
+	if err == nil {
+		exit, err = execution.Wait(lease.ctx)
+	}
 	executionCtxErr := lease.ctx.Err()
 	callerCtxErr := lease.caller.Err()
 	releaseErr := spawn.release(true, false, nil)

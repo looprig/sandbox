@@ -93,7 +93,7 @@ func TestElevatedConfiguredResourceLimitsAcceptance(t *testing.T) {
 	copyElevatedLimitsHelper(t, source, helper)
 	resultPath := filepath.Join(workspace, "elevated-limits-result.json")
 	var stdout, stderr bytes.Buffer
-	code, err := spec.Launch(enforce.LaunchRequest{
+	execution, err := spec.Launch(enforce.LaunchRequest{
 		Context: context.Background(),
 		Dir:     workspace,
 		Argv: []string{
@@ -102,8 +102,12 @@ func TestElevatedConfiguredResourceLimitsAcceptance(t *testing.T) {
 		},
 		Env: os.Environ(), Stdin: bytes.NewReader(nil), Stdout: &stdout, Stderr: &stderr,
 	})
+	if err != nil {
+		t.Fatalf("launch elevated resource-limit probe: %v", err)
+	}
+	code, err := execution.Wait(context.Background())
 	if err != nil || code != 0 {
-		t.Fatalf("launch elevated resource-limit probe = code %d err %v stdout=%q stderr=%q",
+		t.Fatalf("wait elevated resource-limit probe = code %d err %v stdout=%q stderr=%q",
 			code, err, stdout.String(), stderr.String())
 	}
 	data, err := os.ReadFile(resultPath)

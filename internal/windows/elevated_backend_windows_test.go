@@ -230,7 +230,7 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
-				launch: func(request enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+				launch: func(request enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (enforce.Execution, error) {
 					if issued.Handle != 123 || issued.Desktop == "" || request.Dir != `C:\work` ||
 						!slices.Equal(request.Argv, []string{`C:\tool.exe`, "arg"}) ||
 						!slices.Equal(request.Env, []string{"A=B"}) {
@@ -238,9 +238,9 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 					}
 					_, _ = io.WriteString(request.Stdout, "output")
 					if err := release(); err != nil {
-						return -1, err
+						return nil, err
 					}
-					return 7, nil
+					return fixedExecution{code: 7}, nil
 				},
 			}}
 			p := policy.Effective{
@@ -263,11 +263,15 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 				t.Fatalf("runtime baseline absent from report: %#v", report)
 			}
 			var output strings.Builder
-			code, err := spec.Launch(enforce.LaunchRequest{
+			execution, err := spec.Launch(enforce.LaunchRequest{
 				Context: context.Background(), Dir: `C:\work`,
 				Argv: []string{`C:\tool.exe`, "arg"}, Env: []string{"A=B"},
 				Stdout: &output, Stderr: io.Discard,
 			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, err := execution.Wait(context.Background())
 			if err != nil || code != 7 || output.String() != "output" {
 				t.Fatalf("launch = code %d output %q err %v", code, output.String(), err)
 			}
@@ -300,14 +304,17 @@ func TestElevatedConcurrentExecutionsOwnIndependentLeasesAndSpecReleaseDrains(t 
 		acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 			return lease, nil
 		},
-		launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, _ brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+		launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, _ brokerIssuedToken, _ policy.Limits, release func() error) (enforce.Execution, error) {
 			launchMu.Lock()
 			index := next
 			next++
 			launchMu.Unlock()
 			started <- struct{}{}
 			<-finish[index]
-			return 0, release()
+			if err := release(); err != nil {
+				return nil, err
+			}
+			return fixedExecution{}, nil
 		},
 	}}
 	spec, _, _, _, err := backend.Compile(policy.Effective{})

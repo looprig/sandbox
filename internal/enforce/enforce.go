@@ -49,11 +49,19 @@ type Spec struct {
 
 	// Launch is an optional backend-owned execution path for platforms whose
 	// security boundary cannot be expressed by configuring an exec.Cmd. Inputs
-	// are immutable snapshots owned by the caller. Returning proves the launched
-	// process boundary is empty; this permits the executor to release transient
-	// grants and proxy authority immediately after completion. Ordinary backends
-	// leave Launch nil and continue to use Wrap.
-	Launch func(LaunchRequest) (exitCode int, err error)
+	// are immutable snapshots owned by the caller. Launch must return as soon
+	// as the launched process's OS-level authority has been established (e.g.
+	// a Windows Job with the target process assigned and resumed) — it must
+	// NOT block for the process's entire lifetime, and a backend must never
+	// fake this by wrapping an internally blocking launch in a goroutine; the
+	// launch sequencing itself (suspended-create, authority-assign, resume)
+	// must genuinely return control before the process's own lifetime
+	// completes. The returned Execution's Wait is the only place the
+	// process's terminal result is observed and the launch's authority is
+	// finally retired; a caller that calls Launch successfully must always
+	// call Wait exactly once, even if it wants nothing but to release
+	// resources. Ordinary backends leave Launch nil and continue to use Wrap.
+	Launch func(LaunchRequest) (Execution, error)
 
 	// GrantAuthority is an opaque backend-owned key for compiling transient
 	// grants against this exact base spec. The executor only returns it to the
@@ -63,6 +71,20 @@ type Spec struct {
 	// Release relinquishes immutable resources owned by the compiled spec. It may
 	// be nil when the spec owns none and must be safe to call idempotently.
 	Release func() error
+}
+
+// Execution is a backend-owned handle to a launch that has already
+// established its OS-level authority (e.g. a Windows Job with the target
+// process assigned and resumed) before Launch returned it. Wait blocks until
+// the process reaches a terminal state AND the backend has proven that
+// authority is empty (no residual descendant remains inside it), returning
+// the portable exit code. Wait must be idempotent and safe for concurrent or
+// sequential callers: every caller observes the identical result, and the
+// real OS wait plus authority proof happens exactly once — the same
+// contract exec.Process.Wait already guarantees for the pipe-backed
+// asynchronous process API in this module's exec package.
+type Execution interface {
+	Wait(ctx context.Context) (exitCode int, err error)
 }
 
 // LaunchRequest is the complete non-authority execution input supplied to a

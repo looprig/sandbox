@@ -273,14 +273,14 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
 					return lease, nil
 				},
-				launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (int, error) {
+				launch: func(_ enforce.LaunchRequest, _ elevatedSetupSnapshot, issued brokerIssuedToken, _ policy.Limits, release func() error) (enforce.Execution, error) {
 					if issued.Handle != 123 || lease.account != test.wantAccount {
 						t.Fatalf("launch token/account = %v/%v", issued.Handle, lease.account)
 					}
 					if err := release(); err != nil {
-						return -1, err
+						return nil, err
 					}
-					return 0, nil
+					return fixedExecution{}, nil
 				},
 			}}
 			spec, report, level, bits, err := backend.Compile(test.policy)

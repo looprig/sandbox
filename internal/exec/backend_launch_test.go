@@ -10,6 +10,21 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 )
 
+// fixedExecution is a minimal enforce.Execution fake whose Wait returns
+// immediately with a pre-decided (exitCode, err) pair, for tests that fake
+// enforce.Spec.Launch directly and don't need any real asynchronous
+// handshake — they already establish "authority" synchronously inside the
+// fake Launch closure itself, exactly as before this field returned an
+// Execution instead of a bare exit code.
+type fixedExecution struct {
+	code int
+	err  error
+}
+
+func (execution fixedExecution) Wait(context.Context) (int, error) {
+	return execution.code, execution.err
+}
+
 func TestBackendOwnedLaunchPreservesExecutorLifecycleAndOutputConvention(t *testing.T) {
 	executor := &Executor{lifecycle: newExecutorLifecycle()}
 	lease, err := executor.beginExecution(context.Background())
@@ -18,7 +33,7 @@ func TestBackendOwnedLaunchPreservesExecutorLifecycleAndOutputConvention(t *test
 	}
 	var order []string
 	originalEnv := []string{"A=B"}
-	spec := enforce.Spec{Launch: func(request enforce.LaunchRequest) (int, error) {
+	spec := enforce.Spec{Launch: func(request enforce.LaunchRequest) (enforce.Execution, error) {
 		order = append(order, "launch")
 		if request.Context != lease.ctx || request.Dir != "/work" ||
 			!slices.Equal(request.Argv, []string{"/tool", "arg"}) ||
@@ -33,7 +48,7 @@ func TestBackendOwnedLaunchPreservesExecutorLifecycleAndOutputConvention(t *test
 		request.Env[0] = "mutated"
 		_, _ = io.WriteString(request.Stdout, "out")
 		_, _ = io.WriteString(request.Stderr, "err")
-		return 9, nil
+		return fixedExecution{code: 9}, nil
 	}}
 	out, code, err := executor.run(lease, "/work", []string{"/tool", "arg"},
 		snapshot{spec: spec, env: originalEnv},
@@ -63,9 +78,9 @@ func TestBackendOwnedLaunchDoesNotStartAfterCancellation(t *testing.T) {
 	cancel()
 	called := false
 	_, code, err := executor.run(lease, "/work", []string{"/tool"},
-		snapshot{spec: enforce.Spec{Launch: func(enforce.LaunchRequest) (int, error) {
+		snapshot{spec: enforce.Spec{Launch: func(enforce.LaunchRequest) (enforce.Execution, error) {
 			called = true
-			return 0, nil
+			return fixedExecution{}, nil
 		}}},
 		nil)
 	if !errors.Is(err, context.Canceled) || code != -1 || called {

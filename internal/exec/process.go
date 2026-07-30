@@ -414,6 +414,35 @@ func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processS
 	}
 }
 
+// newBackendOwnedProcess adapts a backend-owned enforce.Execution — the
+// handle a compiled enforce.Spec.Launch returns once it has already
+// established the launched process's OS-level authority (e.g. a Windows
+// elevated Job with the target assigned and resumed) — into the same
+// asynchronous Process shape newPipeProcess produces from a plain os/exec.Cmd,
+// so a future caller preparing a backend-confined process never needs a
+// second, parallel asynchronous execution model: Wait, Close, Activities, and
+// stream access all behave identically regardless of which constructor built
+// the Process.
+//
+// stdout/stderr/stdin are the caller-facing pipe ends; how a specific backend
+// produces the OTHER ends and copies between them and the real OS process is
+// entirely that backend's concern (see the Windows elevated stdio bridge) —
+// this constructor only needs the already-live caller-facing ends. execution
+// supplies the terminal result in place of cmd.Wait/exec.ExitError; a
+// backend-owned Process has no *exec.Cmd for this package to reap, so
+// Process.cmd stays nil and runWait must not dereference it in that case.
+func newBackendOwnedProcess(execution enforce.Execution, stdout, stderr io.ReadCloser, stdin *processStdin) *Process {
+	return &Process{
+		execution:  execution,
+		stdout:     stdout,
+		stderr:     stderr,
+		stdin:      stdin,
+		startedAt:  time.Now(),
+		activities: make(chan ProcessActivity),
+		done:       make(chan struct{}),
+	}
+}
+
 // Process is a running asynchronous process. Stdout/Stderr/Stdin are real,
 // live pipes available immediately after Start — the caller reads and writes
 // incrementally, not only after the process exits. Methods other than Wait
@@ -423,10 +452,15 @@ func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processS
 // exposes no OS process identifier; a model-facing process handle belongs in
 // a higher layer, not this one.
 type Process struct {
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	stderr io.ReadCloser
-	stdin  *processStdin
+	// cmd is set by newPipeProcess (a plain, unconfined os/exec.Cmd spawn)
+	// and nil for a backend-owned construction (newBackendOwnedProcess),
+	// which sets execution instead; exactly one of the two is ever non-nil,
+	// and runWait branches on execution to decide which one to reap.
+	cmd       *exec.Cmd
+	execution enforce.Execution
+	stdout    io.ReadCloser
+	stderr    io.ReadCloser
+	stdin     *processStdin
 
 	startedAt time.Time
 
@@ -518,12 +552,27 @@ func (p *Process) Wait(ctx context.Context) (ProcessResult, error) {
 	}
 }
 
-// runWait performs the single real OS wait for this process. It is started
-// by exactly one Wait caller's sync.Once and every other caller (concurrent
-// or later) only ever observes its result through the done channel's
-// happens-before guarantee.
+// runWait performs the single real terminal wait for this process — either
+// reaping p.cmd directly, or (for a backend-owned construction) delegating to
+// p.execution.Wait, which itself blocks until the backend's own OS-level
+// authority (e.g. a Windows Job) is proven empty. It is started by exactly
+// one Wait caller's sync.Once and every other caller (concurrent or later)
+// only ever observes its result through the done channel's happens-before
+// guarantee.
+//
+// Like p.cmd.Wait() below, p.execution.Wait is deliberately called with
+// context.Background() rather than any individual caller's ctx: Process.Wait
+// already guarantees that a caller's context cancellation only stops that
+// call from waiting, never the process/authority itself, and runWait runs
+// exactly once regardless of how many callers or contexts are involved.
 func (p *Process) runWait() {
-	err := p.cmd.Wait()
+	var exitCode int
+	var err error
+	if p.execution != nil {
+		exitCode, err = p.execution.Wait(context.Background())
+	} else {
+		err = p.cmd.Wait()
+	}
 	finishedAt := time.Now()
 	// The activity stream must close before any Wait caller can observe a
 	// result; closing here, strictly before result/done, guarantees that
@@ -533,14 +582,22 @@ func (p *Process) runWait() {
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
-		p.result = ProcessResult{ExitCode: 0, StartedAt: p.startedAt, FinishedAt: finishedAt}
+		// For p.cmd, a nil Wait error always means a clean exit 0 (exitCode's
+		// zero value already matches); for p.execution, a nil error already
+		// carries the real portable exit code (an enforce.Execution's Wait
+		// reports a ran-but-nonzero process this way, with a nil error,
+		// exactly like this package's own Process.Wait convention).
+		p.result = ProcessResult{ExitCode: exitCode, StartedAt: p.startedAt, FinishedAt: finishedAt}
 	case errors.As(err, &exitErr):
-		// A ran-but-non-zero process is a result, not an error: mirrors the
-		// synchronous RunCommand/RunArgv exit-code convention exactly.
+		// A ran-but-non-zero *exec.Cmd process is a result, not an error:
+		// mirrors the synchronous RunCommand/RunArgv exit-code convention
+		// exactly. This case is unreachable for a backend-owned execution,
+		// whose Wait never produces an *exec.Cmd-shaped error.
 		p.result = ProcessResult{ExitCode: exitErr.ExitCode(), StartedAt: p.startedAt, FinishedAt: finishedAt}
 	default:
-		// A genuine post-spawn failure (e.g. an I/O teardown error): distinct
-		// from both a clean exit and a non-zero exit.
+		// A genuine post-spawn failure (e.g. an I/O teardown error, or a
+		// backend's own authority-proof failure): distinct from both a clean
+		// exit and a non-zero exit.
 		p.resultErr = err
 	}
 	close(p.done)

@@ -19,51 +19,56 @@ import (
 // streams and the capability-only protected runner launcher. The broker owns
 // the named desktop and lease; this process receives only their immutable name
 // and a duplicated restricted primary-token handle.
-func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetupSnapshot, issued brokerIssuedToken, limits policy.Limits, releaseLease func() error) (_ int, err error) {
+//
+// executeElevatedRunner itself must return promptly once the launched
+// process's Job/process authority has been established — it must never block
+// for the process's own lifetime. It calls launcher.Launch (which already
+// returns as soon as the runner is Job-assigned and resumed) and, on
+// success, hands the resulting *elevatedRunnerExecution* plus the still-open
+// stdio bridge to elevatedAsyncExecution. retire is the single combined
+// closure (broker lease release plus the compiled spec's active-launch
+// registration) threaded through as elevatedRunnerLaunch.ReleaseLease; a
+// later call to the returned value's Wait is what actually reaps the
+// process, proves the Job is empty, drains the bridge, and retires it (via
+// elevatedRunnerExecution.release). On any failure, launcher.Launch itself
+// is responsible for retiring the retire obligation on every one of its own
+// return paths — synchronously once it has exact Job-empty proof, or by
+// quarantining the whole capsule for a later proof — so this function must
+// call retire directly only for failures that occur before Launch is ever
+// invoked (nothing here has created any OS-level authority yet in that
+// case).
+func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetupSnapshot, issued brokerIssuedToken, limits policy.Limits, retire func() error) (enforce.Execution, error) {
+	if retire == nil {
+		return nil, errors.New("windows sandbox: elevated launch retirement is required")
+	}
 	if request.Context == nil {
-		return -1, errors.New("windows sandbox: elevated launch context is required")
+		return nil, errors.Join(errors.New("windows sandbox: elevated launch context is required"), retire())
 	}
 	if err := request.Context.Err(); err != nil {
-		return -1, err
+		return nil, errors.Join(err, retire())
 	}
 	if request.Stdin == nil || request.Stdout == nil || request.Stderr == nil {
-		return -1, errors.New("windows sandbox: elevated standard streams are required")
+		return nil, errors.Join(errors.New("windows sandbox: elevated standard streams are required"), retire())
 	}
 	if issued.Handle == 0 || uint64(uintptr(issued.Handle)) != issued.Handle {
-		return -1, errors.New("windows sandbox: broker token handle is invalid")
+		return nil, errors.Join(errors.New("windows sandbox: broker token handle is invalid"), retire())
 	}
 	if !validQualifiedDesktop(issued.Desktop) {
-		return -1, errors.New("windows sandbox: broker desktop name is invalid")
+		return nil, errors.Join(errors.New("windows sandbox: broker desktop name is invalid"), retire())
 	}
-
-	var releaseOnce sync.Once
-	var releaseErr error
-	release := func() error {
-		releaseOnce.Do(func() {
-			if releaseLease != nil {
-				releaseErr = releaseLease()
-			}
-		})
-		return releaseErr
-	}
-	ownedByExecution := false
-	defer func() {
-		if !ownedByExecution {
-			err = errors.Join(err, release())
-		}
-	}()
 
 	bridge, err := newElevatedStdioBridge(request.Context, request.Stdin, request.Stdout, request.Stderr)
 	if err != nil {
-		return -1, err
+		return nil, errors.Join(err, retire())
 	}
-	defer func() { err = errors.Join(err, bridge.Close()) }()
 
 	launcher, err := newElevatedRunnerLauncher(nativeElevatedRunnerProcessAPI{})
 	if err != nil {
-		return -1, err
+		return nil, errors.Join(err, retire(), bridge.Close())
 	}
+
 	execution, err := launcher.Launch(elevatedRunnerLaunch{
+		Context:    request.Context,
 		Token:      win.Token(uintptr(issued.Handle)),
 		HostPath:   snapshot.HostPath,
 		HostSHA256: snapshot.HostSHA256,
@@ -79,19 +84,57 @@ func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetup
 			MaxProcesses: limits.MaxPIDs, MaxMemoryBytes: limits.MaxMemBytes,
 			MaxCPUPct: limits.MaxCPUPct,
 		},
-		ReleaseLease: release,
+		ReleaseLease: retire,
 	})
+	// From this point Launch itself owns retiring `retire` on every one of
+	// its own outcomes (success transfers it into execution.release; failure
+	// retires it directly after proof, or via quarantine): this function must
+	// never call retire again below, on either the success or the failure
+	// path, to avoid retiring authority before an outstanding Job-empty
+	// proof.
 	if err != nil {
-		return -1, err
+		return nil, errors.Join(err, bridge.Close())
 	}
-	ownedByExecution = true
-	if err := bridge.CloseChildEnds(); err != nil {
-		_, waitErr := execution.Wait(request.Context)
-		return -1, errors.Join(err, waitErr)
+
+	// Closing the parent's copies of the child-side descriptors as soon as
+	// the child holds its own inherited copies (rather than waiting for
+	// Wait) matches the same fd-lifetime discipline process.go's
+	// spawnProcess already requires: otherwise a parent-side leak would keep
+	// the output-copy goroutines from ever observing EOF. Authority already
+	// belongs to execution at this point regardless of whether this close
+	// succeeds, so a failure here is folded into the eventual Wait result
+	// rather than treated as a launch failure.
+	closeErr := bridge.CloseChildEnds()
+	return newElevatedAsyncExecution(execution, bridge, closeErr), nil
+}
+
+// elevatedAsyncExecution adapts one successfully launched
+// *elevatedRunnerExecution* plus its owned stdio bridge into
+// enforce.Execution. Bridge child-end descriptors are already closed by the
+// time this is constructed (see executeElevatedRunner); Wait only needs to
+// reap the process/Job (which also retires the broker lease and the
+// compiled spec's active registration — see elevatedRunnerExecution.Wait)
+// and drain the remaining output-copy goroutines.
+type elevatedAsyncExecution struct {
+	execution      *elevatedRunnerExecution
+	bridge         *elevatedStdioBridge
+	bridgeCloseErr error
+}
+
+func newElevatedAsyncExecution(execution *elevatedRunnerExecution, bridge *elevatedStdioBridge, bridgeCloseErr error) *elevatedAsyncExecution {
+	return &elevatedAsyncExecution{execution: execution, bridge: bridge, bridgeCloseErr: bridgeCloseErr}
+}
+
+func (async *elevatedAsyncExecution) Wait(ctx context.Context) (int, error) {
+	if async == nil || async.execution == nil {
+		return -1, fmt.Errorf("%w: execution is missing", errElevatedRunnerLaunch)
 	}
-	code, waitErr := execution.Wait(request.Context)
-	copyErr := bridge.WaitOutput()
-	return int(code), errors.Join(waitErr, copyErr)
+	code, waitErr := async.execution.Wait(ctx)
+	var copyErr error
+	if async.bridge != nil {
+		copyErr = async.bridge.WaitOutput()
+	}
+	return code, errors.Join(async.bridgeCloseErr, waitErr, copyErr)
 }
 
 type elevatedStdioBridge struct {

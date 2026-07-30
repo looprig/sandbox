@@ -20,7 +20,14 @@ import (
 	win "golang.org/x/sys/windows"
 )
 
-type elevatedRunnerLaunchFunc func(enforce.LaunchRequest, elevatedSetupSnapshot, brokerIssuedToken, policy.Limits, func() error) (int, error)
+// elevatedRunnerLaunchFunc's final func() error parameter retires BOTH the
+// per-execution broker lease and the compiled elevated Spec's active-launch
+// registration (see elevatedBackend.Compile's active sync.WaitGroup below);
+// it is idempotent and must be called exactly once across the whole launch,
+// whether synchronously on an early failure, synchronously after this
+// function obtains exact authority-empty proof for a later failure, or
+// eventually by the returned Execution's Wait.
+type elevatedRunnerLaunchFunc func(enforce.LaunchRequest, elevatedSetupSnapshot, brokerIssuedToken, policy.Limits, func() error) (enforce.Execution, error)
 
 // elevatedSetupSnapshot is the compiler's immutable, already-verified view of
 // the installed tier. Individual mechanism checks remain explicit so a future
@@ -455,30 +462,47 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	}
 	spec := enforce.Spec{
 		GrantAuthority: grantAuthority,
-		Launch: func(request enforce.LaunchRequest) (int, error) {
+		Launch: func(request enforce.LaunchRequest) (enforce.Execution, error) {
 			if request.Context == nil {
-				return -1, errors.New("sandbox: elevated launch context is required")
+				return nil, errors.New("sandbox: elevated launch context is required")
 			}
 			if err := request.Context.Err(); err != nil {
-				return -1, err
+				return nil, err
 			}
 			lifecycleMu.Lock()
 			if closing {
 				lifecycleMu.Unlock()
-				return -1, errors.New("sandbox: elevated specification is released")
+				return nil, errors.New("sandbox: elevated specification is released")
 			}
 			active.Add(1)
 			lifecycleMu.Unlock()
-			defer active.Done()
+			// active.Done is deliberately NOT deferred around this whole call:
+			// once launch (below) is invoked, IT owns retiring — synchronously
+			// after exact authority-empty proof, or via quarantine — through
+			// the combined retire closure built below. Only the two failures
+			// below that occur before launch is ever called (lease.Acquire,
+			// IssueToken — neither of which can have created any OS-level
+			// authority) retire directly here.
 			executionLease, err := lease.Acquire(request.Context)
 			if err != nil {
-				return -1, fmt.Errorf("acquire per-spawn Windows broker lease: %w", err)
+				active.Done()
+				return nil, fmt.Errorf("acquire per-spawn Windows broker lease: %w", err)
 			}
 			issued, err := executionLease.IssueToken(account)
 			if err != nil {
-				return -1, errors.Join(fmt.Errorf("issue per-spawn restricted token: %w", err), executionLease.Release())
+				active.Done()
+				return nil, errors.Join(fmt.Errorf("issue per-spawn restricted token: %w", err), executionLease.Release())
 			}
-			return launch(request, snapshot, issued, p.Limits, executionLease.Release)
+			var retireOnce sync.Once
+			var retireErr error
+			retire := func() error {
+				retireOnce.Do(func() {
+					retireErr = executionLease.Release()
+					active.Done()
+				})
+				return retireErr
+			}
+			return launch(request, snapshot, issued, p.Limits, retire)
 		},
 		Release: release,
 	}

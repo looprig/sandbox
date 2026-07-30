@@ -15,8 +15,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/pkg/profile"
 )
+
+// fakeBackendExecution is a minimal enforce.Execution test double: Wait
+// blocks until release is closed (or ctx is done), then returns the
+// pre-decided (code, err) exactly once, recording how many times it was
+// actually invoked.
+type fakeBackendExecution struct {
+	code    int
+	err     error
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeBackendExecution) Wait(ctx context.Context) (int, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.release != nil {
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return f.code, f.err
+}
 
 // newProcessTestExecutor builds a minimal, unconfined (Isolation: Unconfined)
 // executor with the given Command authority. Unconfined keeps these tests
@@ -687,3 +715,75 @@ func TestProcessActivityEffectiveKindIsConservativeForInvalidActivity(t *testing
 		t.Fatalf("EffectiveKind(zero) = %v, want conservative ProcessActivityBroadWrite", got)
 	}
 }
+
+// TestBackendOwnedProcessReportsExecutionResult proves newBackendOwnedProcess
+// (the seam a backend-confined PreparedProcess/Start will use once it is
+// wired to a real enforce.Backend — see enforce.Spec.Launch/Execution) shares
+// the exact same asynchronous Process contract a plain os/exec.Cmd-backed
+// Process already provides: Wait blocks until the backend's own Execution
+// completes and reports its exact result exactly once, the activity stream
+// still closes before Wait returns, and Close still behaves normally, all
+// without ever touching the (nil, for this construction) *exec.Cmd.
+func TestBackendOwnedProcessReportsExecutionResult(t *testing.T) {
+	execution := &fakeBackendExecution{code: 7, release: make(chan struct{})}
+	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil)
+
+	done := make(chan ProcessResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := proc.Wait(context.Background())
+		errCh <- err
+		done <- result
+	}()
+
+	select {
+	case <-proc.Activities():
+		t.Fatal("activity stream closed before the backend execution completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(execution.release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("Wait error = %v, want nil", err)
+	}
+	result := <-done
+	if result.ExitCode != 7 {
+		t.Fatalf("Wait ExitCode = %d, want 7", result.ExitCode)
+	}
+	if _, open := <-proc.Activities(); open {
+		t.Fatal("activity stream did not close by the time Wait returned")
+	}
+
+	// Concurrent/later callers must observe the identical cached result
+	// without invoking the backend's Execution.Wait again.
+	again, err := proc.Wait(context.Background())
+	if err != nil || again.ExitCode != 7 {
+		t.Fatalf("second Wait = %+v, %v, want ExitCode 7, nil", again, err)
+	}
+	execution.mu.Lock()
+	calls := execution.calls
+	execution.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("execution.Wait called %d times, want exactly 1", calls)
+	}
+
+	if err := proc.Close(context.Background()); err != nil {
+		t.Fatalf("Close = %v, want nil", err)
+	}
+}
+
+// TestBackendOwnedProcessSurfacesExecutionError proves a genuine backend
+// authority-proof failure (e.g. a Windows Job that never proved empty) is
+// reported as a Wait error, using the identical "err != nil is a genuine
+// failure, distinct from a ran-but-nonzero result" convention a cmd-backed
+// Process already guarantees.
+func TestBackendOwnedProcessSurfacesExecutionError(t *testing.T) {
+	wantErr := errors.New("backend authority proof failed")
+	execution := &fakeBackendExecution{err: wantErr}
+	proc := newBackendOwnedProcess(execution, io.NopCloser(strings.NewReader("")), io.NopCloser(strings.NewReader("")), nil)
+	if _, err := proc.Wait(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Wait error = %v, want %v", err, wantErr)
+	}
+}
+
+var _ enforce.Execution = (*fakeBackendExecution)(nil)
