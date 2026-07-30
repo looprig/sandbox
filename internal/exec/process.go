@@ -706,7 +706,13 @@ func (p *PreparedProcess) spawnAndSupervise(ctx context.Context) (*Process, erro
 		_ = p.spawn.release(false, false, err)
 		return nil, err
 	}
-	go p.supervise(proc)
+	// supervise deliberately owns no request-scoped context: per Task 10B's
+	// setup-vs-lifetime contract, Start's ctx governs the spawn window only,
+	// never the returned Process's own lifetime (Wait/stream-draining/
+	// terminalization must survive the caller's ctx being canceled right
+	// after handoff). supervise's own loop terminates on process exit or
+	// executor/session close, so this goroutine is not unbounded.
+	go p.supervise(proc) // #nosec G118 -- supervise deliberately outlives the request ctx; see comment above
 	return proc, nil
 }
 

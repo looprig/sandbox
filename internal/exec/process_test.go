@@ -497,7 +497,7 @@ func TestPreparedProcessEffectiveAccessSharesNoBackingStorage(t *testing.T) {
 
 	first := prepared.EffectiveAccess()
 	paths := first.WritePaths()
-	paths = append(paths, "/should-not-leak")
+	_ = append(paths, "/should-not-leak") // mutate any shared backing array in place; result intentionally discarded
 
 	second := prepared.EffectiveAccess()
 	if len(second.WritePaths()) != 0 {
