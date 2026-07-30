@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"context"
 	"errors"
+	"io"
 	"runtime"
 	"testing"
 	"time"
@@ -166,6 +167,65 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		time.Now().Add(time.Minute).UnixMilli()); err != nil {
 		t.Fatalf("IssueGrant: %v", err)
 	}
+
+	// Pipe-backed asynchronous process API: prepare, start, stream, and wait
+	// on a single trivially-successful command. A Gated Command authority (set
+	// above) demands at least one grant be present; this microtask does not
+	// yet cryptographically verify it.
+	prepared, err := executor.PrepareProcess(context.Background(), sandbox.ProcessOptions{
+		Directory:   workspace,
+		Command:     facadeProcessSuccessCommand(),
+		ExecutionID: "facade-process",
+		Grants:      []string{"facade-placeholder-grant"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	var (
+		_ sandbox.ProcessAccess     = prepared.EffectiveAccess()
+		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessReadOnly
+		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessScopedWrite
+		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessBroadWrite
+	)
+	proc, err := prepared.Start(context.Background())
+	if err != nil {
+		t.Fatalf("PreparedProcess.Start: %v", err)
+	}
+	var (
+		_ io.ReadCloser  = proc.Stdout()
+		_ io.ReadCloser  = proc.Stderr()
+		_ io.WriteCloser = proc.Stdin()
+	)
+	result, err := proc.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Process.Wait: %v", err)
+	}
+	var _ sandbox.ProcessResult = result
+	if result.ExitCode != 0 {
+		t.Fatalf("Process.Wait ExitCode = %d, want 0", result.ExitCode)
+	}
+	if err := proc.Close(context.Background()); err != nil {
+		t.Fatalf("Process.Close: %v", err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatalf("PreparedProcess.Close (post-start no-op): %v", err)
+	}
+
+	var (
+		_ sandbox.ProcessActivityKind = sandbox.ProcessActivityWrite
+		_ sandbox.ProcessActivityKind = sandbox.ProcessActivityBroadWrite
+		_ sandbox.ProcessActivity     = sandbox.ProcessActivity{Kind: sandbox.ProcessActivityWrite}
+	)
+}
+
+// facadeProcessSuccessCommand mirrors the internal/exec package's portable
+// test-fixture command strings, kept local here since this file deliberately
+// only reaches the exported surface (see the package doc above).
+func facadeProcessSuccessCommand() string {
+	if runtime.GOOS == "windows" {
+		return "exit /b 0"
+	}
+	return "true"
 }
 
 func TestFacadeWindowsSetupUnavailableOnNonWindows(t *testing.T) {

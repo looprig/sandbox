@@ -252,3 +252,53 @@ const (
 	GrantClassFilesystemTreeWrite = exec.GrantClassFilesystemTreeWrite
 	GrantClassFilesystemHostWrite = exec.GrantClassFilesystemHostWrite
 )
+
+// Pipe-backed asynchronous process vocabulary. Executor.PrepareProcess (a
+// method promoted through the Executor alias above) is this microtask's
+// entry point; ProcessOptions/PreparedProcess/Process/ProcessResult are its
+// request and result types. These are Sandbox's own named types: their
+// method shapes structurally match Harness's
+// tool.AsyncProcessRunner/PreparedProcess/Process (github.com/looprig/harness/
+// pkg/tool) so a consumer can adapt between the two, but this module never
+// imports Harness (SPEC's module-boundary rule).
+type (
+	// ProcessOptions describes one asynchronous process admission request.
+	ProcessOptions = exec.ProcessOptions
+	// PreparedProcess is a validated, single-use process start.
+	PreparedProcess = exec.PreparedProcess
+	// Process is a running asynchronous process with live stdio pipes.
+	Process = exec.Process
+	// ProcessResult is the terminal result of an asynchronous process.
+	ProcessResult = exec.ProcessResult
+	// ProcessAccess is the authoritative, immutable description of a
+	// prepared process's workspace access.
+	ProcessAccess = exec.ProcessAccess
+	// ProcessAccessKind classifies ProcessAccess.
+	ProcessAccessKind = exec.ProcessAccessKind
+	// ProcessActivity reports one unit of workspace activity from a running
+	// process.
+	ProcessActivity = exec.ProcessActivity
+	// ProcessActivityKind classifies ProcessActivity.
+	ProcessActivityKind = exec.ProcessActivityKind
+)
+
+// ProcessAccessKind values.
+const (
+	ProcessAccessReadOnly    = exec.ProcessAccessReadOnly
+	ProcessAccessScopedWrite = exec.ProcessAccessScopedWrite
+	ProcessAccessBroadWrite  = exec.ProcessAccessBroadWrite
+)
+
+// ProcessActivityKind values.
+const (
+	ProcessActivityWrite      = exec.ProcessActivityWrite
+	ProcessActivityBroadWrite = exec.ProcessActivityBroadWrite
+)
+
+// Process/PreparedProcess sentinels.
+var (
+	ErrProcessClosed         = exec.ErrProcessClosed
+	ErrProcessAlreadyStarted = exec.ErrProcessAlreadyStarted
+	ErrProcessTTYUnsupported = exec.ErrProcessTTYUnsupported
+	ErrProcessStdinClosed    = exec.ErrProcessStdinClosed
+)
