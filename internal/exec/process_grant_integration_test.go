@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/looprig/sandbox/internal/enforce"
 )
 
 // TestIntegrationProcessPreparedGrantLifetime exercises the full two-phase
@@ -19,10 +21,18 @@ import (
 // (no test-injected backend/processTree/quarantine seam), exactly like this
 // package's other //go:build integration and platform acceptance tests. Its
 // tagged execution is deferred to Task 13's owning phase gate on a worker
-// with real grant backends, matching this plan's general policy; it is
-// written to run for real wherever a supported backend is available
-// (including this host's own Seatbelt backend on darwin, gated by
-// requireSandboxExec exactly like TestAcceptanceMatrixDarwin).
+// with real grant backends, matching this plan's general policy.
+//
+// This doc comment originally claimed the test also runs for real on this
+// host's own Seatbelt backend on darwin (gated by requireSandboxExec exactly
+// like TestAcceptanceMatrixDarwin). That was true when this test was
+// written (Task 11), before Task 12C made every Darwin async Start() fail
+// closed with enforce.ErrLifetimeContainmentUnavailable (Darwin has no real
+// process-tree containment primitive yet, so this phase deliberately does
+// not claim Darwin async execution). Real end-to-end exercise of this test
+// is therefore Linux-only now; on darwin it skips as soon as Start reports
+// exactly that expected fail-closed error, rather than treating it as a
+// failure.
 func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 	requireSandboxExec(t)
 
@@ -82,6 +92,9 @@ func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 
 	proc, err := prepared.Start(context.Background())
 	if err != nil {
+		if runtime.GOOS == "darwin" && errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
+			t.Skipf("Start: %v (expected: darwin has no async lifetime-containment primitive yet, per Task 12C)", err)
+		}
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.Close(context.Background()) })
