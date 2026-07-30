@@ -127,21 +127,32 @@ type elevatedRunnerExecution struct {
 	code int
 	err  error
 
-	// mu guards job/process/release against a concurrent Signal-driven
-	// terminateJob call (below) racing Wait's own once-guarded clear of the
-	// same fields once Job-empty proof has retired every authority this
-	// execution owns. Wait itself remains single-writer (sync.Once already
-	// serializes its one real execution), so mu only ever needs to
-	// coordinate with a caller outside that Once — never with itself.
+	// mu guards only a consistent snapshot read/clear of job/process/release
+	// against Wait's own once-guarded clear of the same fields once Job-empty
+	// proof has retired every authority this execution owns. It does NOT by
+	// itself prevent a concurrent Signal-driven terminateJob call from
+	// racing proveJobEmptyThenRetire's own job.Close()/job.Terminate() —
+	// those calls happen outside this lock's critical section (see Wait).
+	// That race is instead made safe by *Job*'s own internal mutex: both
+	// Job.Terminate and Job.Close serialize through it, and Close zeroes
+	// job.handle under that lock before actually closing, so a Terminate
+	// racing a Close either runs before the zeroing (harmlessly terminates a
+	// Job already being torn down) or after it (a no-op on a cleared
+	// handle) — never a use-after-close or a double-close. Wait itself
+	// remains single-writer (sync.Once already serializes its one real
+	// execution), so mu only ever needs to coordinate with a caller outside
+	// that Once — never with itself.
 	mu sync.Mutex
 }
 
 func (launcher *elevatedRunnerLauncher) Launch(spec elevatedRunnerLaunch) (_ *elevatedRunnerExecution, err error) {
-	if launcher == nil || launcher.api == nil {
-		return nil, fmt.Errorf("%w: launcher is incomplete", errElevatedRunnerLaunch)
-	}
 	if spec.ReleaseLease == nil {
 		return nil, fmt.Errorf("%w: launch retirement is required", errElevatedRunnerLaunch)
+	}
+	if launcher == nil || launcher.api == nil {
+		// Nothing was ever acquired beyond the caller-supplied spec itself:
+		// retire directly, exactly like every other pre-Job failure below.
+		return nil, errors.Join(fmt.Errorf("%w: launcher is incomplete", errElevatedRunnerLaunch), spec.ReleaseLease())
 	}
 	ctx := spec.Context
 	if ctx == nil {
@@ -352,10 +363,14 @@ func (execution *elevatedRunnerExecution) Wait(ctx context.Context) (int, error)
 // authority remains, via the identical TerminateJobObject primitive
 // settleFailedJobLaunch/proveJobEmptyThenRetire already use for every other
 // termination path in this file — never a second, independently-aimed
-// mechanism. Safe to call concurrently with Wait: mu guards the same job
-// field Wait itself clears once Job-empty proof has retired every authority
-// this execution owns, so a call arriving after that proof is a harmless
-// no-op rather than a use of a stale handle.
+// mechanism. Safe to call concurrently with Wait: mu guards a consistent
+// read of the same job field Wait itself clears once Job-empty proof has
+// retired every authority this execution owns, so a call arriving after
+// that clear sees a nil job and no-ops. A call that reads a non-nil job
+// just before Wait's own proveJobEmptyThenRetire clears it can still race
+// that call's job.Close()/job.Terminate() outside mu's critical section —
+// see mu's own doc comment for why Job's internal locking, not mu, is what
+// makes that specific race safe.
 func (execution *elevatedRunnerExecution) terminateJob() error {
 	if execution == nil {
 		return nil
