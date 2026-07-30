@@ -41,6 +41,11 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: go test -race (seatbelt)
         run: go test -race -count=1 ./...
+      # Darwin does not claim async pipe-process support (Task 12c): this is
+      # ONLY the pre-spawn fail-closed contract proof, never a live async
+      # lifecycle selector.
+      - name: go test -tags integration -race (Darwin async pre-spawn fail-closed contract)
+        run: go test -tags integration -race -count=1 ./internal/exec -run '^TestIntegrationProcessTreeDarwinSetsidFailsClosed$'
 
   # Linux RUNG 2: the default GitHub runner (or any host where unprivileged
   # userns is unavailable) exercises the Landlock + seccomp + TCP-port path.
@@ -54,6 +59,12 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: go test -race (rung 2; rung 1 skips)
         run: go test -race -count=1 ./...
+      # Task 13: the tagged async process-lifecycle acceptance coverage from
+      # Tasks 10-12 (prepared/grant lifetime, and the Unix process-tree
+      # parent-death/double-fork/setsid-escape containment proofs; the
+      # Darwin-only case in this same file self-skips off this GOOS).
+      - name: go test -tags integration -race (async process lifecycle - grant, tree)
+        run: go test -tags integration -race -count=1 ./internal/exec -run 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)'
 
   # Linux RUNG 1: enable unprivileged user namespaces + load nf_conntrack so the
   # namespace/mount-view/nftables enforcement path actually executes. This is
@@ -74,6 +85,12 @@ jobs:
           sudo modprobe nf_tables || true
       - name: go test -race (rung 1 enforcement)
         run: go test -race -count=1 ./...
+      # Task 13: same tagged async process-lifecycle selectors as rung 2, run
+      # again here so the Rung-1 PID-namespace/nftables containment path
+      # (enabled above) is what the parent-death/double-fork/setsid-escape
+      # proofs actually exercise on this worker.
+      - name: go test -tags integration -race (async process lifecycle - grant, tree)
+        run: go test -tags integration -race -count=1 ./internal/exec -run 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)'
 
   # Compile every package's test binary independently. This catches
   # architecture-specific Windows files even when the live worker is x64.
@@ -159,7 +176,7 @@ jobs:
           go test -race -count=1 ./internal/winpath ./internal/policy ./pkg/profile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $lines = @(& go test -json -race -count=1 ./internal/windows ./internal/exec ./pkg/sandboxtest `
-            -run 'Disposable|RestrictedBrokerEscape|WindowsRestricted|WindowsPath|ACLProjection')
+            -run 'Disposable|RestrictedBrokerEscape|WindowsRestricted|WindowsPath|ACLProjection|ProcessTreeWindows')
           $lines | ForEach-Object { Write-Output $_ }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $skips = @($lines | ForEach-Object {
@@ -222,8 +239,8 @@ jobs:
       - name: elevated setup, configuration, and adversarial acceptance (skip is failure)
         shell: powershell
         run: |
-          $lines = @(& go test -json -race -count=1 ./internal/windows `
-            -run '^(TestElevatedDisposableAcceptance|TestSetupIntegration|TestRecoveryIntegration)')
+          $lines = @(& go test -json -race -count=1 ./internal/windows ./internal/exec `
+            -run '^(TestElevatedDisposableAcceptance|TestSetupIntegration|TestRecoveryIntegration|TestProcessTreeWindows)')
           $lines | ForEach-Object { Write-Output $_ }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $skips = @($lines | ForEach-Object {
