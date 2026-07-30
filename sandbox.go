@@ -301,4 +301,14 @@ var (
 	ErrProcessAlreadyStarted = exec.ErrProcessAlreadyStarted
 	ErrProcessTTYUnsupported = exec.ErrProcessTTYUnsupported
 	ErrProcessStdinClosed    = exec.ErrProcessStdinClosed
+	// ErrLifetimeContainmentUnavailable reports that a Supervised (async,
+	// PreparedProcess.Start) spawn cannot be given an exact, kernel-enforced
+	// process-tree teardown proof before it starts, so it was rejected before
+	// any child process was created rather than run with only a best-effort
+	// process-group signal-and-poll fallback. On Darwin this is returned for
+	// every real Seatbelt-confined Supervised spawn until a concrete
+	// containment primitive is wired for this platform; on Linux it is
+	// returned only when Rung 2 selects a spawn with no delegated cgroup v2
+	// pids ancestor available.
+	ErrLifetimeContainmentUnavailable = enforce.ErrLifetimeContainmentUnavailable
 )

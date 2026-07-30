@@ -195,8 +195,23 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessScopedWrite
 		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessBroadWrite
 	)
+	// On Darwin, Start must fail closed with ErrLifetimeContainmentUnavailable
+	// before any process is created: this module does not yet claim Darwin
+	// async execution (SPEC Task 12c — no kernel-enforced process-tree
+	// containment mechanism is wired for this platform yet). Every other
+	// platform still runs the real success path this facade advertises.
+	// Process/Wait/Close all tolerate a nil receiver (documented, deliberate
+	// zero-value safety), so the surrounding API-surface coverage below stays
+	// unconditional regardless of which branch runs.
 	proc, err := prepared.Start(context.Background())
-	if err != nil {
+	if runtime.GOOS == "darwin" {
+		if !errors.Is(err, sandbox.ErrLifetimeContainmentUnavailable) {
+			t.Fatalf("PreparedProcess.Start on darwin = %v, want ErrLifetimeContainmentUnavailable", err)
+		}
+		if proc != nil {
+			t.Fatalf("PreparedProcess.Start returned a non-nil Process alongside a fail-closed error: %v", proc)
+		}
+	} else if err != nil {
 		t.Fatalf("PreparedProcess.Start: %v", err)
 	}
 	var (
@@ -205,13 +220,19 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		_ io.WriteCloser = proc.Stdin()
 	)
 	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Process.Wait: %v", err)
+	if runtime.GOOS == "darwin" {
+		if !errors.Is(err, sandbox.ErrProcessClosed) {
+			t.Fatalf("Process.Wait on darwin's never-started (nil) Process = %v, want ErrProcessClosed", err)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("Process.Wait: %v", err)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("Process.Wait ExitCode = %d, want 0", result.ExitCode)
+		}
 	}
 	var _ sandbox.ProcessResult = result
-	if result.ExitCode != 0 {
-		t.Fatalf("Process.Wait ExitCode = %d, want 0", result.ExitCode)
-	}
 	if err := proc.Close(context.Background()); err != nil {
 		t.Fatalf("Process.Close: %v", err)
 	}
@@ -257,30 +278,31 @@ func TestFacadeWindowsSetupUnavailableOnNonWindows(t *testing.T) {
 // failure mode this catches: it would compile everywhere and match nowhere.
 func TestFacadeExportsTheConsumedSentinels(t *testing.T) {
 	for name, err := range map[string]error{
-		"ErrInvalidProfile":             sandbox.ErrInvalidProfile,
-		"ErrSandboxUnavailable":         sandbox.ErrSandboxUnavailable,
-		"ErrWindowsSetupRequired":       sandbox.ErrWindowsSetupRequired,
-		"ErrWindowsSetupStale":          sandbox.ErrWindowsSetupStale,
-		"ErrWindowsElevationRequired":   sandbox.ErrWindowsElevationRequired,
-		"ErrExecutorClosed":             sandbox.ErrExecutorClosed,
-		"ErrExecutorSetClosed":          sandbox.ErrExecutorSetClosed,
-		"ErrExecutorLimit":              sandbox.ErrExecutorLimit,
-		"ErrEgressRouteDenied":          sandbox.ErrEgressRouteDenied,
-		"ErrNetworkTargetDenied":        sandbox.ErrNetworkTargetDenied,
-		"ErrGrantRequired":              sandbox.ErrGrantRequired,
-		"ErrGrantDenied":                sandbox.ErrGrantDenied,
-		"ErrGrantMalformed":             sandbox.ErrGrantMalformed,
-		"ErrGrantExpired":               sandbox.ErrGrantExpired,
-		"ErrGrantReplay":                sandbox.ErrGrantReplay,
-		"ErrGrantUnsupported":           sandbox.ErrGrantUnsupported,
-		"ErrGrantBadMAC":                sandbox.ErrGrantBadMAC,
-		"ErrGrantWrongCommand":          sandbox.ErrGrantWrongCommand,
-		"ErrGrantWrongExecution":        sandbox.ErrGrantWrongExecution,
-		"ErrGrantWrongWorkingDirectory": sandbox.ErrGrantWrongWorkingDirectory,
-		"ErrGrantProfileMismatch":       sandbox.ErrGrantProfileMismatch,
-		"ErrGrantGuaranteeMismatch":     sandbox.ErrGrantGuaranteeMismatch,
-		"ErrGrantRouteMismatch":         sandbox.ErrGrantRouteMismatch,
-		"ErrGrantTargetChanged":         sandbox.ErrGrantTargetChanged,
+		"ErrInvalidProfile":                 sandbox.ErrInvalidProfile,
+		"ErrSandboxUnavailable":             sandbox.ErrSandboxUnavailable,
+		"ErrWindowsSetupRequired":           sandbox.ErrWindowsSetupRequired,
+		"ErrWindowsSetupStale":              sandbox.ErrWindowsSetupStale,
+		"ErrWindowsElevationRequired":       sandbox.ErrWindowsElevationRequired,
+		"ErrExecutorClosed":                 sandbox.ErrExecutorClosed,
+		"ErrExecutorSetClosed":              sandbox.ErrExecutorSetClosed,
+		"ErrExecutorLimit":                  sandbox.ErrExecutorLimit,
+		"ErrEgressRouteDenied":              sandbox.ErrEgressRouteDenied,
+		"ErrNetworkTargetDenied":            sandbox.ErrNetworkTargetDenied,
+		"ErrGrantRequired":                  sandbox.ErrGrantRequired,
+		"ErrGrantDenied":                    sandbox.ErrGrantDenied,
+		"ErrGrantMalformed":                 sandbox.ErrGrantMalformed,
+		"ErrGrantExpired":                   sandbox.ErrGrantExpired,
+		"ErrGrantReplay":                    sandbox.ErrGrantReplay,
+		"ErrGrantUnsupported":               sandbox.ErrGrantUnsupported,
+		"ErrLifetimeContainmentUnavailable": sandbox.ErrLifetimeContainmentUnavailable,
+		"ErrGrantBadMAC":                    sandbox.ErrGrantBadMAC,
+		"ErrGrantWrongCommand":              sandbox.ErrGrantWrongCommand,
+		"ErrGrantWrongExecution":            sandbox.ErrGrantWrongExecution,
+		"ErrGrantWrongWorkingDirectory":     sandbox.ErrGrantWrongWorkingDirectory,
+		"ErrGrantProfileMismatch":           sandbox.ErrGrantProfileMismatch,
+		"ErrGrantGuaranteeMismatch":         sandbox.ErrGrantGuaranteeMismatch,
+		"ErrGrantRouteMismatch":             sandbox.ErrGrantRouteMismatch,
+		"ErrGrantTargetChanged":             sandbox.ErrGrantTargetChanged,
 	} {
 		if err == nil {
 			t.Errorf("%s is nil", name)

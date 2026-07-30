@@ -17,7 +17,13 @@ package exec
 // part of this microtask — Rung-1 PID-namespace / delegated-cgroup exact
 // process-tree CONTAINMENT (the proof terminateAndWait relies on for a
 // Supervised spawn) — lives separately in process_tree_linux.go /
-// process_tree_darwin.go, since that half genuinely differs by platform.
+// process_tree_darwin.go, since that half genuinely differs by platform:
+// Linux selects and retains a real kernel-enforced mechanism
+// (process_tree_linux.go); Darwin has none yet, so its attachSupervisedProof
+// (process_tree_darwin.go) rejects every Supervised spawn unconditionally
+// with enforce.ErrLifetimeContainmentUnavailable before cmd.Start() is ever
+// reached (Task 12c) — a deliberate fail-closed contract, not a gap left for
+// a later task to silently fill with process-group polling.
 
 import "syscall"
 

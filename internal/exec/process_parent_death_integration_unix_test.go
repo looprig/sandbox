@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -250,4 +251,78 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 		t.Fatalf("Wait (force-killed immediate child): %v", err)
 	}
 	assertEscapeContained(t, marker, pidPath)
+}
+
+// TestIntegrationProcessTreeDarwinSetsidFailsClosed is Task 12c's Phase-Gate-3
+// selector. Unlike the three tests above — which exercise real containment on
+// whatever this host provides, and already skip themselves on Darwin via
+// startEscapeTarget's errors.Is(enforce.ErrLifetimeContainmentUnavailable)
+// check — this test asserts Darwin's fail-closed CONTRACT directly: a real
+// Executor (built through the production platform backend selector, exactly
+// like integrationEscapeExecutor's other callers) asked to run a command that
+// would, if it ever ran, setsid-detach a grandchild and write a delayed
+// marker (setsidEscapeScript) is instead rejected with
+// enforce.ErrLifetimeContainmentUnavailable before any process — target or
+// grandchild — is ever created. "Before any process is created" is proved two
+// ways: the call that fails returns no Process at all, and the delayed marker
+// together with the target's own pid file are polled for and never appear —
+// past escapeGrandchildDelay, so absence is unambiguous non-execution, not an
+// unfinished wait (mirrors assertEscapeContained's proof exactly).
+//
+// On this codebase's current architecture the rejection surfaces from
+// PreparedProcess.Start (newProcessTree -> attachSupervisedProof,
+// process_tree_darwin.go), not from PrepareProcess itself: PrepareProcess
+// only performs grant/resource reservation and never touches the process
+// tree. Both are "before spawn" (strictly before cmd.Start()'s syscall), so
+// this test accepts either call failing with the sentinel, exactly like
+// startEscapeTarget's own dual check above — but Start is what actually fails
+// on this codebase today, and is asserted to return no Process when it does.
+func TestIntegrationProcessTreeDarwinSetsidFailsClosed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin-only fail-closed contract; see TestIntegrationProcessTree(SetsidEscape|DoubleFork|ParentDeath) for real containment proof on other platforms")
+	}
+	set, executor, workspace := integrationEscapeExecutor(t)
+	defer func() { _ = set.Close() }()
+
+	marker := filepath.Join(workspace, "darwin-failclosed-marker")
+	pidPath := filepath.Join(workspace, "darwin-failclosed-pid")
+	script := setsidEscapeScript(marker, pidPath)
+
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: script, ExecutionID: "darwin-failclosed",
+	})
+	switch {
+	case err != nil:
+		if !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
+			t.Fatalf("PrepareProcess failed with an unexpected error: %v, want enforce.ErrLifetimeContainmentUnavailable", err)
+		}
+	default:
+		defer func() { _ = prepared.Close() }()
+		proc, startErr := prepared.Start(context.Background())
+		if startErr == nil {
+			// Defensive only: if a future change makes Start succeed without a
+			// real containment primitive, do not leak the process this test
+			// never expected to exist.
+			_ = proc.Signal(context.Background(), ProcessSignalKill)
+			_, _ = proc.Wait(context.Background())
+			t.Fatal("Start unexpectedly succeeded on darwin; want enforce.ErrLifetimeContainmentUnavailable before any spawn")
+		}
+		if !errors.Is(startErr, enforce.ErrLifetimeContainmentUnavailable) {
+			t.Fatalf("Start error = %v, want it to wrap enforce.ErrLifetimeContainmentUnavailable", startErr)
+		}
+		if proc != nil {
+			t.Fatalf("Start returned a non-nil Process alongside a fail-closed error: %v", proc)
+		}
+	}
+
+	// The core proof: the spawn was rejected before cmd.Start ever ran, so
+	// neither the immediate target (pidPath) nor its would-be setsid-detached
+	// grandchild (marker) ever executed.
+	time.Sleep(escapeObservationWindow)
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("delayed marker exists even though the spawn was rejected before it started: stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(pidPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("target pid file exists even though the spawn was rejected before it started: stat err = %v", statErr)
+	}
 }
