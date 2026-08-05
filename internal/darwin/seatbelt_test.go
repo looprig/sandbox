@@ -27,6 +27,28 @@ func TestCompileSBPLBase(t *testing.T) {
 	}
 }
 
+// TestCompileSBPLXcrunCachePlumbing asserts every profile carries the fixed,
+// backend-controlled xcrun/git tool-path cache allow (compileXcrunCachePlumbing),
+// in both the /private/var/folders and /var/folders spellings, reports it via
+// CompileReport for honesty, and that the resulting profile still parses under
+// the real SBPL compiler.
+func TestCompileSBPLXcrunCachePlumbing(t *testing.T) {
+	t.Setenv("HOME", "/lrsbx-home/tester")
+	profile, report, _, _ := compileSBPL(backendFixturePolicy(fixtureWorkspaceWrite, "/ws"))
+	for _, want := range []string{
+		`(allow file-read* file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$"))`,
+		`(allow file-read* file-write* (regex #"^/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$"))`,
+	} {
+		if !strings.Contains(profile, want) {
+			t.Errorf("profile missing xcrun-cache allow %q:\n%s", want, profile)
+		}
+	}
+	if !hasReport(report, "xcrun-cache", "widened") {
+		t.Errorf("report missing xcrun-cache/widened entry: %+v", report.Entries)
+	}
+	sandboxExecParses(t, profile)
+}
+
 // TestCompileSBPLSecretDenyAfterBroadRead asserts the last-match-wins ordering:
 // the §5.3 secret deny for ~/.ssh is emitted AFTER the broad file-read* allow, so
 // the deny overrides the allow under SBPL's last-match-wins precedence.
@@ -295,11 +317,20 @@ func TestCompileSBPLGlobDenyQuoteFailsClosed(t *testing.T) {
 	if !strings.Contains(profile, wantDeny) {
 		t.Errorf("quote-bearing deny glob not failed-closed to a conservative subpath deny %q\n%s", wantDeny, profile)
 	}
-	// No regex literal at all should be emitted for this policy (secret denials
+	// No DENY regex literal should be emitted for this policy (secret denials
 	// dropped, so the only deny is the quote glob → which must NOT be a #"..."
-	// literal).
-	if strings.Contains(profile, `#"`) {
-		t.Errorf("profile emitted a regex literal for a quote-bearing glob (would be malformed):\n%s", profile)
+	// literal). ALLOW regex literals are expected regardless of this policy's
+	// denies — see compileXcrunCachePlumbing's fixed, backend-controlled rules,
+	// which are never derived from caller-supplied (and therefore possibly
+	// quote-bearing) glob input.
+	for _, denyRegex := range []string{
+		`(deny file-read* (regex #"`,
+		`(deny process-exec (regex #"`,
+		`(deny file-write* (regex #"`,
+	} {
+		if strings.Contains(profile, denyRegex) {
+			t.Errorf("profile emitted a deny regex literal for a quote-bearing glob (would be malformed):\n%s", profile)
+		}
 	}
 	var found bool
 	for _, e := range report.Entries {

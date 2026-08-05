@@ -38,6 +38,38 @@ const baseSandboxPreamble = `(version 1)
 (allow file-read* (subpath "/private/var/select"))
 `
 
+// xcrunCacheRegex matches Xcode's `xcrun`/`git` cache file inside the real
+// per-user Darwin temp directory (both the canonical /private/var/folders
+// spelling and the /var/folders alias a caller's own environment reports).
+// Anchored to the "<user-token>/<session-token>/T/" shape so it never widens
+// beyond one specific per-user directory tree, and to the "xcrun_db" filename
+// prefix so it never widens beyond that one cache file family.
+const xcrunCacheRegex = `/var/folders/[^/]+/[^/]+/T/xcrun_db[^/]*$`
+
+// compileXcrunCachePlumbing allow-lists Xcode's per-user xcrun/git tool-path
+// cache file. That cache is written to the real, OS-assigned Darwin user temp
+// directory resolved via confstr(_CS_DARWIN_USER_TEMP_DIR) -- independent of
+// the TMPDIR env var this package sets for the child process (see
+// exec.ExecutorSet.For's scratch TMPDIR grant) -- so without this rule every
+// git/xcrun-backed command denies that one cache write with a non-fatal but
+// noisy "Operation not permitted", even though the command itself still
+// succeeds. This is deliberately scoped platform runtime plumbing, not a
+// policy.FS entry: glob ALLOWs are not part of the effective-profile
+// vocabulary (compileSeatbeltGlobRule handles only glob DENYs), and widening
+// this through pol.FS would corrupt the GuaranteeWriteBoundary/ReadBoundary
+// accounting for every profile. Other users' per-user temp directories remain
+// unreadable (OS-enforced 0700 on the parent), and the filename anchor limits
+// exposure to this one tool-path cache, never arbitrary files a caller might
+// place in their own temp directory.
+func compileXcrunCachePlumbing(b *strings.Builder, report *profile.CompileReport) {
+	b.WriteString(`(allow file-read* file-write* (regex #"^/private` + xcrunCacheRegex + `"))` + "\n")
+	b.WriteString(`(allow file-read* file-write* (regex #"^` + xcrunCacheRegex + `"))` + "\n")
+	report.Entries = append(report.Entries, profile.ReportEntry{
+		Feature: "xcrun-cache", Status: "widened",
+		Detail: "allow-listed Xcode's per-user xcrun/git tool-path cache file (xcrun_db*) in the real Darwin user temp directory, independent of the profile's own read/write grants",
+	})
+}
+
 // mDNSResponderSocket is the unix-domain socket macOS getaddrinfo hands DNS
 // queries to (the unsandboxed mDNSResponder daemon does the actual :53 traffic).
 // M1 verified this — not outbound :53 — is the load-bearing DNS rule (§5.2).
@@ -60,6 +92,7 @@ const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 func compileSBPL(p policy.Effective) (sbpl string, report profile.CompileReport, level uint8, guaranteeBits uint64) {
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
+	compileXcrunCachePlumbing(&b, &report)
 
 	compileFS(&b, &report, p.FS)
 	compileNet(&b, &report, p.Net)

@@ -423,3 +423,52 @@ func TestSeatbeltEnforceLevelAndGuarantees(t *testing.T) {
 		t.Error("Guarantees().AddressNetwork = true, want false (SBPL cannot address-scope)")
 	}
 }
+
+// TestSeatbeltEnforceXcrunCachePlumbing proves compileXcrunCachePlumbing's
+// narrow, backend-controlled allow: a write to a filename matching Xcode's
+// per-user xcrun/git tool-path cache pattern (xcrun_db*) succeeds even though
+// it targets the REAL host temp directory (os.TempDir(), independent of and
+// outside the workspace and the executor's own scratch TMPDIR grant), while a
+// non-matching sibling filename in that exact same real directory is still
+// denied — proving the rule is scoped to the cache filename, not widened to
+// the whole per-user temp tree.
+func TestSeatbeltEnforceXcrunCachePlumbing(t *testing.T) {
+	requireSandboxExec(t)
+	ws := t.TempDir()
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
+	if err != nil {
+		t.Fatalf("newExecutor: %v", err)
+	}
+	ctx := context.Background()
+
+	realTmp := os.TempDir() // the REAL per-user Darwin temp dir, not the child's scratch TMPDIR
+	name := fmt.Sprintf("xcrun_db-%d", time.Now().UnixNano())
+	cacheTarget := filepath.Join(realTmp, name)
+	otherTarget := filepath.Join(realTmp, "not-"+name)
+	t.Cleanup(func() {
+		os.Remove(cacheTarget)
+		os.Remove(otherTarget)
+	})
+
+	out, code, err := e.RunCommand(ctx, ws, "echo hi > "+cacheTarget)
+	if err != nil {
+		t.Fatalf("xcrun cache write: spawn err %v (out=%s)", err, out)
+	}
+	if code != 0 {
+		t.Errorf("xcrun cache write: exit %d, want 0 (xcrun_db* in the real temp dir must be allow-listed); out=%s", code, out)
+	}
+	if _, serr := os.Stat(cacheTarget); serr != nil {
+		t.Errorf("xcrun cache write: %s not created (%v)", cacheTarget, serr)
+	}
+
+	out, code, err = e.RunCommand(ctx, ws, "echo hi > "+otherTarget)
+	if err != nil {
+		t.Fatalf("non-cache sibling write: spawn err %v", err)
+	}
+	if code == 0 {
+		t.Errorf("non-cache sibling write: exit 0, want nonzero (the rule must stay scoped to xcrun_db*, not the whole real temp dir); out=%s", out)
+	}
+	if _, serr := os.Stat(otherTarget); serr == nil {
+		t.Errorf("non-cache sibling write: %s exists, want denied/not created", otherTarget)
+	}
+}
