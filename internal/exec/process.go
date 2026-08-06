@@ -964,7 +964,29 @@ func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, t
 // output buffer (built for RunCommand's whole-output contract), this wires
 // real live pipes so Stdout/Stderr/Stdin behave identically to the
 // process-tree-confined path.
+//
+// p.options.TTY is rejected here, first, before anything else: this path is
+// reached only when the compiled spec sets Launch (spawnAndSupervise's own
+// dispatch, above) — today that means exactly one thing on exactly one
+// platform, the Windows elevated/broker backend
+// (internal/windows/elevated_backend_windows.go) — and it has no ConPTY (or
+// equivalent) wiring of its own. ttySupported (terminal_unix.go,
+// terminal_windows.go, terminal_other.go) is a platform-wide constant
+// PrepareProcess checks before Start has even decided which of these two
+// dispatch branches it will take (that split only happens here, at Start
+// time, via p.snapshot.spec.Launch), so PrepareProcess admitting
+// ProcessOptions.TTY == true on a platform where ttySupported is true says
+// nothing about whether THIS SPECIFIC backend can honor it. Without this
+// check, a TTY request that resolves to this path would silently come back
+// as a plain pipe-backed Process — exactly the silent pipe/PTY fallback this
+// package's own top-of-file doc comment (above) says must never happen.
+// Real ConPTY support for the elevated/broker backend is a later task's
+// scope, not this one's; this keeps the gap fail-closed in the meantime.
 func (p *PreparedProcess) startBackendOwned(ctx context.Context) (*Process, error) {
+	if p.options.TTY {
+		return nil, ErrProcessTTYUnsupported
+	}
+
 	lease := p.lease
 	s := p.snapshot
 	dir := p.options.Directory

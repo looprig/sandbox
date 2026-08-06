@@ -379,7 +379,7 @@ func TestProcessConPTYOutputEOFNormalization(t *testing.T) {
 // TestProcessConPTYUnavailable proves the "typed unavailable behavior"
 // acceptance criterion: a host that lacks the CreatePseudoConsole export
 // (probed by conPTYProbe, terminal_windows.go, before any allocation) fails
-// Start with the typed ErrConPTYUnavailable sentinel — never a panic (see
+// Start with the typed ErrProcessConPTYUnavailable sentinel — never a panic (see
 // conPTYCreatePseudoConsoleProc's own doc comment for why probing first,
 // rather than calling golang.org/x/sys/windows.CreatePseudoConsole directly,
 // matters) — and no Process is ever returned, and no child is ever spawned
@@ -389,7 +389,7 @@ func TestProcessConPTYOutputEOFNormalization(t *testing.T) {
 // indirection on Unix) lets this run deterministically on any Windows host,
 // including one that DOES have ConPTY.
 func TestProcessConPTYUnavailable(t *testing.T) {
-	injected := fmt.Errorf("%w: injected unavailable ConPTY", ErrConPTYUnavailable)
+	injected := fmt.Errorf("%w: injected unavailable ConPTY", ErrProcessConPTYUnavailable)
 	original := conPTYProbe
 	conPTYProbe = func() error { return injected }
 	t.Cleanup(func() { conPTYProbe = original })
@@ -420,8 +420,8 @@ func TestProcessConPTYUnavailable(t *testing.T) {
 		t.Fatalf("PrepareProcess: %v", err)
 	}
 	proc, err := prepared.Start(context.Background())
-	if !errors.Is(err, ErrConPTYUnavailable) {
-		t.Fatalf("Start error = %v, want ErrConPTYUnavailable", err)
+	if !errors.Is(err, ErrProcessConPTYUnavailable) {
+		t.Fatalf("Start error = %v, want ErrProcessConPTYUnavailable", err)
 	}
 	if proc != nil {
 		t.Fatal("Start returned a non-nil Process alongside an unavailable-ConPTY failure")

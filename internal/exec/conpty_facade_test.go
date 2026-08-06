@@ -9,7 +9,7 @@ import (
 )
 
 // This file is Task 22B's compile-only, non-Windows-build-tag proof that its
-// facade/typed-error surface — ErrConPTYUnavailable (process_errors.go, no
+// facade/typed-error surface — ErrProcessConPTYUnavailable (process_errors.go, no
 // build tag) and the platform-neutral ConPTYLaunchPlan vocabulary
 // (conpty_launch_plan.go, Task 22A, already covered on its own by
 // conpty_launch_plan_test.go) — is real, ordinary, always-visible package
@@ -31,36 +31,36 @@ import (
 // merely compiles) on darwin and linux, and would compile identically on
 // any other non-Windows platform.
 
-// TestErrConPTYUnavailableIsAnOrdinarySentinel proves ErrConPTYUnavailable
+// TestErrProcessConPTYUnavailableIsAnOrdinarySentinel proves ErrProcessConPTYUnavailable
 // is a normal, comparable, wrappable error value: constructible, wrappable
 // via fmt.Errorf's %w (exactly how terminal_windows.go's own
 // probeConPTYAvailable wraps it with the underlying LazyProc.Find error),
 // and recoverable via errors.Is/errors.Unwrap — the exact surface a
 // cross-platform caller needs, reachable from this non-Windows file with no
 // import of anything Windows-specific at all.
-func TestErrConPTYUnavailableIsAnOrdinarySentinel(t *testing.T) {
-	if ErrConPTYUnavailable == nil {
-		t.Fatal("ErrConPTYUnavailable is nil")
+func TestErrProcessConPTYUnavailableIsAnOrdinarySentinel(t *testing.T) {
+	if ErrProcessConPTYUnavailable == nil {
+		t.Fatal("ErrProcessConPTYUnavailable is nil")
 	}
-	if ErrConPTYUnavailable.Error() == "" {
-		t.Fatal("ErrConPTYUnavailable has an empty message")
+	if ErrProcessConPTYUnavailable.Error() == "" {
+		t.Fatal("ErrProcessConPTYUnavailable has an empty message")
 	}
 
-	wrapped := fmt.Errorf("probe CreatePseudoConsole: %w: some underlying detail", ErrConPTYUnavailable)
-	if !errors.Is(wrapped, ErrConPTYUnavailable) {
-		t.Fatalf("errors.Is(wrapped, ErrConPTYUnavailable) = false for %v", wrapped)
+	wrapped := fmt.Errorf("probe CreatePseudoConsole: %w: some underlying detail", ErrProcessConPTYUnavailable)
+	if !errors.Is(wrapped, ErrProcessConPTYUnavailable) {
+		t.Fatalf("errors.Is(wrapped, ErrProcessConPTYUnavailable) = false for %v", wrapped)
 	}
-	if errors.Unwrap(wrapped) != ErrConPTYUnavailable {
-		t.Fatalf("errors.Unwrap(wrapped) = %v, want ErrConPTYUnavailable", errors.Unwrap(wrapped))
+	if errors.Unwrap(wrapped) != ErrProcessConPTYUnavailable {
+		t.Fatalf("errors.Unwrap(wrapped) = %v, want ErrProcessConPTYUnavailable", errors.Unwrap(wrapped))
 	}
 
 	// Distinct from the compile-time, platform-generic sentinel: a caller
 	// must be able to tell "this platform never supports a TTY at all"
 	// (ErrProcessTTYUnsupported) apart from "this platform generically
 	// supports ConPTY, but this specific host does not"
-	// (ErrConPTYUnavailable) — see both sentinels' own doc comments
+	// (ErrProcessConPTYUnavailable) — see both sentinels' own doc comments
 	// (process_errors.go).
-	if errors.Is(ErrConPTYUnavailable, ErrProcessTTYUnsupported) {
-		t.Fatal("ErrConPTYUnavailable must not satisfy errors.Is against ErrProcessTTYUnsupported — they are distinct, independently checkable failure modes")
+	if errors.Is(ErrProcessConPTYUnavailable, ErrProcessTTYUnsupported) {
+		t.Fatal("ErrProcessConPTYUnavailable must not satisfy errors.Is against ErrProcessTTYUnsupported — they are distinct, independently checkable failure modes")
 	}
 }

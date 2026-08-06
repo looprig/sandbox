@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/looprig/sandbox/internal/enforce"
+	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
 )
 
@@ -793,3 +794,79 @@ func TestBackendOwnedProcessSurfacesExecutionError(t *testing.T) {
 }
 
 var _ enforce.Execution = (*fakeBackendExecution)(nil)
+
+// launchOnlyBackend is a minimal enforce.Backend test double whose Compile
+// always returns a Launch-carrying enforce.Spec, never Wrap — the same
+// dispatch shape the real Windows elevated/broker backend
+// (internal/windows/elevated_backend_windows.go) produces, which is what
+// actually routes PreparedProcess.Start through startBackendOwned instead
+// of startConfined (see spawnAndSupervise's own dispatch, process.go). The
+// real elevated backend cannot be exercised end to end here at all — even
+// on a real Windows host, TestWindowsElevatedSelectionNeverFallsBack
+// (windows_selection_test.go) shows it fails closed with ErrSetupRequired
+// without a live broker connection — so, mirroring this exact codebase's
+// own established precedent for testing the backend-owned dispatch path
+// generically (TestBackendOwnedLaunchPreservesExecutorLifecycleAndOutputConvention,
+// backend_launch_test.go; TestWindowsCompiledSpecUsesFreshSpawnCleanupAndOwnerRelease,
+// windows_selection_test.go), this uses a fake Launch closure instead. Its
+// own logic is platform neutral, so TestStartBackendOwnedRejectsTTY below
+// runs — and genuinely exercises startBackendOwned's real guard — on every
+// platform this suite runs on, not only Windows.
+type launchOnlyBackend struct {
+	launched bool
+}
+
+func (b *launchOnlyBackend) Compile(policy.Effective) (enforce.Spec, CompileReport, uint8, uint64, error) {
+	spec := enforce.Spec{Launch: func(enforce.LaunchRequest) (enforce.Execution, error) {
+		b.launched = true
+		return fixedExecution{}, nil
+	}}
+	return spec, CompileReport{}, LevelNone, GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub, nil
+}
+
+// TestStartBackendOwnedRejectsTTY proves Important 1's fix: a TTY request
+// that resolves to the backend-owned dispatch branch (startBackendOwned,
+// process.go — today, in production, exactly the Windows elevated/broker
+// backend) is rejected with ErrProcessTTYUnsupported at Start, not silently
+// downgraded to a plain pipe-backed Process. Before this fix, ttySupported
+// (terminal_windows.go) being platform-wide true meant PrepareProcess
+// admitted this request, and startBackendOwned never inspected
+// p.options.TTY at all — the backend's own Launch is checked here (via
+// launchOnlyBackend.launched) as the decisive proof that no process was
+// ever actually spawned, not merely that some error came back.
+func TestStartBackendOwnedRejectsTTY(t *testing.T) {
+	workspace := t.TempDir()
+	backend := &launchOnlyBackend{}
+	prof := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	set, err := NewExecutorSet(prof, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(backend)))
+	if err != nil {
+		t.Fatalf("NewExecutorSet: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("backend-owned-tty")
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: workspace, Command: portableSuccessCommand(),
+		ExecutionID: "backend-owned-tty", TTY: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	proc, err := prepared.Start(context.Background())
+	if !errors.Is(err, ErrProcessTTYUnsupported) {
+		t.Fatalf("Start error = %v, want ErrProcessTTYUnsupported", err)
+	}
+	if proc != nil {
+		t.Fatal("Start returned a non-nil Process alongside a TTY-on-backend-owned-path rejection")
+	}
+	if backend.launched {
+		t.Fatal("the backend's own Launch was invoked despite the TTY rejection — a process was actually spawned")
+	}
+}

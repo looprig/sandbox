@@ -300,7 +300,15 @@ var (
 	ErrProcessClosed         = exec.ErrProcessClosed
 	ErrProcessAlreadyStarted = exec.ErrProcessAlreadyStarted
 	ErrProcessTTYUnsupported = exec.ErrProcessTTYUnsupported
-	ErrProcessStdinClosed    = exec.ErrProcessStdinClosed
+	// ErrProcessConPTYUnavailable reports that a TTY-backed process request
+	// on Windows resolved to a host that does not export the
+	// CreatePseudoConsole API (Windows 10 1809+ / Windows Server 2019+
+	// only) — a runtime capability gap distinct from
+	// ErrProcessTTYUnsupported's own compile-time/backend-dispatch checks.
+	// See exec.ErrProcessConPTYUnavailable's own doc comment
+	// (internal/exec/process_errors.go) for the full distinction.
+	ErrProcessConPTYUnavailable = exec.ErrProcessConPTYUnavailable
+	ErrProcessStdinClosed       = exec.ErrProcessStdinClosed
 	// ErrLifetimeContainmentUnavailable reports that a Supervised (async,
 	// PreparedProcess.Start) spawn cannot be given an exact, kernel-enforced
 	// process-tree teardown proof before it starts, so it was rejected before

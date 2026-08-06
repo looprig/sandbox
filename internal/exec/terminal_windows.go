@@ -132,7 +132,7 @@ var conPTYCreatePseudoConsoleProc = windows.NewLazySystemDLL("kernel32.dll").New
 // probeConPTYAvailable is conPTYProbe's production implementation.
 func probeConPTYAvailable() error {
 	if err := conPTYCreatePseudoConsoleProc.Find(); err != nil {
-		return fmt.Errorf("%w: %v", ErrConPTYUnavailable, err)
+		return fmt.Errorf("%w: %v", ErrProcessConPTYUnavailable, err)
 	}
 	return nil
 }
