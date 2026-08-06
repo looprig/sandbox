@@ -230,23 +230,96 @@ func (tree *processTree) openTerminal(cmd *exec.Cmd) (processTerminal, func() er
 
 // startConPTY performs a ConPTY-backed launch's remaining three steps —
 // ConPTYStepCreateSuspended, ConPTYStepAssignJob, ConPTYStepResume
-// (conpty_launch_plan.go) — in that exact order, composing with this SAME
-// tree.job the plain cmd.Start()-driven path (start, above) already uses,
-// never a second, unconfined containment mechanism. It builds and validates
-// a full ConPTYLaunchPlan from pending's already-completed first two steps
-// plus this tree's own Job before touching any further Windows API, so a
-// defect in this method's own field wiring is caught by that type's own
-// validation logic rather than resting only on this method's own doc
-// comment's claim.
+// (conpty_launch_plan.go) — composing with this SAME tree.job the plain
+// cmd.Start()-driven path (start, above) already uses, never a second,
+// unconfined containment mechanism. It builds and validates a full
+// ConPTYLaunchPlan from pending's already-completed first two steps plus
+// this tree's own Job, then — unlike an earlier version of this method,
+// which built that plan only to validate its fields and then executed a
+// hand-written sequence that merely happened to agree with it — actually
+// iterates plan.Steps() and dispatches each one to conPTYLaunch.perform:
+// the order actually walked here IS the plan's own returned order, not a
+// parallel sequence a future edit could silently desynchronize from it. A
+// step reordering would now have to happen inside conpty_launch_plan.go's
+// own canonicalConPTYLaunchOrder — guarded by TestConPTYLaunchPlanOrdersJobBeforeResume
+// and friends — rather than merely in this file, to change what actually
+// executes and in what order.
 func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch) error {
 	jobHandle := tree.job.Handle()
 	if jobHandle == 0 {
 		return errors.New("sandbox: ConPTY launch has no Windows Job to assign")
 	}
-	if _, err := NewConPTYLaunchPlan(pending.pipes, pending.attribute, ConPTYJobAssignment{JobHandle: uintptr(jobHandle)}, ConPTYBrokerCredentials{}); err != nil {
+	plan, err := NewConPTYLaunchPlan(pending.pipes, pending.attribute, ConPTYJobAssignment{JobHandle: uintptr(jobHandle)}, ConPTYBrokerCredentials{})
+	if err != nil {
 		return fmt.Errorf("sandbox: build ConPTY launch plan: %w", err)
 	}
 
+	launch := &conPTYLaunch{cmd: cmd, tree: tree, pending: pending}
+	for _, step := range plan.Steps() {
+		if err := launch.perform(step); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// conPTYLaunch carries the state one ConPTY-backed launch accumulates as
+// startConPTY walks plan.Steps() (above): pi is populated by
+// ConPTYStepCreateSuspended and consumed by ConPTYStepAssignJob and
+// ConPTYStepResume in turn, exactly the "how much state each step needs to
+// thread to the next" this type exists to hold so startConPTY's own loop
+// body can stay a plain step-to-method dispatch.
+type conPTYLaunch struct {
+	cmd     *exec.Cmd
+	tree    *processTree
+	pending *conPTYPendingLaunch
+
+	pi windows.ProcessInformation
+}
+
+// perform dispatches one ConPTYLaunchStep to the real Windows call it names.
+// The switch's own case order is irrelevant to execution order — that is
+// entirely determined by the order startConPTY's loop feeds steps into this
+// method, i.e. by plan.Steps() itself — so reordering the cases below (e.g.
+// swapping the ConPTYStepAssignJob/ConPTYStepResume bodies' positions in
+// this source file) has no effect on what actually runs first; only
+// changing the plan's own canonical order does.
+func (launch *conPTYLaunch) perform(step ConPTYLaunchStep) error {
+	switch step {
+	case ConPTYStepAllocatePipes, ConPTYStepCreatePseudoConsole:
+		// Already performed, for real, by openTerminal — before this launch's
+		// plan even existed — because the actual process creation
+		// (ConPTYStepCreateSuspended, below) must not run before lease.start's
+		// own linearization check, while pure resource allocation with no
+		// process involved yet is safe earlier, exactly like every other
+		// platform's openProcessTerminal (see openTerminal's own doc comment).
+		// This still walks both steps here, as real, checked steps in the
+		// same loop every other step goes through, rather than silently
+		// skipping them: a caller that somehow reached this method with
+		// invalid pipes/attribute is rejected here, not several steps later
+		// against a nonsensical CreateProcess call.
+		if !launch.pending.pipes.valid() || !launch.pending.attribute.valid() {
+			return errors.New("sandbox: ConPTY launch reached startConPTY with invalid pipes or pseudo-console attribute")
+		}
+		return nil
+	case ConPTYStepCreateSuspended:
+		return launch.createSuspended()
+	case ConPTYStepAssignJob:
+		return launch.assignJob()
+	case ConPTYStepResume:
+		return launch.resume()
+	default:
+		return fmt.Errorf("sandbox: ConPTY launch plan produced an unhandled step %v", step)
+	}
+}
+
+// createSuspended performs ConPTYStepCreateSuspended: builds the raw
+// CreateProcess call's application path, command line, environment block,
+// and PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute list, then creates the
+// process CREATE_SUSPENDED, recording the result in launch.pi for
+// assignJob/resume to consume.
+func (launch *conPTYLaunch) createSuspended() error {
+	cmd := launch.cmd
 	appPath, err := conPTYApplicationPath(cmd)
 	if err != nil {
 		return err
@@ -280,7 +353,7 @@ func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch
 		return fmt.Errorf("sandbox: allocate ConPTY process attribute list: %w", err)
 	}
 	defer attributes.Delete()
-	pconsole := conPTYAttributeHandle(pending.attribute)
+	pconsole := conPTYAttributeHandle(launch.pending.attribute)
 	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&pconsole), unsafe.Sizeof(pconsole)); err != nil {
 		return fmt.Errorf("sandbox: attach ConPTY attribute: %w", err)
 	}
@@ -306,24 +379,43 @@ func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch
 	if err := windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi); err != nil {
 		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", err)
 	}
+	launch.pi = pi
+	return nil
+}
 
-	// The process is suspended from here on; every failure must terminate it
-	// before returning, exactly mirroring start's own plain-path
-	// setup-failure handling above ("The process is still suspended on every
-	// setup failure...").
-	if err := tree.job.Assign(pi.Process); err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = closeConPTYHandles(pi.Thread, pi.Process)
+// assignJob performs ConPTYStepAssignJob: assigns the still-suspended
+// process launch.pi.Process (createSuspended, above, always runs first —
+// plan.Steps() guarantees ConPTYStepCreateSuspended precedes
+// ConPTYStepAssignJob) to launch.tree's own Job. The process is still
+// suspended on any failure here, exactly mirroring start's own plain-path
+// setup-failure handling above ("The process is still suspended on every
+// setup failure...") — terminate it directly, before returning.
+func (launch *conPTYLaunch) assignJob() error {
+	if err := launch.tree.job.Assign(launch.pi.Process); err != nil {
+		_ = windows.TerminateProcess(launch.pi.Process, 1)
+		_ = closeConPTYHandles(launch.pi.Thread, launch.pi.Process)
 		return fmt.Errorf("sandbox: assign ConPTY process to job: %w", err)
 	}
-	tree.mu.Lock()
-	tree.assigned = true
-	tree.mu.Unlock()
+	launch.tree.mu.Lock()
+	launch.tree.assigned = true
+	launch.tree.mu.Unlock()
+	return nil
+}
 
-	status, _, callErr := ntResumeProcess.Call(uintptr(pi.Process))
+// resume performs ConPTYStepResume: resumes launch.pi.Process, which
+// plan.Steps() guarantees was already assigned to launch.tree's Job
+// (assignJob, above) — a process must never run a single instruction of its
+// own code before it is already contained by its Job, which is exactly why
+// ConPTYStepAssignJob is ordered before ConPTYStepResume in the first place.
+// On success it also performs the tail bookkeeping the original hand-written
+// sequence performed at this same point: closing the now-redundant thread
+// handle and wrapping the process into a real *os.Process for
+// exec.Cmd.Wait/Process.runWait to reap, both documented in place below.
+func (launch *conPTYLaunch) resume() error {
+	status, _, callErr := ntResumeProcess.Call(uintptr(launch.pi.Process))
 	if status != 0 {
-		_ = tree.terminate()
-		_ = closeConPTYHandles(pi.Thread, pi.Process)
+		_ = launch.tree.terminate()
+		_ = closeConPTYHandles(launch.pi.Thread, launch.pi.Process)
 		return fmt.Errorf("sandbox: resume ConPTY process: NTSTATUS %#x: %v", status, callErr)
 	}
 
@@ -340,12 +432,12 @@ func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch
 	// (process.go: "A failure here is folded into terminal cleanup instead
 	// of failing Start: the process is already running under confinement,
 	// so it must not be abandoned mid-handoff").
-	_ = windows.CloseHandle(pi.Thread)
+	_ = windows.CloseHandle(launch.pi.Thread)
 
 	// exec.Cmd.Wait (invoked by Process.runWait, process.go) requires
-	// cmd.Process to be a real *os.Process; since this method bypassed
+	// cmd.Process to be a real *os.Process; since startConPTY bypassed
 	// cmd.Start() entirely, nothing has set it. os.FindProcess opens its OWN
-	// fresh handle by PID — there is no public API to wrap pi.Process's
+	// fresh handle by PID — there is no public API to wrap launch.pi.Process's
 	// already-open handle directly into an *os.Process. This does carry one
 	// honestly-disclosed, unavoidable-without-a-private-stdlib-hook race: if
 	// the PID were reused by an unrelated process in the vanishingly small
@@ -355,22 +447,22 @@ func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch
 	// thread handle above, a failure HERE is still a real launch failure —
 	// with no *os.Process, Process.runWait's own cmd.Wait() call would find
 	// cmd.Process nil and never be able to reap or observe this process at
-	// all — so tree.terminate() (the process is already assigned, so this
-	// reaches the real Job-based termination, not a bare Process.Kill)
+	// all — so launch.tree.terminate() (the process is already assigned, so
+	// this reaches the real Job-based termination, not a bare Process.Kill)
 	// really is the right response specifically for this one failure.
-	process, err := os.FindProcess(int(pi.ProcessId))
+	process, err := os.FindProcess(int(launch.pi.ProcessId))
 	if err != nil {
-		_ = tree.terminate()
-		_ = windows.CloseHandle(pi.Process)
+		_ = launch.tree.terminate()
+		_ = windows.CloseHandle(launch.pi.Process)
 		return fmt.Errorf("sandbox: reopen ConPTY process handle: %w", err)
 	}
-	cmd.Process = process
-	// pi.Process is now redundant (os.FindProcess above opened its own
+	launch.cmd.Process = process
+	// launch.pi.Process is now redundant (os.FindProcess above opened its own
 	// handle); closing it is cleanup, not part of the launch — see this
-	// method's own comment on the identical pi.Thread close above for why a
-	// failure here must not be reported as a launch failure once cmd.Process
-	// is already set.
-	_ = windows.CloseHandle(pi.Process)
+	// method's own comment on the identical thread-handle close above for
+	// why a failure here must not be reported as a launch failure once
+	// cmd.Process is already set.
+	_ = windows.CloseHandle(launch.pi.Process)
 	return nil
 }
 

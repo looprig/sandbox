@@ -162,11 +162,21 @@ var errConPTYClosed = errors.New("sandbox: ConPTY already closed")
 // three for the Process's whole lifetime.
 //
 // console is guarded by mu so Close and resize can never race each other
-// into a use-after-close — mirroring internal/windows/job_windows.go's own
-// Job type exactly (zero the handle under the lock, then perform the real OS
-// call), since console, like a Job handle, is a bare windows.Handle never
-// wrapped in an *os.File and therefore never gets *os.File's own
-// internal/poll concurrent-close protection for free. input/output ARE
+// into a use-after-close: BOTH methods hold mu for the full duration of
+// their own real syscall (ClosePseudoConsole/ResizePseudoConsole), not just
+// while reading or zeroing the field — mirroring
+// internal/windows/job_windows.go's Job.Assign/Job.Terminate literally,
+// which hold job.mu via a defer spanning their own real syscalls. (Job.Close
+// itself instead zeroes job.handle under the lock and calls CloseHandle
+// after releasing it — safe there only because Job.Assign/Job.Terminate are
+// what actually hold the lock through their syscalls; this type does not
+// have that asymmetry available, since resize is the only "live operation on
+// a handle that might already be closing" method here, so both it and Close
+// hold the lock through their own syscalls, matching Assign/Terminate's
+// shape rather than Close's.) console, like a Job handle, is a bare
+// windows.Handle never wrapped in an *os.File and therefore never gets
+// *os.File's own internal/poll concurrent-close protection for free.
+// input/output ARE
 // *os.File-wrapped (via os.NewFile over a real pipe handle, which Go's
 // os package auto-detects as FILE_TYPE_PIPE and therefore already normalizes
 // ERROR_BROKEN_PIPE to io.EOF on Read — see this type's Read doc — so they
@@ -215,15 +225,28 @@ func (t *conPTYTerminal) Write(p []byte) (int, error) {
 // SIGHUP to the terminal's whole foreground process group. It then releases
 // this type's own two retained pipe ends. Idempotent via closeOnce, exactly
 // like terminalMaster.Close.
+//
+// t.mu is held for the ENTIRE ClosePseudoConsole call, not just the read/
+// zero of t.console beforehand — mirroring internal/windows/job_windows.go's
+// Job.Assign/Job.Terminate literally, which hold job.mu via a defer spanning
+// their own real syscalls, not merely the read of job.handle. Releasing the
+// lock before calling the real API (an earlier version of both this method
+// and resize, below, did exactly that) is a genuine handle-lifetime race the
+// Go race detector cannot see at all: a concurrent resize could still be
+// mid-syscall against the SAME handle value this method has already decided
+// to close, or could start its own syscall against a handle number the OS
+// has, by then, already reused for something else entirely. Holding the lock
+// through the syscall here (matched by resize also holding it through ITS
+// OWN syscall) makes the two calls fully mutually exclusive for real,
+// instead of merely mutually exclusive for the field read.
 func (t *conPTYTerminal) Close() error {
 	t.closeOnce.Do(func() {
 		t.mu.Lock()
-		console := t.console
-		t.console = 0
-		t.mu.Unlock()
-		if console != 0 {
-			windows.ClosePseudoConsole(console)
+		if t.console != 0 {
+			windows.ClosePseudoConsole(t.console)
+			t.console = 0
 		}
+		t.mu.Unlock()
 		t.closeInputOnce.Do(func() { _ = t.input.Close() })
 		t.closeErr = t.output.Close()
 	})
@@ -233,19 +256,25 @@ func (t *conPTYTerminal) Close() error {
 // resize changes the pseudo console's buffer/window size via
 // ResizePseudoConsole. rows/cols follow processTerminalTarget's documented
 // Rows-then-Cols order (terminal.go); ConPTY's own windows.Coord is
-// (X=columns, Y=rows), so the two are swapped here. mu guards console exactly
-// like Job's own mu guards its handle (job_windows.go) — see this type's own
-// doc comment for why that pattern, not *os.File's SyscallConn/Control
-// (terminal_unix.go's terminalMaster.resize), is the right one here: console
-// is a bare windows.Handle, never wrapped in an *os.File.
+// (X=columns, Y=rows), so the two are swapped here.
+//
+// t.mu is held for the ENTIRE ResizePseudoConsole call via defer, not merely
+// while reading t.console — mirroring internal/windows/job_windows.go's
+// Job.Assign/Job.Terminate literally (see Close's own doc comment, above,
+// for why releasing the lock before the actual syscall — this method's own
+// earlier shape — is a real handle-lifetime race despite being invisible to
+// the Go race detector, and why holding it through the syscall here, not
+// *os.File's SyscallConn/Control the way terminal_unix.go's
+// terminalMaster.resize does, is the right pattern: console is a bare
+// windows.Handle, never wrapped in an *os.File, so it has none of that
+// type's own concurrent-close protection for free).
 func (t *conPTYTerminal) resize(rows, cols uint16) error {
 	t.mu.Lock()
-	console := t.console
-	t.mu.Unlock()
-	if console == 0 {
+	defer t.mu.Unlock()
+	if t.console == 0 {
 		return errConPTYClosed
 	}
-	return windows.ResizePseudoConsole(console, windows.Coord{X: int16(cols), Y: int16(rows)})
+	return windows.ResizePseudoConsole(t.console, windows.Coord{X: int16(cols), Y: int16(rows)})
 }
 
 // conPTYInterruptByte is the ASCII ETX / Ctrl-C control character. Writing
