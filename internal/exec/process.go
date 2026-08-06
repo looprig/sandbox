@@ -40,9 +40,11 @@ import (
 // atomically transfers everything reserved into a process-owned background
 // goroutine that outlives the call, confining the actual spawn through the
 // same processTree/backend machinery executor.run already uses. TTY requests
-// are rejected rather than silently downgraded, because pipe/PTY stream-mode
-// fallback must never be silent (mirrors the Harness reference's documented
-// contract).
+// are honored with a real platform PTY where one exists (Unix, via
+// terminal_unix.go) and rejected outright everywhere else
+// (ErrProcessTTYUnsupported, terminal_other.go) rather than silently
+// downgraded to pipes — pipe/PTY stream-mode fallback must never be silent
+// (mirrors the Harness reference's documented contract).
 
 // ProcessOptions describes one asynchronous process admission request.
 // Grants are opaque, execution-bound tokens; this microtask does not verify
@@ -208,7 +210,12 @@ func (e *Executor) PrepareProcess(ctx context.Context, opts ProcessOptions) (*Pr
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if opts.TTY {
+	// ttySupported is true on Unix (terminal_unix.go) and false everywhere
+	// else (terminal_other.go, including Windows until a later phase wires
+	// ConPTY): a TTY request on a platform with no real PTY primitive is
+	// rejected here, before any reservation, exactly like before this
+	// package had PTY support at all — never silently downgraded to pipes.
+	if opts.TTY && !ttySupported {
 		return nil, ErrProcessTTYUnsupported
 	}
 	if !validGrantText(opts.Command) {
@@ -760,6 +767,18 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 			return nil, err
 		}
 	}
+	if p.options.TTY {
+		// Session/controlling-terminal setup only (Setsid/Setctty on Unix;
+		// unreachable everywhere else — see ttySupported in PrepareProcess)
+		// — never a PTY device allocation. This must run before e.processTree
+		// below so newProcessTree (process_tree_unix.go) can see Setsid
+		// already requested and skip layering its own Setpgid on top of it
+		// (POSIX forbids setpgid on a session leader), and it must run after
+		// configure above so a backend that builds cmd.SysProcAttr from
+		// scratch there (e.g. the Linux backend's namespace cloneflags)
+		// never clobbers it.
+		prepareTerminalSysProcAttr(cmd)
+	}
 	tree, err := e.processTree(cmd, processTreeOptions{
 		Sandboxed: s.policy.Isolation != Unconfined,
 		Limits:    s.policy.Limits,
@@ -777,6 +796,10 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	}
 	spawn.prover = tree
 	spawn.cmd = cmd
+
+	if p.options.TTY {
+		return p.startConfinedTTY(ctx, cmd, tree)
+	}
 
 	outR, outW, errR, errW, err := wireOutputPipes(cmd)
 	if err != nil {
@@ -826,6 +849,76 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	// ErrProcessSignalUnsupported. On platforms with no such implementation
 	// yet (Windows/other), attachSignaler is a no-op and signaler stays nil,
 	// matching the pre-12B fail-closed default exactly.
+	attachSignaler(proc, tree)
+	return proc, nil
+}
+
+// startConfinedTTY is startConfined's PTY branch: reached only when
+// p.options.TTY is true, and only after e.processTree (called by
+// startConfined just before this method) has already succeeded. The
+// mandatory Supervised containment proof (Task 12b/12c) is exactly as
+// required for a PTY spawn as for the pipe-backed one, and Darwin's
+// fail-closed Seatbelt rejection there (process_tree_darwin.go) already runs
+// strictly before this method is ever entered — so no PTY device is ever
+// allocated and no child is ever spawned on a platform/backend combination
+// that cannot supervise it (see process_pty_integration_unix_test.go's
+// TestIntegrationProcessPTYDarwinLifetimeUnavailable). tree is accepted as a
+// parameter (not re-derived) so this method shares the identical containment
+// decision startConfined already made; it never calls e.processTree itself.
+func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, tree processTreeBoundary) (*Process, error) {
+	lease := p.lease
+	spawn := p.spawn
+
+	terminal, closeSlave, err := openProcessTerminal(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	// pumpR/pumpW back newPTYProcess's output-draining pump goroutine (see its
+	// own doc comment): Process.Stdout() reads from pumpR, never from the
+	// master directly, so the master is drained continuously for the whole
+	// life of the process regardless of whether/when a caller reads Stdout —
+	// otherwise an undrained PTY output queue blocks the child's own exit()
+	// indefinitely on Darwin (Task 21's confirmed PTY hang). Created here,
+	// before lease.start, exactly like startConfined's own outR/outW/inR/inW:
+	// a failure this early must abort the spawn before any child exists, not
+	// leak an already-running one.
+	pumpR, pumpW, err := os.Pipe()
+	if err != nil {
+		_ = errors.Join(terminal.Close(), closeSlave())
+		return nil, err
+	}
+
+	// Re-check as close to the actual OS spawn as this function gets, so a
+	// cancellation that lands after Start's own entry check but before the
+	// fork/exec syscall still aborts the handoff instead of racing it —
+	// exactly like startConfined's own pipe-path recheck.
+	if err := ctx.Err(); err != nil {
+		_ = errors.Join(terminal.Close(), closeSlave(), pumpR.Close(), pumpW.Close())
+		return nil, err
+	}
+
+	if err := lease.start(cmd, tree); err != nil {
+		_ = errors.Join(terminal.Close(), closeSlave(), pumpR.Close(), pumpW.Close())
+		return nil, err
+	}
+	// The child now holds its own inherited copy of the slave (dup'd onto
+	// its stdin/stdout/stderr alike); the parent must drop its own reference
+	// so the master this Process retains can ever observe the child's exit
+	// as EOF/EIO (mirrors startConfined's identical outW/errW/inR closure
+	// for the pipe-backed path exactly). A failure here is folded into
+	// terminal cleanup instead of failing Start: the process is already
+	// running under confinement, so it must not be abandoned mid-handoff.
+	if closeErr := closeSlave(); closeErr != nil {
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
+	}
+	proc := newPTYProcess(cmd, terminal, pumpR, pumpW, p.options.TerminateGrace)
+	// Wires Process.Signal to real Unix signal delivery on this run's process
+	// tree, exactly like startConfined's pipe-backed path: a PTY spawn's
+	// process group id equals cmd.Process.Pid either way (see
+	// prepareTerminalSysProcAttr's doc, terminal_unix.go), so the identical
+	// signalGroup-based delivery lifetime_unix.go already provides needs no
+	// PTY-specific variant.
 	attachSignaler(proc, tree)
 	return proc, nil
 }
@@ -1100,10 +1193,100 @@ func newPipeProcess(cmd *exec.Cmd, stdout, stderr io.ReadCloser, stdin *processS
 		stdout:         stdout,
 		stderr:         stderr,
 		stdin:          stdin,
+		streamMode:     ProcessStreamModePipes,
 		startedAt:      time.Now(),
 		activities:     make(chan ProcessActivity),
 		done:           make(chan struct{}),
 		terminateGrace: resolveProcessTerminateGrace(terminateGrace),
+	}
+}
+
+// newPTYProcess constructs a *Process around an already-opened, already-
+// attached PTY terminal endpoint (see openProcessTerminal, terminal_unix.go)
+// whose slave half the parent has already dropped its own reference to
+// (mirrors newPipeProcess's outR/errR/inW: only the ends the Process itself
+// needs are ever retained past Start), and pumpR/pumpW — a dedicated
+// os.Pipe pair the caller (startConfinedTTY) created before the child was
+// even spawned, exactly like the pipe-backed path's own outR/outW.
+//
+// Stdout is deliberately NOT the master directly: this starts a background
+// pump goroutine (pumpPTYOutput) that continuously copies terminal -> pumpW
+// for as long as the terminal produces output, independent of whether or
+// when a caller ever reads Stdout, and Stdout() returns pumpR instead. This
+// is Task 21's fix for the confirmed PTY hang: on Darwin, a session leader
+// with ANY undrained output sitting in the PTY's kernel queue blocks in
+// exit() until the master is drained (or closed/revoked), so without this
+// pump, Process.Wait's runWait — which blocks in a raw wait4 on the child —
+// would deadlock forever whenever nothing has drained the master (including
+// when nobody has even called Wait yet — see supervise, which always calls
+// Wait itself even if no other caller ever does). The pump owns pumpW for
+// its whole lifetime and is the only thing that ever closes it (see
+// pumpPTYOutput's own doc); a slow Stdout() reader only backs up pumpR/
+// pumpW's own ~64KB pipe buffer, identical to the pipe-backed path's
+// existing backpressure — it can never re-block the master drain that
+// already happened at the kernel level the moment the pump's Read call
+// returned.
+//
+// Stdin wraps the SAME terminal endpoint through terminalStdin (terminal.go),
+// not the master directly: closing Stdin must deliver EOF in-band (the VEOF
+// control byte) rather than tearing down the whole terminal — see
+// terminalStdin's own doc comment. terminalCloser separately retains the
+// master itself so Process.Close can still hang it up for real — that,
+// exclusively, is what actually closes the master (which ends the pump,
+// which then closes pumpW so Stdout() readers observe EOF).
+//
+// Stderr is the synthetic, permanently-empty, already-closed reader
+// ProcessStreamModePTY's contract requires (see closedEmptyReadCloser): a
+// PTY-backed Process never silently falls back to a second real pipe.
+func newPTYProcess(cmd *exec.Cmd, terminal processTerminal, pumpR, pumpW *os.File, terminateGrace time.Duration) *Process {
+	go pumpPTYOutput(pumpW, terminal)
+	return &Process{
+		cmd:            cmd,
+		stdout:         pumpR,
+		stderr:         closedEmptyReadCloser{},
+		stdin:          newProcessStdin(newTerminalStdin(terminal)),
+		streamMode:     ProcessStreamModePTY,
+		resizer:        terminal,
+		terminalCloser: terminal,
+		startedAt:      time.Now(),
+		activities:     make(chan ProcessActivity),
+		done:           make(chan struct{}),
+		terminateGrace: resolveProcessTerminateGrace(terminateGrace),
+	}
+}
+
+// pumpPTYOutput continuously drains terminal (a PTY-backed Process's master)
+// into pumpW. It mirrors drainCombinedOutput's (executor.go) read-loop shape
+// exactly — the same 32KB buffer, the same "return on any read error"
+// termination — except it copies into a live pipe instead of a
+// mutex-guarded buffer, since a PTY Process's Stdout is itself a live stream,
+// not a captured result collected after the fact.
+//
+// It owns pumpW for its entire lifetime and is the only goroutine that ever
+// closes it (deferred, so it runs on every exit path), which is what makes
+// Stdout() readers observe EOF: draining ends either because terminal.Read
+// returned its already-normalized io.EOF (the child exited and this
+// package's own parent-side slave reference was already dropped — see
+// openProcessTerminal's doc, terminal_unix.go), because Process.Close closed
+// the master out from under an in-flight Read (see terminalCloser,
+// process.go), or because nobody drained Stdout() and pumpW's write blocked
+// against a full, undrained pipe until Process.Close's unconditional
+// p.stdout.Close() severed the read end out from under it. Every one of
+// those paths returns from this function, so the goroutine never leaks
+// regardless of which one fires.
+func pumpPTYOutput(pumpW *os.File, terminal processTerminal) {
+	defer pumpW.Close()
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := terminal.Read(buf)
+		if n > 0 {
+			if _, writeErr := pumpW.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
 	}
 }
 
@@ -1130,6 +1313,7 @@ func newBackendOwnedProcess(execution enforce.Execution, stdout, stderr io.ReadC
 		stdout:         stdout,
 		stderr:         stderr,
 		stdin:          stdin,
+		streamMode:     ProcessStreamModePipes,
 		startedAt:      time.Now(),
 		activities:     make(chan ProcessActivity),
 		done:           make(chan struct{}),
@@ -1155,6 +1339,12 @@ type Process struct {
 	stdout    io.ReadCloser
 	stderr    io.ReadCloser
 	stdin     *processStdin
+
+	// streamMode reports which of Stdout/Stderr's two topologies this
+	// Process was constructed with (see ProcessStreamMode, terminal.go).
+	// Every constructor in this package sets it explicitly; there is no
+	// implicit zero-value default.
+	streamMode ProcessStreamMode
 
 	startedAt time.Time
 
@@ -1191,6 +1381,25 @@ type Process struct {
 	terminateErr  error
 	killOnce      sync.Once
 	killErr       error
+
+	// resizer is the narrow seam Resize (below) drives to actually change a
+	// PTY's window size, exactly like signaler is Signal's seam onto real OS
+	// signal delivery. Only newPTYProcess ever sets this; every pipe-backed
+	// Process leaves it nil, so Resize fails closed with
+	// ErrProcessResizeUnsupported instead of silently succeeding.
+	resizer processTerminalTarget
+
+	// terminalCloser is the narrow seam Close (below) drives to actually hang
+	// up a PTY-backed Process's real terminal master. It is deliberately
+	// distinct from stdin's Close (terminalStdin, terminal.go, writes the
+	// in-band VEOF byte instead of touching this) and from stdout's Close
+	// (closes only the output-draining pump's pipe read end, never the
+	// master — see newPTYProcess, above): a real master close is a genuine
+	// hangup — SIGHUP delivered to the terminal's whole foreground process
+	// group, plus losing whatever output is still buffered there — and
+	// Process exposes exactly one path to it. Only newPTYProcess ever sets
+	// this; every pipe-backed Process leaves it nil.
+	terminalCloser io.Closer
 }
 
 // Stdout returns the process's live standard-output pipe.
@@ -1219,6 +1428,19 @@ func (p *Process) Stdin() io.WriteCloser {
 		return nil
 	}
 	return p.stdin
+}
+
+// StreamMode reports this Process's stream topology: distinct pipes
+// (ProcessStreamModePipes, every Process this package constructed before PTY
+// support existed and every pipe-backed Process since) or one combined PTY
+// stream (ProcessStreamModePTY, newPTYProcess). A nil Process reports
+// ProcessStreamModePipes, matching every other nil-receiver accessor on this
+// type returning its harmless zero value.
+func (p *Process) StreamMode() ProcessStreamMode {
+	if p == nil {
+		return ProcessStreamModePipes
+	}
+	return p.streamMode
 }
 
 // Activities returns the optional typed workspace-activity stream. It closes
@@ -1321,7 +1543,13 @@ func (p *Process) runWait() {
 // interrupt/terminate/kill, and Wait to observe the eventual exit — so a
 // caller that wants the process to actually stop must still arrange that
 // separately (e.g. via Signal, closing stdin, or waiting for natural
-// completion).
+// completion). For a PTY-backed Process this additionally closes the real
+// terminal master (terminalCloser) — a genuine hangup, delivering SIGHUP to
+// the terminal's whole foreground process group — which is deliberately
+// distinct from Stdin().Close() (delivers EOF in-band as the VEOF byte
+// instead; see terminalStdin, terminal.go) and ends the output-draining pump
+// (pumpPTYOutput, above), which in turn closes Stdout's pipe so any blocked
+// reader observes EOF.
 func (p *Process) Close(ctx context.Context) error {
 	if p == nil {
 		return nil
@@ -1337,6 +1565,9 @@ func (p *Process) Close(ctx context.Context) error {
 		}
 		if p.stderr != nil {
 			err = errors.Join(err, p.stderr.Close())
+		}
+		if p.terminalCloser != nil {
+			err = errors.Join(err, p.terminalCloser.Close())
 		}
 		p.closeErr = err
 	})
@@ -1444,6 +1675,33 @@ func (p *Process) Signal(ctx context.Context, kind ProcessSignal) error {
 	default: // ProcessSignalTerminate
 		return p.dispatchTerminate()
 	}
+}
+
+// Resize changes a PTY-backed Process's terminal window size. It is a no-op
+// (nil error) once the process is confirmed terminal, exactly like Signal's
+// identical treatment of a concurrent natural exit — a resize request racing
+// the process's own exit is not itself an error. A pipe-backed Process (or a
+// PTY-backed one on a platform whose terminal has no resize primitive wired)
+// has no resizer and fails closed with ErrProcessResizeUnsupported instead of
+// silently succeeding, exactly like Signal's own fail-closed default for an
+// unwired signaler.
+func (p *Process) Resize(ctx context.Context, rows, cols uint16) error {
+	if p == nil {
+		return ErrProcessClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.confirmedTerminal() {
+		return nil
+	}
+	if p.resizer == nil {
+		return ErrProcessResizeUnsupported
+	}
+	return p.resizer.resize(rows, cols)
 }
 
 // confirmedTerminal reports whether this Process's terminal wait (runWait,

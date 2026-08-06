@@ -36,7 +36,21 @@ func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, er
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Setpgid = true
+	// A PTY-backed spawn (startConfined's TTY branch, process.go) already set
+	// Setsid — via prepareTerminalSysProcAttr, terminal_unix.go — before this
+	// function ever runs. POSIX forbids a session leader from also being
+	// setpgid'd (its own setpgid call fails EPERM unconditionally, confirmed
+	// empirically on this codebase's darwin target: `fork/exec: operation not
+	// permitted`), so this must not layer Setpgid on top of an
+	// already-requested Setsid. Nothing downstream needs it to: setsid(2)
+	// already makes the child's process group id equal its own pid as an
+	// intrinsic side effect — the exact pgid-equals-pid outcome
+	// Setpgid+Pgid:0 exists to produce below — and every containment
+	// primitive this type owns (signalGroup, terminateAndWait) keys off
+	// cmd.Process.Pid, which is identical either way.
+	if !cmd.SysProcAttr.Setsid {
+		cmd.SysProcAttr.Setpgid = true
+	}
 	tree := &processTree{cmd: cmd}
 	cmd.Cancel = tree.terminate
 	if options.Supervised {

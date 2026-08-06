@@ -19,10 +19,11 @@ var (
 	ErrProcessAlreadyStarted = errors.New("sandbox: process already started")
 
 	// ErrProcessTTYUnsupported reports a prepare request for a TTY-backed
-	// process. PTY/ConPTY execution is a later phase's scope (SPEC's Unix PTY
-	// and Windows ConPTY work); this pipe-backed microtask only ever admits
-	// ProcessOptions.TTY == false, and fails closed rather than silently
-	// downgrading to pipes.
+	// process on a platform/build with no real PTY primitive wired
+	// (ttySupported is false — see terminal_other.go; ConPTY is Windows's own
+	// later-phase scope). Unix (terminal_unix.go) admits ProcessOptions.TTY
+	// == true and spawns a real PTY instead of returning this error. This
+	// never silently downgrades a TTY request to pipes on any platform.
 	ErrProcessTTYUnsupported = errors.New("sandbox: process TTY mode is not yet supported")
 
 	// ErrProcessStdinClosed reports a write attempted after the process's

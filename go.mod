@@ -3,6 +3,7 @@ module github.com/looprig/sandbox
 go 1.26.4
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/google/nftables v0.3.0
 	golang.org/x/sys v0.45.0
 )

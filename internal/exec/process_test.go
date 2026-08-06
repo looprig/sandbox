@@ -505,15 +505,13 @@ func TestPreparedProcessEffectiveAccessSharesNoBackingStorage(t *testing.T) {
 	}
 }
 
-func TestPrepareProcessRejectsTTY(t *testing.T) {
-	executor := newProcessTestExecutor(t, Allow)
-	dir := t.TempDir()
-	if _, err := executor.PrepareProcess(context.Background(), ProcessOptions{
-		Directory: dir, Command: portableSuccessCommand(), ExecutionID: "tty-rejected", TTY: true,
-	}); !errors.Is(err, ErrProcessTTYUnsupported) {
-		t.Fatalf("PrepareProcess with TTY error = %v, want ErrProcessTTYUnsupported", err)
-	}
-}
+// TestPrepareProcessRejectsTTY moved to terminal_other_test.go (build-tagged
+// !darwin && !linux): Task 21 gave Unix a real PTY primitive (terminal_unix.go,
+// ttySupported = true), so a TTY request there is now admitted, not rejected
+// — the fail-closed ErrProcessTTYUnsupported contract this test proves is
+// exclusively terminal_other.go's, on platforms with no real PTY primitive
+// wired at all. See process_pty_unix_test.go for this package's extensive
+// Unix coverage of the opposite (successful) case.
 
 func TestPrepareProcessCommandAuthority(t *testing.T) {
 	tests := []struct {
