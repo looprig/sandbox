@@ -853,6 +853,37 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	return proc, nil
 }
 
+// processTreeTerminalOpener is an optional seam a platform's process tree can
+// implement when a terminal-backed launch cannot be composed the same way
+// the plain cmd.Start()-driven path already is (openProcessTerminal,
+// prepareTerminalSysProcAttr, then lease.start's own tree.start(cmd)) — see
+// process_tree_windows.go's own processTree.openTerminal doc comment for
+// exactly why Windows's ConPTY-backed launch is this case (Go's os/exec has
+// no extensibility point for attaching PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
+// and therefore why the real suspended-create must happen inside tree.start
+// itself instead. Mirrors the identical optional-interface-plus-type-
+// assertion idiom attachSignaler already uses against processSignalTarget,
+// below. Only Windows's own *processTree implements this; every Unix tree
+// never does, so openConfinedTerminal's fallback to the existing per-platform
+// openProcessTerminal free function is exercised on every other platform
+// exactly as before this interface existed.
+type processTreeTerminalOpener interface {
+	openTerminal(cmd *exec.Cmd) (processTerminal, func() error, error)
+}
+
+// openConfinedTerminal opens the terminal endpoint startConfinedTTY attaches
+// to a confined spawn, preferring tree's own openTerminal (Windows's ConPTY
+// composition, see processTreeTerminalOpener) when tree implements it, and
+// falling back to the existing per-platform openProcessTerminal free
+// function (terminal_unix.go, terminal_other.go) otherwise — unchanged
+// behavior for every platform that predates this seam.
+func openConfinedTerminal(cmd *exec.Cmd, tree processTreeBoundary) (processTerminal, func() error, error) {
+	if opener, ok := tree.(processTreeTerminalOpener); ok {
+		return opener.openTerminal(cmd)
+	}
+	return openProcessTerminal(cmd)
+}
+
 // startConfinedTTY is startConfined's PTY branch: reached only when
 // p.options.TTY is true, and only after e.processTree (called by
 // startConfined just before this method) has already succeeded. The
@@ -869,7 +900,7 @@ func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, t
 	lease := p.lease
 	spawn := p.spawn
 
-	terminal, closeSlave, err := openProcessTerminal(cmd)
+	terminal, closeSlave, err := openConfinedTerminal(cmd, tree)
 	if err != nil {
 		return nil, err
 	}

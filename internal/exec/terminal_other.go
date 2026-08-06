@@ -1,17 +1,18 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package exec
 
 import "os/exec"
 
-// This file is every non-Unix platform's (Windows and anything else, until a
-// later phase wires ConPTY — Windows is explicitly out of Task 21's scope)
-// counterpart to terminal_unix.go: it exists only so process.go, which has no
-// build tag and must compile identically everywhere, has something to call.
-// Neither function below is ever reachable in production: PrepareProcess
-// checks ttySupported before startConfined's TTY branch is ever entered, so a
-// TTY request on this platform is already rejected with
-// ErrProcessTTYUnsupported long before either of these would run.
+// This file is every remaining platform's (not darwin, not linux, not
+// windows — Windows now has its own real ConPTY implementation,
+// terminal_windows.go) counterpart to terminal_unix.go: it exists only so
+// process.go, which has no build tag and must compile identically
+// everywhere, has something to call. Neither function below is ever
+// reachable in production: PrepareProcess checks ttySupported before
+// startConfined's TTY branch is ever entered, so a TTY request on this
+// platform is already rejected with ErrProcessTTYUnsupported long before
+// either of these would run.
 
 // ttySupported is false on every platform this file builds for. See
 // terminal_unix.go's identical constant for the platforms where it is true.

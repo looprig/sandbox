@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	winjob "github.com/looprig/sandbox/internal/windows"
 	"golang.org/x/sys/windows"
@@ -27,6 +29,17 @@ type processTree struct {
 	cmd      *exec.Cmd
 	job      *winjob.Job
 	assigned bool
+
+	// conPTY, once set by openTerminal (terminal_windows.go), is the pending
+	// ConPTY launch start must drive through startConPTY instead of the plain
+	// cmd.Start() path below: nil for every ordinary pipe-backed spawn, which
+	// continues to use cmd.Start() exactly as it always has. Guarded by mu for
+	// consistency with every other field on this type, even though in
+	// practice openTerminal (which sets it) and start (which reads it) are
+	// always called sequentially, from the same goroutine, by
+	// startConfinedTTY (process.go), with no concurrent access to this field
+	// from anywhere else at that point.
+	conPTY *conPTYPendingLaunch
 }
 
 func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, error) {
@@ -68,6 +81,18 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 	if tree == nil || cmd == nil || cmd != tree.cmd {
 		return errors.New("sandbox: invalid command process tree")
 	}
+	tree.mu.Lock()
+	pending := tree.conPTY
+	tree.mu.Unlock()
+	if pending != nil {
+		// A ConPTY-backed launch cannot go through cmd.Start() at all — see
+		// openTerminal's own doc comment (terminal_windows.go) for why —
+		// so startConPTY performs the equivalent CreateSuspended -> AssignJob
+		// -> Resume sequence itself, composing with this SAME tree.job the
+		// plain path below already uses, never a second Job or a second,
+		// unconfined containment mechanism.
+		return tree.startConPTY(cmd, pending)
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -96,6 +121,257 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 	_ = tree.terminate()
 	_ = cmd.Wait()
 	return fmt.Errorf("sandbox: start process tree: %w", setupErr)
+}
+
+// conPTYPendingLaunch is what openTerminal (below) hands to start via
+// tree.conPTY once it has performed ConPTYStepAllocatePipes and
+// ConPTYStepCreatePseudoConsole for real (conpty_launch_plan.go): just
+// enough of a ConPTYLaunchPlan's own fields for startConPTY to build and
+// validate a full plan recording the whole launch before performing its
+// remaining three steps. Everything else startConPTY needs — argv, working
+// directory, environment — is read directly from the SAME cmd both
+// openTerminal and start already receive, so this type carries nothing else.
+type conPTYPendingLaunch struct {
+	pipes     ConPTYPipes
+	attribute ConPTYAttribute
+}
+
+// openTerminal implements processTreeTerminalOpener (process.go): it
+// performs ConPTYStepAllocatePipes and ConPTYStepCreatePseudoConsole
+// (conpty_launch_plan.go) for real — allocating the two pipe pairs and
+// creating the pseudo console — and stashes the result on tree itself
+// (rather than returning it directly to its caller the way
+// openProcessTerminal does on Unix) so the later start(cmd) call —
+// openConfinedTterminal's caller (startConfinedTTY, process.go) always makes
+// one on the same cmd afterward, via lease.start — can perform the
+// remaining three steps (CreateSuspended, AssignJob, Resume) composing with
+// the SAME tree.job this tree already created in newProcessTree, never a
+// second Job or a second, unconfined containment mechanism.
+//
+// This deliberately does NOT itself create, assign, or resume any process:
+// doing so here — before lease.start's own linearization check
+// (executor_lifecycle.go acquires lifecycle.mu and re-checks lease.ctx) —
+// would spawn (and, once resumed, run) a process even if the executor set
+// had already begun closing between PrepareProcess and Start, defeating that
+// check's whole purpose. Every other platform's openProcessTerminal
+// (terminal_unix.go, terminal_other.go) keeps the identical property: it
+// only ever allocates a terminal DEVICE, never a process, strictly before
+// lease.start's own critical section runs.
+//
+// A ConPTY-backed launch cannot instead go through the plain cmd.Start()
+// path start (above) already uses for a pipe-backed spawn: Go's os/exec has
+// no extensibility point for attaching the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+// attribute CreateProcess needs — syscall.SysProcAttr's Windows fields are
+// fixed (HideWindow, CmdLine, CreationFlags, Token, ProcessAttributes,
+// ThreadAttributes, NoInheritHandles, AdditionalInheritedHandles,
+// ParentProcess), none of them a general "extra ProcThreadAttributeList
+// entry" seam — so startConPTY (below) performs the equivalent raw
+// CreateProcess call itself instead.
+func (tree *processTree) openTerminal(cmd *exec.Cmd) (processTerminal, func() error, error) {
+	if tree == nil {
+		return nil, nil, errors.New("sandbox: nil ConPTY process tree")
+	}
+	if err := conPTYProbe(); err != nil {
+		return nil, nil, err
+	}
+
+	var inRead, inWrite, outRead, outWrite windows.Handle
+	if err := windows.CreatePipe(&inRead, &inWrite, nil, 0); err != nil {
+		return nil, nil, fmt.Errorf("sandbox: allocate ConPTY input pipe: %w", err)
+	}
+	if err := windows.CreatePipe(&outRead, &outWrite, nil, 0); err != nil {
+		_ = closeConPTYHandles(inRead, inWrite)
+		return nil, nil, fmt.Errorf("sandbox: allocate ConPTY output pipe: %w", err)
+	}
+
+	var console windows.Handle
+	if err := windows.CreatePseudoConsole(defaultConPTYSize, inRead, outWrite, 0, &console); err != nil {
+		_ = closeConPTYHandles(inRead, inWrite, outRead, outWrite)
+		return nil, nil, fmt.Errorf("sandbox: create pseudo console: %w", err)
+	}
+
+	// CreatePseudoConsole has taken what it needs from inRead/outWrite; drop
+	// the parent's own copies now, exactly like ConPTYPipes's own doc comment
+	// requires (conpty_launch_plan.go) — this happens here, synchronously,
+	// rather than via the closeSlave closure this method returns below,
+	// because ConPTY (unlike a Unix PTY slave, which the CHILD must still
+	// inherit its own copy of via fork before the parent may drop its own)
+	// needs nothing further from these two handles once CreatePseudoConsole
+	// itself has returned: no child exists yet, and none needs to for this
+	// step.
+	if err := closeConPTYHandles(inRead, outWrite); err != nil {
+		windows.ClosePseudoConsole(console)
+		_ = closeConPTYHandles(inWrite, outRead)
+		return nil, nil, fmt.Errorf("sandbox: release handed-off ConPTY pipe ends: %w", err)
+	}
+
+	tree.mu.Lock()
+	tree.conPTY = &conPTYPendingLaunch{
+		pipes: ConPTYPipes{
+			ConsoleInputRead: uintptr(inRead), ConsoleInputWrite: uintptr(inWrite),
+			ConsoleOutputRead: uintptr(outRead), ConsoleOutputWrite: uintptr(outWrite),
+		},
+		attribute: ConPTYAttribute{PseudoConsoleHandle: uintptr(console)},
+	}
+	tree.mu.Unlock()
+
+	terminal := &conPTYTerminal{
+		console: console,
+		input:   os.NewFile(uintptr(inWrite), "sandbox-conpty-input"),
+		output:  os.NewFile(uintptr(outRead), "sandbox-conpty-output"),
+	}
+	// No parent-side handle remains to drop after start(cmd) succeeds — see
+	// this method's own doc comment above for why that already happened,
+	// synchronously, right after CreatePseudoConsole returned — so the
+	// returned closeSlave is a harmless no-op, called at the same point
+	// startConfinedTTY (process.go) already calls it for the Unix path.
+	return terminal, func() error { return nil }, nil
+}
+
+// startConPTY performs a ConPTY-backed launch's remaining three steps —
+// ConPTYStepCreateSuspended, ConPTYStepAssignJob, ConPTYStepResume
+// (conpty_launch_plan.go) — in that exact order, composing with this SAME
+// tree.job the plain cmd.Start()-driven path (start, above) already uses,
+// never a second, unconfined containment mechanism. It builds and validates
+// a full ConPTYLaunchPlan from pending's already-completed first two steps
+// plus this tree's own Job before touching any further Windows API, so a
+// defect in this method's own field wiring is caught by that type's own
+// validation logic rather than resting only on this method's own doc
+// comment's claim.
+func (tree *processTree) startConPTY(cmd *exec.Cmd, pending *conPTYPendingLaunch) error {
+	jobHandle := tree.job.Handle()
+	if jobHandle == 0 {
+		return errors.New("sandbox: ConPTY launch has no Windows Job to assign")
+	}
+	if _, err := NewConPTYLaunchPlan(pending.pipes, pending.attribute, ConPTYJobAssignment{JobHandle: uintptr(jobHandle)}, ConPTYBrokerCredentials{}); err != nil {
+		return fmt.Errorf("sandbox: build ConPTY launch plan: %w", err)
+	}
+
+	appPath, err := conPTYApplicationPath(cmd)
+	if err != nil {
+		return err
+	}
+	appPath16, err := windows.UTF16PtrFromString(appPath)
+	if err != nil {
+		return err
+	}
+	cmdLine, err := conPTYCommandLine(cmd.Args)
+	if err != nil {
+		return err
+	}
+	cmdLine16, err := windows.UTF16PtrFromString(cmdLine)
+	if err != nil {
+		return err
+	}
+	envBlock, err := conPTYEnvBlock(cmd.Env)
+	if err != nil {
+		return err
+	}
+	var dir16 *uint16
+	if cmd.Dir != "" {
+		dir16, err = windows.UTF16PtrFromString(cmd.Dir)
+		if err != nil {
+			return err
+		}
+	}
+
+	attributes, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return fmt.Errorf("sandbox: allocate ConPTY process attribute list: %w", err)
+	}
+	defer attributes.Delete()
+	pconsole := conPTYAttributeHandle(pending.attribute)
+	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&pconsole), unsafe.Sizeof(pconsole)); err != nil {
+		return fmt.Errorf("sandbox: attach ConPTY attribute: %w", err)
+	}
+
+	// EXTENDED_STARTUPINFO_PRESENT is required for ProcThreadAttributeList to
+	// take effect at all; CREATE_UNICODE_ENVIRONMENT is required because
+	// envBlock above is UTF-16. cmd.SysProcAttr.CreationFlags already carries
+	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above),
+	// exactly like the plain path, preserving sendInterrupt's own
+	// CTRL_BREAK_EVENT targeting unchanged for a ConPTY-backed Process too.
+	flags := cmd.SysProcAttr.CreationFlags | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
+	// StartupInfo.Flags deliberately does NOT include STARTF_USESTDHANDLES: a
+	// ConPTY-attached child's console I/O routes entirely through the
+	// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute above, never through
+	// inherited stdio handles — Microsoft's own ConPTY sample code uses the
+	// identical bInheritHandles=FALSE, no-STARTF_USESTDHANDLES shape this
+	// call mirrors.
+	startup := windows.StartupInfoEx{
+		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
+		ProcThreadAttributeList: attributes.List(),
+	}
+	var pi windows.ProcessInformation
+	if err := windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi); err != nil {
+		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", err)
+	}
+
+	// The process is suspended from here on; every failure must terminate it
+	// before returning, exactly mirroring start's own plain-path
+	// setup-failure handling above ("The process is still suspended on every
+	// setup failure...").
+	if err := tree.job.Assign(pi.Process); err != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = closeConPTYHandles(pi.Thread, pi.Process)
+		return fmt.Errorf("sandbox: assign ConPTY process to job: %w", err)
+	}
+	tree.mu.Lock()
+	tree.assigned = true
+	tree.mu.Unlock()
+
+	status, _, callErr := ntResumeProcess.Call(uintptr(pi.Process))
+	if status != 0 {
+		_ = tree.terminate()
+		_ = closeConPTYHandles(pi.Thread, pi.Process)
+		return fmt.Errorf("sandbox: resume ConPTY process: NTSTATUS %#x: %v", status, callErr)
+	}
+
+	// The process is already resumed and running, correctly Job-confined, by
+	// this point — every step below is redundant-handle bookkeeping, not
+	// part of establishing that confinement, so a failure here must be
+	// folded into best-effort cleanup rather than reported as a launch
+	// failure: reporting an error here while the process is already
+	// irrevocably running (and, once os.FindProcess below succeeds,
+	// abandoning it with no *Process to ever Wait on) would be strictly
+	// worse than leaking one redundant OS handle in this sandbox's own
+	// process — mirrors the identical principle startConfined's pipe-backed
+	// path already applies to its own post-spawn handle-closing failures
+	// (process.go: "A failure here is folded into terminal cleanup instead
+	// of failing Start: the process is already running under confinement,
+	// so it must not be abandoned mid-handoff").
+	_ = windows.CloseHandle(pi.Thread)
+
+	// exec.Cmd.Wait (invoked by Process.runWait, process.go) requires
+	// cmd.Process to be a real *os.Process; since this method bypassed
+	// cmd.Start() entirely, nothing has set it. os.FindProcess opens its OWN
+	// fresh handle by PID — there is no public API to wrap pi.Process's
+	// already-open handle directly into an *os.Process. This does carry one
+	// honestly-disclosed, unavoidable-without-a-private-stdlib-hook race: if
+	// the PID were reused by an unrelated process in the vanishingly small
+	// window between resume and this call, os.FindProcess would open a
+	// handle to the WRONG process. This is the same trade-off any Windows
+	// PID-based API carries and is not specific to this method. Unlike the
+	// thread handle above, a failure HERE is still a real launch failure —
+	// with no *os.Process, Process.runWait's own cmd.Wait() call would find
+	// cmd.Process nil and never be able to reap or observe this process at
+	// all — so tree.terminate() (the process is already assigned, so this
+	// reaches the real Job-based termination, not a bare Process.Kill)
+	// really is the right response specifically for this one failure.
+	process, err := os.FindProcess(int(pi.ProcessId))
+	if err != nil {
+		_ = tree.terminate()
+		_ = windows.CloseHandle(pi.Process)
+		return fmt.Errorf("sandbox: reopen ConPTY process handle: %w", err)
+	}
+	cmd.Process = process
+	// pi.Process is now redundant (os.FindProcess above opened its own
+	// handle); closing it is cleanup, not part of the launch — see this
+	// method's own comment on the identical pi.Thread close above for why a
+	// failure here must not be reported as a launch failure once cmd.Process
+	// is already set.
+	_ = windows.CloseHandle(pi.Process)
+	return nil
 }
 
 func (tree *processTree) terminate() error {
@@ -199,14 +475,33 @@ func (tree *processTree) sendKill() error { return tree.terminate() }
 // (ErrProcessSignalUnsupported) for the Windows restricted async path — the
 // last platform this seam needed wiring for. tree always implements
 // processSignalTarget (the three methods above), so this assignment is
-// unconditional once tree is non-nil. lifetime_other.go's build constraint
-// excludes windows so there is exactly one attachSignaler definition per
-// platform, never two competing for the same build.
+// unconditional once tree is non-nil, EXCEPT for a ConPTY-backed Process
+// (tree.conPTY != nil, set by openTerminal — terminal_windows.go), which
+// gets conPTYSignaler instead: tree's own sendInterrupt cannot reach a
+// ConPTY-attached child at all (see conPTYSignaler's own doc comment,
+// terminal_windows.go, for exactly why), so wiring tree directly for that
+// case would silently accept an interrupt request this platform cannot
+// actually honor for it. lifetime_other.go's build constraint excludes
+// windows so there is exactly one attachSignaler definition per platform,
+// never two competing for the same build.
 func attachSignaler(proc *Process, tree processTreeBoundary) {
 	if proc == nil || tree == nil {
 		return
 	}
-	if signaler, ok := tree.(processSignalTarget); ok {
-		proc.signaler = signaler
+	signaler, ok := tree.(processSignalTarget)
+	if !ok {
+		return
 	}
+	if concrete, ok := tree.(*processTree); ok {
+		concrete.mu.Lock()
+		isConPTY := concrete.conPTY != nil
+		concrete.mu.Unlock()
+		if isConPTY {
+			if terminal, ok := proc.terminalCloser.(*conPTYTerminal); ok {
+				proc.signaler = conPTYSignaler{terminal: terminal, tree: signaler}
+				return
+			}
+		}
+	}
+	proc.signaler = signaler
 }

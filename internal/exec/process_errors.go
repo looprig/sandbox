@@ -19,12 +19,25 @@ var (
 	ErrProcessAlreadyStarted = errors.New("sandbox: process already started")
 
 	// ErrProcessTTYUnsupported reports a prepare request for a TTY-backed
-	// process on a platform/build with no real PTY primitive wired
-	// (ttySupported is false — see terminal_other.go; ConPTY is Windows's own
-	// later-phase scope). Unix (terminal_unix.go) admits ProcessOptions.TTY
-	// == true and spawns a real PTY instead of returning this error. This
-	// never silently downgrades a TTY request to pipes on any platform.
+	// process on a platform/build with no real PTY primitive wired at all
+	// (ttySupported is false — see terminal_other.go). Unix (terminal_unix.go)
+	// and Windows (terminal_windows.go, ConPTY) both admit
+	// ProcessOptions.TTY == true and spawn a real terminal instead of
+	// returning this error. This never silently downgrades a TTY request to
+	// pipes on any platform.
 	ErrProcessTTYUnsupported = errors.New("sandbox: process TTY mode is not yet supported")
+
+	// ErrConPTYUnavailable reports that this Windows host does not export the
+	// CreatePseudoConsole API a ConPTY-backed TTY request needs (Windows 10
+	// 1809+ / Windows Server 2019+ only). Unlike ErrProcessTTYUnsupported —
+	// decided once, at compile time, from the ttySupported constant, before
+	// any reservation is made (PrepareProcess) — this is a runtime capability
+	// check specific to the actual host: Windows generically supports ConPTY
+	// (ttySupported is true there), but a specific old host may not, so this
+	// surfaces later, from Start, once terminal_windows.go's openTerminal
+	// actually probes for the API. See probeConPTYAvailable
+	// (terminal_windows.go) for the probe itself.
+	ErrConPTYUnavailable = errors.New("sandbox: ConPTY (pseudo console) is not available on this host")
 
 	// ErrProcessStdinClosed reports a write attempted after the process's
 	// stdin was closed (explicitly or by a prior EOF).
