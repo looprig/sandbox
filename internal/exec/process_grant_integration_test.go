@@ -125,6 +125,27 @@ func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 	}
 }
 
+// skipIfNoRealBackend skips (rather than fails) when err reflects this host
+// having no usable OS confinement backend at all (enforce.ErrUnavailable —
+// e.g. a Linux kernel with no Landlock support, which every OTHER Linux
+// confined-spawn test in this package already gates on via
+// requireLandlockV4/requireSeccomp) — a genuine environment gap, not a
+// containment defect the calling test's own proof is responsible for. Any
+// other error still fails the test. This file carries only the
+// `//go:build integration` constraint (no darwin || linux restriction, unlike
+// process_parent_death_integration_unix_test.go, this helper's original
+// home): every `-tags integration` build on every platform this module
+// targets, including GOOS=windows, must be able to resolve this symbol —
+// process_grant_integration_test.go's own TestIntegrationProcessPreparedGrantLifetime
+// is one of several platform-neutral callers.
+func skipIfNoRealBackend(t *testing.T, op string, err error) {
+	t.Helper()
+	if errors.Is(err, enforce.ErrUnavailable) {
+		t.Skipf("%s: no OS confinement backend available on this host (%v); the containment this test proves cannot be exercised without one", op, err)
+	}
+	t.Fatalf("%s: %v", op, err)
+}
+
 func separatorFor() string {
 	if runtime.GOOS == "windows" {
 		return " & "

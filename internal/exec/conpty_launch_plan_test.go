@@ -110,6 +110,56 @@ func TestConPTYLaunchPlanOrdersJobBeforeResume(t *testing.T) {
 	})
 }
 
+// TestConPTYBrokerJobPlan is Task 22C's own queued phase-gate selector: it
+// binds a BROKER-credentialed ConPTYLaunchPlan — both TokenHandle and Desktop
+// set, ConPTYBrokerCredentials's own elevated-path shape — to the exact same
+// Job-before-Resume ordering invariant TestConPTYLaunchPlanOrdersJobBeforeResume
+// (above) already proves for the no-broker/restricted shape, and separately
+// proves a broker-credentialed plan is rejected by Validate() once its own
+// step order is mutated away from that invariant. 22A's own tests already
+// cover broker-credential SHAPE validation in isolation
+// (TestNewConPTYLaunchPlanRejectsInvalidFields's "token without
+// desktop"/"desktop without token" cases) and canonical-order
+// Job-before-Resume for the NO-broker shape
+// (TestConPTYLaunchPlanOrdersJobBeforeResume) separately; nothing under this
+// exact name previously bound the two together for the broker-credentialed
+// shape specifically.
+func TestConPTYBrokerJobPlan(t *testing.T) {
+	broker := ConPTYBrokerCredentials{TokenHandle: 99, Desktop: `\Sandbox\Desktop`}
+
+	t.Run("a broker-credentialed plan built by the constructor orders Job assignment before resume", func(t *testing.T) {
+		plan, err := NewConPTYLaunchPlan(validConPTYPipes(), validConPTYAttribute(), validConPTYJobAssignment(), broker)
+		if err != nil {
+			t.Fatalf("NewConPTYLaunchPlan: %v", err)
+		}
+		if got := plan.Broker(); got != broker {
+			t.Fatalf("Broker() = %+v, want %+v", got, broker)
+		}
+		steps := plan.Steps()
+		assignAt := indexOfConPTYStep(steps, ConPTYStepAssignJob)
+		resumeAt := indexOfConPTYStep(steps, ConPTYStepResume)
+		if assignAt < 0 || resumeAt < 0 {
+			t.Fatalf("broker-credentialed plan is missing a required step: %v", steps)
+		}
+		if assignAt >= resumeAt {
+			t.Fatalf("Job assignment (position %d) must precede resume (position %d): %v", assignAt, resumeAt, steps)
+		}
+	})
+
+	t.Run("a broker-credentialed plan with a mutated step order fails Validate", func(t *testing.T) {
+		plan := &ConPTYLaunchPlan{
+			pipes:     validConPTYPipes(),
+			attribute: validConPTYAttribute(),
+			job:       validConPTYJobAssignment(),
+			broker:    broker,
+			steps:     swapConPTYSteps(canonicalConPTYLaunchOrder(), ConPTYStepAssignJob, ConPTYStepResume),
+		}
+		if err := plan.Validate(); err == nil {
+			t.Fatalf("expected a broker-credentialed plan with resume before Job assignment to fail Validate")
+		}
+	})
+}
+
 func TestNewConPTYLaunchPlanRejectsInvalidFields(t *testing.T) {
 	cases := map[string]struct {
 		pipes     ConPTYPipes

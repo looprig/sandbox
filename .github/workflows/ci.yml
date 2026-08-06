@@ -188,6 +188,54 @@ jobs:
             $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
             throw "requested Windows restricted mechanism did not execute"
           }
+      # Task 22B's ConPTY tests are default-tag and platform-independent of
+      # any live gate (they drive a captureBackend test double, not a real
+      # backend), but this is the first time they actually run on live
+      # Windows rather than only cross-compiling.
+      - name: ConPTY interactive terminal (skip is failure)
+        shell: powershell
+        run: |
+          $lines = @(& go test -json -race -count=1 ./internal/exec -run '^TestProcessConPTY')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object { $_.Action -eq 'skip' })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "ConPTY interactive terminal tests did not execute"
+          }
+      # Phase Gate 5's own tagged-discovery matrix: proves every tagged
+      # ConPTY integration test is actually discoverable under this exact
+      # -run selector before any of them are asked to run.
+      - name: tagged-integration ConPTY discovery
+        shell: powershell
+        run: |
+          $lines = @(& go test -tags integration -list 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree|ProcessPTY|ConPTY)' ./internal/exec)
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($lines -match 'ConPTY')) {
+            throw "tagged-integration discovery did not list a ConPTY test"
+          }
+      # Task 22C's decisive containment proof: the real restrictedBackend,
+      # driven through a ConPTY-backed spawn, must deny a write outside its
+      # granted roots exactly like the non-TTY pipe-backed path already
+      # proves elsewhere in this job.
+      - name: ConPTY restricted containment proof (skip is failure)
+        shell: powershell
+        env:
+          SANDBOX_WINDOWS_DISPOSABLE_ACL_TEST: "1"
+        run: |
+          $lines = @(& go test -json -tags integration -race -count=1 ./internal/exec -run '^TestIntegrationConPTYRestricted$')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object { $_.Action -eq 'skip' })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "ConPTY restricted containment proof did not execute"
+          }
 
   # This worker is destroyed/reimaged after each job. The cleanup step runs for
   # success, failure, and cancellation, and residue makes the job fail.
@@ -253,6 +301,36 @@ jobs:
             throw "requested Windows elevated mechanism did not execute"
           }
           go test -count=100 ./internal/windows -run 'Elevated.*Race|RecoveryIntegration|Broker.*Recovery'
+      # Phase Gate 5's own tagged-discovery matrix: proves every tagged
+      # ConPTY integration test is actually discoverable under this exact
+      # -run selector before any of them are asked to run.
+      - name: tagged-integration ConPTY discovery
+        shell: powershell
+        run: |
+          $lines = @(& go test -tags integration -list 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree|ProcessPTY|ConPTY)' ./internal/exec)
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($lines -match 'ConPTY')) {
+            throw "tagged-integration discovery did not list a ConPTY test"
+          }
+      # Task 22C's fail-closed proof under a REAL elevated broker: TTY:true
+      # must be admitted at PrepareProcess but rejected at Start with
+      # ErrProcessTTYUnsupported, and a TTY:false control run through the
+      # SAME broker must still succeed (otherwise the rejection would be
+      # indistinguishable from a broken/unavailable broker).
+      - name: ConPTY elevated fail-closed proof (skip is failure)
+        shell: powershell
+        run: |
+          $lines = @(& go test -json -tags integration -race -count=1 ./internal/exec -run '^TestIntegrationConPTYElevated$')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object { $_.Action -eq 'skip' })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "ConPTY elevated fail-closed proof did not execute"
+          }
       - name: unconditional cleanup and empty residue verification
         if: always()
         shell: powershell

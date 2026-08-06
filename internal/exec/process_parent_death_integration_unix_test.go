@@ -71,20 +71,11 @@ func integrationEscapeExecutor(t *testing.T) (*ExecutorSet, *Executor, string) {
 	return set, executor, workspace
 }
 
-// skipIfNoRealBackend skips (rather than fails) when err reflects this host
-// having no usable OS confinement backend at all (enforce.ErrUnavailable —
-// e.g. a Linux kernel with no Landlock support, which every OTHER Linux
-// confined-spawn test in this package already gates on via
-// requireLandlockV4/requireSeccomp) — a genuine environment gap, not a
-// containment defect this microtask's proof is responsible for. Any other
-// error still fails the test.
-func skipIfNoRealBackend(t *testing.T, op string, err error) {
-	t.Helper()
-	if errors.Is(err, enforce.ErrUnavailable) {
-		t.Skipf("%s: no OS confinement backend available on this host (%v); the process-tree escape containment this test proves cannot be exercised without one", op, err)
-	}
-	t.Fatalf("%s: %v", op, err)
-}
+// skipIfNoRealBackend now lives in process_grant_integration_test.go: that
+// file carries only the `//go:build integration` constraint (no darwin ||
+// linux restriction, unlike this one), so a helper every platform's own
+// `-tags integration` build needs to resolve — this file's own callers
+// included — must live somewhere Windows compiles it too, not here.
 
 // requireSettidHelper skips the test on a host/image without the setsid
 // binary (util-linux) — needed for a genuine session-detach escape, rather

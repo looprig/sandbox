@@ -314,10 +314,15 @@ func (launch *conPTYLaunch) perform(step ConPTYLaunchStep) error {
 }
 
 // createSuspended performs ConPTYStepCreateSuspended: builds the raw
-// CreateProcess call's application path, command line, environment block,
-// and PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute list, then creates the
-// process CREATE_SUSPENDED, recording the result in launch.pi for
-// assignJob/resume to consume.
+// CreateProcess/CreateProcessAsUser call's application path, command line,
+// environment block, and PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute list,
+// then creates the process CREATE_SUSPENDED — through the caller's own token
+// when cmd.SysProcAttr.Token is unset, or through that specific token via
+// CreateProcessAsUser when a backend (today: configureRestrictedSpawn,
+// internal/windows/backend_windows.go) has set one — recording the result in
+// launch.pi for assignJob/resume to consume. See the token dispatch below,
+// just before the CreateProcess/CreateProcessAsUser call itself, for why
+// both branches must exist rather than only the token-less one.
 func (launch *conPTYLaunch) createSuspended() error {
 	cmd := launch.cmd
 	appPath, err := conPTYApplicationPath(cmd)
@@ -375,8 +380,30 @@ func (launch *conPTYLaunch) createSuspended() error {
 		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
 		ProcThreadAttributeList: attributes.List(),
 	}
+	// cmd.SysProcAttr.Token, when non-zero, is the restricted token
+	// configureRestrictedSpawn (internal/windows/backend_windows.go) already
+	// built for this spawn. cmd.Start() would launch through it via
+	// CreateProcessAsUser (see syscall.StartProcess, syscall/exec_windows.go:
+	// "if sys.Token != 0 { ... CreateProcessAsUser(sys.Token, ...) } else {
+	// ... CreateProcess(...) }") — but a ConPTY-backed launch bypasses
+	// cmd.Start() entirely (this file's own top-of-file doc comment), so it
+	// must reproduce that SAME dispatch itself. Falling through to the
+	// token-less CreateProcess below unconditionally — as an earlier version
+	// of this method did — would silently launch the child under THIS
+	// process's own full token instead of the restricted one: the Job
+	// containment would still hold, but the entire token/ACL restriction
+	// configureRestrictedSpawn established would be dropped with no error or
+	// warning. CreateProcessAsUser takes the identical argument list as
+	// CreateProcess with the token prepended; the call below mirrors
+	// syscall.StartProcess's own shape exactly, using the same
+	// appPath16/cmdLine16/envBlock/dir16/startup values built above either way.
 	var pi windows.ProcessInformation
-	if err := windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi); err != nil {
+	if cmd.SysProcAttr.Token != 0 {
+		err = windows.CreateProcessAsUser(windows.Token(cmd.SysProcAttr.Token), appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi)
+	} else {
+		err = windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi)
+	}
+	if err != nil {
 		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", err)
 	}
 	launch.pi = pi
