@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/creack/pty"
 )
@@ -113,11 +114,15 @@ func openProcessTerminal(cmd *exec.Cmd) (processTerminal, func() error, error) {
 // gone (the child exited, and this package's own parent-side copy was
 // already dropped right after Start — see openProcessTerminal's doc above),
 // a Linux master read returns EIO rather than a clean 0-byte read (Darwin
-// already returns a clean EOF for the identical condition); the pump — the
-// only remaining reader of this value — must observe the identical io.EOF
-// contract the pipe-backed path already guarantees on every platform, never
-// a raw, platform-specific errno, since it in turn is exactly what
-// Process.Stdout's own readers must see once draining ends.
+// already returns a clean EOF for the identical condition). This keeps
+// terminalMaster's own Read contract platform-uniform (io.EOF, never a raw
+// platform errno) as a guarantee of this type itself — NOT because it is
+// load-bearing for today's one production caller: pumpPTYOutput's loop
+// (process.go) already returns, and closes its pipe, on ANY read error,
+// normalized or not, so Process.Stdout's own readers would see a plain
+// io.EOF from the pump either way. TestTerminalMasterReadNormalizesEIOToEOF
+// (process_pty_unix_test.go) exercises this directly against Read itself,
+// not only transitively through Stdout().
 //
 // Close is idempotent via closeOnce: Process.Close's own terminalCloser.Close()
 // call is the only path that ever reaches it in production (Stdin().Close()
@@ -153,6 +158,52 @@ func (m *terminalMaster) Close() error {
 // (pixel dimensions) are deliberately left zero: nothing in this package's
 // contract (ProcessOptions, Process.Resize) carries pixel geometry, and a
 // zero X/Y is the same "unknown" value most terminal emulators already send.
+//
+// This deliberately does NOT call github.com/creack/pty's own Setsize:
+// Setsize issues its ioctl against m.f.Fd() directly, and Fd() itself warns
+// that "if the file descriptor is used incorrectly, subsequent behavior is
+// undefined" — it forfeits the safe-concurrent-close protection
+// (internal/poll's reference-counted FD) that already makes Read, Write,
+// and Close on m.f safe against each other, so a resize (e.g. forwarding a
+// SIGWINCH) racing Process.Close's master teardown would be a raw ioctl on
+// a file descriptor that could already be closed, or worse, already reused
+// by an unrelated concurrent open elsewhere in this process. Going through
+// (*os.File).SyscallConn().Control instead reuses that exact protection: per
+// syscall.RawConn's own doc, the fd Control's callback receives "is
+// guaranteed to remain valid while f executes", and Control itself returns
+// an error instead of ever invoking the callback once m.f is closed.
+// TestProcessPTYResizeCloseRace (process_pty_unix_test.go) exercises Resize
+// concurrently with Close under -race as this fix's minimum bar.
 func (m *terminalMaster) resize(rows, cols uint16) error {
-	return pty.Setsize(m.f, &pty.Winsize{Rows: rows, Cols: cols})
+	conn, err := m.f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	ws := &pty.Winsize{Rows: rows, Cols: cols}
+	var ctlErr error
+	if err := conn.Control(func(fd uintptr) {
+		ctlErr = ioctlSetWinsize(fd, ws)
+	}); err != nil {
+		return err
+	}
+	return ctlErr
+}
+
+// ioctlSetWinsize issues the raw TIOCSWINSZ ioctl against fd directly. It
+// exists only so terminalMaster.resize (above) can drive the ioctl from
+// inside a syscall.RawConn.Control callback — which hands this function a
+// bare fd, not an *os.File — instead of going through
+// github.com/creack/pty's own Setsize (see resize's doc comment for why).
+// ws's field layout (Rows, Cols, X, Y uint16) is pty.Winsize's own exported
+// type, so it is ABI-identical to this ioctl's expected struct winsize by
+// construction; mirrors github.com/creack/pty's own ioctlInner exactly (same
+// syscall, same "non-zero errno is the error" convention), which is
+// otherwise unexported and unreachable from this package.
+func ioctlSetWinsize(fd uintptr, ws *pty.Winsize) error {
+	//nolint:gosec // Expected unsafe pointer for a TIOCSWINSZ ioctl syscall.
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(ws)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }

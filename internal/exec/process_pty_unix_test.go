@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -442,6 +443,100 @@ func TestProcessPTYNoPipeFallback(t *testing.T) {
 	}
 	if !strings.Contains(got, "out-marker") || !strings.Contains(got, "err-marker") {
 		t.Fatalf("combined output = %q, want it to contain both out-marker and err-marker (a silent second pipe would leave err-marker off Stdout entirely)", got)
+	}
+}
+
+// TestProcessPTYCloseAfterNaturalExit proves Close() returns nil on the
+// most common, well-behaved sequence — run to completion, Wait, then Close —
+// even though terminalStdin.Close() (terminal.go) writes the VEOF byte to
+// the master unconditionally: by the time the child has already exited, this
+// package's own parent-side slave reference is already gone (dropped right
+// after Start — see openProcessTerminal's doc, terminal_unix.go), so that
+// write fails with EIO. terminalStdin.Close() must normalize that to nil —
+// there is nothing left to signal EOF to — rather than let it surface as
+// Process.Close's returned error, mirroring the pipe-backed path, which
+// never errors on closing your own pipe end regardless of the peer's state.
+// startPTYProcess's own t.Cleanup ignores Close's error (`_ =
+// proc.Close(...)`), so this regression would be invisible to every other
+// test in this file; this test calls Close directly and checks it.
+func TestProcessPTYCloseAfterNaturalExit(t *testing.T) {
+	proc := startPTYProcess(t, "true")
+	if _, err := proc.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := proc.Close(context.Background()); err != nil {
+		t.Fatalf("Close after natural exit = %v, want nil (EIO from writing VEOF to an already-gone slave must be normalized away)", err)
+	}
+}
+
+// TestTerminalMasterReadNormalizesEIOToEOF is a direct unit-level proof of
+// terminalMaster.Read's own contract — exercised against Read itself, not
+// only transitively through Process.Stdout()/the output-draining pump (see
+// that method's own doc comment for why the two are independent guarantees).
+// It never spawns a Process or a child at all: opening a PTY and closing its
+// only slave reference, in this test's own process, already reproduces "every
+// slave-side reference is gone" — the exact condition the doc contract is
+// about. Mirrors TestProcessPTYEIONormalization's own caveat: Linux reports
+// this condition as EIO on the master (which Read must normalize), Darwin
+// already reports a clean EOF for the identical condition, so the assertion
+// is meaningful — and holds — on both, even though only Linux actually
+// exercises the normalization branch itself.
+func TestTerminalMasterReadNormalizesEIOToEOF(t *testing.T) {
+	master, slave, err := openPTY()
+	if err != nil {
+		t.Fatalf("openPTY: %v", err)
+	}
+	tm := newTerminalMaster(master)
+	t.Cleanup(func() { _ = tm.Close() })
+
+	if err := slave.Close(); err != nil {
+		t.Fatalf("slave.Close: %v", err)
+	}
+
+	buf := make([]byte, 8)
+	if _, err := tm.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read once every slave reference is gone = %v, want io.EOF (never a raw platform errno)", err)
+	}
+}
+
+// TestProcessPTYResizeCloseRace exercises Process.Resize concurrently with
+// Process.Close under -race. terminalMaster.resize (terminal_unix.go) now
+// drives the TIOCSWINSZ ioctl through (*os.File).SyscallConn().Control
+// instead of github.com/creack/pty's own Setsize (which issues its ioctl
+// against a raw Fd(), forfeiting the safe-concurrent-close protection Read/
+// Write/Close already get) specifically so a resize (e.g. forwarding a
+// SIGWINCH) racing session teardown — a realistic usage pattern for this
+// module, not a contrived one — can never land on an already-closed or
+// already-reused file descriptor. This test cannot, from this package,
+// observe internal/poll's reference counting directly; it proves this fix's
+// stated minimum bar instead: concurrent Resize/Close neither deadlocks nor
+// panics nor is flagged by the race detector, and the process still reaches
+// a confirmed terminal state promptly afterward.
+func TestProcessPTYResizeCloseRace(t *testing.T) {
+	proc := startPTYProcess(t, "sleep 5")
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = proc.Resize(context.Background(), uint16(20+i%10), uint16(80+i%10))
+		}
+	}()
+
+	if err := proc.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+
+	// A generous timeout, not a tight one: this test's point is the absence
+	// of a deadlock/panic/race, not exact timing, and -race's instrumentation
+	// overhead on 200 rapid ioctl syscalls plus a real child spawn/reap can
+	// legitimately push this well past the other tests' usual 5s under load.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.Wait(ctx); err != nil {
+		t.Fatalf("Wait after concurrent Resize/Close did not return in time: %v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package exec
 import (
 	"errors"
 	"io"
+	"syscall"
 )
 
 // This file declares the platform-neutral PTY vocabulary Process/PrepareProcess
@@ -37,14 +38,6 @@ const (
 func (m ProcessStreamMode) Valid() bool {
 	return m >= ProcessStreamModePipes && m <= ProcessStreamModePTY
 }
-
-// ErrProcessResizeUnsupported reports that a not-yet-terminal Process has no
-// terminal-resize implementation wired (see processTerminalTarget, below): a
-// pipe-mode Process, or a TTY request this platform cannot yet honor at all
-// (PrepareProcess already fails those closed with ErrProcessTTYUnsupported
-// before a Process ever exists, so this sentinel is unreachable through that
-// path). Mirrors ErrProcessSignalUnsupported's fail-closed contract exactly.
-var ErrProcessResizeUnsupported = errors.New("sandbox: process resize is not yet supported")
 
 // processTerminalTarget is the narrow seam Process.Resize drives to actually
 // change a PTY's window size — exactly like processSignalTarget (process.go)
@@ -117,7 +110,23 @@ func newTerminalStdin(terminal processTerminal) *terminalStdin {
 
 func (s *terminalStdin) Write(p []byte) (int, error) { return s.terminal.Write(p) }
 
+// Close writes the VEOF byte and normalizes syscall.EIO to nil — extending
+// the identical EIO-normalization precedent terminalMaster.Read already
+// applies on the read side (terminal_unix.go). On the well-behaved,
+// by-far-most-common sequence (the child already ran to completion and this
+// package's own parent-side slave reference was already dropped — see
+// openProcessTerminal's doc, terminal_unix.go), the master's slave side is
+// already gone by the time a caller gets around to Close()ing Stdin, and a
+// write in that state fails with EIO: there is nothing left to signal EOF
+// to, so that failure is not a real error from this call's point of view,
+// and must not surface as Process.Close's returned error the way the
+// pipe-backed path never errors on closing your own pipe end regardless of
+// the peer's state. Every other write failure (a real device error, say)
+// still propagates.
 func (s *terminalStdin) Close() error {
 	_, err := s.terminal.Write([]byte{veofByte})
+	if errors.Is(err, syscall.EIO) {
+		return nil
+	}
 	return err
 }

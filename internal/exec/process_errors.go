@@ -38,4 +38,13 @@ var (
 	// Process values to a real implementation; a Process already confirmed
 	// terminal never reaches this error regardless.
 	ErrProcessSignalUnsupported = errors.New("sandbox: process signal delivery is not yet supported")
+
+	// ErrProcessResizeUnsupported reports that a not-yet-terminal Process has
+	// no terminal-resize implementation wired (see processTerminalTarget,
+	// terminal.go): a pipe-mode Process, or a TTY request this platform
+	// cannot yet honor at all (PrepareProcess already fails those closed
+	// with ErrProcessTTYUnsupported before a Process ever exists, so this
+	// sentinel is unreachable through that path). Mirrors
+	// ErrProcessSignalUnsupported's fail-closed contract exactly.
+	ErrProcessResizeUnsupported = errors.New("sandbox: process resize is not yet supported")
 )
