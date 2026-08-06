@@ -18,8 +18,10 @@ require_line() {
 }
 
 for arch in amd64 arm64; do
-	require_line "$arch example/always"
-	require_line "$arch example/windows-$arch"
+	for package in "example/always" "example/windows-$arch"; do
+		require_line "$arch none $package"
+		require_line "$arch integration $package"
+	done
 done
 if grep -Fq 'host-only' "$log"; then
 	echo "cross-build compiled a package from host-only enumeration" >&2

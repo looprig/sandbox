@@ -108,6 +108,11 @@ func TestIntegrationConPTYRestricted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareProcess (echo): %v", err)
 	}
+	// A no-op once Start below succeeds (PreparedProcess.Close's own doc
+	// comment), kept for the same belt-and-suspenders reason every other
+	// PrepareProcess call in this package pairs one: it is the ONLY release
+	// path if a future edit inserts a failure between here and Start.
+	t.Cleanup(func() { _ = prepared.Close() })
 	proc, err := prepared.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start (echo): %v", err)
@@ -158,6 +163,8 @@ func TestIntegrationConPTYRestricted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareProcess (write): %v", err)
 	}
+	// Same belt-and-suspenders reason as the echo phase's own prepared.Close above.
+	t.Cleanup(func() { _ = writePrepared.Close() })
 	writeProc, err := writePrepared.Start(context.Background())
 	if err != nil {
 		t.Fatalf("Start (write): %v", err)
