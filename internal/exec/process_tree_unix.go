@@ -130,23 +130,33 @@ func (tree *processTree) terminateAndWait() (error, error) {
 	if tree.pgid <= 0 {
 		return nil, nil
 	}
+	signalAndPollProcessGroupZero(tree.pgid, tree.signalGroup)
+	return nil, nil
+}
+
+// signalAndPollProcessGroupZero drives pgid's whole process group to zero the
+// best-effort way: reap zombies, inspect, SIGKILL again while anything is
+// still live, poll until the group is empty. Shared by every non-Supervised
+// spawn's terminateAndWait and by Darwin's Supervised prover when its
+// descendant tracker is unavailable (process_tree_darwin.go).
+func signalAndPollProcessGroupZero(pgid int, signalGroup func(syscall.Signal) error) {
 	for {
-		reapProcessGroup(tree.pgid)
-		active, err := processGroupActive(tree.pgid)
+		reapProcessGroup(pgid)
+		active, err := processGroupActive(pgid)
 		if err != nil {
-			// Inspection failure is not evidence that the group is gone. Keep the
-			// lease and every backing resource live until absence can be verified.
+			// Inspection failure is not evidence that the group is gone. Keep
+			// polling until absence can be verified.
 			time.Sleep(time.Millisecond)
 			continue
 		}
 		if !active {
-			return nil, nil
+			return
 		}
 		// Cancellation may already have delivered SIGKILL while the group is in
 		// the exit transition. Darwin can report EPERM for a redundant kill during
-		// that window. No kill error proves absence, so retain authority and retry
-		// after inspecting the group again.
-		_ = tree.terminate()
+		// that window. No kill error proves absence, so retry after inspecting the
+		// group again.
+		_ = signalGroup(syscall.SIGKILL)
 		time.Sleep(time.Millisecond)
 	}
 }
