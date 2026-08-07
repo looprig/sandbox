@@ -76,7 +76,7 @@ func compileXcrunCachePlumbing(b *strings.Builder, report *profile.CompileReport
 const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 
 // ptySlaveIoctlRegex matches macOS's PTY slave device family, /dev/ttysNNN
-// (devfs — never a /private alias like /tmp/​/var/​/etc, so no
+// (devfs — never a /private alias like /tmp, /var, /etc, so no
 // seatbeltPathAliases handling is needed here). Anchored to the fixed
 // "/dev/ttys" prefix plus one-or-more digits so it never widens beyond that
 // one device family — not /dev/ptmx (the PTY *master*, see
