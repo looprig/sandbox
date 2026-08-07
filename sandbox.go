@@ -285,6 +285,10 @@ type (
 	ProcessStreamMode = exec.ProcessStreamMode
 	// ProcessSignal is a portable process-tree signal request.
 	ProcessSignal = exec.ProcessSignal
+	// LifetimeContainment reports the process-tree teardown contract a
+	// Supervised spawn actually received (enforced / best-effort /
+	// unspecified). See Process.LifetimeContainment.
+	LifetimeContainment = exec.LifetimeContainment
 )
 
 // ProcessAccessKind values.
@@ -311,6 +315,13 @@ const (
 	ProcessSignalInterrupt = exec.ProcessSignalInterrupt
 	ProcessSignalTerminate = exec.ProcessSignalTerminate
 	ProcessSignalKill      = exec.ProcessSignalKill
+)
+
+// LifetimeContainment values.
+const (
+	LifetimeContainmentUnspecified = exec.LifetimeContainmentUnspecified
+	LifetimeContainmentEnforced    = exec.LifetimeContainmentEnforced
+	LifetimeContainmentBestEffort  = exec.LifetimeContainmentBestEffort
 )
 
 // Process/PreparedProcess sentinels.
