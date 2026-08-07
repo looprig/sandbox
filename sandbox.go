@@ -280,6 +280,11 @@ type (
 	ProcessActivity = exec.ProcessActivity
 	// ProcessActivityKind classifies ProcessActivity.
 	ProcessActivityKind = exec.ProcessActivityKind
+	// ProcessStreamMode describes a running process's stream topology
+	// (distinct pipes or one combined PTY stream).
+	ProcessStreamMode = exec.ProcessStreamMode
+	// ProcessSignal is a portable process-tree signal request.
+	ProcessSignal = exec.ProcessSignal
 )
 
 // ProcessAccessKind values.
@@ -293,6 +298,19 @@ const (
 const (
 	ProcessActivityWrite      = exec.ProcessActivityWrite
 	ProcessActivityBroadWrite = exec.ProcessActivityBroadWrite
+)
+
+// ProcessStreamMode values.
+const (
+	ProcessStreamModePipes = exec.ProcessStreamModePipes
+	ProcessStreamModePTY   = exec.ProcessStreamModePTY
+)
+
+// ProcessSignal values.
+const (
+	ProcessSignalInterrupt = exec.ProcessSignalInterrupt
+	ProcessSignalTerminate = exec.ProcessSignalTerminate
+	ProcessSignalKill      = exec.ProcessSignalKill
 )
 
 // Process/PreparedProcess sentinels.
