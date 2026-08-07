@@ -56,7 +56,8 @@ func (p *darwinBestEffortProof) terminateAndWait() (error, error) {
 		p.tracker.killAndAwaitZero(pgid)
 		return nil, nil
 	}
-	// Tracker unavailable (construction or arm failed): plain group sweep.
+	// Tracker unavailable (construction failed in attachSupervisedProof):
+	// plain group sweep.
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	signalAndPollProcessGroupZero(pgid, func(sig syscall.Signal) error {
 		err := syscall.Kill(-pgid, sig)

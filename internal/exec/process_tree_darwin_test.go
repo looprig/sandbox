@@ -136,17 +136,48 @@ func TestAttachSupervisedProofSeatbeltBestEffort(t *testing.T) {
 	proof.close()
 }
 
+// stubZeroProver is a minimal zeroProver that deliberately does NOT
+// implement lifetimeReporter, used by TestProcessTreeLifetimeDelegation to
+// exercise processTree.lifetimeContainment's fallback-to-Enforced branch:
+// any non-nil proof with no self-reported answer is treated as
+// kernel-enforced, mirroring the real Linux namespace/cgroup provers
+// (process_tree_linux.go), which don't implement lifetimeReporter either.
+type stubZeroProver struct{}
+
+func (stubZeroProver) terminateAndWait() (error, error) { return nil, nil }
+func (stubZeroProver) close()                           {}
+
 // TestProcessTreeLifetimeDelegation proves processTree.lifetimeContainment's
-// platform-neutral delegation semantics (process_tree_unix.go): a proofless
-// tree — the zero value, standing in for any non-Supervised spawn or a
-// Supervised spawn on a platform/backend with no proof attached — answers
-// Unspecified. This lives in the darwin-tagged test file (process_tree_unix.go
+// platform-neutral delegation semantics (process_tree_unix.go) across all
+// three branches: a proofless tree — the zero value, standing in for any
+// non-Supervised spawn or a Supervised spawn on a platform/backend with no
+// proof attached — answers Unspecified; a proof that implements
+// lifetimeReporter (darwinBestEffortProof, exercised here directly rather
+// than via attachSupervisedProof, since lifetimeContainment() never touches
+// its cmd/tracker fields) delegates to that proof's own answer; and a proof
+// with no lifetimeReporter implementation (stubZeroProver, above) falls back
+// to Enforced. This lives in the darwin-tagged test file (process_tree_unix.go
 // itself, and the method under test, build on darwin || linux) per the plan's
 // own note that a darwin file is fine for this platform-neutral case.
 func TestProcessTreeLifetimeDelegation(t *testing.T) {
-	// nil proof → Unspecified; reporter proof → its answer.
-	tree := &processTree{}
-	if got := tree.lifetimeContainment(); got != LifetimeContainmentUnspecified {
-		t.Fatalf("nil-proof tree = %v, want unspecified", got)
-	}
+	t.Run("nil proof reports Unspecified", func(t *testing.T) {
+		tree := &processTree{}
+		if got := tree.lifetimeContainment(); got != LifetimeContainmentUnspecified {
+			t.Fatalf("nil-proof tree = %v, want unspecified", got)
+		}
+	})
+
+	t.Run("a lifetimeReporter proof delegates to its own answer", func(t *testing.T) {
+		tree := &processTree{proof: &darwinBestEffortProof{}}
+		if got := tree.lifetimeContainment(); got != LifetimeContainmentBestEffort {
+			t.Fatalf("reporter-proof tree = %v, want best-effort (delegated from darwinBestEffortProof.lifetimeContainment)", got)
+		}
+	})
+
+	t.Run("a non-reporter proof falls back to Enforced", func(t *testing.T) {
+		tree := &processTree{proof: stubZeroProver{}}
+		if got := tree.lifetimeContainment(); got != LifetimeContainmentEnforced {
+			t.Fatalf("non-reporter-proof tree = %v, want enforced", got)
+		}
+	})
 }
