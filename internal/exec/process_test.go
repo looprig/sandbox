@@ -306,6 +306,35 @@ func TestProcessNonzeroExitIsResult(t *testing.T) {
 	}
 }
 
+// TestProcessLifetimeContainmentUnconfinedUnspecified exercises the honest
+// answer for a spawn through newProcessTestExecutor's Unconfined/null-backend
+// executor: no processTree proof is ever attached (attachSupervisedProof
+// scopes to the real Seatbelt/Linux backends only), so the spawn makes no
+// containment claim at all — LifetimeContainmentUnspecified, not Enforced.
+func TestProcessLifetimeContainmentUnconfinedUnspecified(t *testing.T) {
+	executor := newProcessTestExecutor(t, Allow)
+	dir := t.TempDir()
+	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
+		Directory: dir, Command: portableSuccessCommand(), ExecutionID: "lifetime-unspecified",
+	})
+	if err != nil {
+		t.Fatalf("PrepareProcess: %v", err)
+	}
+	proc, err := prepared.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Close(context.Background()) })
+
+	if got := proc.LifetimeContainment(); got != LifetimeContainmentUnspecified {
+		t.Fatalf("LifetimeContainment() = %v, want %v (null backend makes no claim)", got, LifetimeContainmentUnspecified)
+	}
+
+	if _, err := proc.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
 // TestProcessSpawnFailureIsError exercises spawnProcess directly (this file
 // is an internal, white-box test) rather than through PrepareProcess/Start,
 // because PrepareProcess already rejects a non-existent directory during

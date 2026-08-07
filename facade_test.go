@@ -190,29 +190,32 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		t.Fatalf("PrepareProcess: %v", err)
 	}
 	var (
-		_ sandbox.ProcessAccess     = prepared.EffectiveAccess()
-		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessReadOnly
-		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessScopedWrite
-		_ sandbox.ProcessAccessKind = sandbox.ProcessAccessBroadWrite
+		_ sandbox.ProcessAccess       = prepared.EffectiveAccess()
+		_ sandbox.ProcessAccessKind   = sandbox.ProcessAccessReadOnly
+		_ sandbox.ProcessAccessKind   = sandbox.ProcessAccessScopedWrite
+		_ sandbox.ProcessAccessKind   = sandbox.ProcessAccessBroadWrite
+		_ sandbox.LifetimeContainment = sandbox.LifetimeContainmentUnspecified
+		_ sandbox.LifetimeContainment = sandbox.LifetimeContainmentEnforced
+		_ sandbox.LifetimeContainment = sandbox.LifetimeContainmentBestEffort
 	)
-	// On Darwin, Start must fail closed with ErrLifetimeContainmentUnavailable
-	// before any process is created: this module does not yet claim Darwin
-	// async execution (SPEC Task 12c — no kernel-enforced process-tree
-	// containment mechanism is wired for this platform yet). Every other
-	// platform still runs the real success path this facade advertises.
-	// Process/Wait/Close all tolerate a nil receiver (documented, deliberate
-	// zero-value safety), so the surrounding API-surface coverage below stays
-	// unconditional regardless of which branch runs.
+	// Darwin now takes the same success path as every other platform: the
+	// real Seatbelt-backed backend attaches a best-effort supervised proof
+	// (process-group SIGKILL plus descendant tracking) instead of failing
+	// Start closed (SPEC's earlier Task 12c fail-closed contract was
+	// superseded by the best-effort downgrade — see
+	// docs/lifetime-containment.md). This untagged test therefore spawns a
+	// real Seatbelt-confined process on dev Macs — sandbox-exec is present on
+	// every macOS install, and proving the public surface end to end is
+	// exactly this file's job. Process/Wait/Close all tolerate a nil receiver
+	// (documented, deliberate zero-value safety) regardless.
 	proc, err := prepared.Start(context.Background())
-	if runtime.GOOS == "darwin" {
-		if !errors.Is(err, sandbox.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("PreparedProcess.Start on darwin = %v, want ErrLifetimeContainmentUnavailable", err)
-		}
-		if proc != nil {
-			t.Fatalf("PreparedProcess.Start returned a non-nil Process alongside a fail-closed error: %v", proc)
-		}
-	} else if err != nil {
+	if err != nil {
 		t.Fatalf("PreparedProcess.Start: %v", err)
+	}
+	if runtime.GOOS == "darwin" {
+		if got := proc.LifetimeContainment(); got != sandbox.LifetimeContainmentBestEffort {
+			t.Fatalf("Process.LifetimeContainment on darwin = %v, want %v", got, sandbox.LifetimeContainmentBestEffort)
+		}
 	}
 	var (
 		_ io.ReadCloser  = proc.Stdout()
@@ -220,17 +223,11 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 		_ io.WriteCloser = proc.Stdin()
 	)
 	result, err := proc.Wait(context.Background())
-	if runtime.GOOS == "darwin" {
-		if !errors.Is(err, sandbox.ErrProcessClosed) {
-			t.Fatalf("Process.Wait on darwin's never-started (nil) Process = %v, want ErrProcessClosed", err)
-		}
-	} else {
-		if err != nil {
-			t.Fatalf("Process.Wait: %v", err)
-		}
-		if result.ExitCode != 0 {
-			t.Fatalf("Process.Wait ExitCode = %d, want 0", result.ExitCode)
-		}
+	if err != nil {
+		t.Fatalf("Process.Wait: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("Process.Wait ExitCode = %d, want 0", result.ExitCode)
 	}
 	var _ sandbox.ProcessResult = result
 	if err := proc.Close(context.Background()); err != nil {

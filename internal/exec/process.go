@@ -797,8 +797,22 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	spawn.prover = tree
 	spawn.cmd = cmd
 
+	// Computed once here, before the TTY branch below, rather than separately
+	// in each branch: both startConfined's own pipe path and
+	// startConfinedTTY (which this function hands tree to directly) confine
+	// through this exact tree, so there is exactly one containment answer for
+	// this spawn, not two independently-derived ones. tree is a
+	// processTreeBoundary; the type assertion below never widens that
+	// interface (see lifetimeReporter's own doc, lifetime_containment.go) —
+	// it mirrors attachSignaler's identical type-assertion idiom against
+	// processSignalTarget, just above.
+	lifetime := LifetimeContainmentUnspecified
+	if reporter, ok := tree.(lifetimeReporter); ok {
+		lifetime = reporter.lifetimeContainment()
+	}
+
 	if p.options.TTY {
-		return p.startConfinedTTY(ctx, cmd, tree)
+		return p.startConfinedTTY(ctx, cmd, tree, lifetime)
 	}
 
 	outR, outW, errR, errW, err := wireOutputPipes(cmd)
@@ -841,6 +855,7 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
 	}
 	proc := newPipeProcess(cmd, outR, errR, newProcessStdin(inW), p.options.TerminateGrace)
+	proc.lifetime = lifetime
 	// Wires Process.Signal to real Unix signal delivery on this run's process
 	// tree (Task 12A left this seam nil/unwired). tree is a
 	// processTreeBoundary; on darwin/linux the concrete *processTree
@@ -896,7 +911,10 @@ func openConfinedTerminal(cmd *exec.Cmd, tree processTreeBoundary) (processTermi
 // TestIntegrationProcessPTYDarwinLifetimeUnavailable). tree is accepted as a
 // parameter (not re-derived) so this method shares the identical containment
 // decision startConfined already made; it never calls e.processTree itself.
-func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, tree processTreeBoundary) (*Process, error) {
+// lifetime is likewise accepted rather than recomputed: it is startConfined's
+// own lifetimeReporter answer for this same tree, computed once before the
+// TTY/pipe branch split.
+func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, tree processTreeBoundary, lifetime LifetimeContainment) (*Process, error) {
 	lease := p.lease
 	spawn := p.spawn
 
@@ -944,6 +962,7 @@ func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, t
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
 	}
 	proc := newPTYProcess(cmd, terminal, pumpR, pumpW, p.options.TerminateGrace)
+	proc.lifetime = lifetime
 	// Wires Process.Signal to real Unix signal delivery on this run's process
 	// tree, exactly like startConfined's pipe-backed path: a PTY spawn's
 	// process group id equals cmd.Process.Pid either way (see
@@ -1042,6 +1061,11 @@ func (p *PreparedProcess) startBackendOwned(ctx context.Context) (*Process, erro
 		return errors.Join(outW.Close(), errW.Close(), inR.Close())
 	})
 	proc := newBackendOwnedProcess(execution, outR, errR, newProcessStdin(inW), p.options.TerminateGrace)
+	// Enforced, unconditionally: this path is reached only for the Windows
+	// elevated/broker backend (see this method's own doc comment above), whose
+	// Job object is kernel-enforced teardown by construction — there is no
+	// tree/proof to ask, unlike the confined path's lifetimeReporter seam.
+	proc.lifetime = LifetimeContainmentEnforced
 	// Wires Process.Signal to real signal delivery when the backend's own
 	// Execution value implements processSignalTarget — e.g. the Windows
 	// elevated runner's *elevatedAsyncExecution (internal/windows), which
@@ -1453,6 +1477,18 @@ type Process struct {
 	// Process exposes exactly one path to it. Only newPTYProcess ever sets
 	// this; every pipe-backed Process leaves it nil.
 	terminalCloser io.Closer
+
+	// lifetime is this spawn's actually-achieved process-tree teardown
+	// contract (see LifetimeContainment, lifetime_containment.go), fixed at
+	// construction and never mutated afterward — exactly like streamMode,
+	// above. startConfined/startConfinedTTY set it from the processTree's own
+	// lifetimeReporter answer (Unspecified when the tree carries no proof at
+	// all, e.g. an Unconfined/null-backend spawn); startBackendOwned sets it
+	// unconditionally to Enforced (the Windows elevated broker's Job is
+	// kernel-enforced by construction, with no tree/proof of its own to ask).
+	// The zero value (LifetimeContainmentUnspecified) already matches
+	// spawnProcess's unconfined free-function path, which sets nothing here.
+	lifetime LifetimeContainment
 }
 
 // Stdout returns the process's live standard-output pipe.
@@ -1494,6 +1530,19 @@ func (p *Process) StreamMode() ProcessStreamMode {
 		return ProcessStreamModePipes
 	}
 	return p.streamMode
+}
+
+// LifetimeContainment reports the process-tree teardown contract this spawn
+// actually received: Enforced (Linux namespace/cgroup, Windows Job),
+// BestEffort (Darwin Seatbelt — see docs/lifetime-containment.md), or
+// Unspecified (an Unconfined/null-backend spawn making no claim). A nil
+// Process reports Unspecified, matching every other nil-receiver accessor on
+// this type returning its harmless zero value.
+func (p *Process) LifetimeContainment() LifetimeContainment {
+	if p == nil {
+		return LifetimeContainmentUnspecified
+	}
+	return p.lifetime
 }
 
 // Activities returns the optional typed workspace-activity stream. It closes
