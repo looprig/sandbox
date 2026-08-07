@@ -75,6 +75,87 @@ func compileXcrunCachePlumbing(b *strings.Builder, report *profile.CompileReport
 // M1 verified this — not outbound :53 — is the load-bearing DNS rule (§5.2).
 const mDNSResponderSocket = "/private/var/run/mDNSResponder"
 
+// ptySlaveIoctlRegex matches macOS's PTY slave device family, /dev/ttysNNN
+// (devfs — never a /private alias like /tmp/​/var/​/etc, so no
+// seatbeltPathAliases handling is needed here). Anchored to the fixed
+// "/dev/ttys" prefix plus one-or-more digits so it never widens beyond that
+// one device family — not /dev/ptmx (the PTY *master*, see
+// compilePTYSlaveIoctl's own doc comment for why that side needs no rule at
+// all), and not any other /dev entry (disks, audio, etc.).
+const ptySlaveIoctlRegex = `^/dev/ttys[0-9]+$`
+
+// compilePTYSlaveIoctl allow-lists the ioctl(2) operations a confined
+// process needs on its own already-open PTY slave (its controlling
+// terminal). Deliberate, user-approved 2026-08-07 scope extension: the
+// Darwin best-effort supervised-lifetime plan's own architecture note
+// ("access confinement is untouched") predates this — real end-to-end
+// exercise of a Seatbelt-confined TTY-backed spawn (only possible once
+// PrepareProcess/Start stopped rejecting every Darwin Supervised spawn
+// outright) surfaced that `stty size` — and by extension any tool that
+// queries/configures its controlling terminal, not just this one command —
+// failed inside the sandbox with "TIOCGETD: Operation not permitted", even
+// though the identical command already worked unconfined and even though
+// plain PTY read/write and isatty()-style checks already worked *confined*.
+// That asymmetry is exactly what motivates this rule rather than a broader
+// one: this codebase's own child never itself *opens* a device path for its
+// stdio — openProcessTerminal (internal/exec/terminal_unix.go) opens both
+// halves of the PTY from the UNSANDBOXED parent process (via
+// github.com/creack/pty, i.e. /dev/ptmx) and attaches the already-open slave
+// fd directly to the child's stdin/stdout/stderr before sandbox-exec ever
+// wraps it — so the child's plain read/write (and apparently isatty, which
+// this profile already permitted with no rule at all) ride the already-open
+// fd and are never subject to Seatbelt's open-time file-read*/file-write*
+// checks at all. ioctl(2) is different: Seatbelt intercepts it per-call,
+// keyed by the fd's underlying path, regardless of when the fd was opened —
+// hence a real, previously-undiscovered gap once a TTY-backed spawn actually
+// ran under real confinement for the first time (Task 6 of the darwin
+// best-effort-lifetime plan; darwin's PTY path failed closed, pre-spawn,
+// before that).
+//
+// This is unconditional (called for every compiled profile, not gated
+// behind any policy.Effective flag) for the same structural reason
+// compileXcrunCachePlumbing is: compileSBPL runs exactly once, at executor
+// construction (see (*Executor) construction in internal/exec/executor.go),
+// strictly before any later PrepareProcess call ever requests TTY: true and
+// therefore strictly before any PTY device — let alone its concrete
+// /dev/ttysNNN path — exists to name literally. A profile that never spawns
+// a TTY-backed process simply never exercises this rule.
+//
+// The regex, not the (extension "com.apple.sandbox.pty") predicate Apple's
+// own shipped application.sb pairs with an equivalent (regex
+// "^/dev/ttys[0-9]*") file-read*/file-write* rule (grep
+// /System/Library/Sandbox/Profiles/application.sb): that extension token is
+// privately issued (com.apple.sandbox.pty is an Apple-internal sandbox
+// extension class) and unavailable to an unsigned, unentitled sandbox-exec
+// process like this one — this codebase cannot request or hold it. Empirical
+// verification (throwaway sandbox-exec probes against a real PTY slave and
+// this package's own real Compile output, not committed — mirroring the M1
+// spike's own empirical-SBPL-verification method): a plain, un-extension-
+// gated (allow file-ioctl (regex ...)) is syntactically valid under
+// unentitled sandbox-exec and is BOTH necessary (the denial reproduces
+// without it) AND sufficient (stty size succeeds end-to-end, including
+// reporting a real resized "30 120" through a genuinely resized PTY, with
+// it) — matching this file's own file-ioctl idiom elsewhere on this host
+// (e.g. /System/Library/Sandbox/Profiles/com.apple.diskimagesiod.sb's
+// (allow file-ioctl (regex #"/dev/r?disk.*")), also path-scoped with no
+// per-ioctl-command predicate).
+//
+// What this explicitly does NOT widen: no file-read*/file-write* grant
+// beyond what already worked (a disjoint SBPL operation category from
+// file-ioctl); no ioctl grant on /dev/ptmx or any device other than the
+// /dev/ttysNNN family (the child never opens ptmx itself, see above); no
+// change to any non-PTY spawn (dead rule for a profile whose executor is
+// never asked for TTY: true); no change to compileGuarantees' bitmask
+// (ReadBoundary/WriteBoundary accounting inspects policy.FS access only,
+// never this operation category).
+func compilePTYSlaveIoctl(b *strings.Builder, report *profile.CompileReport) {
+	b.WriteString(`(allow file-ioctl (regex #"` + ptySlaveIoctlRegex + `"))` + "\n")
+	report.Entries = append(report.Entries, profile.ReportEntry{
+		Feature: "pty-slave-ioctl", Status: "widened",
+		Detail: "allow-listed ioctl(2) on the /dev/ttysNNN PTY-slave device family so a confined TTY-backed spawn's controlling-terminal tools (e.g. stty) work; scoped to that one device family, no broader file-read/write grant, no non-PTY-spawn effect",
+	})
+}
+
 // compileSBPL generates the SBPL profile for a policy and returns it alongside
 // the compilation report, the achieved isolation level, and the guarantee
 // bitmask. It resolves ordinary configured paths so rules match the kernel's
@@ -93,6 +174,7 @@ func compileSBPL(p policy.Effective) (sbpl string, report profile.CompileReport,
 	var b strings.Builder
 	b.WriteString(baseSandboxPreamble)
 	compileXcrunCachePlumbing(&b, &report)
+	compilePTYSlaveIoctl(&b, &report)
 
 	compileFS(&b, &report, p.FS)
 	compileNet(&b, &report, p.Net)
