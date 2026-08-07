@@ -23,16 +23,16 @@ import (
 // tagged execution is deferred to Task 13's owning phase gate on a worker
 // with real grant backends, matching this plan's general policy.
 //
-// This doc comment originally claimed the test also runs for real on this
-// host's own Seatbelt backend on darwin (gated by requireSandboxExec exactly
-// like TestAcceptanceMatrixDarwin). That was true when this test was
-// written (Task 11), before Task 12C made every Darwin async Start() fail
-// closed with enforce.ErrLifetimeContainmentUnavailable (Darwin has no real
-// process-tree containment primitive yet, so this phase deliberately does
-// not claim Darwin async execution). Real end-to-end exercise of this test
-// is therefore Linux-only now; on darwin it skips as soon as Start reports
-// exactly that expected fail-closed error, rather than treating it as a
-// failure.
+// This test runs for real on this host's own Seatbelt backend on darwin too
+// (gated by requireSandboxExec exactly like TestAcceptanceMatrixDarwin).
+// Between Task 12C and the 2026-08-06 best-effort containment decision, every
+// Darwin async Start() failed closed with
+// enforce.ErrLifetimeContainmentUnavailable (Darwin had no process-tree
+// containment primitive at all), so this test was Linux-only in the
+// meantime; process_tree_darwin.go's attachSupervisedProof now attaches a
+// best-effort prover instead of rejecting, so the grant lifecycle below runs
+// end-to-end under real Seatbelt confinement on darwin exactly like it always
+// has on Linux.
 func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 	requireSandboxExec(t)
 
@@ -92,9 +92,6 @@ func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 
 	proc, err := prepared.Start(context.Background())
 	if err != nil {
-		if runtime.GOOS == "darwin" && errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Skipf("Start: %v (expected: darwin has no async lifetime-containment primitive yet, per Task 12C)", err)
-		}
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.Close(context.Background()) })

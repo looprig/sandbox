@@ -160,10 +160,29 @@ func setsidEscapeScript(marker, pidPath string) string {
 // backgrounded subshell) on top of setsidEscapeScript's session detach —
 // characterizing the double-fork idiom (fork, fork again, exit the
 // intermediate) rather than only a single setsid detach.
+//
+// The trailing `wait` (before the outer script's own `exit 0`) is
+// load-bearing, not decorative: without it, the pid-file write
+// (`echo $! > pidPath`) happens *inside* the backgrounded intermediate
+// subshell, racing the outer script's own near-instant exit — unlike
+// setsidEscapeScript, whose pid-file write runs synchronously in the OUTER
+// (foreground) shell before it exits. Once the outer process (this run's
+// Supervised spawn root) exits, the supervisor's teardown SIGKILLs the whole
+// process group essentially immediately (no grace delay); on a sufficiently
+// fast teardown (empirically, darwin's best-effort proof) that can reap the
+// intermediate before it schedules its own echo, so pidPath is never
+// written and the test times out waiting for it — a race in this script,
+// not a containment gap. `wait` (no args) blocks the outer shell on its one
+// background job — the intermediate subshell — which itself finishes almost
+// immediately after backgrounding the real (setsid-detached) grandchild and
+// writing pidPath, so this still exits fast (it does NOT wait out the
+// grandchild's own escapeGrandchildDelay sleep) while guaranteeing pidPath
+// exists before the outer process, and therefore the supervised spawn's
+// root, ever exits.
 func doubleForkEscapeScript(marker, pidPath string) string {
 	grandchild := "sleep " + strconv.Itoa(int(escapeGrandchildDelay.Seconds())) + "; printf 1 > " + portableShellQuote(marker)
 	return "( setsid sh -c " + portableShellQuote(grandchild) + " </dev/null >/dev/null 2>&1 & echo $! > " +
-		portableShellQuote(pidPath) + " ) & exit 0"
+		portableShellQuote(pidPath) + " ) & wait; exit 0"
 }
 
 // TestIntegrationProcessTreeSetsidEscape proves a grandchild that detaches
@@ -244,76 +263,56 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 	assertEscapeContained(t, marker, pidPath)
 }
 
-// TestIntegrationProcessTreeDarwinSetsidFailsClosed is Task 12c's Phase-Gate-3
-// selector. Unlike the three tests above — which exercise real containment on
-// whatever this host provides, and already skip themselves on Darwin via
-// startEscapeTarget's errors.Is(enforce.ErrLifetimeContainmentUnavailable)
-// check — this test asserts Darwin's fail-closed CONTRACT directly: a real
-// Executor (built through the production platform backend selector, exactly
-// like integrationEscapeExecutor's other callers) asked to run a command that
-// would, if it ever ran, setsid-detach a grandchild and write a delayed
-// marker (setsidEscapeScript) is instead rejected with
-// enforce.ErrLifetimeContainmentUnavailable before any process — target or
-// grandchild — is ever created. "Before any process is created" is proved two
-// ways: the call that fails returns no Process at all, and the delayed marker
-// together with the target's own pid file are polled for and never appear —
-// past escapeGrandchildDelay, so absence is unambiguous non-execution, not an
-// unfinished wait (mirrors assertEscapeContained's proof exactly).
-//
-// On this codebase's current architecture the rejection surfaces from
-// PreparedProcess.Start (newProcessTree -> attachSupervisedProof,
-// process_tree_darwin.go), not from PrepareProcess itself: PrepareProcess
-// only performs grant/resource reservation and never touches the process
-// tree. Both are "before spawn" (strictly before cmd.Start()'s syscall), so
-// this test accepts either call failing with the sentinel, exactly like
-// startEscapeTarget's own dual check above — but Start is what actually fails
-// on this codebase today, and is asserted to return no Process when it does.
-func TestIntegrationProcessTreeDarwinSetsidFailsClosed(t *testing.T) {
+// TestIntegrationProcessTreeDarwinSetsidEscapeContained is Task 6's
+// replacement for the deleted TestIntegrationProcessTreeDarwinSetsidFailsClosed:
+// the 2026-08-06 best-effort containment decision (process_tree_darwin.go's
+// attachSupervisedProof) stopped rejecting Darwin Supervised spawns and
+// instead attaches a best-effort process-tree teardown prover — the
+// proc-table-closure descendant tracker (process_descendants_darwin.go) —
+// alongside the plain process-group signal-and-poll every other platform
+// already had. This test proves that prover actually holds for real, under
+// real Seatbelt confinement: a setsid-detached grandchild (the exact escape
+// vector TestIntegrationProcessTreeSetsidEscape above already proves on every
+// platform this real-backend pattern reaches, darwin included since Task 4)
+// does not survive the supervised spawn's normal teardown, and the spawn
+// self-reports exactly the containment level it actually achieved
+// (LifetimeContainmentBestEffort) rather than silently claiming more. Kept as
+// an explicit darwin-gated test — rather than folded into the generic
+// TestIntegrationProcessTreeSetsidEscape above — so this specific contract
+// (self-reported best-effort, not kernel-enforced) stays independently named
+// and discoverable, exactly like the deleted fail-closed test it replaces
+// was.
+func TestIntegrationProcessTreeDarwinSetsidEscapeContained(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin-only fail-closed contract; see TestIntegrationProcessTree(SetsidEscape|DoubleFork|ParentDeath) for real containment proof on other platforms")
+		t.Skip("darwin-specific best-effort containment proof; see TestIntegrationProcessTree(SetsidEscape|DoubleFork|ParentDeath) above for the platform-neutral escape proof, which (since Task 4) also runs for real against darwin's own backend")
 	}
+	requireSetsidHelper(t)
 	set, executor, workspace := integrationEscapeExecutor(t)
 	defer func() { _ = set.Close() }()
 
-	marker := filepath.Join(workspace, "darwin-failclosed-marker")
-	pidPath := filepath.Join(workspace, "darwin-failclosed-pid")
-	script := setsidEscapeScript(marker, pidPath)
+	marker := filepath.Join(workspace, "darwin-escape-marker")
+	pidPath := filepath.Join(workspace, "darwin-escape-pid")
+	proc := startEscapeTarget(t, executor, workspace, setsidEscapeScript(marker, pidPath))
 
-	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
-		Directory: workspace, Command: script, ExecutionID: "darwin-failclosed",
-	})
-	switch {
-	case err != nil:
-		if !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("PrepareProcess failed with an unexpected error: %v, want enforce.ErrLifetimeContainmentUnavailable", err)
-		}
-	default:
-		defer func() { _ = prepared.Close() }()
-		proc, startErr := prepared.Start(context.Background())
-		if startErr == nil {
-			// Defensive only: if a future change makes Start succeed without a
-			// real containment primitive, do not leak the process this test
-			// never expected to exist.
-			_ = proc.Signal(context.Background(), ProcessSignalKill)
-			_, _ = proc.Wait(context.Background())
-			t.Fatal("Start unexpectedly succeeded on darwin; want enforce.ErrLifetimeContainmentUnavailable before any spawn")
-		}
-		if !errors.Is(startErr, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("Start error = %v, want it to wrap enforce.ErrLifetimeContainmentUnavailable", startErr)
-		}
-		if proc != nil {
-			t.Fatalf("Start returned a non-nil Process alongside a fail-closed error: %v", proc)
-		}
+	// The self-reported contract: darwin has no kernel-enforced tree
+	// teardown, so this spawn must honestly report BestEffort, never
+	// Enforced (which would misreport a guarantee darwin cannot make; see
+	// LifetimeContainment, lifetime_containment.go) and never Unspecified
+	// (which would misreport that no containment attempt was even made).
+	if got := proc.LifetimeContainment(); got != LifetimeContainmentBestEffort {
+		t.Fatalf("LifetimeContainment() = %v, want LifetimeContainmentBestEffort (darwin's best-effort descendant-tracker prover)", got)
 	}
 
-	// The core proof: the spawn was rejected before cmd.Start ever ran, so
-	// neither the immediate target (pidPath) nor its would-be setsid-detached
-	// grandchild (marker) ever executed.
-	time.Sleep(escapeObservationWindow)
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("delayed marker exists even though the spawn was rejected before it started: stat err = %v", statErr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := proc.Wait(ctx); err != nil {
+		t.Fatalf("Wait (immediate child): %v", err)
 	}
-	if _, statErr := os.Stat(pidPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("target pid file exists even though the spawn was rejected before it started: stat err = %v", statErr)
-	}
+	waitForPath(t, pidPath)
+	// The core proof: after the supervised spawn's own teardown, the
+	// setsid-detached grandchild the descendant tracker is specifically
+	// responsible for discovering (it left the process group, so the plain
+	// group SIGKILL alone cannot reach it) is gone too — same proof
+	// assertEscapeContained already performs for the platform-neutral tests.
+	assertEscapeContained(t, marker, pidPath)
 }

@@ -5,9 +5,6 @@ package exec
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -20,18 +17,20 @@ import (
 // process_parent_death_integration_unix_test.go's own real-backend pattern
 // (no withBackend test seam — NewExecutorSet selects whatever this host's
 // production platform.Backend actually provides): a live end-to-end PTY
-// lifecycle on Linux (TestIntegrationProcessPTYLifecycle), and Darwin's
-// SEPARATE fail-closed contract for a REAL Seatbelt-confined PTY spawn
-// (TestIntegrationProcessPTYDarwinLifetimeUnavailable) — proving Darwin
-// rejects strictly before any PTY device is allocated or child process is
-// spawned, exactly like process_parent_death_integration_unix_test.go's own
-// TestIntegrationProcessTreeDarwinSetsidFailsClosed already proves for the
-// pipe-backed path. This file deliberately carries no darwin||linux build
-// restriction (unlike those two _unix_test.go files) — see PHASE GATE 5's
-// command matrix, which discovers this file's tests with a plain `-tags
-// integration -list` on every OS — so both tests below gate themselves on
-// runtime.GOOS internally instead, and build a fresh local executor helper
-// rather than depending on the unix-only helpers those other files declare.
+// lifecycle, TestIntegrationProcessPTYLifecycle, exercised for real on both
+// Linux and Darwin. Darwin previously (Task 12c) rejected every Supervised
+// spawn — including this one — with enforce.ErrLifetimeContainmentUnavailable
+// strictly before any PTY device was allocated; the 2026-08-06 best-effort
+// containment decision (process_tree_darwin.go's attachSupervisedProof,
+// LifetimeContainmentBestEffort) replaced that rejection, so this test's own
+// enforce.ErrLifetimeContainmentUnavailable skip branches below now stay live
+// only for the case that sentinel still legitimately covers — Linux Rung 2
+// with no delegated cgroup v2 ancestor — and are never hit on darwin. This
+// file deliberately carries no darwin||linux build restriction (unlike those
+// two _unix_test.go files) — see PHASE GATE 5's command matrix, which
+// discovers this file's tests with a plain `-tags integration -list` on
+// every OS — so it builds a fresh local executor helper rather than
+// depending on the unix-only helpers those other files declare.
 //
 // Tagged execution is deferred to Phase Gate 5's approved Linux and Darwin
 // workers; this codebase's own execution rules do not require running it
@@ -68,19 +67,23 @@ func integrationTerminalExecutor(t *testing.T, name string) (*ExecutorSet, *Exec
 	return set, executor, workspace
 }
 
-// TestIntegrationProcessPTYLifecycle is Task 21's exact live Linux test: a
-// real end-to-end PTY-backed process — real interactive echo, a real resize,
-// and a real EOF-driven exit — through the production PrepareProcess/Start
-// path on whatever containment this host's real Linux backend actually
-// provides (Rung 1's PID namespace, or Rung 2 with a delegated cgroup v2
-// scope; Rung 2 with neither fails closed with
-// enforce.ErrLifetimeContainmentUnavailable exactly like the pipe-backed
-// path already does — that is this host's own documented fail-closed
-// contract, not a defect this test reports).
+// TestIntegrationProcessPTYLifecycle is Task 21's live PTY test, now
+// exercised for real on every platform this file's own real-backend pattern
+// reaches: a real end-to-end PTY-backed process — real interactive echo, a
+// real resize, and a real EOF-driven exit — through the production
+// PrepareProcess/Start path on whatever containment this host's real backend
+// actually provides. On Linux that is Rung 1's PID namespace or Rung 2 with a
+// delegated cgroup v2 scope; Rung 2 with neither still fails closed with
+// enforce.ErrLifetimeContainmentUnavailable exactly like the pipe-backed path
+// already does (this host's own documented fail-closed contract, not a
+// defect this test reports). On Darwin, PrepareProcess/Start now attach the
+// best-effort process-tree teardown prover instead
+// (LifetimeContainmentBestEffort; see process_tree_darwin.go) and never
+// return that sentinel for a real Seatbelt-confined spawn, so this test runs
+// the exact same live PTY lifecycle there too — a real Seatbelt denial
+// surfacing here (e.g. /dev/ptmx access) would be a genuine SBPL profile
+// gap, not something this test papers over with a skip.
 func TestIntegrationProcessPTYLifecycle(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("this is the exact live Linux PTY lifecycle test; see TestIntegrationProcessPTYDarwinLifetimeUnavailable for Darwin's own contract")
-	}
 	set, executor, workspace := integrationTerminalExecutor(t, "pty-lifecycle")
 	defer func() { _ = set.Close() }()
 
@@ -133,66 +136,5 @@ func TestIntegrationProcessPTYLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(string(collected), "30 120") {
 		t.Fatalf("`stty size` output = %q, want it to contain the resized \"30 120\"", string(collected))
-	}
-}
-
-// TestIntegrationProcessPTYDarwinLifetimeUnavailable proves Darwin's
-// fail-closed CONTRACT directly for a REAL Seatbelt-confined PTY request: a
-// real Executor (built through the production platform backend selector,
-// exactly like integrationTerminalExecutor's other callers) asked to
-// PrepareProcess/Start a TTY-backed spawn is rejected with
-// enforce.ErrLifetimeContainmentUnavailable before any PTY device is
-// allocated and before any process — target or otherwise — is ever created.
-// "Before any process is created" is proved by a marker file the target
-// command would write if it ever ran, polled for and never found; "before
-// any PTY device is allocated" follows structurally from this codebase's own
-// ordering (startConfinedTTY, process.go, calls openProcessTerminal only
-// after e.processTree has already succeeded — see that method's own doc
-// comment), not from anything this test can observe as a side effect
-// directly, exactly like process_parent_death_integration_unix_test.go's
-// TestIntegrationProcessTreeDarwinSetsidFailsClosed already reasons for the
-// pipe-backed path.
-func TestIntegrationProcessPTYDarwinLifetimeUnavailable(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin-only fail-closed contract; see TestIntegrationProcessPTYLifecycle for real PTY execution on Linux")
-	}
-	set, executor, workspace := integrationTerminalExecutor(t, "pty-darwin-failclosed")
-	defer func() { _ = set.Close() }()
-
-	marker := filepath.Join(workspace, "darwin-pty-failclosed-marker")
-	command := portableWriteCommand(marker, "spawned")
-
-	prepared, err := executor.PrepareProcess(context.Background(), ProcessOptions{
-		Directory: workspace, Command: command, ExecutionID: "pty-darwin-failclosed", TTY: true,
-	})
-	switch {
-	case err != nil:
-		if !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("PrepareProcess failed with an unexpected error: %v, want enforce.ErrLifetimeContainmentUnavailable", err)
-		}
-	default:
-		defer func() { _ = prepared.Close() }()
-		proc, startErr := prepared.Start(context.Background())
-		if startErr == nil {
-			// Defensive only: if a future change makes Start succeed without a
-			// real containment primitive, do not leak the process this test
-			// never expected to exist.
-			_ = proc.Signal(context.Background(), ProcessSignalKill)
-			_, _ = proc.Wait(context.Background())
-			t.Fatal("Start unexpectedly succeeded on darwin; want enforce.ErrLifetimeContainmentUnavailable before any spawn")
-		}
-		if !errors.Is(startErr, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("Start error = %v, want it to wrap enforce.ErrLifetimeContainmentUnavailable", startErr)
-		}
-		if proc != nil {
-			t.Fatalf("Start returned a non-nil Process alongside a fail-closed error: %v", proc)
-		}
-	}
-
-	// The core proof: the spawn was rejected before cmd.Start ever ran, so
-	// the target never executed and never wrote its marker.
-	time.Sleep(2 * time.Second)
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("marker exists even though the PTY spawn was rejected before it started: stat err = %v", statErr)
 	}
 }
