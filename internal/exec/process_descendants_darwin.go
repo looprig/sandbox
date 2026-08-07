@@ -18,19 +18,22 @@ const (
 	// wakeIdent is the EVFILT_USER identity used to unblock the kevent loop
 	// on close. Any constant works; it only has to be stable within one kq.
 	wakeIdent = 1
+	// launchdPID is pid 1 on darwin, the universal reparent target — see the
+	// pid-1 guard in sample() below.
+	launchdPID int32 = 1
 )
 
-// descendantForkNoteSupported records whether this kernel accepts
-// EVFILT_PROC NOTE_FORK registration, probed once per process the first time
-// a tracker is created. Empirically verified 2026-08-06 on macOS 26.5.2
-// (arm64): registering NOTE_FORK|NOTE_EXIT on a live child succeeds (err ==
-// nil), so newDescendantTracker optimistically starts every tracker with
-// forkNote true — matching "if err is nil: proceed as designed" from the
-// probe that motivated this mechanism. watch's own ENOTSUP handling still
-// degrades a given tracker to NOTE_EXIT-only permanently if a real
-// registration ever fails with ENOTSUP (e.g. a future kernel, or a sandboxed
-// context that rejects it), so this initial value is only a starting point,
-// not a permanent assumption.
+// descendantForkNoteSupported is the starting assumption for every new
+// tracker's forkNote field, based on a one-time empirical check during
+// development (macOS 26.5.2 arm64, see the plan doc's Step 0): registering
+// EVFILT_PROC NOTE_FORK|NOTE_EXIT on a live child returned a nil error, so
+// trackers default to requesting NOTE_FORK acceleration. This is NOT
+// re-verified at runtime and NOT shared state across trackers — it is a
+// hardcoded starting value read once by newDescendantTracker. If the
+// assumption is wrong on some other host/kernel, each tracker independently
+// discovers ENOTSUP via its own first watch() call and degrades its own
+// forkNote field to false permanently (see watch's ENOTSUP handling); that
+// per-tracker discovery never writes back to this package variable.
 var descendantForkNoteSupported = true
 
 // descendantMember is one tracked process: pid plus the start-time identity
@@ -91,6 +94,7 @@ type descendantTracker struct {
 	loops    sync.WaitGroup
 	rootPID  int32
 	forkNote bool // NOTE_FORK accepted by this kernel (degrades if not)
+	armed    bool // arm() already called — see arm's single-call contract
 }
 
 func newDescendantTracker() (*descendantTracker, error) {
@@ -120,11 +124,25 @@ func newDescendantTracker() (*descendantTracker, error) {
 }
 
 // arm begins tracking pid (which must already exist — call after cmd.Start())
-// and starts the sampler and kevent loops.
+// and starts the sampler and kevent loops. arm may be called at most once
+// per tracker: a second call would start a second runKevents/runSampler
+// goroutine pair sharing the same kq, and since a kqueue only delivers a
+// given ready event to one blocked Kevent() caller, close()'s single
+// NOTE_TRIGGER wake would then unblock only one of the two concurrent
+// runKevents goroutines — the other parks forever and close()'s loops.Wait()
+// deadlocks. Call arm again on an already-armed tracker and it returns an
+// error instead of starting a second pair.
 func (tracker *descendantTracker) arm(pid int) error {
 	if tracker == nil {
 		return errors.New("sandbox: nil descendant tracker")
 	}
+	tracker.mu.Lock()
+	if tracker.armed {
+		tracker.mu.Unlock()
+		return errors.New("sandbox: descendant tracker already armed")
+	}
+	tracker.armed = true
+	tracker.mu.Unlock()
 	tracker.rootPID = int32(pid)
 	if start, ok := processStartTime(int32(pid)); ok {
 		tracker.mu.Lock()
@@ -241,17 +259,18 @@ func (tracker *descendantTracker) sample() {
 				continue
 			}
 			ppid, pgid := procs[i].Eproc.Ppid, procs[i].Eproc.Pgid
-			// launchd (pid 1) is the universal reparent target on darwin:
-			// once a member's own parent dies, its ppid becomes 1 — the
-			// tracker's doc comment already accounts for this ("the
-			// ancestry link that let us find it is gone"). It must never
-			// itself act as a closure anchor, or any process whose ppid or
-			// pgid is 1 (i.e. nearly every daemon on the system) would be
-			// wrongly recruited into this run's tracked set — catastrophic
-			// if pid 1 is ever a member (which legitimate discovery never
-			// produces, but a test's injectMemberForTest seam can).
-			parentKnown := ppid != 1 && setHas(memberPIDs, ppid)
-			groupKnown := pgid != 1 && setHas(memberPIDs, pgid)
+			// launchd (launchdPID) is the universal reparent target on
+			// darwin: once a member's own parent dies, its ppid becomes
+			// launchdPID — the tracker's doc comment already accounts for
+			// this ("the ancestry link that let us find it is gone"). It
+			// must never itself act as a closure anchor, or any process
+			// whose ppid or pgid is launchdPID (i.e. nearly every daemon on
+			// the system) would be wrongly recruited into this run's
+			// tracked set — catastrophic if launchdPID is ever a member
+			// (which legitimate discovery never produces, but a test's
+			// injectMemberForTest seam can).
+			parentKnown := ppid != launchdPID && setHas(memberPIDs, ppid)
+			groupKnown := pgid != launchdPID && setHas(memberPIDs, pgid)
 			if parentKnown || groupKnown {
 				memberPIDs[pid] = struct{}{}
 				added = append(added, pid)
