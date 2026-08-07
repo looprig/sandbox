@@ -49,6 +49,30 @@ func TestCompileSBPLXcrunCachePlumbing(t *testing.T) {
 	sandboxExecParses(t, profile)
 }
 
+// TestCompileSBPLPTYSlaveIoctl asserts every profile carries the fixed
+// PTY-slave ioctl allow (compilePTYSlaveIoctl) scoped to exactly the
+// /dev/ttysNNN device family, reports it via CompileReport for honesty, and
+// that the resulting profile still parses under the real SBPL compiler. This
+// is the fast unit-level pin for the rule that unblocks `stty size` and
+// other controlling-terminal ioctls under real Seatbelt confinement
+// (TestIntegrationProcessPTYLifecycle, internal/exec — the heavier
+// -tags integration real-sandbox-exec path) — this test exists so an
+// accidental broadening (e.g. a loosened regex) or accidental deletion of
+// this security-relevant rule is caught at the fast unit-test tier too, not
+// only by the integration suite.
+func TestCompileSBPLPTYSlaveIoctl(t *testing.T) {
+	t.Setenv("HOME", "/lrsbx-home/tester")
+	profile, report, _, _ := compileSBPL(backendFixturePolicy(fixtureWorkspaceWrite, "/ws"))
+	want := `(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))`
+	if !strings.Contains(profile, want) {
+		t.Errorf("profile missing PTY-slave ioctl allow %q:\n%s", want, profile)
+	}
+	if !hasReport(report, "pty-slave-ioctl", "widened") {
+		t.Errorf("report missing pty-slave-ioctl/widened entry: %+v", report.Entries)
+	}
+	sandboxExecParses(t, profile)
+}
+
 // TestCompileSBPLSecretDenyAfterBroadRead asserts the last-match-wins ordering:
 // the §5.3 secret deny for ~/.ssh is emitted AFTER the broad file-read* allow, so
 // the deny overrides the allow under SBPL's last-match-wins precedence.
