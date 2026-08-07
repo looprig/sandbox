@@ -1,5 +1,7 @@
 package exec
 
+import "fmt"
+
 // LifetimeContainment reports which process-tree teardown contract a
 // Supervised spawn actually received — achieved enforcement, not requested
 // policy (the same honesty rule as profile.Guarantees).
@@ -24,14 +26,21 @@ const (
 	LifetimeContainmentBestEffort
 )
 
+// String never panics. An unrecognized value (out-of-range constructions
+// are possible since LifetimeContainment is a public alias,
+// sandbox.LifetimeContainment) reports as LifetimeContainment(N) rather
+// than silently aliasing to a real member's string, so it surfaces as
+// visibly wrong instead of misreporting a containment contract.
 func (c LifetimeContainment) String() string {
 	switch c {
+	case LifetimeContainmentUnspecified:
+		return "unspecified"
 	case LifetimeContainmentEnforced:
 		return "enforced"
 	case LifetimeContainmentBestEffort:
 		return "best-effort"
 	default:
-		return "unspecified"
+		return fmt.Sprintf("LifetimeContainment(%d)", uint8(c))
 	}
 }
 
