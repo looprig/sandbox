@@ -3,7 +3,6 @@
 package exec
 
 import (
-	"errors"
 	"os/exec"
 	"testing"
 
@@ -11,54 +10,64 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 )
 
-// TestDarwinLifetimeCapabilityFailsClosed is Task 12c's queued phase-gate
-// selector test: it proves the Darwin fail-closed CONTAINMENT DECISION itself
-// — a Supervised spawn compiled through the real Seatbelt backend
-// (darwin.NewBackend()) is rejected with
-// enforce.ErrLifetimeContainmentUnavailable before any OS process is ever
-// created, a Supervised spawn NOT claiming real Seatbelt confinement (a nil
-// backend, or a test double pinned through withBackend, exactly like
-// enforce.NewNull()'s Unconfined path) is completely unaffected, and a
-// non-Supervised (synchronous RunCommand/RunArgv) spawn is unaffected
-// regardless of backend — mirroring process_tree_linux_test.go's
+// TestDarwinLifetimeCapabilityBestEffort is Task 4's queued phase-gate
+// selector test: it proves the Darwin BEST-EFFORT CONTAINMENT DECISION — a
+// Supervised spawn compiled through the real Seatbelt backend
+// (darwin.NewBackend()) gets a best-effort zeroProver attached (process-group
+// SIGKILL-and-poll plus proc-table-closure descendant tracking via
+// descendantTracker, process_descendants_darwin.go) rather than being
+// rejected outright, a Supervised spawn NOT claiming real Seatbelt
+// confinement (a nil backend, or a test double pinned through withBackend,
+// exactly like enforce.NewNull()'s Unconfined path) is completely
+// unaffected, and a non-Supervised (synchronous RunCommand/RunArgv) spawn is
+// unaffected regardless of backend — mirroring process_tree_linux_test.go's
 // TestProcessTreeLinuxContainmentPlan. It exercises attachSupervisedProof and
 // newProcessTree directly (the exact functions a Supervised spawn's
 // process.go/startConfined path calls) so the contract can be asserted
 // without spawning a real process or depending on the integration-tagged
 // escape proof in process_parent_death_integration_unix_test.go.
-func TestDarwinLifetimeCapabilityFailsClosed(t *testing.T) {
-	t.Run("a Supervised spawn through the real Seatbelt backend rejects unconditionally, attaching no proof", func(t *testing.T) {
+func TestDarwinLifetimeCapabilityBestEffort(t *testing.T) {
+	t.Run("a Supervised spawn through the real Seatbelt backend attaches a best-effort proof, no error", func(t *testing.T) {
 		cmd := exec.Command("true")
 		proof, err := attachSupervisedProof(cmd, processTreeOptions{Supervised: true, Backend: darwin.NewBackend()})
-		if err == nil {
-			t.Fatal("attachSupervisedProof succeeded on darwin; want a fail-closed error (no containment primitive exists yet)")
+		if err != nil {
+			t.Fatalf("attachSupervisedProof = %v, want nil error: darwin's best-effort prover always attaches", err)
 		}
-		if proof != nil {
-			t.Fatalf("attachSupervisedProof returned a non-nil proof alongside an error: %v", proof)
+		if proof == nil {
+			t.Fatal("attachSupervisedProof returned a nil proof for the real Seatbelt backend; want a best-effort prover")
 		}
-		if !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Errorf("error = %v, want it to wrap enforce.ErrLifetimeContainmentUnavailable", err)
+		reporter, ok := proof.(lifetimeReporter)
+		if !ok {
+			t.Fatal("darwin proof must implement lifetimeReporter")
+		}
+		if got := reporter.lifetimeContainment(); got != LifetimeContainmentBestEffort {
+			t.Fatalf("lifetimeContainment() = %v, want LifetimeContainmentBestEffort", got)
+		}
+		if _, ok := proof.(pidArmer); !ok {
+			t.Fatal("darwin proof must implement pidArmer, armed post-Start by processTree.start")
 		}
 		if cmd.Process != nil {
 			t.Fatal("attachSupervisedProof must never itself spawn a process")
 		}
+		proof.close()
 	})
 
-	t.Run("newProcessTree propagates the rejection before cmd.Start is ever reached", func(t *testing.T) {
+	t.Run("newProcessTree attaches the best-effort proof, never rejecting, before cmd.Start is ever reached", func(t *testing.T) {
 		cmd := exec.Command("true")
 		tree, err := newProcessTree(cmd, processTreeOptions{Supervised: true, Backend: darwin.NewBackend()})
-		if !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
-			t.Fatalf("newProcessTree error = %v, want it to wrap enforce.ErrLifetimeContainmentUnavailable", err)
+		if err != nil {
+			t.Fatalf("newProcessTree error = %v, want nil: darwin's best-effort prover never fails closed", err)
 		}
-		if tree != nil {
-			t.Fatalf("newProcessTree returned a non-nil tree alongside a fail-closed error: %v", tree)
+		if tree == nil {
+			t.Fatal("newProcessTree returned a nil tree alongside a nil error")
 		}
-		// newProcessTree only ever wires cmd.Cancel / SysProcAttr.Setpgid ahead
-		// of the containment decision; it never calls cmd.Start. Process being
-		// nil is the direct proof no child was created by this call.
+		if tree.proof == nil {
+			t.Fatal("newProcessTree did not attach a containment proof for the real Seatbelt backend")
+		}
 		if cmd.Process != nil {
-			t.Fatal("a rejected containment plan must never result in a spawned process")
+			t.Fatal("newProcessTree must never itself spawn a process")
 		}
+		tree.close()
 	})
 
 	t.Run("a Supervised spawn NOT claiming real Seatbelt confinement is unaffected", func(t *testing.T) {
@@ -87,7 +96,7 @@ func TestDarwinLifetimeCapabilityFailsClosed(t *testing.T) {
 		cmd := exec.Command("true")
 		tree, err := newProcessTree(cmd, processTreeOptions{Supervised: false, Backend: darwin.NewBackend()})
 		if err != nil {
-			t.Fatalf("newProcessTree (non-Supervised) = %v, want nil: Task 12c does not touch the synchronous path", err)
+			t.Fatalf("newProcessTree (non-Supervised) = %v, want nil: Task 4 does not touch the synchronous path", err)
 		}
 		if tree == nil {
 			t.Fatal("newProcessTree (non-Supervised) returned a nil tree")
@@ -96,4 +105,48 @@ func TestDarwinLifetimeCapabilityFailsClosed(t *testing.T) {
 			t.Fatal("a non-Supervised process tree unexpectedly carries a containment proof")
 		}
 	})
+}
+
+// TestAttachSupervisedProofSeatbeltBestEffort is the plan's own illustrative
+// test: a focused, single-assertion-block check that attachSupervisedProof's
+// real-Seatbelt-backend result is armable and self-reports best-effort
+// containment. TestDarwinLifetimeCapabilityBestEffort above covers the same
+// ground as part of its broader scoping table; this stands alone so the
+// exact contract can be run in isolation (see this file's package doc-level
+// Step 2 verification command).
+func TestAttachSupervisedProofSeatbeltBestEffort(t *testing.T) {
+	cmd := exec.Command("/usr/bin/true")
+	proof, err := attachSupervisedProof(cmd, processTreeOptions{
+		Supervised: true,
+		Backend:    darwin.NewBackend(),
+	})
+	if err != nil {
+		t.Fatalf("attachSupervisedProof: %v", err)
+	}
+	if proof == nil {
+		t.Fatal("expected a best-effort prover, got nil")
+	}
+	reporter, ok := proof.(lifetimeReporter)
+	if !ok || reporter.lifetimeContainment() != LifetimeContainmentBestEffort {
+		t.Fatal("prover must report best-effort containment")
+	}
+	if _, ok := proof.(pidArmer); !ok {
+		t.Fatal("prover must be armable post-Start")
+	}
+	proof.close()
+}
+
+// TestProcessTreeLifetimeDelegation proves processTree.lifetimeContainment's
+// platform-neutral delegation semantics (process_tree_unix.go): a proofless
+// tree — the zero value, standing in for any non-Supervised spawn or a
+// Supervised spawn on a platform/backend with no proof attached — answers
+// Unspecified. This lives in the darwin-tagged test file (process_tree_unix.go
+// itself, and the method under test, build on darwin || linux) per the plan's
+// own note that a darwin file is fine for this platform-neutral case.
+func TestProcessTreeLifetimeDelegation(t *testing.T) {
+	// nil proof → Unspecified; reporter proof → its answer.
+	tree := &processTree{}
+	if got := tree.lifetimeContainment(); got != LifetimeContainmentUnspecified {
+		t.Fatalf("nil-proof tree = %v, want unspecified", got)
+	}
 }

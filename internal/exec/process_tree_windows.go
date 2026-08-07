@@ -546,6 +546,18 @@ func (tree *processTree) close() {
 	}
 }
 
+// lifetimeContainment: a Windows supervised spawn lives in a Job with
+// kill-on-close (newProcessTree above always creates one, and start always
+// assigns the child to it before resuming — see start's own setup-failure
+// handling, which terminates rather than ever leaving a resumed process
+// unassigned); teardown is therefore kernel-enforced unconditionally for
+// every *processTree this type produces, so this never needs to
+// distinguish an assigned/unassigned case the way tree.assigned's other
+// uses do.
+func (tree *processTree) lifetimeContainment() LifetimeContainment {
+	return LifetimeContainmentEnforced
+}
+
 // sendInterrupt requests cooperative interruption by delivering a
 // CTRL_BREAK_EVENT console control event to this run's own process group —
 // the closest cooperative-interrupt primitive Windows actually offers.

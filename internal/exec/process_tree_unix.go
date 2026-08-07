@@ -71,7 +71,29 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 		return err
 	}
 	tree.pgid = cmd.Process.Pid
+	if armer, ok := tree.proof.(pidArmer); ok {
+		// Arm failure only widens the best-effort gap; the spawn is already
+		// running and group teardown still applies (the prover's own
+		// tracker-nil fallback, process_tree_darwin.go).
+		_ = armer.armPID(cmd.Process.Pid)
+	}
 	return nil
+}
+
+// lifetimeContainment surfaces the spawn's teardown contract: the proof's
+// own answer when it has one (lifetimeReporter), Enforced for any other
+// non-nil proof (the Linux namespace/cgroup provers are kernel-enforced by
+// construction and don't bother implementing lifetimeReporter themselves),
+// and Unspecified for a proofless tree (Unconfined/null/test backends — the
+// escapable group sweep makes no containment claim).
+func (tree *processTree) lifetimeContainment() LifetimeContainment {
+	if tree == nil || tree.proof == nil {
+		return LifetimeContainmentUnspecified
+	}
+	if reporter, ok := tree.proof.(lifetimeReporter); ok {
+		return reporter.lifetimeContainment()
+	}
+	return LifetimeContainmentEnforced
 }
 
 // terminate delivers SIGKILL to this run's whole process group. It is the
