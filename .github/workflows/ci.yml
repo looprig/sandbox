@@ -179,10 +179,16 @@ jobs:
             -run 'Disposable|RestrictedBrokerEscape|WindowsRestricted|WindowsPath|ACLProjection|ProcessTreeWindows')
           $lines | ForEach-Object { Write-Output $_ }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $skips = @($lines | ForEach-Object {
-            try { $_ | ConvertFrom-Json } catch { $null }
-          } | Where-Object {
-            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          $events = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+          $outputByTest = @{}
+          foreach ($e in $events) {
+            if ($e.Action -eq 'output' -and $e.Test) {
+              $key = "$($e.Package)::$($e.Test)"
+              $outputByTest[$key] = [string]$outputByTest[$key] + $e.Output
+            }
+          }
+          $skips = @($events | Where-Object {
+            $_.Action -eq 'skip' -and [string]$outputByTest["$($_.Package)::$($_.Test)"] -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
           })
           if ($skips.Count -ne 0) {
             $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
@@ -291,10 +297,16 @@ jobs:
             -run '^(TestElevatedDisposableAcceptance|TestSetupIntegration|TestRecoveryIntegration|TestProcessTreeWindows)')
           $lines | ForEach-Object { Write-Output $_ }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $skips = @($lines | ForEach-Object {
-            try { $_ | ConvertFrom-Json } catch { $null }
-          } | Where-Object {
-            $_.Action -eq 'skip' -and $_.Output -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
+          $events = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } | Where-Object { $_ })
+          $outputByTest = @{}
+          foreach ($e in $events) {
+            if ($e.Action -eq 'output' -and $e.Test) {
+              $key = "$($e.Package)::$($e.Test)"
+              $outputByTest[$key] = [string]$outputByTest[$key] + $e.Output
+            }
+          }
+          $skips = @($events | Where-Object {
+            $_.Action -eq 'skip' -and [string]$outputByTest["$($_.Package)::$($_.Test)"] -notmatch 'ALLOWED_WINDOWS_LIMITATION:'
           })
           if ($skips.Count -ne 0) {
             $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
