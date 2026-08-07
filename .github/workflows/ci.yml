@@ -41,11 +41,18 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: go test -race (seatbelt)
         run: go test -race -count=1 ./...
-      # Darwin does not claim async pipe-process support (Task 12c): this is
-      # ONLY the pre-spawn fail-closed contract proof, never a live async
-      # lifecycle selector.
-      - name: go test -tags integration -race (Darwin async pre-spawn fail-closed contract)
-        run: go test -tags integration -race -count=1 ./internal/exec -run '^TestIntegrationProcessTreeDarwinSetsidFailsClosed$'
+      # Darwin's Seatbelt backend no longer rejects async Supervised spawns
+      # pre-spawn (the 2026-08-06 best-effort acceptance decision superseded
+      # Task 12c's fail-closed contract; see docs/lifetime-containment.md).
+      # TestIntegrationProcessPTYLifecycle proves a real Seatbelt-confined
+      # async PTY spawn now runs end-to-end instead of being rejected before
+      # it starts; TestIntegrationProcessTreeDarwinSetsidEscapeContained
+      # proves the best-effort descendant tracker actually catches a
+      # setsid-detached grandchild under real confinement (it self-skips,
+      # rather than approximating the proof, on a runner image with no
+      # setsid binary).
+      - name: go test -tags integration -race (Darwin async best-effort lifetime containment)
+        run: go test -tags integration -race -count=1 ./internal/exec -run 'TestIntegrationProcessTreeDarwinSetsidEscapeContained|TestIntegrationProcessPTYLifecycle'
 
   # Linux RUNG 2: the default GitHub runner (or any host where unprivileged
   # userns is unavailable) exercises the Landlock + seccomp + TCP-port path.

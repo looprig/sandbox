@@ -9,17 +9,22 @@ package sandbox
 // load-bearing dispatch (init_linux.go) needs no consumer change.
 //
 // This no-op says nothing about a platform's asynchronous/long-running command
-// SUPERVISION capability, which is a separate contract entirely and differs
-// between the two platforms this file covers. On Darwin, internal/exec's
-// PreparedProcess.Start runs every Supervised (async, pipe-backed) spawn:
-// macOS has no kernel-enforced process-tree containment primitive available
-// to an unentitled process, so the spawn instead receives a best-effort
-// teardown prover (process-group SIGKILL plus process-table-closure
-// descendant tracking), with the downgrade from a kernel-enforced proof
-// reported per spawn through exec.LifetimeContainment (see
-// docs/lifetime-containment.md); Seatbelt access confinement itself is
-// unaffected. On every other non-Linux platform this file covers, Supervised
-// spawn support depends on whatever that platform's own backend wires (e.g.
-// Windows's Job-based kernel-enforced containment, internal/windows). A
-// caller must not read Init's no-op as saying anything about either.
+// SUPERVISION capability, which is a separate contract entirely and is not
+// uniform across the platforms this file covers (everything except Linux —
+// not just darwin and windows, but any other GOOS this module builds for).
+// On Darwin, internal/exec's PreparedProcess.Start runs every Supervised
+// (async, pipe-backed) spawn: macOS has no kernel-enforced process-tree
+// containment primitive available to an unentitled process, so the spawn
+// instead receives a best-effort teardown prover (process-group SIGKILL plus
+// process-table-closure descendant tracking), with the downgrade from a
+// kernel-enforced proof reported per spawn through exec.LifetimeContainment
+// (see docs/lifetime-containment.md); Seatbelt access confinement itself is
+// unaffected. On Windows, Supervised spawn support is real and
+// kernel-enforced through its own backend (internal/windows's Job-based
+// containment). On every other GOOS this file covers — anything that is
+// neither darwin, linux, nor windows — internal/exec has no process-tree
+// primitive at all (process_tree_other.go's newProcessTree unconditionally
+// returns enforce.ErrUnavailable): no spawn, Supervised or otherwise,
+// succeeds there. A caller must not read Init's no-op as saying anything
+// about any of the three.
 func Init() {}
