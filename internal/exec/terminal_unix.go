@@ -55,8 +55,9 @@ const ttySupported = true
 //
 // This never opens a PTY device: only openProcessTerminal does that, and
 // only after e.processTree has already succeeded — see startConfinedTTY's
-// own doc comment (process.go) for why that ordering is load-bearing on
-// Darwin.
+// own doc comment (process.go) for why that ordering matters (no PTY device
+// is ever allocated on a platform/backend combination that cannot supervise
+// the spawn).
 func prepareTerminalSysProcAttr(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -76,9 +77,12 @@ var openPTY = pty.Open
 // shape, and matching Ctty: 0's assumption above that fd 0 is the slave). It
 // is called by startConfinedTTY (process.go) only after e.processTree has
 // already succeeded, so a platform/backend combination that cannot supervise
-// the spawn (Darwin's Seatbelt fail-closed contract, process_tree_darwin.go)
-// rejects before this function — and therefore before any PTY device or
-// child process — is ever reached.
+// the spawn (today: Linux Rung 2 with no delegated cgroup v2 ancestor,
+// enforce.ErrLifetimeContainmentUnavailable) rejects before this function —
+// and therefore before any PTY device or child process — is ever reached.
+// Darwin's real Seatbelt backend never rejects here: e.processTree attaches
+// a best-effort teardown prover instead (process_tree_darwin.go), so this
+// function is always reached for a real Seatbelt-confined PTY spawn.
 //
 // The returned closeSlave drops only the PARENT's own reference to the
 // slave; startConfinedTTY calls it right after cmd.Start succeeds (mirroring

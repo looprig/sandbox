@@ -922,18 +922,22 @@ func openConfinedTerminal(cmd *exec.Cmd, tree processTreeBoundary) (processTermi
 // startConfinedTTY is startConfined's PTY branch: reached only when
 // p.options.TTY is true, and only after e.processTree (called by
 // startConfined just before this method) has already succeeded. The
-// mandatory Supervised containment proof (Task 12b/12c) is exactly as
-// required for a PTY spawn as for the pipe-backed one, and Darwin's
-// fail-closed Seatbelt rejection there (process_tree_darwin.go) already runs
-// strictly before this method is ever entered — so no PTY device is ever
-// allocated and no child is ever spawned on a platform/backend combination
-// that cannot supervise it (see process_pty_integration_unix_test.go's
-// TestIntegrationProcessPTYDarwinLifetimeUnavailable). tree is accepted as a
-// parameter (not re-derived) so this method shares the identical containment
-// decision startConfined already made; it never calls e.processTree itself.
-// lifetime is likewise accepted rather than recomputed: it is startConfined's
-// own lifetimeReporter answer for this same tree, computed once before the
-// TTY/pipe branch split.
+// mandatory Supervised containment decision (Task 12b) is made exactly once
+// for a PTY spawn, just as for the pipe-backed one, strictly before this
+// method is ever entered — so no PTY device is ever allocated and no child
+// is ever spawned on a platform/backend combination e.processTree itself
+// rejects (today: Linux Rung 2 with no delegated cgroup v2 ancestor,
+// enforce.ErrLifetimeContainmentUnavailable). Darwin's real Seatbelt backend
+// no longer rejects here: it attaches a best-effort teardown prover instead
+// (process_tree_darwin.go), so a PTY spawn proceeds and later reports
+// LifetimeContainmentBestEffort (see
+// process_pty_integration_unix_test.go's
+// TestIntegrationProcessPTYLifecycle, exercised for real on both Linux and
+// Darwin). tree is accepted as a parameter (not re-derived) so this method
+// shares the identical containment decision startConfined already made; it
+// never calls e.processTree itself. lifetime is likewise accepted rather
+// than recomputed: it is startConfined's own lifetimeReporter answer for
+// this same tree, computed once before the TTY/pipe branch split.
 func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, tree processTreeBoundary, lifetime LifetimeContainment) (*Process, error) {
 	lease := p.lease
 	spawn := p.spawn

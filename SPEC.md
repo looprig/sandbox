@@ -316,6 +316,20 @@ Failure to select a usable Linux rung returns `ErrSandboxUnavailable` rather
 than a null backend. On other operating systems `Sandboxed` is unavailable;
 the null backend accepts only an acknowledged `Unconfined` profile.
 
+Supervised spawns (`Executor.PrepareProcess`/`Process.Start`) additionally
+report a per-spawn process-tree teardown contract through
+`Process.LifetimeContainment`. Linux and Windows retain kernel-enforced
+teardown (`Enforced`: Rung 1's PID namespace, Rung 2's delegated cgroup v2, or
+a Windows Job). macOS Supervised spawns instead receive best-effort lifetime
+containment (`BestEffort`: process-group teardown plus process-table-closure
+descendant tracking), with the downgrade reported per spawn rather than
+assumed; Seatbelt access-confinement guarantees are unaffected. This
+supersedes the earlier fail-closed posture (Task 12c), which rejected every
+macOS Supervised spawn before it started; the 2026-08-06 acceptance decision
+accepts the downgrade because an escaped descendant remains fully confined by
+the spawn's Seatbelt profile, orphaned but never unconfined. See
+`docs/lifetime-containment.md`.
+
 ### 7.5 Linux filesystem snapshots
 
 Both Linux rungs share Landlock's additive allowlist. On each read, execute, or

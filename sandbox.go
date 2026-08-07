@@ -342,10 +342,12 @@ var (
 	// PreparedProcess.Start) spawn cannot be given an exact, kernel-enforced
 	// process-tree teardown proof before it starts, so it was rejected before
 	// any child process was created rather than run with only a best-effort
-	// process-group signal-and-poll fallback. On Darwin this is returned for
-	// every real Seatbelt-confined Supervised spawn until a concrete
-	// containment primitive is wired for this platform; on Linux it is
-	// returned only when Rung 2 selects a spawn with no delegated cgroup v2
-	// pids ancestor available.
+	// process-group signal-and-poll fallback. Its concrete remaining caller
+	// is Linux, returned only when Rung 2 selects a spawn with no delegated
+	// cgroup v2 pids ancestor available. Darwin no longer returns this: a
+	// real Seatbelt-confined Supervised spawn instead receives a best-effort
+	// process-tree teardown prover, with the downgrade from a kernel-enforced
+	// proof reported per spawn through LifetimeContainment (see
+	// Process.LifetimeContainment and docs/lifetime-containment.md).
 	ErrLifetimeContainmentUnavailable = enforce.ErrLifetimeContainmentUnavailable
 )

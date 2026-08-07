@@ -21,13 +21,14 @@ import (
 // This file is Task 12's real, deliberate Unix process-tree escape proof: a
 // live Executor built through the REAL platform backend selector (no
 // withBackend test seam — on Linux this exercises whichever Rung this host
-// actually achieves; on Darwin, Task 12c's separate fail-closed contract is
-// exercised instead of a success path, see below) runs a target that forks a
-// detached grandchild — closing stdio, calling setsid, double-forking — and
-// this test proves that grandchild does NOT survive the supervised spawn's
-// teardown, even though a plain process-group SIGKILL-and-poll (the
-// mechanism this microtask replaces for a Supervised spawn) can be defeated
-// by exactly this shape of descendant.
+// actually achieves; on Darwin this exercises the real Seatbelt backend's
+// best-effort containment prover, see
+// TestIntegrationProcessTreeDarwinSetsidEscapeContained below) runs a target
+// that forks a detached grandchild — closing stdio, calling setsid,
+// double-forking — and this test proves that grandchild does NOT survive the
+// supervised spawn's teardown, even though a plain process-group
+// SIGKILL-and-poll (the mechanism this microtask replaces for a Supervised
+// spawn) can be defeated by exactly this shape of descendant.
 //
 // Run with: go test -tags integration -race ./internal/exec -run
 // 'TestIntegrationProcessTreeParentDeath|TestIntegrationProcessTreeDoubleFork|TestIntegrationProcessTreeSetsidEscape'

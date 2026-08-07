@@ -21,12 +21,18 @@ var ErrUnavailable = errors.New("sandbox: OS confinement unavailable")
 // double-forks escapes it undetected); only a mechanism the kernel itself
 // enforces — a fresh PID namespace (namespace teardown on init exit) or a
 // delegated cgroup v2 scope (cgroup.kill plus a proven-empty cgroup.procs
-// read) — qualifies. Concrete callers: the Linux backend when Rung 2 is
-// selected and no delegated cgroup v2 pids ancestor exists (Task 12b), and
-// the Darwin backend unconditionally until a real containment primitive
-// exists (Task 12c). errors.Is matches this sentinel across both; the
-// external-facing string is stable ("lifetime_enforcement_unavailable") so a
-// caller can key on it without importing this package.
+// read) — qualifies. The concrete remaining caller is the Linux backend when
+// Rung 2 is selected and no delegated cgroup v2 pids ancestor exists (Task
+// 12b). Darwin no longer returns this sentinel: since the 2026-08-06
+// acceptance decision, every Supervised spawn compiled through the real
+// Seatbelt backend instead receives a best-effort process-tree teardown
+// prover (process-group SIGKILL plus process-table-closure descendant
+// tracking) rather than being rejected before it starts, and the downgrade
+// from a kernel-enforced proof is reported per spawn through
+// exec.LifetimeContainment (see docs/lifetime-containment.md), not through
+// this error. errors.Is still matches this sentinel wherever it is returned;
+// the external-facing string is stable ("lifetime_enforcement_unavailable")
+// so a caller can key on it without importing this package.
 var ErrLifetimeContainmentUnavailable = errors.New("sandbox: lifetime_enforcement_unavailable")
 
 // This file defines the internal backend seam: the shape every OS enforcement

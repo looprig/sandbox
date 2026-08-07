@@ -13,16 +13,25 @@ import (
 // immediate child's PID, so cancellation and normal completion can revoke every
 // descendant that remains in the run's group before the execution lease ends.
 //
-// proof, when non-nil, is a platform-exact containment zeroProver attached by
-// a Supervised spawn (see processTreeOptions.Supervised, attachSupervisedProof
-// in process_tree_linux.go / process_tree_darwin.go): SPEC Task 12b requires
-// every supervised spawn to select a mechanism the kernel itself enforces
-// (Linux Rung 1's PID namespace or a delegated cgroup v2 scope) rather than
+// proof, when non-nil, is a zeroProver attached by a Supervised spawn (see
+// processTreeOptions.Supervised, attachSupervisedProof in
+// process_tree_linux.go / process_tree_darwin.go). SPEC Task 12b requires
+// every Supervised spawn to be given SOME proof rather than rely solely on
 // this type's own process-group signal-and-poll, which a setsid or
-// double-fork descendant can escape undetected. When proof is nil (every
-// non-Supervised spawn, and every spawn on a platform with no exact mechanism
-// wired yet) terminateAndWait keeps its original process-group behavior
-// unchanged.
+// double-fork descendant can escape undetected — but the proof itself now
+// comes in two kinds, not one: Linux attaches a kernel-exact proof (Rung 1's
+// PID namespace or a delegated cgroup v2 scope, LifetimeContainmentEnforced);
+// Darwin attaches a best-effort prover instead (process-group SIGKILL-and-
+// poll plus process-table-closure descendant tracking,
+// LifetimeContainmentBestEffort — macOS has no kernel-enforced tree-teardown
+// primitive available to an unentitled process, see
+// docs/lifetime-containment.md). When proof is nil (every non-Supervised
+// spawn, and a Supervised spawn whose backend makes no containment claim at
+// all — an Unconfined executor or a pinned test backend) terminateAndWait
+// keeps its original, proofless process-group behavior unchanged. This is
+// distinct from attachSupervisedProof instead returning an error (Linux Rung
+// 2 with no delegated cgroup v2 ancestor): that case fails newProcessTree
+// itself, so no processTree — and no spawn — exists at all.
 type processTree struct {
 	cmd   *exec.Cmd
 	pgid  int
@@ -126,20 +135,27 @@ func (tree *processTree) signalGroup(sig syscall.Signal) error {
 	return err
 }
 
-// terminateAndWait proves this run's process tree is fully gone.
+// terminateAndWait tears down and proves this run's process tree gone, one
+// of three ways depending on what proof (see the processTree.proof doc
+// above) actually is:
 //
-// When tree.proof is set (a Supervised spawn with an exact platform proof
-// attached — see the processTree.proof doc above) it defers entirely to that
-// proof after one defensive group SIGKILL: the direct child has already been
-// reaped by every caller of terminateAndWait (Process.Wait/cmd.Wait always
-// runs first — see process.go's supervise and executor.go's run), so for
-// Rung 1 the kernel's own PID-namespace-teardown-on-init-exit guarantee is
-// already exact by the time this runs, and for a delegated cgroup the proof
-// is transientCgroup.KillAndWait's cgroup.kill + cgroup.procs-empty read.
-//
-// Otherwise (every non-Supervised spawn, and any Supervised spawn on a
-// platform with no exact mechanism wired yet) it keeps the original
-// process-group signal-and-poll behavior unchanged.
+//   - An exact kernel proof (Linux, Supervised): defers entirely to that
+//     proof after one defensive group SIGKILL. The direct child has already
+//     been reaped by every caller of terminateAndWait (Process.Wait/cmd.Wait
+//     always runs first — see process.go's supervise and executor.go's run),
+//     so for Rung 1 the kernel's own PID-namespace-teardown-on-init-exit
+//     guarantee is already exact by the time this runs, and for a delegated
+//     cgroup the proof is transientCgroup.KillAndWait's cgroup.kill +
+//     cgroup.procs-empty read.
+//   - A best-effort prover (Darwin, Supervised): also defers to that proof,
+//     which normally drives every tracked descendant to zero via its own
+//     descendantTracker.killAndAwaitZero (process_descendants_darwin.go),
+//     falling back to this same plain process-group signal-and-poll sweep
+//     only if the tracker itself failed to construct
+//     (darwinBestEffortProof.terminateAndWait, process_tree_darwin.go).
+//   - No proof at all (every non-Supervised spawn, and a Supervised spawn on
+//     a backend that makes no containment claim, e.g. Unconfined) runs the
+//     original process-group signal-and-poll sweep directly, unchanged.
 func (tree *processTree) terminateAndWait() (error, error) {
 	if tree == nil {
 		return nil, nil

@@ -19,11 +19,16 @@ package exec
 // Supervised spawn) — lives separately in process_tree_linux.go /
 // process_tree_darwin.go, since that half genuinely differs by platform:
 // Linux selects and retains a real kernel-enforced mechanism
-// (process_tree_linux.go); Darwin has none yet, so its attachSupervisedProof
-// (process_tree_darwin.go) rejects every Supervised spawn unconditionally
-// with enforce.ErrLifetimeContainmentUnavailable before cmd.Start() is ever
-// reached (Task 12c) — a deliberate fail-closed contract, not a gap left for
-// a later task to silently fill with process-group polling.
+// (process_tree_linux.go), reporting LifetimeContainmentEnforced. Darwin has
+// no such kernel primitive available to an unentitled process (NOTE_TRACK is
+// ENOTSUP; Endpoint Security needs an Apple-granted entitlement), so its
+// attachSupervisedProof (process_tree_darwin.go) instead attaches a
+// best-effort prover — process-group SIGKILL-and-poll plus process-table-
+// closure descendant tracking — to every real Seatbelt-confined Supervised
+// spawn and reports LifetimeContainmentBestEffort, a deliberate, accepted
+// downgrade (2026-08-06) rather than the earlier fail-closed rejection this
+// package used to return via enforce.ErrLifetimeContainmentUnavailable. See
+// docs/lifetime-containment.md.
 
 import "syscall"
 

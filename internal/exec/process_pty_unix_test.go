@@ -29,11 +29,13 @@ import (
 // _unix_test.go async lifecycle tests (e.g. process_parent_death_unix_test.go's
 // spawnSupervisedSleep). That keeps this file runnable for real inside the
 // managed development sandbox on darwin, with no dependency on real OS
-// confinement: attachSupervisedProof only rejects a Supervised spawn compiled
-// through the REAL Seatbelt backend (process_tree_darwin.go), and
-// captureBackend is not that. Darwin's SEPARATE fail-closed rejection for a
-// REAL Seatbelt-confined PTY spawn is process_pty_integration_unix_test.go's
-// job (TestIntegrationProcessPTYDarwinLifetimeUnavailable), not this file's.
+// confinement: attachSupervisedProof only attaches Darwin's best-effort
+// prover to a Supervised spawn compiled through the REAL Seatbelt backend
+// (process_tree_darwin.go), and captureBackend is not that, so every spawn
+// here reports LifetimeContainmentUnspecified rather than BestEffort. A REAL
+// Seatbelt-confined PTY spawn's best-effort containment is proved for real,
+// under the real backend, by process_pty_integration_unix_test.go's
+// TestIntegrationProcessPTYLifecycle — not this file's job.
 
 // startPTYProcess prepares and starts a real TTY-backed Process running
 // command, failing the test on any error. Both the Process and the
@@ -545,8 +547,9 @@ func TestProcessPTYResizeCloseRace(t *testing.T) {
 // prepareTerminalSysProcAttr (terminal_unix.go) already set Setsid: POSIX
 // forbids setpgid on a session leader (EPERM unconditionally), so layering
 // both would make every real PTY spawn fail to start. Mirrors
-// TestDarwinLifetimeCapabilityFailsClosed's style of exercising
-// newProcessTree directly, without spawning a real process.
+// TestDarwinLifetimeCapabilityBestEffort's (process_tree_darwin_test.go)
+// style of exercising newProcessTree/attachSupervisedProof directly, without
+// spawning a real process.
 func TestProcessPTYSessionSetupNoSetpgidConflict(t *testing.T) {
 	cmd := exec.Command("true")
 	prepareTerminalSysProcAttr(cmd)
