@@ -1,0 +1,379 @@
+//go:build darwin
+
+package exec
+
+import (
+	"errors"
+	"sync"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	// descendantSampleInterval paces the kern.proc.all closure sampler. A
+	// NOTE_FORK kevent on any member triggers an immediate extra sample.
+	descendantSampleInterval = 100 * time.Millisecond
+	// wakeIdent is the EVFILT_USER identity used to unblock the kevent loop
+	// on close. Any constant works; it only has to be stable within one kq.
+	wakeIdent = 1
+)
+
+// descendantForkNoteSupported records whether this kernel accepts
+// EVFILT_PROC NOTE_FORK registration, probed once per process the first time
+// a tracker is created. Empirically verified 2026-08-06 on macOS 26.5.2
+// (arm64): registering NOTE_FORK|NOTE_EXIT on a live child succeeds (err ==
+// nil), so newDescendantTracker optimistically starts every tracker with
+// forkNote true — matching "if err is nil: proceed as designed" from the
+// probe that motivated this mechanism. watch's own ENOTSUP handling still
+// degrades a given tracker to NOTE_EXIT-only permanently if a real
+// registration ever fails with ENOTSUP (e.g. a future kernel, or a sandboxed
+// context that rejects it), so this initial value is only a starting point,
+// not a permanent assumption.
+var descendantForkNoteSupported = true
+
+// descendantMember is one tracked process: pid plus the start-time identity
+// that guards against pid reuse (a recycled pid is a different process and
+// must never be signaled on this member's behalf).
+type descendantMember struct {
+	pid   int32
+	start unix.Timeval
+}
+
+func setHas(set map[int32]struct{}, pid int32) bool {
+	_, ok := set[pid]
+	return ok
+}
+
+// descendantTracker follows one spawned process's fork tree, BEST-EFFORT.
+//
+// Darwin has no kernel fork-following: EVFILT_PROC NOTE_TRACK is rejected
+// with ENOTSUP by XNU's filt_procattach (empirically verified 2026-08-06 on
+// macOS 26.5.2; the constant exists in headers for FreeBSD compatibility
+// only). So membership is discovered by sampling the process table
+// (kern.proc.all) and growing the transitive closure rooted at the spawn —
+// ppid-of-member or pgid-equals-member-pid joins — recorded permanently as
+// (pid, start-time) so reparenting to launchd cannot erase a member. kqueue
+// NOTE_FORK on members triggers immediate resampling to narrow the
+// between-samples race; NOTE_EXIT retires members.
+//
+// NOTE_FORK itself was also empirically verified on this host (registering
+// EVFILT_PROC with NOTE_FORK|NOTE_EXIT on a live child returned a nil error),
+// so trackers start with forkNote true and request NOTE_FORK acceleration by
+// default; watch degrades a tracker to NOTE_EXIT-only permanently the first
+// time a registration comes back ENOTSUP.
+//
+// Accepted gaps (why this is LifetimeContainmentBestEffort, never a proof):
+//   - a descendant that double-forks AND leaves the group between two
+//     samples, unobserved, is never discovered;
+//   - a member whose pid is recycled before retirement is skipped at kill
+//     time by the start-time identity check (fail-safe direction: prefer
+//     missing an escapee to killing an innocent process);
+//   - arming happens just after cmd.Start(), so a child forked in that
+//     window is caught only by the first sample's closure walk (via its
+//     ppid/pgid link), not by kevents.
+//
+// pid 1 (launchd) is never treated as a closure anchor in sample() even if
+// it is somehow present in members (see sample()'s ppid/pgid != 1 guard):
+// once a member's parent dies and it reparents to launchd, its ppid becomes
+// 1, and (as above) the ancestry link is already gone by design — treating
+// launchd as an anchor would instead wrongly recruit every one of its real
+// children (nearly every daemon on the system) into this run's tracked set.
+type descendantTracker struct {
+	mu       sync.Mutex
+	kq       int
+	members  map[int32]descendantMember
+	watched  map[int32]bool // kevent registration succeeded for this member
+	closed   bool
+	resample chan struct{} // NOTE_FORK → immediate sample request
+	stop     chan struct{}
+	loops    sync.WaitGroup
+	rootPID  int32
+	forkNote bool // NOTE_FORK accepted by this kernel (degrades if not)
+}
+
+func newDescendantTracker() (*descendantTracker, error) {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(kq)
+	tracker := &descendantTracker{
+		kq:       kq,
+		members:  make(map[int32]descendantMember),
+		watched:  make(map[int32]bool),
+		resample: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		forkNote: descendantForkNoteSupported,
+	}
+	// Registering the wake event first means close() can always deliver it —
+	// closing a kqueue fd does NOT unblock a parked Kevent call.
+	_, err = unix.Kevent(kq, []unix.Kevent_t{{
+		Ident: wakeIdent, Filter: unix.EVFILT_USER, Flags: unix.EV_ADD | unix.EV_CLEAR,
+	}}, nil, nil)
+	if err != nil {
+		_ = unix.Close(kq)
+		return nil, err
+	}
+	return tracker, nil
+}
+
+// arm begins tracking pid (which must already exist — call after cmd.Start())
+// and starts the sampler and kevent loops.
+func (tracker *descendantTracker) arm(pid int) error {
+	if tracker == nil {
+		return errors.New("sandbox: nil descendant tracker")
+	}
+	tracker.rootPID = int32(pid)
+	if start, ok := processStartTime(int32(pid)); ok {
+		tracker.mu.Lock()
+		tracker.members[int32(pid)] = descendantMember{pid: int32(pid), start: start}
+		tracker.mu.Unlock()
+	}
+	tracker.watch(int32(pid))
+	tracker.sample() // synchronous first sample: catch pre-arm forks now
+	tracker.loops.Add(2)
+	go tracker.runKevents()
+	go tracker.runSampler()
+	return nil
+}
+
+// watch registers NOTE_FORK|NOTE_EXIT (or NOTE_EXIT alone once a kernel has
+// rejected NOTE_FORK) for pid. Failure is recorded, not fatal: sampling
+// still covers the member.
+func (tracker *descendantTracker) watch(pid int32) {
+	fflags := uint32(unix.NOTE_EXIT)
+	tracker.mu.Lock()
+	forkNote := tracker.forkNote
+	tracker.mu.Unlock()
+	if forkNote {
+		fflags |= unix.NOTE_FORK
+	}
+	_, err := unix.Kevent(tracker.kq, []unix.Kevent_t{{
+		Ident:  uint64(pid),
+		Filter: unix.EVFILT_PROC,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
+		Fflags: fflags,
+	}}, nil, nil)
+	if err == syscall.ENOTSUP && forkNote {
+		// Kernel without NOTE_FORK: degrade to NOTE_EXIT-only permanently.
+		tracker.mu.Lock()
+		tracker.forkNote = false
+		tracker.mu.Unlock()
+		tracker.watch(pid)
+		return
+	}
+	tracker.mu.Lock()
+	tracker.watched[pid] = err == nil
+	tracker.mu.Unlock()
+}
+
+func (tracker *descendantTracker) runKevents() {
+	defer tracker.loops.Done()
+	events := make([]unix.Kevent_t, 16)
+	for {
+		n, err := unix.Kevent(tracker.kq, nil, events, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return
+		}
+		for _, event := range events[:n] {
+			switch {
+			case event.Filter == unix.EVFILT_USER:
+				return // close() woke us
+			case event.Filter != unix.EVFILT_PROC:
+				continue
+			case event.Fflags&unix.NOTE_EXIT != 0:
+				tracker.mu.Lock()
+				delete(tracker.members, int32(event.Ident))
+				delete(tracker.watched, int32(event.Ident))
+				tracker.mu.Unlock()
+			case event.Fflags&unix.NOTE_FORK != 0:
+				select {
+				case tracker.resample <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (tracker *descendantTracker) runSampler() {
+	defer tracker.loops.Done()
+	ticker := time.NewTicker(descendantSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-tracker.stop:
+			return
+		case <-tracker.resample:
+		case <-ticker.C:
+		}
+		tracker.sample()
+	}
+}
+
+// sample grows the member set to the current transitive closure rooted at
+// the spawn. Iterates to fixpoint within one snapshot so a whole fork chain
+// appearing between samples is captured at once.
+func (tracker *descendantTracker) sample() {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return // sampling is best-effort; the next tick retries
+	}
+	tracker.mu.Lock()
+	memberPIDs := make(map[int32]struct{}, len(tracker.members)+1)
+	for pid := range tracker.members {
+		memberPIDs[pid] = struct{}{}
+	}
+	memberPIDs[tracker.rootPID] = struct{}{} // root anchors even pre-membership
+	tracker.mu.Unlock()
+
+	var added []int32
+	for {
+		grew := false
+		for i := range procs {
+			pid := procs[i].Proc.P_pid
+			if _, known := memberPIDs[pid]; known {
+				continue
+			}
+			ppid, pgid := procs[i].Eproc.Ppid, procs[i].Eproc.Pgid
+			// launchd (pid 1) is the universal reparent target on darwin:
+			// once a member's own parent dies, its ppid becomes 1 — the
+			// tracker's doc comment already accounts for this ("the
+			// ancestry link that let us find it is gone"). It must never
+			// itself act as a closure anchor, or any process whose ppid or
+			// pgid is 1 (i.e. nearly every daemon on the system) would be
+			// wrongly recruited into this run's tracked set — catastrophic
+			// if pid 1 is ever a member (which legitimate discovery never
+			// produces, but a test's injectMemberForTest seam can).
+			parentKnown := ppid != 1 && setHas(memberPIDs, ppid)
+			groupKnown := pgid != 1 && setHas(memberPIDs, pgid)
+			if parentKnown || groupKnown {
+				memberPIDs[pid] = struct{}{}
+				added = append(added, pid)
+				grew = true
+			}
+		}
+		if !grew {
+			break
+		}
+	}
+	if len(added) == 0 {
+		return
+	}
+	tracker.mu.Lock()
+	for i := range procs {
+		pid := procs[i].Proc.P_pid
+		for _, addedPID := range added {
+			if pid == addedPID {
+				tracker.members[pid] = descendantMember{pid: pid, start: procs[i].Proc.P_starttime}
+			}
+		}
+	}
+	tracker.mu.Unlock()
+	for _, pid := range added {
+		tracker.watch(pid)
+	}
+}
+
+// liveMembers returns the currently tracked members (tests + teardown).
+func (tracker *descendantTracker) liveMembers() []descendantMember {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	members := make([]descendantMember, 0, len(tracker.members))
+	for _, member := range tracker.members {
+		members = append(members, member)
+	}
+	return members
+}
+
+// injectMemberForTest plants a member entry with an arbitrary start-time so
+// tests can prove the identity guard. Test seam only.
+func (tracker *descendantTracker) injectMemberForTest(pid int32, start syscall.Timeval) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.members[pid] = descendantMember{pid: pid, start: unix.Timeval{Sec: start.Sec, Usec: start.Usec}}
+}
+
+// memberAlive reports whether member still refers to the same live,
+// non-zombie process it was recorded as. Absent, recycled (start-time
+// mismatch), or zombie ⇒ gone.
+func memberAlive(member descendantMember) bool {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", int(member.pid))
+	if err != nil || info == nil {
+		return false
+	}
+	if info.Proc.P_starttime != member.start {
+		return false // recycled pid — a different process; hands off
+	}
+	return info.Proc.P_stat != darwinZombieState
+}
+
+func processStartTime(pid int32) (unix.Timeval, bool) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", int(pid))
+	if err != nil || info == nil {
+		return unix.Timeval{}, false
+	}
+	return info.Proc.P_starttime, true
+}
+
+// killAndAwaitZero SIGKILLs the process group and every identity-verified
+// live member, polling until the group is inactive and no member remains.
+// One final sample runs first so descendants forked just before teardown are
+// included. Zombies count as gone (their reaper is launchd once the tree's
+// parents are dead; waiting on a corpse would stall the proof forever).
+func (tracker *descendantTracker) killAndAwaitZero(pgid int) {
+	tracker.sample()
+	for {
+		if pgid > 0 {
+			reapProcessGroup(pgid)
+		}
+		groupActive := false
+		if pgid > 0 {
+			var err error
+			groupActive, err = processGroupActive(pgid)
+			if err != nil {
+				groupActive = true // no evidence of absence — keep going
+			}
+		}
+		anyMember := false
+		for _, member := range tracker.liveMembers() {
+			if !memberAlive(member) {
+				tracker.mu.Lock()
+				delete(tracker.members, member.pid)
+				tracker.mu.Unlock()
+				continue
+			}
+			anyMember = true
+			_ = syscall.Kill(int(member.pid), syscall.SIGKILL)
+		}
+		if !groupActive && !anyMember {
+			return
+		}
+		if pgid > 0 {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (tracker *descendantTracker) close() {
+	tracker.mu.Lock()
+	if tracker.closed {
+		tracker.mu.Unlock()
+		return
+	}
+	tracker.closed = true
+	tracker.mu.Unlock()
+	close(tracker.stop)
+	// Wake the kevent loop, join both loops, then release the kqueue.
+	_, _ = unix.Kevent(tracker.kq, []unix.Kevent_t{{
+		Ident: wakeIdent, Filter: unix.EVFILT_USER, Fflags: unix.NOTE_TRIGGER,
+	}}, nil, nil)
+	tracker.loops.Wait()
+	_ = unix.Close(tracker.kq)
+}
