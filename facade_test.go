@@ -12,7 +12,7 @@ import (
 )
 
 // This file is the guard on the public surface. Every identifier below is one
-// that a real consumer outside this module references today — coderig and the
+// that a real consumer outside this module references today — carbon and the
 // looprig integration-test module — so if a future refactor moves something out
 // of the facade without re-exporting it, this file stops compiling here rather
 // than in someone else's repository.
