@@ -79,7 +79,7 @@ required. Invalid enum values, relative or contradictory roots, and an
 unacknowledged or inconsistent unconfined configuration fail validation.
 
 The module deliberately provides no named profile combinations. Applications
-such as CodeRig construct their own product profiles. `Restrict(base, ceiling)`
+Product composition roots construct their own product profiles. `Restrict(base, ceiling)`
 returns the component-wise, immutable intersection of two profiles and never
 widens `base`.
 
