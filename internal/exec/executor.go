@@ -710,7 +710,11 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 	limit, limited := outputLimit(lease.caller)
 	var outputOverflow atomic.Bool
 	var outputMu sync.Mutex
-	outputCtx, cancelOutput := context.WithCancel(lease.ctx)
+	outputCtx := lease.ctx
+	cancelOutput := func() {}
+	if limited {
+		outputCtx, cancelOutput = context.WithCancel(lease.ctx)
+	}
 	defer cancelOutput()
 	var stdout, stderr io.Writer = &output, &output
 	if limited {
