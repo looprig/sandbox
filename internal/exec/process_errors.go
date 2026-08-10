@@ -9,6 +9,10 @@ import "errors"
 // keeping them in their own file mirrors how this microtask's public types
 // live in their own process.go rather than growing executor.go.
 var (
+	// ErrOutputLimit reports that a bounded direct-argv run exceeded its
+	// caller-supplied combined stdout/stderr limit and was terminated.
+	ErrOutputLimit = errors.New("sandbox: process output limit exceeded")
+
 	// ErrProcessClosed reports that a PreparedProcess or Process was already
 	// closed and no further preparation, start, or stream operation may
 	// proceed through it.
