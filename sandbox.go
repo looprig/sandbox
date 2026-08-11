@@ -215,6 +215,7 @@ func WithWindowsSandboxStateRoot(path string) ExecutorSetOption {
 
 // Executor lifecycle sentinels.
 var (
+	ErrOutputLimit       = exec.ErrOutputLimit
 	ErrExecutorLimit     = exec.ErrExecutorLimit
 	ErrExecutorSetClosed = exec.ErrExecutorSetClosed
 	ErrExecutorClosed    = exec.ErrExecutorClosed

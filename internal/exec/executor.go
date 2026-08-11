@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/looprig/sandbox/pkg/profile"
@@ -45,6 +46,20 @@ const defaultGrantTTL = 15 * time.Minute
 // extra-kill window against promptness for the narrow "Cancel didn't work"
 // case.
 const spawnWaitGrace = time.Second
+
+type outputLimitContextKey struct{}
+
+func withOutputLimit(ctx context.Context, limit int64) context.Context {
+	return context.WithValue(ctx, outputLimitContextKey{}, limit)
+}
+
+func outputLimit(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	limit, ok := ctx.Value(outputLimitContextKey{}).(int64)
+	return limit, ok && limit > 0
+}
 
 // Init is defined per-platform (init_linux.go / init_other.go): it is THE
 // re-exec dispatch entry point (SPEC §6). Consumers MUST call it as the very
@@ -319,6 +334,24 @@ func (e *Executor) resolveErr(compileErr error) error {
 // detect a process that did not complete normally (spawn failure, signal kill,
 // or context cancellation all report code -1).
 func (e *Executor) RunArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
+	return e.runArgv(ctx, dir, argv)
+}
+
+// RunArgvLimited runs direct argv under the compiled policy while enforcing
+// a combined stdout/stderr byte limit during capture. Once the limit is
+// reached the process is killed and ErrOutputLimit is returned; output beyond
+// the limit is discarded instead of retained in memory.
+func (e *Executor) RunArgvLimited(ctx context.Context, dir string, argv []string, maxOutputBytes int64) ([]byte, int, error) {
+	if maxOutputBytes <= 0 {
+		return nil, -1, ErrOutputLimit
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return e.runArgv(withOutputLimit(ctx, maxOutputBytes), dir, argv)
+}
+
+func (e *Executor) runArgv(ctx context.Context, dir string, argv []string) ([]byte, int, error) {
 	lease, err := e.beginExecution(ctx)
 	if err != nil {
 		return nil, -1, err
@@ -459,6 +492,8 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
 
 	var output bytes.Buffer
+	limit, limited := outputLimit(lease.caller)
+	var outputOverflow atomic.Bool
 	var outputMu sync.Mutex
 	var drainWG sync.WaitGroup
 	exitCode := -1
@@ -485,8 +520,17 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		// Wait): a full pipe buffer would otherwise block the child from
 		// exiting, which would block Wait from ever returning.
 		drainWG.Add(2)
-		go func() { defer drainWG.Done(); drainCombinedOutput(&outputMu, &output, process.Stdout()) }()
-		go func() { defer drainWG.Done(); drainCombinedOutput(&outputMu, &output, process.Stderr()) }()
+		drain := func(src io.Reader) {
+			if limited {
+				drainBoundedOutput(&outputMu, &output, src, limit, &outputOverflow, func() {
+					_ = process.Signal(context.Background(), ProcessSignalKill)
+				})
+				return
+			}
+			drainCombinedOutput(&outputMu, &output, src)
+		}
+		go func() { defer drainWG.Done(); drain(process.Stdout()) }()
+		go func() { defer drainWG.Done(); drain(process.Stderr()) }()
 		// process.Wait reaps the OS process only; unlike the exec.Cmd-owned
 		// pipes this replaces, it does not itself wait for the drain
 		// goroutines above to observe EOF. That is deliberately provided by
@@ -534,6 +578,9 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		err = treeErr
 	}
 	out = output.Bytes()
+	if outputOverflow.Load() {
+		return out, -1, ErrOutputLimit
+	}
 	if treeErr != nil {
 		return out, -1, treeErr
 	}
@@ -580,6 +627,62 @@ func drainCombinedOutput(mu *sync.Mutex, dst *bytes.Buffer, src io.Reader) {
 	}
 }
 
+func drainBoundedOutput(mu *sync.Mutex, dst *bytes.Buffer, src io.Reader, limit int64, overflow *atomic.Bool, terminate func()) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			mu.Lock()
+			remaining := limit - int64(dst.Len())
+			if remaining > 0 {
+				writeN := n
+				if int64(writeN) > remaining {
+					writeN = int(remaining)
+				}
+				_, _ = dst.Write(buf[:writeN])
+			}
+			if int64(n) > remaining {
+				overflow.Store(true)
+			}
+			mu.Unlock()
+			if overflow.Load() {
+				terminate()
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+type boundedOutputWriter struct {
+	mu         *sync.Mutex
+	dst        *bytes.Buffer
+	limit      int64
+	overflow   *atomic.Bool
+	onOverflow func()
+}
+
+func (w *boundedOutputWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	remaining := w.limit - int64(w.dst.Len())
+	if remaining > 0 {
+		writeN := len(p)
+		if int64(writeN) > remaining {
+			writeN = int(remaining)
+		}
+		_, _ = w.dst.Write(p[:writeN])
+	}
+	if int64(len(p)) > remaining {
+		if w.overflow.CompareAndSwap(false, true) && w.onOverflow != nil {
+			w.onOverflow()
+		}
+	}
+	return len(p), nil
+}
+
 func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []string, s snapshot, observe func(), afterZero ...func() error) (out []byte, code int, runErr error) {
 	spawn := newQuarantinedSpawn(nil, nil, lease)
 	spawn.observe = observe
@@ -604,6 +707,20 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 		env = []string{}
 	}
 	var output bytes.Buffer
+	limit, limited := outputLimit(lease.caller)
+	var outputOverflow atomic.Bool
+	var outputMu sync.Mutex
+	outputCtx := lease.ctx
+	cancelOutput := func() {}
+	if limited {
+		outputCtx, cancelOutput = context.WithCancel(lease.ctx)
+	}
+	defer cancelOutput()
+	var stdout, stderr io.Writer = &output, &output
+	if limited {
+		writer := &boundedOutputWriter{mu: &outputMu, dst: &output, limit: limit, overflow: &outputOverflow, onOverflow: cancelOutput}
+		stdout, stderr = writer, writer
+	}
 	// Launch itself only establishes the backend's OS-level authority and
 	// returns promptly (see enforce.Spec.Launch's doc comment); this
 	// synchronous RunCommand/RunArgv path immediately calls Wait on the
@@ -613,17 +730,17 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 	// byte-for-byte unchanged. A future microtask (Task 11) is what actually
 	// lets a caller observe the asynchronous handoff.
 	execution, err := s.spec.Launch(enforce.LaunchRequest{
-		Context: lease.ctx,
+		Context: outputCtx,
 		Dir:     dir,
 		Argv:    append([]string(nil), argv...),
 		Env:     env,
 		Stdin:   bytes.NewReader(nil),
-		Stdout:  &output,
-		Stderr:  &output,
+		Stdout:  stdout,
+		Stderr:  stderr,
 	})
 	var exit int
 	if err == nil {
-		exit, err = execution.Wait(lease.ctx)
+		exit, err = execution.Wait(outputCtx)
 	}
 	executionCtxErr := lease.ctx.Err()
 	callerCtxErr := lease.caller.Err()
@@ -631,6 +748,9 @@ func (e *Executor) runBackendOwned(lease *executionLease, dir string, argv []str
 	released = true
 	if releaseErr != nil {
 		return output.Bytes(), -1, releaseErr
+	}
+	if outputOverflow.Load() {
+		return output.Bytes(), -1, ErrOutputLimit
 	}
 	if executionCtxErr != nil {
 		if callerCtxErr != nil {
