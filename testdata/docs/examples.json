@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "repository": "sandbox",
+  "proofSources": [
+    {
+      "id": "example-sandbox-policy-enforcement-fixture",
+      "type": "executable-fixture",
+      "path": "examples/policy-enforcement/example_test.go",
+      "symbol": "TestExamplePolicyAndEnforcement"
+    },
+    {
+      "id": "example-sandbox-artifacts-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    },
+    {
+      "id": "example-sandbox-profile-source",
+      "type": "source",
+      "path": "sandbox.go",
+      "symbol": "NewProfile"
+    },
+    {
+      "id": "example-sandbox-restrict-source",
+      "type": "source",
+      "path": "sandbox.go",
+      "symbol": "Restrict"
+    },
+    {
+      "id": "example-sandbox-executor-set-source",
+      "type": "source",
+      "path": "sandbox.go",
+      "symbol": "NewExecutorSet"
+    },
+    {
+      "id": "example-sandbox-command-reporting-source",
+      "type": "source",
+      "path": "internal/exec/executor.go",
+      "symbol": "(*Executor).RunArgv"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-sandbox-policy-and-enforcement",
+      "ecosystem": "go",
+      "owner": "sandbox",
+      "sourcePath": "examples/policy-enforcement/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/sandbox": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "A public-API fixture proves profile construction and Restrict intersection, command gating before spawn, ExecutorSet memoization and close behavior, successful confined argv execution, and platform-specific Level, Guarantees, and CompileReport disclosure without claiming identical enforcement across operating systems.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The fixture closes each ExecutorSet, verifies closed sets and executors reject new work, and relies on t.TempDir plus ExecutorSet.Close to remove the caller-owned scratch contents and set-owned HOME and TMPDIR after child processes exit.",
+      "liveGate": null,
+      "proofIds": [
+        "example-sandbox-policy-enforcement-fixture",
+        "example-sandbox-artifacts-contract-test",
+        "example-sandbox-profile-source",
+        "example-sandbox-restrict-source",
+        "example-sandbox-executor-set-source",
+        "example-sandbox-command-reporting-source"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+name: Docs examples
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run deterministic offline examples
+        run: GOWORK=off go test -race ./...
+      - name: Run repository-native checks
+        run: GOWORK=off make test test-linux-build test-windows-build test-async-ci
