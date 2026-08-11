@@ -123,6 +123,7 @@ func TestAccessFor(t *testing.T) {
 		{name: "additional read", kind: "filesystem.read", scope: filepath.Join(root, "file"), want: Gated},
 		{name: "additional tree write", kind: "filesystem.write", scope: "tree:" + root, want: Allow},
 		{name: "host exact read", kind: "filesystem.read", scope: filepath.Join(filepath.Dir(workspace), "elsewhere"), want: Deny},
+		{name: "unconfigured tree read", kind: "filesystem.read", scope: "tree:" + filepath.Join(workspace, "missing"), want: Deny},
 		{name: "host broad write", kind: "filesystem.write", scope: "host:*", want: Gated},
 	}
 	for _, tt := range tests {
@@ -144,7 +145,6 @@ func TestAccessFor(t *testing.T) {
 		{"filesystem.read", ""},
 		{"filesystem.read", "relative"},
 		{"filesystem.read", workspace + string(os.PathSeparator) + ".." + string(os.PathSeparator) + "escape"},
-		{"filesystem.write", "tree:" + filepath.Join(workspace, "missing")},
 		{"filesystem.write", "tree:relative"},
 	}
 	for _, tt := range bad {

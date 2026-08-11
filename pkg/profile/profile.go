@@ -242,7 +242,7 @@ func (p *Profile) filesystemAccess(write bool, scope string) (Access, error) {
 		return Deny, fmt.Errorf("%w: malformed filesystem scope %q", ErrInvalidProfile, scope)
 	}
 	if tree && !p.isConfiguredRoot(path) {
-		return Deny, fmt.Errorf("%w: tree scope is not a configured root %q", ErrInvalidProfile, path)
+		return Deny, nil
 	}
 	return p.accessAtPath(write, path), nil
 }
