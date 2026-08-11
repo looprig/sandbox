@@ -9,6 +9,12 @@
       "symbol": "TestExamplePolicyAndEnforcement"
     },
     {
+      "id": "example-sandbox-windows-profile-contract",
+      "type": "test",
+      "path": "examples/policy-enforcement/windows_contract_test.go",
+      "symbol": "TestWindowsExampleProfilesExposeRequiredGuarantees"
+    },
+    {
       "id": "example-sandbox-artifacts-contract-test",
       "type": "test",
       "path": "examples/contract_test.go",
@@ -50,13 +56,14 @@
         "github.com/looprig/sandbox": "source-workspace"
       },
       "offlineCommand": "GOWORK=off go test -race ./...",
-      "assertion": "A public-API fixture proves profile construction and Restrict intersection, command gating before spawn, ExecutorSet memoization and close behavior, successful confined argv execution, and platform-specific Level, Guarantees, and CompileReport disclosure without claiming identical enforcement across operating systems.",
+      "assertion": "A public-API fixture proves profile construction and Restrict intersection, command gating before spawn, ExecutorSet memoization and close behavior, successful argv execution under the selected platform's available guarantees, and truthful handling of a stricter required profile when platform setup is unavailable; platform-specific Level, Guarantees, and CompileReport are disclosed without uniform enforcement claims.",
       "workflowPath": ".github/workflows/docs-examples.yml",
       "jobId": "docs-examples",
       "cleanup": "The fixture closes each ExecutorSet, verifies closed sets and executors reject new work, and relies on t.TempDir plus ExecutorSet.Close to remove the caller-owned scratch contents and set-owned HOME and TMPDIR after child processes exit.",
-      "liveGate": null,
+      "liveGate": "Windows: the required-boundary profile may report ErrWindowsSetupRequired when elevated setup is absent; the executable profile requires only EnvScrub and is covered by a deterministic Windows build contract.",
       "proofIds": [
         "example-sandbox-policy-enforcement-fixture",
+        "example-sandbox-windows-profile-contract",
         "example-sandbox-artifacts-contract-test",
         "example-sandbox-profile-source",
         "example-sandbox-restrict-source",

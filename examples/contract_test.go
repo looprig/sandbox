@@ -62,6 +62,11 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 			path:      "examples/policy-enforcement/example_test.go",
 			symbol:    "TestExamplePolicyAndEnforcement",
 		},
+		"example-sandbox-windows-profile-contract": {
+			proofType: "test",
+			path:      "examples/policy-enforcement/windows_contract_test.go",
+			symbol:    "TestWindowsExampleProfilesExposeRequiredGuarantees",
+		},
 		"example-sandbox-artifacts-contract-test": {
 			proofType: "test",
 			path:      "examples/contract_test.go",
@@ -137,7 +142,7 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 	if example.OfflineCommand != offlineExamplesCommand {
 		t.Errorf("example offlineCommand = %q", example.OfflineCommand)
 	}
-	const assertion = "A public-API fixture proves profile construction and Restrict intersection, command gating before spawn, ExecutorSet memoization and close behavior, successful confined argv execution, and platform-specific Level, Guarantees, and CompileReport disclosure without claiming identical enforcement across operating systems."
+	const assertion = "A public-API fixture proves profile construction and Restrict intersection, command gating before spawn, ExecutorSet memoization and close behavior, successful argv execution under the selected platform's available guarantees, and truthful handling of a stricter required profile when platform setup is unavailable; platform-specific Level, Guarantees, and CompileReport are disclosed without uniform enforcement claims."
 	if example.Assertion != assertion {
 		t.Errorf("example assertion = %q", example.Assertion)
 	}
@@ -148,11 +153,13 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 	if example.Cleanup != cleanup {
 		t.Errorf("example cleanup = %q", example.Cleanup)
 	}
-	if string(example.LiveGate) != "null" {
-		t.Errorf("example liveGate = %s, want null because the mandatory fixture uses only local platform facilities", example.LiveGate)
+	const liveGate = "Windows: the required-boundary profile may report ErrWindowsSetupRequired when elevated setup is absent; the executable profile requires only EnvScrub and is covered by a deterministic Windows build contract."
+	if string(example.LiveGate) != `"`+liveGate+`"` {
+		t.Errorf("example liveGate = %s, want %q", example.LiveGate, liveGate)
 	}
 	wantProofIDs := []string{
 		"example-sandbox-policy-enforcement-fixture",
+		"example-sandbox-windows-profile-contract",
 		"example-sandbox-artifacts-contract-test",
 		"example-sandbox-profile-source",
 		"example-sandbox-restrict-source",
