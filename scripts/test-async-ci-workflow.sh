@@ -77,17 +77,6 @@ require_in() {
 	fi
 }
 
-# require_not_in NAME PATTERN DESCRIPTION fails if PATTERN DOES appear.
-require_not_in() {
-	job="$1"
-	pattern="$2"
-	description="$3"
-	block=$(job_block "$job")
-	if printf '%s\n' "$block" | grep -qF -- "$pattern"; then
-		fail "job '$job' unexpectedly $description (found literal text: $pattern)"
-	fi
-}
-
 note "checking test-linux-rung1 / test-linux-rung2 async selectors"
 for job in test-linux-rung1 test-linux-rung2; do
 	require_in "$job" '-tags integration' "the integration build tag"
@@ -106,17 +95,13 @@ for job in test-linux-rung1 test-linux-rung2; do
 		"the async process-lifecycle selector (parent-death/double-fork/setsid-escape + grant lifetime)"
 done
 
-note "checking test-macos Darwin pre-spawn fail-closed selector"
+note "checking test-macos Darwin async best-effort selectors"
 require_in test-macos '-tags integration' "the integration build tag"
-require_in test-macos "TestIntegrationProcessTreeDarwinSetsidFailsClosed" \
-	"the Darwin pre-spawn fail-closed selector"
-# Darwin explicitly does not claim async pipe-process execution in this
-# phase (Task 12c): the macOS job must not carry the broader selector that
-# would advertise live async pipe/grant-lifetime execution there.
-require_not_in test-macos "TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)" \
-	"advertises the cross-platform async pipe/grant selector"
-require_not_in test-macos "TestIntegrationProcessPreparedGrantLifetime" \
-	"advertises live grant-lifetime async execution"
+require_in test-macos '-race' "race mode"
+require_in test-macos "TestIntegrationProcessTreeDarwinSetsidEscapeContained" \
+	"the Darwin setsid-escape containment selector"
+require_in test-macos "TestIntegrationProcessPTYLifecycle" \
+	"the Darwin async PTY lifecycle selector"
 
 note "checking windows-restricted / windows-elevated live Job selectors"
 for job in windows-restricted windows-elevated; do
