@@ -10,7 +10,18 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+// injectMemberForTest plants a member entry with an arbitrary start-time so
+// integration tests can prove the identity guard without a production-only
+// test seam.
+func (tracker *descendantTracker) injectMemberForTest(pid int32, start syscall.Timeval) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.members[pid] = descendantMember{pid: pid, start: unix.Timeval{Sec: start.Sec, Usec: start.Usec}}
+}
 
 // startTracked starts cmd in its own process group and arms a tracker on it.
 func startTracked(t *testing.T, cmd *exec.Cmd) *descendantTracker {

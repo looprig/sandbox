@@ -4,6 +4,7 @@ package exec
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"syscall"
 	"time"
@@ -136,6 +137,11 @@ func (tracker *descendantTracker) arm(pid int) error {
 	if tracker == nil {
 		return errors.New("sandbox: nil descendant tracker")
 	}
+	if pid <= 0 || pid > math.MaxInt32 {
+		return errors.New("sandbox: descendant tracker pid is out of range")
+	}
+	// #nosec G115 -- pid is constrained to the positive int32 range above.
+	pid32 := int32(pid)
 	tracker.mu.Lock()
 	if tracker.armed {
 		tracker.mu.Unlock()
@@ -143,13 +149,13 @@ func (tracker *descendantTracker) arm(pid int) error {
 	}
 	tracker.armed = true
 	tracker.mu.Unlock()
-	tracker.rootPID = int32(pid)
-	if start, ok := processStartTime(int32(pid)); ok {
+	tracker.rootPID = pid32
+	if start, ok := processStartTime(pid32); ok {
 		tracker.mu.Lock()
-		tracker.members[int32(pid)] = descendantMember{pid: int32(pid), start: start}
+		tracker.members[pid32] = descendantMember{pid: pid32, start: start}
 		tracker.mu.Unlock()
 	}
-	tracker.watch(int32(pid))
+	tracker.watch(pid32)
 	tracker.sample() // synchronous first sample: catch pre-arm forks now
 	tracker.loops.Add(2)
 	go tracker.runKevents()
@@ -161,6 +167,12 @@ func (tracker *descendantTracker) arm(pid int) error {
 // rejected NOTE_FORK) for pid. Failure is recorded, not fatal: sampling
 // still covers the member.
 func (tracker *descendantTracker) watch(pid int32) {
+	if pid <= 0 {
+		tracker.mu.Lock()
+		tracker.watched[pid] = false
+		tracker.mu.Unlock()
+		return
+	}
 	fflags := uint32(unix.NOTE_EXIT)
 	tracker.mu.Lock()
 	forkNote := tracker.forkNote
@@ -168,8 +180,10 @@ func (tracker *descendantTracker) watch(pid int32) {
 	if forkNote {
 		fflags |= unix.NOTE_FORK
 	}
+	// #nosec G115 -- non-positive PIDs return above, so this conversion is exact.
+	ident := uint64(pid)
 	_, err := unix.Kevent(tracker.kq, []unix.Kevent_t{{
-		Ident:  uint64(pid),
+		Ident:  ident,
 		Filter: unix.EVFILT_PROC,
 		Flags:  unix.EV_ADD | unix.EV_CLEAR,
 		Fflags: fflags,
@@ -205,9 +219,14 @@ func (tracker *descendantTracker) runKevents() {
 			case event.Filter != unix.EVFILT_PROC:
 				continue
 			case event.Fflags&unix.NOTE_EXIT != 0:
+				if event.Ident > math.MaxInt32 {
+					continue
+				}
+				// #nosec G115 -- event identity is bounded to int32 immediately above.
+				pid := int32(event.Ident)
 				tracker.mu.Lock()
-				delete(tracker.members, int32(event.Ident))
-				delete(tracker.watched, int32(event.Ident))
+				delete(tracker.members, pid)
+				delete(tracker.watched, pid)
 				tracker.mu.Unlock()
 			case event.Fflags&unix.NOTE_FORK != 0:
 				select {
@@ -308,14 +327,6 @@ func (tracker *descendantTracker) liveMembers() []descendantMember {
 		members = append(members, member)
 	}
 	return members
-}
-
-// injectMemberForTest plants a member entry with an arbitrary start-time so
-// tests can prove the identity guard. Test seam only.
-func (tracker *descendantTracker) injectMemberForTest(pid int32, start syscall.Timeval) {
-	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
-	tracker.members[pid] = descendantMember{pid: pid, start: unix.Timeval{Sec: start.Sec, Usec: start.Usec}}
 }
 
 // memberAlive reports whether member still refers to the same live,

@@ -204,7 +204,7 @@ func (m *terminalMaster) resize(rows, cols uint16) error {
 // syscall, same "non-zero errno is the error" convention), which is
 // otherwise unexported and unreachable from this package.
 func ioctlSetWinsize(fd uintptr, ws *pty.Winsize) error {
-	//nolint:gosec // Expected unsafe pointer for a TIOCSWINSZ ioctl syscall.
+	// #nosec G103 -- TIOCSWINSZ requires passing the winsize pointer to ioctl.
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(ws)))
 	if errno != 0 {
 		return errno
