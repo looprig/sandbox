@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  GO_VERSION: "1.26.5"
+  GO_VERSION: "1.26.6"
 
 jobs:
   # Format, vet, and the cgo-free -trimpath build on Linux (fast fail).
