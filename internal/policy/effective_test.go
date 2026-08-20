@@ -173,7 +173,7 @@ func TestCompileEffectivePolicyUsesNarrowRuntimeClosure(t *testing.T) {
 	}{
 		{path: "/bin/sh", want: ReadAccess | ExecAccess},
 		{path: "/usr/bin/env", want: ReadAccess | ExecAccess},
-		{path: "/usr/lib/libSystem.B.dylib", want: ReadAccess},
+		libraryProbe(),
 		{path: "/etc/hosts", want: ReadAccess},
 		{path: "/usr/local/private", want: DenyAccess},
 		{path: "/etc/ssh/ssh_config", want: DenyAccess},
@@ -207,4 +207,25 @@ func TestCompileEffectivePolicyRejectsZeroProfile(t *testing.T) {
 	if _, err := Compile(&Profile{}); !errors.Is(err, ErrInvalidProfile) {
 		t.Fatalf("Compile zero error = %v, want ErrInvalidProfile", err)
 	}
+}
+
+// libraryProbe returns the runtime-library expectation for this GOOS. The
+// shared-library location and the access it needs are both platform facts:
+// Darwin resolves dylibs through /usr/lib and needs only read, while a
+// usr-merged Linux resolves the ELF interpreter through /usr/lib/<triplet>
+// and needs execute as well (Landlock's EXECUTE right covers mapping a file
+// PROT_EXEC). Asserting one platform's answer on the other is what this
+// per-GOOS split exists to prevent.
+func libraryProbe() struct {
+	path string
+	want FSAccess
+} {
+	type probe = struct {
+		path string
+		want FSAccess
+	}
+	if runtime.GOOS == "darwin" {
+		return probe{path: "/usr/lib/libSystem.B.dylib", want: ReadAccess}
+	}
+	return probe{path: "/usr/lib/x86_64-linux-gnu/libc.so.6", want: ReadAccess | ExecAccess}
 }

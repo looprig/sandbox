@@ -3,6 +3,7 @@
 package linux
 
 import (
+	"errors"
 	"fmt"
 	"github.com/looprig/sandbox/internal/policy"
 	"io/fs"
@@ -772,11 +773,28 @@ func pivotInto(newroot string) error {
 	return nil
 }
 
-// touchFile creates an empty regular file (a no-op if it already exists), used
-// for file bind mountpoints and the shared empty mask source.
+// touchFile ensures a regular-file bind MOUNTPOINT exists at path. It is only
+// ever a mountpoint: the bind is laid over it immediately and nothing is ever
+// written through this handle.
+//
+// It therefore must not demand write permission on a target that already
+// exists. Opening O_WRONLY unconditionally did exactly that, and failed with
+// EACCES whenever the new root resolved onto a tree whose files this user
+// namespace's mapped uid may not write -- the Rung-1 mount view hit it on
+// /etc/hosts beneath a writable "/" bind, aborting stage 2 and surfacing to
+// the caller as the "cannot execute" exit code 126. Create only when absent,
+// and treat a concurrent create as success.
 func touchFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return nil
+		}
 		return err
 	}
 	return f.Close()
