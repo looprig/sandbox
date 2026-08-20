@@ -70,11 +70,6 @@ const mountViewOp = "mount-view"
 // fresh empty read-only tmpfs instead (applyMask).
 const emptyMaskFile = ".lrsandbox-empty"
 
-// oldRootDir is the pivot_root put_old directory (created on the new-root
-// tmpfs). After pivot_root the previous root is detached from here (MNT_DETACH),
-// which is what makes every host path NOT bound into the new root INVISIBLE.
-const oldRootDir = ".lrsandbox-oldroot"
-
 // MountViewPlan is the Rung-1 filesystem intent distilled from a policy.Effective at
 // compile time (SPEC §7.2 Rung 1, §7.5). It holds bind ROOTS and deny intent,
 // not stat'd entries: the dir/file classification and the glob scan are redone
@@ -768,21 +763,39 @@ func applyMask(newroot string, m MaskSpec) error {
 // fails closed — a partial pivot that left the old root reachable would be a
 // containment escape.
 func pivotInto(newroot string) error {
-	oldroot := filepath.Join(newroot, oldRootDir)
-	if err := os.MkdirAll(oldroot, 0o700); err != nil {
-		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mkdir put_old: %w", err)}
+	// pivot_root(2) requires new_root to BE a mount point. Whether it already
+	// is depends on the policy -- a bind whose target is "/" lands directly on
+	// it -- so bind it onto itself first. That changes nothing about the view
+	// and makes the requirement unconditional.
+	if err := unix.Mount(newroot, newroot, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind new root onto itself: %w", err)}
 	}
-	if err := unix.PivotRoot(newroot, oldroot); err != nil {
+	fd, err := unix.Open(newroot, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("open new root: %w", err)}
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Fchdir(fd); err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("chdir new root: %w", err)}
+	}
+	// The put_old == new_root form documented in man 2 pivot_root (NOTES).
+	//
+	// The previous code created a real put_old directory INSIDE the new root.
+	// That cannot work once a policy binds "/" onto the new root: the new root
+	// is then the host root view, and mkdir there is EACCES for this user
+	// namespace's mapped uid -- the "mkdir put_old ... permission denied" that
+	// aborted stage 2 and surfaced as exit code 126. This form needs no
+	// writable directory at all: the old root ends up mounted over the new
+	// root, "." still refers to it, and detaching "." removes it.
+	if err := unix.PivotRoot(".", "."); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("pivot_root: %w", err)}
+	}
+	if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("detach old root: %w", err)}
 	}
 	if err := unix.Chdir("/"); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("chdir new /: %w", err)}
 	}
-	oldMount := "/" + oldRootDir
-	if err := unix.Unmount(oldMount, unix.MNT_DETACH); err != nil {
-		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("detach old root: %w", err)}
-	}
-	_ = os.Remove(oldMount) // best-effort: the put_old dir is now empty
 	return nil
 }
 
