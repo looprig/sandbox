@@ -91,6 +91,15 @@ func TestIntegrationProcessPreparedGrantLifetime(t *testing.T) {
 	}
 
 	proc, err := prepared.Start(context.Background())
+	if errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
+		// A supervised spawn has no best-effort fallback: without a delegated
+		// cgroup v2 pids ancestor there is no cgroup.kill containment proof,
+		// so Start fails closed by design (SPEC Task 12b). Hosted CI runners
+		// do not delegate that controller. Accept only this exact sentinel --
+		// any other Start error is still a failure -- and stop before the
+		// lifecycle assertions, which need a live process to mean anything.
+		t.Skipf("lifetime containment unavailable on this host: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

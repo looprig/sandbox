@@ -714,7 +714,20 @@ func applyBind(newroot string, b BindSpec) error {
 		// mount_setattr(AT_RECURSIVE, MOUNT_ATTR_RDONLY) pass could make the view
 		// self-sufficient, but risks EPERM on host-locked submounts under "/", so it
 		// is deferred to CI validation.)
-		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+		//
+		// The remount must carry the flags the bind ALREADY has. A user
+		// namespace locks MS_NOSUID/MS_NODEV/MS_NOEXEC and the atime policy on
+		// any mount it did not create itself, and a MS_REMOUNT that would
+		// clear a locked flag is refused with EPERM -- which is exactly how
+		// this failed on /etc/resolv.conf ("remount ro: operation not
+		// permitted"), aborting stage 2 and surfacing as exit code 126.
+		// Passing MS_RDONLY alone implicitly asks to clear every other flag,
+		// so read them back off the fresh bind and preserve them.
+		locked, err := lockedMountFlags(target)
+		if err != nil {
+			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("read bind flags %s: %w", b.Target, err)}
+		}
+		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|locked, ""); err != nil {
 			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("remount ro %s: %w", b.Target, err)}
 		}
 	}
@@ -798,4 +811,43 @@ func touchFile(path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// lockedMountFlags reports the mount flags already present on path that a user
+// namespace forbids a remount from clearing. The kernel locks these on any
+// mount the namespace did not create, so a MS_REMOUNT must repeat them
+// verbatim or fail with EPERM. statfs is the portable way to read them back;
+// its ST_* bits are a separate vocabulary from MS_*, so map each explicitly
+// rather than assuming the constants coincide.
+func lockedMountFlags(path string) (uintptr, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return mapLockedFlags(int64(st.Flags)), nil
+}
+
+// mapLockedFlags translates statfs ST_* bits into the MS_* bits a remount must
+// repeat. Split out from lockedMountFlags so the translation is testable
+// without a mount: the two vocabularies are distinct constants and getting a
+// pairing wrong silently drops a locked flag, which reappears only as an EPERM
+// on a machine whose mounts happen to carry it.
+func mapLockedFlags(statfsFlags int64) uintptr {
+	var flags uintptr
+	for _, pair := range []struct {
+		statfs int64
+		mount  uintptr
+	}{
+		{unix.ST_NOSUID, unix.MS_NOSUID},
+		{unix.ST_NODEV, unix.MS_NODEV},
+		{unix.ST_NOEXEC, unix.MS_NOEXEC},
+		{unix.ST_NOATIME, unix.MS_NOATIME},
+		{unix.ST_NODIRATIME, unix.MS_NODIRATIME},
+		{unix.ST_RELATIME, unix.MS_RELATIME},
+	} {
+		if statfsFlags&pair.statfs != 0 {
+			flags |= pair.mount
+		}
+	}
+	return flags
 }
