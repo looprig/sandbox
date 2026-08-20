@@ -763,13 +763,12 @@ func applyMask(newroot string, m MaskSpec) error {
 // fails closed — a partial pivot that left the old root reachable would be a
 // containment escape.
 func pivotInto(newroot string) error {
-	// pivot_root(2) requires new_root to BE a mount point. Whether it already
-	// is depends on the policy -- a bind whose target is "/" lands directly on
-	// it -- so bind it onto itself first. That changes nothing about the view
-	// and makes the requirement unconditional.
-	if err := unix.Mount(newroot, newroot, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind new root onto itself: %w", err)}
-	}
+	// pivot_root(2) requires new_root to BE a mount point, which it already is:
+	// applyMountView mounts a fresh tmpfs on it before any bind is applied, and
+	// a policy bind targeting "/" lands on top of that. Binding it onto itself
+	// here would be worse than redundant -- MS_REC over a root that already
+	// carries a recursive bind of "/" duplicates that whole tree, which hung
+	// the Rung-1 job until CI killed it (exit 143).
 	fd, err := unix.Open(newroot, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("open new root: %w", err)}
