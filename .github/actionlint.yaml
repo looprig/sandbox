@@ -1,0 +1,10 @@
+# Deployment-specific self-hosted runner labels for the Windows evidence jobs.
+# actionlint cannot know them, and without this file it reports each one as an
+# unknown label, which buries real findings in noise. Declaring them here keeps
+# the workflow statically checkable without weakening the label contract: the
+# jobs still demand exactly these runners.
+self-hosted-runner:
+  labels:
+    - sandbox-standard
+    - sandbox-elevated
+    - sandbox-disposable

@@ -209,6 +209,17 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 	// exactly this file's job. Process/Wait/Close all tolerate a nil receiver
 	// (documented, deliberate zero-value safety) regardless.
 	proc, err := prepared.Start(context.Background())
+	if errors.Is(err, sandbox.ErrLifetimeContainmentUnavailable) {
+		// A supervised spawn has no best-effort fallback on Linux: without a
+		// delegated cgroup v2 pids ancestor there is no cgroup.kill
+		// containment proof, so Start fails closed by design (SPEC Task 12b).
+		// Hosted CI runners do not delegate that controller, which is a
+		// property of the machine, not a defect in the surface under test.
+		// Accept only this exact sentinel -- any other Start error is still a
+		// failure -- and stop before the process-lifecycle assertions, which
+		// need a live process to mean anything.
+		t.Skipf("lifetime containment unavailable on this host: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("PreparedProcess.Start: %v", err)
 	}
