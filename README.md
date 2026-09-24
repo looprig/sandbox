@@ -4,6 +4,33 @@
 access profiles and enforcing them around spawned commands. It does not import
 Harness, open approval prompts, parse tool arguments, or persist permissions.
 
+Enforcement uses Seatbelt on macOS; namespaces, Landlock, seccomp and nftables on
+Linux; and restricted-token and installed-broker tiers on Windows.
+
+## Status
+
+Released and consumed by Carbon and policy53 (and by the `tests` integration
+lane). What is not available yet:
+
+- **The Windows elevated tier is not production-ready.** The code and
+  cross-build coverage exist, but readiness stays unavailable until the runtime
+  matrix passes on supported Windows 11 and Windows Server workers. See
+  [Windows modes and setup](#windows-modes-and-setup).
+- **Linux does not enforce target-scoped network access.** A target grant fails
+  closed there. See
+  [Target-scoped network enforcement](#target-scoped-network-enforcement).
+- Other operating systems reject `Sandboxed` profiles. Only an explicitly
+  acknowledged `Unconfined` profile can run there.
+
+## Install
+
+```sh
+go get github.com/looprig/sandbox@latest
+```
+
+Every consumer's `main` must call `sandbox.Init()` first (see
+[Linux initialization](#linux-initialization)).
+
 ## Module layout
 
 Consumers import one path — `github.com/looprig/sandbox` — and never anything
@@ -35,6 +62,9 @@ internal/               implementation; not importable outside this module
 
 cmd/
   sandbox-host/          protected Windows broker service and restricted runner
+
+examples/policy-enforcement/  runnable profile, grant and guarantee examples
+spikes/                 platform feasibility probes (Windows spike backs a live gate)
 ```
 
 Dependencies point one way: `pkg/*` ← `policy` ← `enforce` ← OS backends ←
@@ -78,8 +108,8 @@ the zero isolation choice is `Sandboxed`. A canonical workspace root is always
 required. Invalid enum values, relative or contradictory roots, and an
 unacknowledged or inconsistent unconfined configuration fail validation.
 
-The module deliberately provides no named profile combinations. Applications
-Product composition roots construct their own product profiles. `Restrict(base, ceiling)`
+The module deliberately provides no named profile combinations. Product
+composition roots construct their own product profiles. `Restrict(base, ceiling)`
 returns the component-wise, immutable intersection of two profiles and never
 widens `base`.
 
@@ -350,7 +380,8 @@ if err != nil || status.Ready {
 }
 ```
 
-`RuntimeEvidencePath` must name the approved Task 5 exact-token evidence from
+`RuntimeEvidencePath` must name the approved exact-token runtime evidence
+(see `docs/plans/2026-07-21-windows-sandbox-implementation.md`) from
 the matching Windows build, architecture, filesystem, Go toolchain, and source
 revision. Setup copies it into protected installation state and fails closed
 when any required runtime row is missing, skipped, stale, or modified.
@@ -396,3 +427,36 @@ Linux consumers call `sandbox.Init()` as the first statement in `main` so a
 re-executed confinement helper can dispatch before application startup. Other
 platforms treat it as a no-op. A Linux executor that requires helper dispatch
 fails construction when initialization was omitted.
+
+## Where it sits
+
+Tier 0 in the Looprig graph: it has no Looprig dependencies. Its direct
+third-party dependencies are `golang.org/x/sys`,
+`github.com/landlock-lsm/go-landlock`, `github.com/google/nftables` and
+`github.com/creack/pty`.
+
+## Development
+
+Go 1.26.8 baseline. Verify standalone against the pinned dependencies:
+
+```sh
+GOWORK=off go test ./...
+```
+
+| Target | What it runs |
+| --- | --- |
+| `make test` | `go test -race ./...`; Go selects the host OS's test files. |
+| `make test-os` | The un-cached OS enforcement suite for the host (macOS Seatbelt, or the Linux namespace/Landlock/seccomp/nftables rungs). A missing prerequisite is an explicit skip, never a pass. |
+| `make test-linux-build` | Cross-compiles the Linux test binaries without running them. |
+| `make test-windows-build` | Cross-compiles every package's tests for both supported Windows architectures. |
+| `make test-windows-restricted`, `make test-windows-elevated` | Live Windows gates. Run them only on disposable workers with the named privilege posture. |
+| `make secure` | gofmt check, vet, staticcheck, gosec, `go mod verify`, govulncheck. |
+| `make fuzz` | Prints how to run a bounded fuzz target (`go test -fuzz=FuzzXxx ... -fuzztime=30s`). |
+
+The Linux enforcement tests need a real Linux host; on macOS they are skipped,
+which does not count as a pass. `SPEC.md` holds the module specification, and
+`docs/` holds the design plans, platform spikes and `docs/lifetime-containment.md`.
+
+## License
+
+Apache License 2.0. See `LICENSE`.
