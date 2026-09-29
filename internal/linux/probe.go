@@ -233,7 +233,33 @@ func bringLoopbackUp() error {
 // effective ONLY when the child exits with the distinctive probeCapEffectiveCode
 // (entered the namespaces AND the op succeeded); every other outcome is read as
 // absent (fail-secure) — see the exit-code check below.
+//
+// It re-execs ONLY after Init() has run on this process's normal path. The
+// probe child can report the capability only by dispatching through Init(), and
+// a binary whose normal path has not called Init() will not dispatch in its
+// child either: the child falls through into the host program's own main()
+// (or, for a test binary, its whole test suite). That child could never answer
+// probeCapEffectiveCode, so the probe is already guaranteed to read "absent" —
+// but running it is not harmless. The fallen-through program may probe again,
+// and every level re-execs once more under a user namespace the host permits:
+// an unbounded, self-replicating process tree (the probe timeout kills only the
+// direct child, orphaning the rest). Measured on an unprivileged-userns host:
+// internal/platform's Init-less test binary grew past 32 GB and brought down
+// the CI runner. So without Init() the answer is "absent" without a spawn,
+// which is exactly the result the spawn would have produced, and
+// PlatformBackend still fails closed with ErrInitNotCalled or ErrUnavailable.
 func probeNamespaceCap(mode string) bool {
+	if !initWasCalled.Load() {
+		return false
+	}
+	return runNamespaceProbe(mode)
+}
+
+// runNamespaceProbe spawns the throwaway namespace-probe child for mode. It is
+// a variable only so a test can observe whether probeNamespaceCap spawns.
+var runNamespaceProbe = spawnNamespaceProbe
+
+func spawnNamespaceProbe(mode string) bool {
 	var companion uintptr
 	switch mode {
 	case nsProbeMount:
