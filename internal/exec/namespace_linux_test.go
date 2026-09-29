@@ -776,9 +776,12 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 		t.Fatalf("write outside: %v", err)
 	}
 
-	// Write mode (workspace rw, glob deny on .env). The workspace is visible/writable
-	// and the .env is masked empty; use Write so the write assertion is meaningful.
-	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws), withBackend(linux.NewBackendRung1()))
+	// Zero-trust write (the test's original PolicyFor(Write) shape): only the
+	// runtime closure and the workspace are bound, the workspace rw with its
+	// .git/.looprig carveouts, plus /dev/null and the glob deny on .env.
+	// fixtureWorkspaceWrite would NOT do: it grants read on "/" and rw on /tmp,
+	// which legitimately exposes the sibling temp dir the HIDDEN case probes.
+	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureScopedRuntime, ws, fixtureWithWritable(ws)), withBackend(linux.NewBackendRung1()))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
@@ -808,6 +811,9 @@ func TestRung1MountViewEnforcement(t *testing.T) {
 	}
 	if !strings.Contains(s, "LOOPRIG_VISIBLE") || strings.Contains(s, "LOOPRIG_WRITE_ALLOWED") || !strings.Contains(s, "LOOPRIG_WRITE_DENIED") {
 		t.Errorf(".looprig carveout was not readable and read-only; out=%q", s)
+	}
+	if strings.Contains(s, "/dev/null") {
+		t.Errorf("/dev/null was not writable in the Rung-1 view; out=%q", s)
 	}
 	if strings.Contains(s, "SECRET=leak") || !strings.Contains(s, "ENV=[]") {
 		t.Errorf("glob-masked .env leaked (want ENV=[]); out=%q", s)

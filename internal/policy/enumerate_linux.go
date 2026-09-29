@@ -151,7 +151,7 @@ func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, i
 	if info.IsDir() {
 		return FSRule{Path: target, Access: access, IsDir: true}, true, nil
 	}
-	if !info.Mode().IsRegular() {
+	if !directFileRuleClass(info.Mode()) {
 		return FSRule{}, false, nil
 	}
 	if cached, ok := resolver.direct[target]; ok {
@@ -186,7 +186,7 @@ func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, i
 		_ = file.Close()
 		return FSRule{}, false, fmt.Errorf("%w: Landlock file %q changed while its rule was compiled", ErrTargetChanged, target)
 	}
-	if !checked.Mode().IsRegular() || !directRegularFileRuleSafe(checked) {
+	if !directFileRuleClass(checked.Mode()) || !directRegularFileRuleSafe(checked) {
 		_ = file.Close()
 		return FSRule{}, false, nil
 	}
@@ -198,6 +198,23 @@ func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, i
 		Target: target, ParentFD: resolved.ChildFD,
 		Access: access, IsDir: false,
 	}, true, nil
+}
+
+// directFileRuleClass reports whether a non-directory a policy names directly may
+// carry a descriptor-bound Landlock rule: a regular file (subject to
+// directRegularFileRuleSafe's single-link check) or a character device.
+//
+// Character devices are admitted because fixed runtime paths the backend itself
+// grants are devices — /dev/null above all (policy.NullDevicePath, README
+// "Fixed runtime paths"). Refusing them silently dropped that grant, so every
+// confined `cmd >/dev/null` failed with EACCES on both rungs. A device rule
+// follows the device inode it was opened on, so the hard-link concern that
+// guards regular files (a second name for a protected file's data) does not
+// apply: another name for the same node reaches only the same device. Block
+// devices, FIFOs and sockets stay refused, and trees are still enumerated
+// without device rules.
+func directFileRuleClass(mode os.FileMode) bool {
+	return mode.IsRegular() || mode&os.ModeCharDevice != 0 && mode&os.ModeDevice != 0
 }
 
 func openDirectRuleFile(target string) (*os.File, error) {

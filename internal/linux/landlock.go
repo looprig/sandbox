@@ -155,7 +155,13 @@ func validateRetainedLandlockFD(fd int, isDir bool) error {
 		}
 		return nil
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+	switch stat.Mode & unix.S_IFMT {
+	case unix.S_IFCHR:
+		// A directly named character device (policy.directFileRuleClass):
+		// the rule follows the device inode, so the link count is irrelevant.
+		return nil
+	case unix.S_IFREG:
+	default:
 		return fmt.Errorf("descriptor names a non-regular file (mode=%#o)", stat.Mode&unix.S_IFMT)
 	}
 	if stat.Nlink != 1 {
