@@ -64,8 +64,9 @@ const GlobScanMaxDepth = 8
 // whole view construction fails CLOSED under one recognizable label (SPEC §7.2).
 const mountViewOp = "mount-view"
 
-// emptyMaskFile is the scratch empty regular file (created on the new-root
-// tmpfs) bound read-only over each masked FILE (a secret deny or a glob match),
+// emptyMaskFile is the scratch empty regular file (created on the bare new-root
+// tmpfs before any bind, then reached by descriptor) bound read-only over each
+// masked FILE (a secret deny or a glob match),
 // hiding the real file's contents behind an empty one. Directory masks use a
 // fresh empty read-only tmpfs instead (applyMask).
 const emptyMaskFile = ".lrsandbox-empty"
@@ -646,6 +647,18 @@ func applyMountView(spec MountViewSpec) error {
 	if err := unix.Mount("tmpfs", newroot, "tmpfs", 0, ""); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mount tmpfs newroot: %w", err)}
 	}
+	// The empty source every FILE mask binds from must be created NOW, while
+	// newroot is still the bare tmpfs. A policy that reads "/" binds the host
+	// root onto newroot in step 3, which both shadows the tmpfs path and makes
+	// it read-only — creating the file after the binds failed every spawn with
+	// a file mask ("mask empty source: ... read-only file system"). The open
+	// descriptor keeps the tmpfs file reachable through /proc/self/fd even once
+	// it is shadowed.
+	emptySource, closeEmpty, err := openEmptyMaskSource(newroot, spec.Masks)
+	if err != nil {
+		return err
+	}
+	defer closeEmpty()
 	// 3. Binds (parents-first, so a nested ro carveout re-masks the rw root under
 	//    it — deny-inside-allow via mount).
 	for _, b := range spec.Binds {
@@ -656,7 +669,7 @@ func applyMountView(spec MountViewSpec) error {
 	// 4. Masks (empty ro binds), AFTER binds so a deny always wins over a covering
 	//    allow (fixed-path secrets + glob-deny matches).
 	for _, m := range spec.Masks {
-		if err := applyMask(newroot, m); err != nil {
+		if err := applyMask(newroot, emptySource, m); err != nil {
 			return err
 		}
 	}
@@ -734,7 +747,7 @@ func applyBind(newroot string, b BindSpec) error {
 // file bind. A mask whose target is not present in the view (never covered by
 // any bind) is a no-op: an unbound host path is already invisible. Fails closed
 // on any real mount error.
-func applyMask(newroot string, m MaskSpec) error {
+func applyMask(newroot, emptySource string, m MaskSpec) error {
 	target := filepath.Join(newroot, m.Target)
 	if _, err := os.Lstat(target); err != nil {
 		return nil // not visible in the view — nothing to mask (already hidden)
@@ -745,17 +758,42 @@ func applyMask(newroot string, m MaskSpec) error {
 		}
 		return nil
 	}
-	empty := filepath.Join(newroot, emptyMaskFile)
-	if err := touchFile(empty); err != nil {
-		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask empty source: %w", err)}
+	if emptySource == "" {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file %s: no empty mask source", m.Target)}
 	}
-	if err := unix.Mount(empty, target, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(emptySource, target, "", unix.MS_BIND, ""); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file %s: %w", m.Target, err)}
 	}
 	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file ro %s: %w", m.Target, err)}
 	}
 	return nil
+}
+
+// openEmptyMaskSource creates the scratch empty file on the bare new-root tmpfs
+// and returns a /proc/self/fd path to it for file masks to bind from, plus a
+// closer for the descriptor. It must run before any bind lands on newroot (see
+// applyMountView). With no file mask it creates nothing and returns "".
+func openEmptyMaskSource(newroot string, masks []MaskSpec) (string, func(), error) {
+	needed := false
+	for _, m := range masks {
+		if !m.IsDir {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return "", func() {}, nil
+	}
+	empty := filepath.Join(newroot, emptyMaskFile)
+	if err := touchFile(empty); err != nil {
+		return "", nil, &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask empty source: %w", err)}
+	}
+	fd, err := unix.Open(empty, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", nil, &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("open mask empty source: %w", err)}
+	}
+	return "/proc/self/fd/" + strconv.Itoa(fd), func() { _ = unix.Close(fd) }, nil
 }
 
 // pivotInto pivot_roots into newroot and detaches the previous root, so host
