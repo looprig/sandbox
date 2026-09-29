@@ -327,17 +327,34 @@ func TestProcessPTYCtrlD(t *testing.T) {
 // SIGINT to the spawned process's foreground process group when the in-band
 // INTR control character (0x03, Ctrl-C) is written to the terminal. This
 // only works if prepareTerminalSysProcAttr's Setsid/Setctty setup genuinely
-// established a job-control-capable session: `sleep 30` has no custom signal
+// established a job-control-capable session: `cat` has no custom signal
 // handling, so only a real, kernel-delivered SIGINT explains a prompt exit.
+//
+// The interrupt is sent only once cat itself has echoed a line back. The
+// command runs under `sh -c`, and dash CATCHES SIGINT under -c, acting on it
+// only at its next check: a Ctrl-C written the instant Start returned (the
+// previous shape, with `sleep 30`) could land while the shell was still
+// starting, be absorbed by it, and leave a sleep forked afterwards that never
+// saw a signal — a ~1% timeout on Linux CI. `exec` leaves no shell behind, and
+// a line round-tripped through cat (the terminal's own echo, then cat's copy)
+// proves cat is the running foreground process before 0x03 is written.
 func TestProcessPTYInterruptForegroundGroup(t *testing.T) {
-	proc := startPTYProcess(t, "sleep 30")
+	proc := startPTYProcess(t, "exec cat")
+	if _, err := proc.Stdin().Write([]byte("ready\n")); err != nil {
+		t.Fatalf("Stdin.Write: %v", err)
+	}
+	readUntilContains(t, proc.Stdout(), "ready\r\nready", 5*time.Second)
 	if _, err := proc.Stdin().Write([]byte{0x03}); err != nil {
 		t.Fatalf("Stdin.Write(Ctrl-C): %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := proc.Wait(ctx); err != nil {
+	result, err := proc.Wait(ctx)
+	if err != nil {
 		t.Fatalf("Wait after in-band interrupt did not return in time (SIGINT was not really delivered to the foreground group): %v", err)
+	}
+	if result.ExitCode == 0 {
+		t.Fatalf("ExitCode = 0, want a SIGINT death (cat exits 0 only on EOF, so the interrupt was not what ended it)")
 	}
 }
 
