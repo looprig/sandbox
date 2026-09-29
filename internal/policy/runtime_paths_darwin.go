@@ -19,3 +19,7 @@ func osRuntimeEntries() []FSEntry {
 	}
 	return append(entries, FSEntry{Path: "/etc/ssl/cert.pem", Access: ReadAccess, Exact: true})
 }
+
+// presentRuntimeEntries is the identity here. Darwin keeps its declared closure unchanged: the Seatbelt profile is generated
+// from it and has no mount view that refuses an absent path.
+func presentRuntimeEntries(entries []FSEntry) []FSEntry { return entries }

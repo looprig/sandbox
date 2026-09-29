@@ -13,3 +13,7 @@ func osRuntimeEntries() []FSEntry {
 		{Path: "/etc/ssl/certs", Access: ReadAccess},
 	}
 }
+
+// presentRuntimeEntries is the identity here. Other Unix targets keep the declared closure; their backends have no mount
+// view that refuses an absent path.
+func presentRuntimeEntries(entries []FSEntry) []FSEntry { return entries }

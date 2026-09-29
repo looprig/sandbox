@@ -367,6 +367,20 @@ enumeration needed for defense in depth and restored literal precedence.
 Therefore Rung 1 has the same per-axis snapshot narrowing as Rung 2 even when
 its mount re-mask is fully enforced.
 
+An absent protected target is where the two rungs differ. Rung 2 runs the
+spawn and relies on the narrowing above ("the same rules apply when the
+protected target is absent at spawn"). Rung 1 refuses the spawn instead: when a
+read-only carveout or a literal deny that the policy declares is absent at
+spawn beneath a bind the view makes writable, enumeration fails closed with a
+`mount-view` error naming the path ("protected path ... unavailable beneath
+writable bind ..."). A mount cannot re-mask a path that does not exist, and
+creating a placeholder would write to the host, so Rung 1 does not launch with
+only Landlock guarding that path. A caller that declares such carveouts on
+Linux should create them before spawning. The backend's own runtime closure is
+not a declared carveout: its entries are narrowed to the paths the host has
+(an arm64 host has no `/lib64`), so a missing runtime path never refuses a
+spawn.
+
 This spawn snapshot is intentionally narrower than the requested covering allow
 on each affected axis. Against the sandboxed target and its descendants, it
 prevents a future `.git`, `.looprig`, or fixed secret path from acquiring

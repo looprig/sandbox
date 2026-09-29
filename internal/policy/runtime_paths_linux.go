@@ -2,6 +2,8 @@
 
 package policy
 
+import "os"
+
 // osRuntimeEntries is the Linux runtime closure.
 //
 // The library directories carry ExecAccess, not merely ReadAccess. Landlock's
@@ -22,4 +24,25 @@ func osRuntimeEntries() []FSEntry {
 		entries = append(entries, FSEntry{Path: path, Access: ReadAccess})
 	}
 	return append(entries, FSEntry{Path: "/etc/ld.so.cache", Access: ReadAccess, Exact: true})
+}
+
+// runtimePathPresent reports whether a runtime-closure path resolves on this
+// host. It follows symlinks, as the Rung-1 mount view does when it binds a root
+// (a usr-merged /lib64 is a symlink; a dangling one is as absent as a missing
+// path). It is a variable only so a test can simulate another host's layout.
+var runtimePathPresent = func(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// presentRuntimeEntries drops runtime-closure entries this host does not have.
+// See MinimalRuntimeEntries for why an absent entry is skipped rather than kept.
+func presentRuntimeEntries(entries []FSEntry) []FSEntry {
+	kept := entries[:0]
+	for _, entry := range entries {
+		if runtimePathPresent(entry.Path) {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
 }
