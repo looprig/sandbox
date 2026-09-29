@@ -51,3 +51,44 @@ func TestLinuxDevNullWritable(t *testing.T) {
 		})
 	}
 }
+
+// TestLinuxZeroTrustWorkspaceWritable proves a production zero-trust profile
+// (HostRead/HostWrite Deny, WorkspaceWrite Allow) can write its own workspace
+// on both Linux rungs. The recursive-read-deny write suppression used to treat
+// the "/" deny as covering the workspace even though the workspace restores
+// read, so every workspace write failed with EACCES.
+func TestLinuxZeroTrustWorkspaceWritable(t *testing.T) {
+	requireLandlockV4(t)
+	requireSeccomp(t)
+	for _, tt := range []struct {
+		name    string
+		rung1   bool
+		backend func() *linux.Backend
+	}{
+		{"rung2", false, linux.NewBackend},
+		{"rung1", true, linux.NewBackendRung1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.rung1 {
+				requireRung1Caps(t)
+			}
+			ws := t.TempDir()
+			prof := mustProfile(t, ProfileConfig{
+				WorkspaceRoot: ws, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+				HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+			})
+			p, err := policy.Compile(prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := newExecutorForEffectivePolicy(p, withBackend(tt.backend()))
+			if err != nil {
+				t.Fatalf("NewExecutor: %v", err)
+			}
+			out, code, err := e.RunCommand(context.Background(), ws, `echo hi > f && cat f && echo WROTE`)
+			if err != nil || code != 0 || !strings.Contains(string(out), "WROTE") {
+				t.Fatalf("workspace write at %s: err=%v code=%d out=%q", tt.name, err, code, out)
+			}
+		})
+	}
+}

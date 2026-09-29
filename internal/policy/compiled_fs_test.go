@@ -451,3 +451,67 @@ func enumerateFSRulesForTest(t *testing.T, compiled CompiledFS) []FSRule {
 	t.Cleanup(func() { CloseRuleFiles(files) })
 	return rules
 }
+
+// TestEnumerateFSRulesKeepsWriteWhereReadIsRestored pins the scope of the
+// recursive-read-deny write suppression. A deny at "/" (HostRead Deny) used to
+// suppress every recursive write allow on the host, so a zero-trust profile
+// could not write its own workspace, nor use a filesystem write grant, on
+// Linux. Where a more specific allow restores the denied read/execute axes
+// over the write allow's path, the write survives; a write-only allow inside a
+// subtree whose read stays denied is still suppressed, and a protected child
+// of the writable workspace is still carved out.
+func TestEnumerateFSRulesKeepsWriteWhereReadIsRestored(t *testing.T) {
+	workspace := t.TempDir()
+	secret := filepath.Join(workspace, "secret")
+	sibling := filepath.Join(workspace, "src")
+	for _, dir := range []string{secret, sibling} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name    string
+		entries []FSEntry
+	}{
+		{"profile workspace entry", []FSEntry{
+			{Path: "/", Denied: AllAccess},
+			{Path: workspace, Access: AllAccess},
+		}},
+		{"write granted as a separate entry", []FSEntry{
+			{Path: "/", Denied: AllAccess},
+			{Path: workspace, Access: ReadAccess | ExecAccess},
+			{Path: workspace, Access: WriteAccess, Canonical: true},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rules := enumerateFSRulesForTest(t, CompileFS(tt.entries))
+			if got := resolveEnumeratedRules(rules, workspace); got&WriteAccess == 0 {
+				t.Fatalf("workspace write suppressed under a read-restored deny: %#x; rules=%+v", got, rules)
+			}
+		})
+	}
+
+	t.Run("protected child stays carved", func(t *testing.T) {
+		rules := enumerateFSRulesForTest(t, CompileFS([]FSEntry{
+			{Path: "/", Denied: AllAccess},
+			{Path: workspace, Access: AllAccess},
+			{Path: secret, Denied: ReadAccess | ExecAccess},
+		}))
+		if got := resolveEnumeratedRules(rules, secret); got&(ReadAccess|ExecAccess) != 0 {
+			t.Fatalf("protected child readable: %#x; rules=%+v", got, rules)
+		}
+		if got := resolveEnumeratedRules(rules, sibling); got&WriteAccess == 0 {
+			t.Fatalf("unprotected sibling lost write: %#x; rules=%+v", got, rules)
+		}
+	})
+	t.Run("write-only allow in a still read-denied subtree", func(t *testing.T) {
+		rules := enumerateFSRulesForTest(t, CompileFS([]FSEntry{
+			{Path: "/", Denied: AllAccess},
+			{Path: workspace, Access: WriteAccess},
+		}))
+		if got := resolveEnumeratedRules(rules, workspace); got&WriteAccess != 0 {
+			t.Fatalf("write-only allow under an unrestored read deny survived: %#x; rules=%+v", got, rules)
+		}
+	})
+}

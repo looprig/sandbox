@@ -254,7 +254,7 @@ func enumerateFSRulesWithResolver(compiled CompiledFS, handles []*PathHandle, re
 	for _, allow := range compiled.Allows {
 		for _, bit := range []FSAccess{ReadAccess, ExecAccess, WriteAccess} {
 			if allow.Access&bit == 0 || deniedAtSamePath(allow, bit, compiled.Denies) ||
-				deniedByRecursiveTopology(allow, bit, compiled.Denies) {
+				deniedByRecursiveTopology(allow, bit, compiled.Allows, compiled.Denies) {
 				continue
 			}
 			excludes := excludesForAllowAxis(allow, bit, compiled.Allows, compiled.Denies)
@@ -345,13 +345,43 @@ func deniedAtSamePath(allow FSAllow, bit FSAccess, denies []FSDeny) bool {
 	return false
 }
 
-func deniedByRecursiveTopology(allow FSAllow, bit FSAccess, denies []FSDeny) bool {
+// deniedByRecursiveTopology suppresses a recursive write allow that sits inside
+// a subtree whose read or execute is still denied: writing there could rename
+// or link a denied entry into a readable alias (6829bff). A deny whose
+// read/execute axes are all restored for the allow's whole path — by a
+// recursive allow strictly beneath the deny and at or above the allow — no
+// longer makes that subtree unreadable, so it does not suppress the write.
+// Without that, a recursive read deny at "/" (a profile with HostRead Deny)
+// suppressed every recursive write allow on the host, including the profile's
+// own writable workspace and any filesystem write grant: the target could not
+// write anywhere. Protected descendants below the allow are still carved out
+// by excludesForAllowAxis.
+func deniedByRecursiveTopology(allow FSAllow, bit FSAccess, allows []FSAllow, denies []FSDeny) bool {
 	if bit != WriteAccess || allow.Exact {
 		return false
 	}
 	for _, deny := range denies {
 		if !deny.Exact && deny.Access&(ReadAccess|ExecAccess) != 0 &&
-			(deny.Path == allow.Path || PathUnder(deny.Path, allow.Path)) {
+			(deny.Path == allow.Path || PathUnder(deny.Path, allow.Path)) &&
+			!readRestoredBetween(deny, allow.Path, allows) {
+			return true
+		}
+	}
+	return false
+}
+
+// readRestoredBetween reports whether every read/execute axis deny removes is
+// granted back by one recursive allow strictly beneath deny.Path whose path is
+// allowPath or one of its ancestors, so the whole of allowPath's subtree is
+// readable again. A restoration at deny.Path itself does not count: at the same
+// path and scope the deny wins (deniedAtSamePath).
+func readRestoredBetween(deny FSDeny, allowPath string, allows []FSAllow) bool {
+	denied := deny.Access & (ReadAccess | ExecAccess)
+	for _, restore := range allows {
+		if restore.Exact || restore.Access&denied != denied || !PathUnder(deny.Path, restore.Path) {
+			continue
+		}
+		if restore.Path == allowPath || PathUnder(restore.Path, allowPath) {
 			return true
 		}
 	}
