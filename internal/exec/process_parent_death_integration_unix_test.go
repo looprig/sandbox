@@ -134,15 +134,36 @@ func startEscapeTarget(t *testing.T, executor *Executor, workspace, script strin
 // detached grandchild never wrote its marker and (when a pid file was
 // captured) is no longer alive — the core "descendant PID disappears; a
 // delayed marker is never written" proof.
-func assertEscapeContained(t *testing.T, marker, pidPath string) {
+func assertEscapeContained(t *testing.T, marker, pidPath, token string) {
 	t.Helper()
 	time.Sleep(escapeObservationWindow)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("detached grandchild's delayed marker exists (escape succeeded): stat err = %v", err)
 	}
-	if pidPath != "" && pidFileAlive(pidPath) {
-		t.Fatalf("detached grandchild pid (from %s) is still alive after containment teardown", pidPath)
+	if escapeGrandchildAlive(t, pidPath, token) {
+		t.Fatalf("detached grandchild (token %s, pid file %s) is still alive after containment teardown", token, pidPath)
 	}
+}
+
+// escapeToken returns a per-test token the detached grandchild carries as its
+// $0 (see escapeGrandchildLaunch), so its liveness can be checked from the
+// host without trusting the pid it recorded: at Linux Rung 1 the target runs
+// in its own PID namespace, so `echo $!` records a namespace-local pid that
+// names an unrelated host process (often a low-numbered root daemon, which
+// kill(pid, 0) reports as alive via EPERM).
+func escapeToken(t *testing.T) string {
+	return "lrsb-escape-" + strconv.Itoa(os.Getpid()) + "-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
+}
+
+// escapeGrandchildLaunch is the shell fragment that setsid-detaches the
+// grandchild with the token as its $0. The token is assembled at run time
+// (printf), so it appears in the grandchild's argv but never literally in the
+// immediate child's own command line: a host-side scan for it can only match
+// the grandchild.
+func escapeGrandchildLaunch(grandchild, token string) string {
+	head, tail := token[:len("lrsb-esc")], token[len("lrsb-esc"):]
+	return "T=$(printf '%s%s' " + portableShellQuote(head) + " " + portableShellQuote(tail) + "); " +
+		"setsid sh -c " + portableShellQuote(grandchild) + " \"$T\""
 }
 
 // setsidEscapeScript builds a target command: it backgrounds a `setsid`-
@@ -151,9 +172,9 @@ func assertEscapeContained(t *testing.T, marker, pidPath string) {
 // stdio (</dev/null >/dev/null 2>&1), recording the detached process's real
 // pid, then exits immediately itself so the immediate child is reaped
 // quickly while the grandchild is still sleeping.
-func setsidEscapeScript(marker, pidPath string) string {
+func setsidEscapeScript(marker, pidPath, token string) string {
 	grandchild := "sleep " + strconv.Itoa(int(escapeGrandchildDelay.Seconds())) + "; printf 1 > " + portableShellQuote(marker)
-	return "setsid sh -c " + portableShellQuote(grandchild) + " </dev/null >/dev/null 2>&1 & echo $! > " +
+	return escapeGrandchildLaunch(grandchild, token) + " </dev/null >/dev/null 2>&1 & echo $! > " +
 		portableShellQuote(pidPath) + "; exit 0"
 }
 
@@ -180,9 +201,9 @@ func setsidEscapeScript(marker, pidPath string) string {
 // grandchild's own escapeGrandchildDelay sleep) while guaranteeing pidPath
 // exists before the outer process, and therefore the supervised spawn's
 // root, ever exits.
-func doubleForkEscapeScript(marker, pidPath string) string {
+func doubleForkEscapeScript(marker, pidPath, token string) string {
 	grandchild := "sleep " + strconv.Itoa(int(escapeGrandchildDelay.Seconds())) + "; printf 1 > " + portableShellQuote(marker)
-	return "( setsid sh -c " + portableShellQuote(grandchild) + " </dev/null >/dev/null 2>&1 & echo $! > " +
+	return "( " + escapeGrandchildLaunch(grandchild, token) + " </dev/null >/dev/null 2>&1 & echo $! > " +
 		portableShellQuote(pidPath) + " ) & wait; exit 0"
 }
 
@@ -196,7 +217,8 @@ func TestIntegrationProcessTreeSetsidEscape(t *testing.T) {
 
 	marker := filepath.Join(workspace, "setsid-marker")
 	pidPath := filepath.Join(workspace, "setsid-pid")
-	proc := startEscapeTarget(t, executor, workspace, setsidEscapeScript(marker, pidPath))
+	token := escapeToken(t)
+	proc := startEscapeTarget(t, executor, workspace, setsidEscapeScript(marker, pidPath, token))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -204,7 +226,7 @@ func TestIntegrationProcessTreeSetsidEscape(t *testing.T) {
 		t.Fatalf("Wait (immediate child): %v", err)
 	}
 	waitForPath(t, pidPath)
-	assertEscapeContained(t, marker, pidPath)
+	assertEscapeContained(t, marker, pidPath, token)
 }
 
 // TestIntegrationProcessTreeDoubleFork proves the same containment holds for
@@ -216,7 +238,8 @@ func TestIntegrationProcessTreeDoubleFork(t *testing.T) {
 
 	marker := filepath.Join(workspace, "doublefork-marker")
 	pidPath := filepath.Join(workspace, "doublefork-pid")
-	proc := startEscapeTarget(t, executor, workspace, doubleForkEscapeScript(marker, pidPath))
+	token := escapeToken(t)
+	proc := startEscapeTarget(t, executor, workspace, doubleForkEscapeScript(marker, pidPath, token))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -224,7 +247,7 @@ func TestIntegrationProcessTreeDoubleFork(t *testing.T) {
 		t.Fatalf("Wait (immediate child): %v", err)
 	}
 	waitForPath(t, pidPath)
-	assertEscapeContained(t, marker, pidPath)
+	assertEscapeContained(t, marker, pidPath, token)
 }
 
 // TestIntegrationProcessTreeParentDeath proves containment holds even when
@@ -247,12 +270,18 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 	// kill, not merely on the immediate child's own cooperative exit (which
 	// TestIntegrationProcessTreeSetsidEscape already covers).
 	grandchild := "sleep " + strconv.Itoa(int(escapeGrandchildDelay.Seconds())) + "; printf 1 > " + portableShellQuote(marker)
-	script := "setsid sh -c " + portableShellQuote(grandchild) + " </dev/null >/dev/null 2>&1 & echo $! > " +
+	token := escapeToken(t)
+	script := escapeGrandchildLaunch(grandchild, token) + " </dev/null >/dev/null 2>&1 & echo $! > " +
 		portableShellQuote(pidPath) + "; : > " + portableShellQuote(started) + "; sleep 30"
 	proc := startEscapeTarget(t, executor, workspace, script)
 
 	waitForPath(t, started)
 	waitForPath(t, pidPath)
+	// Positive control: the liveness check must see the grandchild while it is
+	// alive, or its "gone" verdict below would prove nothing.
+	if !escapeGrandchildAlive(t, pidPath, token) {
+		t.Fatalf("detached grandchild (token %s) not observed alive before the kill; the liveness check is blind", token)
+	}
 	if err := proc.Signal(context.Background(), ProcessSignalKill); err != nil {
 		t.Fatalf("Signal(Kill) on the supervising helper: %v", err)
 	}
@@ -261,7 +290,7 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 	if _, err := proc.Wait(ctx); err != nil {
 		t.Fatalf("Wait (force-killed immediate child): %v", err)
 	}
-	assertEscapeContained(t, marker, pidPath)
+	assertEscapeContained(t, marker, pidPath, token)
 }
 
 // TestIntegrationProcessTreeDarwinSetsidEscapeContained is Task 6's
@@ -293,7 +322,8 @@ func TestIntegrationProcessTreeDarwinSetsidEscapeContained(t *testing.T) {
 
 	marker := filepath.Join(workspace, "darwin-escape-marker")
 	pidPath := filepath.Join(workspace, "darwin-escape-pid")
-	proc := startEscapeTarget(t, executor, workspace, setsidEscapeScript(marker, pidPath))
+	token := escapeToken(t)
+	proc := startEscapeTarget(t, executor, workspace, setsidEscapeScript(marker, pidPath, token))
 
 	// The self-reported contract: darwin has no kernel-enforced tree
 	// teardown, so this spawn must honestly report BestEffort, never
@@ -315,5 +345,5 @@ func TestIntegrationProcessTreeDarwinSetsidEscapeContained(t *testing.T) {
 	// responsible for discovering (it left the process group, so the plain
 	// group SIGKILL alone cannot reach it) is gone too — same proof
 	// assertEscapeContained already performs for the platform-neutral tests.
-	assertEscapeContained(t, marker, pidPath)
+	assertEscapeContained(t, marker, pidPath, token)
 }
