@@ -69,20 +69,26 @@ func TestLinuxTargetGrantFailsClosed(t *testing.T) {
 }
 
 // TestUnpinnedExecutorUsesLinuxBackend confirms an executor built WITHOUT the
-// withBackend seam (the production path) reports the rung-2 posture — proving the
-// wiring flows end to end through NewExecutor.
+// withBackend seam (the production path) reports the posture of the rung this
+// host selects — Rung 1 (LevelFull) where unprivileged user namespaces are
+// usable, otherwise Rung 2 (LevelDegraded) — proving the wiring flows end to
+// end through NewExecutor.
 func TestUnpinnedExecutorUsesLinuxBackend(t *testing.T) {
 	requireLandlockV4(t)
-	ws := t.TempDir()
+	want, rung := LevelDegraded, "Rung 2"
+	if linux.ProbeCaps().SelectRung() == linux.RungOne {
+		want, rung = LevelFull, "Rung 1"
+	}
+	ws := carveoutWorkspace(t)
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("NewExecutor: %v", err)
 	}
-	if e.Level() != LevelDegraded {
-		t.Errorf("Level() = %d, want LevelDegraded (linux.Rung-2 linux enforce.Backend)", e.Level())
+	if e.Level() != want {
+		t.Errorf("Level() = %d, want %d (%s selected on this host)", e.Level(), want, rung)
 	}
 	if !e.Guarantees().WriteBoundary {
-		t.Errorf("Guarantees().WriteBoundary = false, want true (linux.Rung-2 FS confinement live)")
+		t.Errorf("Guarantees().WriteBoundary = false, want true (%s FS confinement live)", rung)
 	}
 	// And it actually runs a command through the stage-2 re-exec + Landlock.
 	out, code, err := e.RunArgv(context.Background(), ws, []string{"echo", "wired"})

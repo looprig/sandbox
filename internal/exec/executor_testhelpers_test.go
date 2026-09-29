@@ -28,6 +28,27 @@ func TestPortableArgvEchoHelper(t *testing.T) {
 	}
 }
 
+// carveoutWorkspace returns a fresh workspace whose protected carveouts
+// (.git and .looprig, which fixtureWorkspaceWrite declares read-only) exist.
+//
+// Tests that let the platform selector choose the backend run at Rung 1
+// wherever the host permits unprivileged user namespaces, and Rung 1 refuses a
+// spawn whose protected child is absent beneath a writable bind: its mount view
+// cannot re-mask a path that is not there (namespace.go, "unavailable beneath
+// writable bind"). A test that is not about carveouts therefore needs them
+// present to run on every rung. Tests that ARE about an absent carveout keep
+// using t.TempDir directly.
+func carveoutWorkspace(t *testing.T) string {
+	t.Helper()
+	workspace := t.TempDir()
+	for _, name := range []string{".git", ".looprig"} {
+		if err := os.Mkdir(filepath.Join(workspace, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return workspace
+}
+
 func portableEchoArgv(t *testing.T, values ...string) []string {
 	t.Helper()
 	executable, err := os.Executable()
@@ -39,7 +60,7 @@ func portableEchoArgv(t *testing.T, values ...string) []string {
 }
 
 func TestPortableShellFixtures(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := carveoutWorkspace(t)
 	work := filepath.Join(workspace, "work")
 	if err := os.Mkdir(work, 0o700); err != nil {
 		t.Fatal(err)

@@ -56,7 +56,7 @@ func TestNewExecutorNullBackendGuarantees(t *testing.T) {
 // convention: a process that runs returns (output, exitCode, nil) with the real
 // code even when non-zero; only a spawn/setup failure returns a non-nil error.
 func TestRunCommand(t *testing.T) {
-	ws := t.TempDir()
+	ws := carveoutWorkspace(t)
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)
@@ -87,7 +87,7 @@ func TestRunCommand(t *testing.T) {
 // TestRunArgv covers the direct-argv path: no shell is interposed, so shell
 // metacharacters are literal arguments rather than syntax.
 func TestRunArgv(t *testing.T) {
-	ws := t.TempDir()
+	ws := carveoutWorkspace(t)
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)
@@ -143,7 +143,7 @@ func TestEnvScrub(t *testing.T) {
 	}
 	t.Setenv("GITHUB_TOKEN", "secret")
 
-	ws := t.TempDir()
+	ws := carveoutWorkspace(t)
 	// Construct AFTER Setenv: assembleEnv snapshots os.Environ() at build time.
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
@@ -251,7 +251,7 @@ func TestInit(t *testing.T) {
 // visible error (ctx.Err()) with code -1, symmetric with cancel-before-start —
 // not a silent nil-error signal kill.
 func TestRunCommandContextTimeout(t *testing.T) {
-	ws := t.TempDir()
+	ws := carveoutWorkspace(t)
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)

@@ -60,7 +60,7 @@ func acceptRowSandboxUnavailable(t *testing.T) {
 func acceptRowEnvScrub(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "gh-secret")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-secret")
-	ws := t.TempDir()
+	ws := carveoutWorkspace(t)
 
 	// Construct AFTER Setenv: the executor snapshots os.Environ at build.
 	e, err := newExecutorForEffectivePolicy(backendFixturePolicy(fixtureWorkspaceWrite, ws))
