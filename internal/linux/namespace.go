@@ -451,8 +451,51 @@ func mountPathVisible(binds []BindSpec, path string) bool {
 	return false
 }
 
+// procSelfFDPrefix names a bind source by descriptor rather than by path.
+const procSelfFDPrefix = "/proc/self/fd/"
+
+// errPinnedBindChanged reports that a grant-pinned bind root no longer names
+// the inode the grant pinned when stage 2 re-resolved it.
+var errPinnedBindChanged = errors.New("pinned bind target changed")
+
+// reopenPinnedBindSource re-resolves target in the CURRENT mount namespace,
+// without following any symlink, and returns an O_PATH descriptor to it only
+// when it is the same inode (device and inode number) as pinnedFD. The stage-2
+// child's mount namespace is a copy of its parent's, so the pinned descriptor
+// (opened before the clone) refers to a mount the kernel will not bind here;
+// the same inode reached through this namespace's copy of the tree is the one
+// the grant approved. Any other inode — a path swapped after the grant was
+// pinned — fails closed.
+func reopenPinnedBindSource(pinnedFD int, target string, isDir bool) (int, error) {
+	var pinned unix.Stat_t
+	if err := unix.Fstat(pinnedFD, &pinned); err != nil {
+		return -1, fmt.Errorf("stat pinned descriptor %d: %w", pinnedFD, err)
+	}
+	flags := uint64(unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC)
+	if isDir {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := unix.Openat2(unix.AT_FDCWD, target, &unix.OpenHow{
+		Flags:   flags,
+		Resolve: uint64(unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS),
+	})
+	if err != nil {
+		return -1, fmt.Errorf("re-resolve pinned target: %w", err)
+	}
+	var current unix.Stat_t
+	if err := unix.Fstat(fd, &current); err != nil {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("stat re-resolved target: %w", err)
+	}
+	if current.Dev != pinned.Dev || current.Ino != pinned.Ino {
+		_ = unix.Close(fd)
+		return -1, errPinnedBindChanged
+	}
+	return fd, nil
+}
+
 func procFDNumber(path string) int {
-	value, err := strconv.Atoi(strings.TrimPrefix(path, "/proc/self/fd/"))
+	value, err := strconv.Atoi(strings.TrimPrefix(path, procSelfFDPrefix))
 	if err != nil {
 		return int(^uint(0) >> 1)
 	}
@@ -705,7 +748,21 @@ func applyBind(newroot string, b BindSpec) error {
 			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("touch bind target %s: %w", b.Target, err)}
 		}
 	}
-	if err := unix.Mount(b.Source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+	source := b.Source
+	if strings.HasPrefix(source, procSelfFDPrefix) {
+		// A grant-pinned root: the descriptor was opened in the PARENT's mount
+		// namespace, and the kernel refuses (EINVAL) to bind-mount a mount
+		// owned by another namespace. Re-resolve the same path in this
+		// namespace and bind from that, but only if it is the very inode the
+		// grant pinned.
+		fd, err := reopenPinnedBindSource(procFDNumber(source), b.Target, b.IsDir)
+		if err != nil {
+			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
+		}
+		defer func() { _ = unix.Close(fd) }()
+		source = procSelfFDPrefix + strconv.Itoa(fd)
+	}
+	if err := unix.Mount(source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
 	}
 	if b.ReadOnly {
