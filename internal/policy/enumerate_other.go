@@ -31,7 +31,7 @@ func (*PinnedPathResolver) ResolveAny(string) (PinnedPathResolution, bool, error
 
 func (*PinnedPathResolver) addFile(*os.File) int { return 0 }
 
-func (*PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo) (FSRule, bool, error) {
+func (*PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo, _ bool) (FSRule, bool, error) {
 	if !info.IsDir() && (!info.Mode().IsRegular() || !directRegularFileRuleSafe(info)) {
 		return FSRule{}, false, nil
 	}

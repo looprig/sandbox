@@ -300,7 +300,7 @@ func enumerateFSRulesWithResolver(compiled CompiledFS, handles []*PathHandle, re
 			if len(excludes) == 0 {
 				info, err := os.Lstat(allow.Path)
 				if err == nil && info.Mode()&fs.ModeSymlink == 0 {
-					rule, ok, err := resolver.directRule(allow.Path, bit, info)
+					rule, ok, err := resolver.directRule(allow.Path, bit, info, true)
 					if err != nil {
 						CloseRuleFiles(resolver.files)
 						return nil, nil, err
@@ -312,7 +312,7 @@ func enumerateFSRulesWithResolver(compiled CompiledFS, handles []*PathHandle, re
 				continue
 			}
 			err = carveGrant(allow.Path, bit, excludes, func(path string, access FSAccess, info os.FileInfo) error {
-				rule, ok, err := resolver.directRule(path, access, info)
+				rule, ok, err := resolver.directRule(path, access, info, false)
 				if err != nil {
 					return err
 				}

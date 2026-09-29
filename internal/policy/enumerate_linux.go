@@ -147,11 +147,15 @@ func (resolver *PinnedPathResolver) addFile(file *os.File) int {
 	return childFD
 }
 
-func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo) (FSRule, bool, error) {
+// directRule builds the descriptor-bound rule for one non-pinned path. explicit
+// is true only when the path IS a policy allow entry (compiled_fs.go's direct
+// branch); it is false for a child emitted while carving a directory tree around
+// an exclusion, which must never widen into device nodes the policy never named.
+func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, info os.FileInfo, explicit bool) (FSRule, bool, error) {
 	if info.IsDir() {
 		return FSRule{Path: target, Access: access, IsDir: true}, true, nil
 	}
-	if !directFileRuleClass(info.Mode()) {
+	if !directFileRuleClass(info.Mode(), target, explicit) {
 		return FSRule{}, false, nil
 	}
 	if cached, ok := resolver.direct[target]; ok {
@@ -186,7 +190,7 @@ func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, i
 		_ = file.Close()
 		return FSRule{}, false, fmt.Errorf("%w: Landlock file %q changed while its rule was compiled", ErrTargetChanged, target)
 	}
-	if !directFileRuleClass(checked.Mode()) || !directRegularFileRuleSafe(checked) {
+	if !directFileRuleClass(checked.Mode(), target, explicit) || !directRegularFileRuleSafe(checked) {
 		_ = file.Close()
 		return FSRule{}, false, nil
 	}
@@ -200,21 +204,25 @@ func (resolver *PinnedPathResolver) directRule(target string, access FSAccess, i
 	}, true, nil
 }
 
-// directFileRuleClass reports whether a non-directory a policy names directly may
-// carry a descriptor-bound Landlock rule: a regular file (subject to
-// directRegularFileRuleSafe's single-link check) or a character device.
+// directFileRuleClass reports whether a non-directory may carry a
+// descriptor-bound Landlock rule: a regular file (subject to
+// directRegularFileRuleSafe's single-link check), or — only as the policy's own
+// explicit entry for NullDevicePath — the /dev/null character device.
 //
-// Character devices are admitted because fixed runtime paths the backend itself
-// grants are devices — /dev/null above all (policy.NullDevicePath, README
-// "Fixed runtime paths"). Refusing them silently dropped that grant, so every
-// confined `cmd >/dev/null` failed with EACCES on both rungs. A device rule
-// follows the device inode it was opened on, so the hard-link concern that
-// guards regular files (a second name for a protected file's data) does not
-// apply: another name for the same node reaches only the same device. Block
-// devices, FIFOs and sockets stay refused, and trees are still enumerated
-// without device rules.
-func directFileRuleClass(mode os.FileMode) bool {
-	return mode.IsRegular() || mode&os.ModeCharDevice != 0 && mode&os.ModeDevice != 0
+// The device exception exists because the backend itself grants /dev/null
+// (policy.NullDevicePath, README "Fixed runtime paths"); refusing it silently
+// dropped that grant, so every confined `cmd >/dev/null` failed with EACCES on
+// both rungs. It is deliberately that narrow: a child reached while carving a
+// granted tree (e.g. rw /dev with /dev/pts denied) keeps the regular-file-only
+// rule, so carving never emits rules for /dev/kmsg, /dev/tty or any other device
+// the policy did not name; nor does an explicit entry for another device. A
+// device rule follows the device inode it was opened on, so the hard-link
+// concern that guards regular files does not apply to it.
+func directFileRuleClass(mode os.FileMode, target string, explicit bool) bool {
+	if mode.IsRegular() {
+		return true
+	}
+	return explicit && target == NullDevicePath && mode&os.ModeCharDevice != 0 && mode&os.ModeDevice != 0
 }
 
 func openDirectRuleFile(target string) (*os.File, error) {
