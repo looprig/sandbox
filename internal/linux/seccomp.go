@@ -3,6 +3,7 @@
 package linux
 
 import (
+	"errors"
 	"runtime"
 	"unsafe"
 
@@ -73,11 +74,18 @@ const SeccompX32SyscallBit = 0x40000000
 const IPProtoMPTCP = unix.IPPROTO_MPTCP
 
 // BuildSeccompFilter builds the Rung-2 classic-BPF program as a []unix.SockFilter.
-// See the annotated instruction listing inline. Structure:
+// See the annotated instruction listing inline; the bracketed indices are the
+// amd64 layout, and the x32 guard ([4]-[5]) exists only there, so later
+// instructions sit two earlier on arm64. Every jump is relative, so dropping the
+// guard moves no branch target. Every syscall number is a golang.org/x/sys/unix
+// SYS_* constant, generated per GOARCH, and the argument offsets assume a
+// little-endian ABI, which both supported architectures are. Structure:
 //
-//	arch guard  -> KILL_PROCESS on mismatch (stops i386 — a different arch value)
-//	x32 guard   -> KILL_PROCESS if nr carries __X32_SYSCALL_BIT (x32 shares the
-//	               x86_64 arch value, so the arch guard alone does NOT stop it)
+//	arch guard  -> KILL_PROCESS on mismatch (stops i386 / AArch32 — a different
+//	               arch value; see SeccompAuditArch)
+//	x32 guard   -> amd64 only: KILL_PROCESS if nr carries __X32_SYSCALL_BIT (x32
+//	               shares the x86_64 arch value, so the arch guard alone does
+//	               NOT stop it)
 //	ptrace / io_uring{setup,enter,register} -> ERRNO(EACCES)
 //	nr != socket -> ALLOW
 //	domain != AF_INET && != AF_INET6 -> ALLOW
@@ -90,24 +98,29 @@ func BuildSeccompFilter() []unix.SockFilter {
 		retAllow = unix.SECCOMP_RET_ALLOW
 		retErrno = unix.SECCOMP_RET_ERRNO | (uint32(unix.EACCES) & unix.SECCOMP_RET_DATA)
 	)
-	return []unix.SockFilter{
-		// --- arch guard ---------------------------------------------------------
+	// --- arch guard ------------------------------------------------------------
+	filter := []unix.SockFilter{
 		// [0] A = seccomp_data.arch
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, SeccompOffArch),
-		// [1] if A == AUDIT_ARCH_X86_64 -> skip the kill, else fall to [2]
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AUDIT_ARCH_X86_64, 1, 0),
-		// [2] arch mismatch (e.g. i386): kill the whole process (fail-closed)
+		// [1] if A == the native arch -> skip the kill, else fall to [2]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, SeccompAuditArch(), 1, 0),
+		// [2] arch mismatch (i386 on x86_64, AArch32 on arm64): kill the whole
+		//     process (fail-closed)
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retKill),
-
-		// --- x32 guard ----------------------------------------------------------
 		// [3] A = seccomp_data.nr
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, SeccompOffNR),
-		// [4] if (A & __X32_SYSCALL_BIT) != 0 -> fall to [5] kill, else skip it
-		seccompJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, SeccompX32SyscallBit, 0, 1),
-		// [5] x32 syscall: kill (shares the x86_64 arch value but its nr would dodge
-		//     the nr compares below and fall through to ALLOW)
-		seccompStmt(unix.BPF_RET|unix.BPF_K, retKill),
-
+	}
+	if seccompGuardX32 {
+		// --- x32 guard (amd64 only) -----------------------------------------------
+		filter = append(filter,
+			// [4] if (A & __X32_SYSCALL_BIT) != 0 -> fall to [5] kill, else skip it
+			seccompJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, SeccompX32SyscallBit, 0, 1),
+			// [5] x32 syscall: kill (shares the x86_64 arch value but its nr would
+			//     dodge the nr compares below and fall through to ALLOW)
+			seccompStmt(unix.BPF_RET|unix.BPF_K, retKill),
+		)
+	}
+	return append(filter, []unix.SockFilter{
 		// A still holds nr (loaded at [3]) for the nr-only denials below.
 		// --- ptrace -------------------------------------------------------------
 		// [6] if A == SYS_ptrace -> fall to [7] deny, else skip it
@@ -164,8 +177,13 @@ func BuildSeccompFilter() []unix.SockFilter {
 		//      positive control proving the socket denials are arg-scoped, not a
 		//      blanket socket() ban.
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
-	}
+	}...)
 }
+
+// SeccompAuditArch is the seccomp_data.arch value the filter accepts: the
+// native architecture this binary was built for (seccomp_arch_*.go), or 0 where
+// no filter is supported.
+func SeccompAuditArch() uint32 { return seccompAuditArch }
 
 // seccompStmt builds a non-branching BPF instruction (jt/jf = 0).
 func seccompStmt(code uint16, k uint32) unix.SockFilter {
@@ -177,6 +195,10 @@ func seccompStmt(code uint16, k uint32) unix.SockFilter {
 func seccompJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
 	return unix.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
 }
+
+// errUnsupportedSeccompArch refuses to install a filter on an architecture with
+// no seccomp_arch_*.go binding (ProbeSeccompFilter already reports it absent).
+var errUnsupportedSeccompArch = errors.New("no seccomp filter for this architecture (" + runtime.GOARCH + ")")
 
 // seccompError is the typed, fail-closed failure of the stage-2 Seccomp install
 // (SPEC §7.2). It names the failing step (PR_SET_NO_NEW_PRIVS or PR_SET_SECCOMP)
@@ -213,6 +235,10 @@ func (e *seccompError) Unwrap() error { return e.Err }
 // slice) live across the call; runtime.KeepAlive is belt-and-braces.
 func installSeccompFilter() error {
 	runtime.LockOSThread() // pin: this thread installs AND execve's; never unlocked.
+
+	if !seccompArchSupported {
+		return &seccompError{Op: "build filter", Err: errUnsupportedSeccompArch}
+	}
 
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return &seccompError{Op: "PR_SET_NO_NEW_PRIVS", Err: err}

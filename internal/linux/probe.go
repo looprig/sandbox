@@ -129,7 +129,15 @@ func ProbeLandlockABI() int {
 // side-effect-free. (A pre-4.14 kernel lacks GET_ACTION_AVAIL and would report
 // false even though filter mode exists — that under-reports, which is
 // fail-secure, and is irrelevant on the modern kernels this ships against.)
+//
+// It also reports false on an architecture this package builds no filter for
+// (seccomp_arch_other.go): the kernel machinery would be present, but the filter
+// could not be installed there, so claiming it would select a rung whose every
+// spawn fails. SelectRung then chooses no enforcing rung (fail secure).
 func ProbeSeccompFilter() bool {
+	if !seccompArchSupported {
+		return false
+	}
 	action := uint32(unix.SECCOMP_RET_KILL_PROCESS)
 	_, _, errno := unix.Syscall(
 		unix.SYS_SECCOMP,

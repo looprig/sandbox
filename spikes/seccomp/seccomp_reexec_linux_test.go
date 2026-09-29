@@ -301,6 +301,12 @@ func parseMarkers(out []byte) map[string]string {
 //	(4) the PARENT (never seccomp'd) can still open a UDP socket
 //	    (confinement is child-local and did not leak).
 func TestSeccompReexecUDPDeny(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		// The spike's hand-built filter is x86_64-only (arch + x32 guards); on
+		// any other architecture its arch guard kills the child. The shipped
+		// filter is per-arch (internal/linux/seccomp_arch_*.go).
+		t.Skipf("seccomp spike filter is x86_64-only; GOARCH=%s", runtime.GOARCH)
+	}
 	// Capability gate: confirm this kernel accepts a seccomp filter after
 	// no_new_privs. A probe subprocess would be heavier; instead we rely on the
 	// host facts (kernel 6.8, seccomp on) and let the stage-2 child surface any

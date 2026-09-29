@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -17,6 +18,16 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// requireSeccompArch skips on an architecture with no filter binding, where
+// BuildSeccompFilter's arch guard accepts nothing (TestSeccompAuditArchMatchesGOARCH
+// proves that fails closed).
+func requireSeccompArch(t *testing.T) {
+	t.Helper()
+	if linux.SeccompAuditArch() == 0 {
+		t.Skipf("no seccomp filter binding for GOARCH=%s", runtime.GOARCH)
+	}
+}
 
 // requireSeccomp skips a test on a host without SECCOMP_MODE_FILTER (rung 2).
 // This host has it, so these tests RUN for real; the skip keeps the suite honest
@@ -116,11 +127,16 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 	t.Parallel()
 	prog := linux.BuildSeccompFilter()
 
-	const (
-		x86      = uint32(unix.AUDIT_ARCH_X86_64)
-		i386     = uint32(unix.AUDIT_ARCH_I386)
-		retErrno = unix.SECCOMP_RET_ERRNO | (uint32(unix.EACCES) & unix.SECCOMP_RET_DATA)
-	)
+	// The filter binds the architecture it was built for; x86 below is that
+	// native arch value on every GOARCH (the name predates arm64 support), and
+	// foreign is a compat arch the guard must kill.
+	requireSeccompArch(t)
+	x86 := linux.SeccompAuditArch()
+	foreign := uint32(unix.AUDIT_ARCH_I386)
+	if runtime.GOARCH == "arm64" {
+		foreign = unix.AUDIT_ARCH_ARM
+	}
+	const retErrno = unix.SECCOMP_RET_ERRNO | (uint32(unix.EACCES) & unix.SECCOMP_RET_DATA)
 	allow := uint32(unix.SECCOMP_RET_ALLOW)
 	kill := uint32(unix.SECCOMP_RET_KILL_PROCESS)
 	dgram := uint64(unix.SOCK_DGRAM)
@@ -135,9 +151,7 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 		want uint32
 	}{
 		// Kill guards (anti-fail-open, fail-closed).
-		{"i386 arch killed", i386, unix.SYS_SOCKET, [6]uint64{unix.AF_INET, stream, 0}, kill},
-		{"x32 socket killed", x86, unix.SYS_SOCKET | linux.SeccompX32SyscallBit, [6]uint64{unix.AF_INET, dgram, 0}, kill},
-		{"x32 write killed", x86, 1 | linux.SeccompX32SyscallBit, [6]uint64{}, kill},
+		{"foreign arch killed", foreign, unix.SYS_SOCKET, [6]uint64{unix.AF_INET, stream, 0}, kill},
 		// UDP denials.
 		{"AF_INET dgram denied", x86, unix.SYS_SOCKET, [6]uint64{unix.AF_INET, dgram, 0}, retErrno},
 		{"AF_INET6 dgram denied", x86, unix.SYS_SOCKET, [6]uint64{unix.AF_INET6, dgram, 0}, retErrno},
@@ -156,8 +170,21 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 		{"AF_INET stream TCP with CLOEXEC allowed", x86, unix.SYS_SOCKET, [6]uint64{unix.AF_INET, stream | cloexec, 0}, allow},
 		{"AF_INET6 stream TCP allowed", x86, unix.SYS_SOCKET, [6]uint64{unix.AF_INET6, stream, 0}, allow},
 		{"AF_UNIX stream allowed", x86, unix.SYS_SOCKET, [6]uint64{unix.AF_UNIX, stream, 0}, allow},
-		{"unrelated syscall allowed", x86, 1 /* write */, [6]uint64{}, allow},
+		{"unrelated syscall allowed", x86, unix.SYS_WRITE, [6]uint64{}, allow},
 		{"openat allowed", x86, unix.SYS_OPENAT, [6]uint64{}, allow},
+	}
+	if runtime.GOARCH == "amd64" {
+		// x32 shares AUDIT_ARCH_X86_64; only its syscall-number bit tells it apart.
+		tests = append(tests, []struct {
+			name string
+			arch uint32
+			nr   uint32
+			args [6]uint64
+			want uint32
+		}{
+			{"x32 socket killed", x86, unix.SYS_SOCKET | linux.SeccompX32SyscallBit, [6]uint64{unix.AF_INET, dgram, 0}, kill},
+			{"x32 write killed", x86, unix.SYS_WRITE | linux.SeccompX32SyscallBit, [6]uint64{}, kill},
+		}...)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
