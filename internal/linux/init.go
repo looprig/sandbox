@@ -83,12 +83,20 @@ type Stage2Spec struct {
 	// rebuilds a go-landlock ruleset from it (applyLandlockRules) and restricts
 	// itself before chdir/execve. policy.FSRule is a concrete, gob-encodable type.
 	FSRules []policy.FSRule
-	// Seccomp requests the Rung-2 Seccomp-BPF filter (Task 12b, SPEC §7.2). When
-	// true the stage-2 child installs BuildSeccompFilter() AFTER Landlock and
-	// BEFORE chdir/execve (installSeccompFilter), so the target inherits it across
-	// the execve and dangerous syscalls (UDP/MPTCP sockets, ptrace, io_uring) are
-	// soft-denied (EACCES). A bool is gob-encodable; the Rung-2 backend sets it.
+	// Seccomp requests the Seccomp-BPF filter (Task 12b, SPEC §7.2). When true
+	// the stage-2 child installs BuildSeccompFilter(SeccompPolicy{AllowUDP:
+	// SeccompAllowUDP}) AFTER Landlock and BEFORE chdir/execve
+	// (installSeccompFilter), so the target inherits it across the execve: the
+	// socket() allowlist (inet TCP, NETLINK_ROUTE, UDP only when permitted),
+	// ptrace, io_uring and the keyring syscalls are soft-denied (EACCES). A bool
+	// is gob-encodable; the backend sets it for both rungs.
 	Seccomp bool
+	// SeccompAllowUDP admits inet UDP sockets in the filter (review H2). The
+	// backend sets it when the policy's network is Open at Rung 2 and always at
+	// Rung 1 (nftables scopes UDP in the Netns); it is false for a Confined
+	// Rung-2 spawn, whose Landlock port rules cannot scope UDP. Its zero value
+	// is the strict filter, so a spec from an older encoder fails narrow.
+	SeccompAllowUDP bool
 	// NetConfined requests the Rung-2 Landlock TCP-port allowlist (Task 12c, SPEC
 	// §7.2, §5.2). When true the stage-2 child calls applyLandlockNet(NetTCPPorts)
 	// AFTER Seccomp and BEFORE chdir/execve, confining TCP connect to NetTCPPorts
@@ -253,7 +261,7 @@ func stage2Setup() error {
 	// filter thread proceeds directly to chdir/execve below on the SAME goroutine
 	// (runtime.LockOSThread), guaranteeing filter-thread == execve-thread.
 	if spec.Seccomp {
-		if err := installSeccompFilter(); err != nil {
+		if err := installSeccompFilter(SeccompPolicy{AllowUDP: spec.SeccompAllowUDP}); err != nil {
 			return &Stage2Error{Op: "Seccomp", Err: err}
 		}
 	}

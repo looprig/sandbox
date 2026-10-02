@@ -11,11 +11,12 @@ import (
 // synthetic linux.Caps values into linux.SelectRung and asserts the chosen rung. The
 // ladder (SPEC §7.2):
 //
-//   - linux.RungOne  iff Userns AND Mountns AND Netns AND LandlockABI>=1 AND Seccomp
+//   - linux.RungOne  iff Userns AND Mountns AND Netns AND LandlockABI>=4 AND Seccomp
 //     (namespaces give the mount view + a Netns for nftables; Landlock+Seccomp
-//     are still applied, so Landlock ABI>=1 and Seccomp are required — but NOT
-//     ABI>=4, because rung 1 scopes network with nftables, not Landlock TCP
-//     rules, so it does not need the v4 TCP-rule feature).
+//     are still applied, and although rung 1 scopes network with nftables
+//     rather than Landlock TCP rules, its stage-2 child applies the SAME
+//     Landlock FS allowlist as rung 2, which refuses below ABI v4 — so an
+//     ABI 1-3 host selecting rung 1 would fail every spawn, review M7).
 //   - else linux.RungTwo iff LandlockABI>=4 AND Seccomp (v4 is where Landlock TCP
 //     port rules land — rung 2's port allowlist needs them).
 //   - else linux.RungNone.
@@ -32,14 +33,14 @@ func TestSelectRung(t *testing.T) {
 			want: linux.RungOne,
 		},
 		{
-			name: "all namespaces + Seccomp + landlock v1 -> linux.RungOne (linux.Rung 1 needs only ABI>=1)",
+			name: "all namespaces + Seccomp + landlock v1 -> linux.RungNone (linux.Rung 1 needs ABI>=4: the stage-2 Landlock apply refuses below v4)",
 			caps: linux.Caps{LandlockABI: 1, Seccomp: true, Userns: true, Mountns: true, Netns: true},
-			want: linux.RungOne,
+			want: linux.RungNone,
 		},
 		{
-			name: "all namespaces + Seccomp + landlock v3 -> linux.RungOne (ABI>=1 suffices for linux.Rung 1)",
+			name: "all namespaces + Seccomp + landlock v3 -> linux.RungNone (ABI 1-3 is neither rung: both apply the v4 Landlock config)",
 			caps: linux.Caps{LandlockABI: 3, Seccomp: true, Userns: true, Mountns: true, Netns: true},
-			want: linux.RungOne,
+			want: linux.RungNone,
 		},
 		{
 			name: "landlock v4 + Seccomp, no namespaces -> linux.RungTwo",
@@ -167,7 +168,7 @@ func TestProbeLinuxCapsConsistency(t *testing.T) {
 // linux.SelectRung and this ever disagree, one of them has drifted from the spec.
 func rederiveRung(c linux.Caps) linux.Rung {
 	switch {
-	case c.Userns && c.Mountns && c.Netns && c.LandlockABI >= 1 && c.Seccomp:
+	case c.Userns && c.Mountns && c.Netns && c.LandlockABI >= 4 && c.Seccomp:
 		return linux.RungOne
 	case c.LandlockABI >= 4 && c.Seccomp:
 		return linux.RungTwo
@@ -190,14 +191,14 @@ func TestProbeLinuxCapsReportsAbsence(t *testing.T) {
 
 	switch got {
 	case linux.RungOne:
-		if !(caps.Userns && caps.Mountns && caps.Netns && caps.LandlockABI >= 1 && caps.Seccomp) {
+		if !(caps.Userns && caps.Mountns && caps.Netns && caps.LandlockABI >= 4 && caps.Seccomp) {
 			t.Fatalf("linux.SelectRung=linux.RungOne but the linux.Rung-1 preconditions are not all met: caps=%+v", caps)
 		}
 	case linux.RungTwo:
 		if !(caps.LandlockABI >= 4 && caps.Seccomp) {
 			t.Fatalf("linux.SelectRung=linux.RungTwo but LandlockABI>=4 && Seccomp is not satisfied: caps=%+v", caps)
 		}
-		if caps.Userns && caps.Mountns && caps.Netns && caps.LandlockABI >= 1 {
+		if caps.Userns && caps.Mountns && caps.Netns {
 			t.Fatalf("linux.SelectRung=linux.RungTwo but all linux.Rung-1 preconditions are met (should be linux.RungOne): caps=%+v", caps)
 		}
 	case linux.RungNone:

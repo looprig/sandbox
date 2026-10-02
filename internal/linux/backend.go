@@ -3,6 +3,7 @@
 package linux
 
 import (
+	"fmt"
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
@@ -114,9 +115,10 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 	}
 	// Task 12c: the TCP-port allowlist earns profile.GuaranteeNetworkBoundary whenever the
 	// policy is net-Confined (!Net.Open). The port boundary is honest because 12b's
-	// Seccomp filter blocks UDP (no address scoping) and MPTCP (which Landlock's
-	// port rules do not cover), so classic TCP is the only egress path and it is
-	// Confined to the allowlist. profile.GuaranteeAddressNetwork is NOT set — Rung 2 cannot
+	// Seccomp socket() allowlist admits only plain inet TCP (plus NETLINK_ROUTE,
+	// which carries no egress) on a Confined spawn — UDP, MPTCP, SCTP, SMC,
+	// AF_UNIX, AF_VSOCK and every other family are refused — so classic TCP is
+	// the only egress path and it is Confined to the allowlist. profile.GuaranteeAddressNetwork is NOT set — Rung 2 cannot
 	// address-scope (Loopback/Private/metadata), recorded unenforced in the report.
 	if cnet.Confined {
 		bits |= profile.GuaranteeNetworkBoundary
@@ -133,13 +135,10 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 	report := fsCompileReport(p, cfs)
 	// Task 12b: record the Rung-2 Seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
-	// in every Rung-2 target, and load-bearingly blocks UDP/MPTCP so the 12c TCP
-	// port allowlist is a sound, non-bypassable network boundary.
-	report.Entries = append(report.Entries, profile.ReportEntry{
-		Feature: "Seccomp-hardening",
-		Status:  "Enforced",
-		Detail:  "Rung-2 Seccomp-BPF filter denies UDP/MPTCP sockets, ptrace, and io_uring in the stage-2 target (EACCES); installed after Landlock, inherited across execve (§7.2)",
-	})
+	// in every Rung-2 target, and its socket() allowlist load-bearingly refuses
+	// every non-TCP egress family/protocol so the 12c TCP port allowlist is a
+	// sound, non-bypassable network boundary.
+	report.Entries = append(report.Entries, seccompReportEntry(!cnet.Confined))
 	// Task 12c: record the Rung-2 network compilation (port allowlist Enforced,
 	// DNS narrowed to TCP, address scoping unenforced).
 	report.Entries = append(report.Entries, NetCompileReport(p.Net, cnet)...)
@@ -162,12 +161,14 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 //     on top of the mount view as defense-in-depth (SPEC §7.2 "then Landlock");
 //   - the cgroup v2 scope (CompileCgroupPolicy, shared) for resource limits.
 //
-// Because the mount view enforces the write boundary, restricted-read, fixed AND
-// glob denies, and nftables enforces the full address-scoped network semantics,
-// a Rung-1 full policy reaches profile.LevelFull with every guarantee the mechanisms
-// apply. The one accepted residual — a file the command itself creates mid-run
-// escaping a spawn-time glob mask (§7.5) — is sound (never wider than policy) and
-// does NOT demote Level. A feature the mechanism cannot reach would lower to
+// Because the mount view enforces the write boundary, restricted-read and fixed
+// denies, and nftables enforces the full address-scoped network semantics, a
+// Rung-1 full policy reaches profile.LevelFull with every guarantee the
+// mechanisms apply. Glob denies are masked by a depth-bounded spawn-time scan of
+// the workspace, $HOME and the bound roots other than "/" and are reported
+// "narrowed" (review M6): a match below GlobScanMaxDepth, one reachable only
+// through a "/" host-read bind, or a file the command itself creates mid-run is
+// not masked (§7.5). That residual does NOT demote Level. A feature the mechanism cannot reach would lower to
 // Degraded and be recorded; for the standard tested profile shapes the mechanisms reach all of
 // them, so Rung 1 is profile.LevelFull. Resource limits are containment-of-cost and never
 // change Level (§7.4).
@@ -217,10 +218,11 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 
 // rung1CompileReport records how the Rung-1 mechanisms compiled each policy
 // feature (SPEC §7.5). At Rung 1 the mount view + nftables enforce features Rung
-// 2 can only narrow or drop: restricted-read invisibility, glob denies, and
-// address-scoped network with the metadata hard-deny — all "Enforced". It also
-// discloses the shared per-axis Landlock snapshot narrowing and the
-// self-created-file glob-mask residual (§7.5); neither demotes Level.
+// 2 can only narrow or drop: restricted-read invisibility and address-scoped
+// network with the metadata hard-deny — "Enforced" — and glob denies, which the
+// bounded spawn-time scan narrows rather than drops. It also discloses the
+// shared per-axis Landlock snapshot narrowing and the glob-mask residual
+// (§7.5); neither demotes Level.
 func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPlan) profile.CompileReport {
 	entries := []profile.ReportEntry{
 		{
@@ -259,8 +261,9 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 	if len(mvp.GlobDenies) > 0 {
 		entries = append(entries, profile.ReportEntry{
 			Feature: "glob-deny",
-			Status:  "Enforced",
-			Detail:  "glob denies (e.g. **/.env*) Enforced by spawn-time bounded enumeration (scan workspace + $HOME to a max depth) masking each match with an empty read-only bind; the only residual is a file the command itself creates mid-run, which holds no pre-existing secret and does not demote Level (§7.5)",
+			Status:  "narrowed",
+			Detail: fmt.Sprintf("glob denies (e.g. **/.env*) are masked with empty read-only binds by a spawn-time bounded enumeration of the workspace, $HOME and every bound writable or read-only root except the filesystem root \"/\", to a depth of %d below each root; "+
+				"a match deeper than that, a match reachable only through a \"/\" host-read bind outside those roots, and a file the command itself creates mid-run are not masked (§7.5)", GlobScanMaxDepth),
 		})
 	}
 	if !p.Env.Inherit {
@@ -271,8 +274,28 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 		})
 	}
 	entries = append(entries, allowPathsReportEntry())
+	// Rung 1 installs the same stage-2 Seccomp filter, with UDP always admitted
+	// (linuxWrap): nftables scopes UDP in the Netns, or the policy is Open.
+	entries = append(entries, seccompReportEntry(true))
 	entries = append(entries, rung1NetReport(nft)...)
 	return profile.CompileReport{Entries: entries}
+}
+
+// seccompReportEntry records the stage-2 Seccomp filter (review C2/H1/H2): the
+// socket() allowlist, whether UDP is admitted for this compile, and the
+// nr-only denials. Both rungs install the same filter shape.
+func seccompReportEntry(allowUDP bool) profile.ReportEntry {
+	udp := "UDP is refused (no Landlock address/port scoping for it; DNS is forced over TCP)"
+	if allowUDP {
+		udp = "UDP (protocol 0/IPPROTO_UDP) is admitted because egress is Open or scoped by the Rung-1 nftables filter"
+	}
+	return profile.ReportEntry{
+		Feature: "Seccomp-hardening",
+		Status:  "Enforced",
+		Detail: "Seccomp-BPF filter in the stage-2 target allows socket() only for AF_INET/AF_INET6 SOCK_STREAM TCP and AF_NETLINK NETLINK_ROUTE; " + udp +
+			"; every other family or protocol (AF_UNIX pathname/abstract sockets such as D-Bus or ssh-agent, AF_VSOCK, AF_SMC, AF_RDS, MPTCP, SCTP, SMC, raw) is refused, socketpair() stays allowed, " +
+			"and ptrace, io_uring and keyctl/add_key/request_key are denied (EACCES); installed after Landlock, inherited across execve (§7.2)",
+	}
 }
 
 func filesystemAxisSnapshotEntry(cfs policy.CompiledFS) (profile.ReportEntry, bool) {
@@ -296,7 +319,7 @@ func filesystemAxisSnapshotEntry(cfs policy.CompiledFS) (profile.ReportEntry, bo
 	detail := "protected path scopes within a recursive allow require shared Landlock child enumeration on denied axes: " +
 		strings.Join(names, ", ") + "; pre-existing unaffected children retain policy-allowed access"
 	if axes&policy.WriteAccess != 0 {
-		detail += ", while withholding directory write at snapshot boundaries and throughout recursive read/execute-denied scopes blocks new entries and prevents rename/link pathname replacement (§7.5)"
+		detail += ", while withholding directory write at snapshot boundaries and throughout recursive read/execute-denied scopes (except where a narrower recursive allow restores the denied read/execute over the writable path) blocks new entries and prevents rename/link pathname replacement (§7.5)"
 	} else {
 		detail += "; write authority is not withheld, so creation may remain permitted, but new entries lack denied-axis authority (§7.5)"
 	}
@@ -470,19 +493,22 @@ func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *r
 			return err
 		}
 		grantRuleFiles = relativeFiles
-		// Seccomp is unconditionally requested for this Rung-2 backend: Rung 2 is
-		// only selected when the Seccomp capability was probed present (SelectRung
-		// requires c.Seccomp), so the stage-2 install cannot be a surprise failure.
-		// It denies UDP/MPTCP sockets, ptrace, and io_uring in the target (Task 12b).
+		// Seccomp is unconditionally requested: both rungs are only selected when
+		// the Seccomp capability was probed present (SelectRung requires
+		// c.Seccomp), so the stage-2 install cannot be a surprise failure. Its
+		// socket() allowlist admits UDP only when nothing else would scope it
+		// anyway: an Open Rung-2 network here, and every Rung-1 spawn below
+		// (nftables scopes UDP in the Netns) — review H2.
 		spec := Stage2Spec{
-			Dir:         dir,
-			Argv:        innerArgv,
-			Env:         targetEnv,
-			FSRules:     fsRules,
-			Seccomp:     true,
-			NetConfined: cnet.Confined,
-			NetTCPPorts: cnet.TcpPorts,
-			Rung:        stage2RungTwo,
+			Dir:             dir,
+			Argv:            innerArgv,
+			Env:             targetEnv,
+			FSRules:         fsRules,
+			Seccomp:         true,
+			SeccompAllowUDP: !cnet.Confined,
+			NetConfined:     cnet.Confined,
+			NetTCPPorts:     cnet.TcpPorts,
+			Rung:            stage2RungTwo,
 		}
 		for index := range handles {
 			spec.GrantFDs = append(spec.GrantFDs, policy.FirstPathHandleChildFD+index)
@@ -506,6 +532,10 @@ func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *r
 			spec.NftRules = r1.nft.toNftSpec()
 			spec.NetConfined = false
 			spec.NetTCPPorts = nil
+			// SPEC §6.1: Rung 1 permits UDP/TCP 53 and nftables drops every
+			// other UDP datagram inside the Netns (and an Open policy creates no
+			// Netns at all), so the filter must not refuse the socket itself.
+			spec.SeccompAllowUDP = true
 		}
 
 		r, w, err := os.Pipe()
