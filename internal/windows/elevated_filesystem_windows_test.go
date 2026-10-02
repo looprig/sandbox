@@ -223,6 +223,9 @@ func TestElevatedBrokerPathClassMatrix(t *testing.T) {
 }
 
 func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
+	// ResourceLimits is earned only for requested limits (review L8), so the
+	// matrix requests one.
+	matrixLimits := policy.Limits{MaxPIDs: 32}
 	requiredCore := uint64(profile.GuaranteeProcessBoundary | profile.GuaranteeReadBoundary |
 		profile.GuaranteeWriteBoundary | profile.GuaranteeResourceLimits)
 	for _, test := range []struct {
@@ -237,6 +240,7 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 			policy: policy.Effective{
 				FS:                 []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess | policy.WriteAccess}},
 				RuntimeBaselines:   []string{policy.WindowsRuntimeBaseline},
+				Limits:             matrixLimits,
 				RequiredGuarantees: requiredCore | profile.GuaranteeNetworkBoundary,
 			},
 			wantAccount: brokerAccountOffline,
@@ -248,6 +252,7 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 			policy: policy.Effective{
 				FS:  []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess}},
 				Net: policy.NetPolicy{Open: true}, RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+				Limits:             matrixLimits,
 				RequiredGuarantees: requiredCore,
 			},
 			wantAccount: brokerAccountOnline, wantBits: requiredCore, wantLevel: profile.LevelFull,
@@ -257,6 +262,7 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 			policy: policy.Effective{
 				FS:  []policy.FSEntry{{Path: `C:\work`, Access: policy.ReadAccess}},
 				Net: policy.NetPolicy{ProxyPort: 49152}, RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+				Limits:             matrixLimits,
 				RequiredGuarantees: requiredCore | profile.GuaranteeNetworkBoundary | profile.GuaranteeTargetNetwork,
 			},
 			wantAccount: brokerAccountOffline,
@@ -293,11 +299,21 @@ func TestElevatedCompileGuaranteeAndReportMatrix(t *testing.T) {
 			if test.policy.Net.Open && bits&profile.GuaranteeNetworkBoundary != 0 {
 				t.Fatal("online account claimed a network boundary")
 			}
-			for _, feature := range []string{
+			enforced := []string{
 				"windows.installed-host", "windows.token", "windows.filesystem.read",
 				"windows.filesystem.write", "windows.job", "windows.private-desktop",
 				"windows.resource-limits", policy.WindowsRuntimeBaseline,
-			} {
+			}
+			firewallStatus := "Enforced"
+			if test.policy.Net.Open {
+				firewallStatus = "unenforced"
+			}
+			if !slices.ContainsFunc(report.Entries, func(entry profile.ReportEntry) bool {
+				return entry.Feature == "windows.firewall" && entry.Status == firewallStatus
+			}) {
+				t.Errorf("windows.firewall row is not %s: %#v", firewallStatus, report)
+			}
+			for _, feature := range enforced {
 				if !slices.ContainsFunc(report.Entries, func(entry profile.ReportEntry) bool {
 					return entry.Feature == feature && entry.Status == "Enforced"
 				}) {

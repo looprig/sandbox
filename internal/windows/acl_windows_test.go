@@ -730,8 +730,29 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	if err := os.WriteFile(concurrentChild, []byte("create allowed after full readback"), 0o600); err != nil {
 		t.Fatalf("relaxed retained root still blocks child creation after Apply: %v", err)
 	}
-	if err := os.Remove(ordinaryFile); err == nil {
-		t.Fatal("relaxed retained file allowed delete sharing")
+	// Review M16: an ordinary, allow-by-inheritance object keeps no handle, so
+	// it can be renamed and deleted while the lease lives (atomic saves, git
+	// checkout, build outputs); only the root, the carveouts and their
+	// ancestors exclude deletion.
+	renamedOrdinary := ordinaryFile + "-renamed"
+	if err := os.Rename(ordinaryFile, renamedOrdinary); err != nil {
+		t.Fatalf("live lease blocked renaming an ordinary file: %v", err)
+	}
+	if err := os.Remove(renamedOrdinary); err != nil {
+		t.Fatalf("live lease blocked deleting an ordinary file: %v", err)
+	}
+	if err := os.Rename(ordinaryDir, ordinaryDir+"-renamed"); err != nil {
+		t.Fatalf("live lease blocked renaming an ordinary directory: %v", err)
+	}
+	if err := os.Rename(ordinaryDir+"-renamed", ordinaryDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(carveoutFile); err == nil {
+		t.Fatal("live lease allowed deleting a write-denied carveout")
+	}
+	if err := os.Rename(carveoutDir, carveoutDir+"-swapped"); err == nil {
+		_ = os.Rename(carveoutDir+"-swapped", carveoutDir)
+		t.Fatal("live lease allowed renaming a carveout directory out from under its policy path")
 	}
 	if err := os.Rename(root, root+"-swapped"); err == nil {
 		_ = os.Rename(root+"-swapped", root)
@@ -770,6 +791,9 @@ func TestACLProjectionDisposableTreeMatrix(t *testing.T) {
 	}
 	if err := os.WriteFile(ordinaryFile, []byte("writer restored after rollback"), 0o600); err != nil {
 		t.Fatalf("retained writer blockade survived projection close: %v", err)
+	}
+	if err := os.Remove(carveoutFile); err != nil {
+		t.Fatalf("carveout delete blockade survived projection close: %v", err)
 	}
 	if err := os.WriteFile(concurrentChild, []byte("namespace restored after rollback"), 0o600); err != nil {
 		t.Fatalf("retained namespace blockade survived projection close: %v", err)

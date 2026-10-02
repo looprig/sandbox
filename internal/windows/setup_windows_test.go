@@ -366,6 +366,7 @@ func TestRemoveInstalledSetupRefusesUnpinnedIdentity(t *testing.T) {
 		accounts: &mappedSetupAccounts{}, services: &fakeServiceAPI{}, credentials: &fakeCredentialStore{},
 		firewall: &fakeFirewallPolicy{effective: true}, removeDir: func(string) error { return nil },
 		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		leases:            func(validatedSetup) ([]SetupProblem, error) { return nil, nil },
 	})
 	if err == nil {
 		t.Fatal("removal adopted deterministic names without manifest-pinned identities")
@@ -458,6 +459,7 @@ func TestRemoveInstalledSetupDeletesWholeInventoriedRootAfterDependencies(t *tes
 		accounts: accounts, services: service, credentials: credentials,
 		firewall:          &fakeFirewallPolicy{effective: true},
 		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		leases:            func(validatedSetup) ([]SetupProblem, error) { return nil, nil },
 		removeDir: func(path string) error {
 			if len(accounts.records) != 0 || service.deleted == "" || !credentials.removed {
 				return errors.New("artifact deletion preceded dependency removal")

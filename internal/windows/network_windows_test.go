@@ -176,10 +176,11 @@ func TestTask20AutoForwardsReservedProxyCapabilityWithoutEphemeralFallback(t *te
 }
 
 func TestTask20ElevatedGuaranteesDescribeOfflineAndTargetPosture(t *testing.T) {
+	// ResourceLimits is not part of the base: it is earned only for
+	// requested limits (review L8; see TestElevatedResourceLimitsOnlyWhenRequested).
 	const base = profile.GuaranteeProcessBoundary |
 		profile.GuaranteeWriteBoundary |
 		profile.GuaranteeReadBoundary |
-		profile.GuaranteeResourceLimits |
 		profile.GuaranteeEnvScrub
 
 	tests := []struct {

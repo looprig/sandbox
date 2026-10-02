@@ -56,6 +56,7 @@ type fakeBrokerJournalFile struct {
 	data       []byte
 	operations []string
 	closed     bool
+	replaceErr error
 }
 
 func (file *fakeBrokerJournalFile) ReadAll() ([]byte, error) {
@@ -73,6 +74,14 @@ func (file *fakeBrokerJournalFile) Sync() error {
 func (file *fakeBrokerJournalFile) Truncate(size int64) error {
 	file.operations = append(file.operations, "truncate")
 	file.data = file.data[:size]
+	return nil
+}
+func (file *fakeBrokerJournalFile) Replace(data []byte) error {
+	file.operations = append(file.operations, "replace")
+	if file.replaceErr != nil {
+		return file.replaceErr
+	}
+	file.data = append([]byte(nil), data...)
 	return nil
 }
 func (file *fakeBrokerJournalFile) Close() error { file.closed = true; return nil }
