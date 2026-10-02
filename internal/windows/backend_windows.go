@@ -10,6 +10,7 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -37,14 +38,107 @@ type restrictedCompileDependencies struct {
 	projectGrant         func(*policy.PathHandle, []policy.FSEntry, SID, *RestrictedJournal, io.Reader) (*ACLProjection, error)
 }
 
+// restrictedBackend is shared by every executor of one ExecutorSet (the set
+// selects the backend once and each keyed executor compiles its own base
+// spec against it), so it holds NO per-executor state: each Compile prepares
+// its own base lease and hands it back on the spec as a
+// restrictedGrantAuthority, and each executor's grants are compiled against
+// the authority on that executor's own spec (CompileWithGrantAuthority). An
+// earlier version kept a single "active base lease" on the backend, which
+// refused a second executor's Compile — and therefore every second executor
+// of a set — with "restricted backend base lease is already active".
 type restrictedBackend struct {
-	config     Config
-	runtime    *RestrictedRuntime
-	deps       restrictedCompileDependencies
-	mu         sync.Mutex
-	baseSID    SID
-	journal    *RestrictedJournal
-	baseActive bool
+	config  Config
+	runtime *RestrictedRuntime
+	deps    restrictedCompileDependencies
+}
+
+// restrictedGrantAuthority is one executor's base lease, carried on that
+// executor's compiled spec as enforce.Spec.GrantAuthority. The executor
+// returns it to this backend unchanged with every grant compile, so a grant
+// always borrows the SID, journal and ACL projections of the lease it was
+// issued under — never another executor's.
+//
+// Borrows keep the lease alive: a transient grant spec's token still names
+// the base SID and relies on the base projections, so releasing the base
+// spec while a grant spec is outstanding only marks the authority retiring;
+// the lease itself is released by whichever of the two lets go last, exactly
+// once. A retiring authority lends nothing new.
+type restrictedGrantAuthority struct {
+	mu       sync.Mutex
+	base     policy.Effective
+	sid      SID
+	journal  *RestrictedJournal
+	release  func() error
+	borrows  int
+	retiring bool
+	released bool
+
+	releaseErr error
+}
+
+func newRestrictedGrantAuthority(base policy.Effective, lease restrictedPreparedLease) *restrictedGrantAuthority {
+	return &restrictedGrantAuthority{base: policy.Clone(base), sid: lease.sid, journal: lease.journal, release: lease.release}
+}
+
+// borrow lends the base lease to one grant compile. base must be the policy
+// the authority was compiled from (compared on normalised clones, as the
+// elevated tier's authority does), which refuses an authority presented on
+// behalf of a different executor.
+func (authority *restrictedGrantAuthority) borrow(base policy.Effective) (SID, *RestrictedJournal, func() error, error) {
+	if authority == nil {
+		return SID{}, nil, nil, errors.New("sandbox: restricted base lease is unavailable")
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if authority.retiring || authority.released || authority.journal == nil {
+		return SID{}, nil, nil, errors.New("sandbox: restricted base lease is unavailable: it is released or retiring")
+	}
+	if !reflect.DeepEqual(authority.base, policy.Clone(base)) {
+		return SID{}, nil, nil, errors.New("sandbox: restricted base lease belongs to another executor")
+	}
+	authority.borrows++
+	var once sync.Once
+	var releaseErr error
+	giveBack := func() error {
+		once.Do(func() {
+			authority.mu.Lock()
+			authority.borrows--
+			releaseErr = authority.releaseIfIdleLocked()
+			authority.mu.Unlock()
+		})
+		return releaseErr
+	}
+	return authority.sid, authority.journal, giveBack, nil
+}
+
+// retire is the base spec's Release: idempotent, and it releases the lease
+// now only when no grant spec still borrows it.
+func (authority *restrictedGrantAuthority) retire() error {
+	if authority == nil {
+		return nil
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	authority.retiring = true
+	return authority.releaseIfIdleLocked()
+}
+
+// releaseIfIdleLocked releases the lease once it is retiring and unborrowed,
+// exactly once, and reports that one release's result to every later caller
+// that reaches it. The lease release runs under mu so a concurrent borrow can
+// never observe a half-released lease.
+func (authority *restrictedGrantAuthority) releaseIfIdleLocked() error {
+	if !authority.retiring || authority.borrows != 0 {
+		return nil
+	}
+	if !authority.released {
+		authority.released = true
+		if authority.release != nil {
+			authority.releaseErr = authority.release()
+		}
+	}
+	return authority.releaseErr
 }
 
 // autoBackend prefers the installed tier. It falls back only when that tier is
@@ -71,6 +165,28 @@ func (backend *autoBackend) ReserveEgressProxy(route network.Route) (*network.Pr
 		return nil, nil, ErrSetupRequired
 	}
 	return provider.ReserveEgressProxy(route)
+}
+
+// CompileWithGrantAuthority routes a grant compile to the tier whose base
+// spec issued authority. A restricted authority goes to the restricted
+// fallback, which compiles the grant against that executor's own base lease;
+// anything else keeps Auto's previous behaviour exactly — a full Compile of
+// the grant policy — because Auto forwarded no grant-path compile before
+// this method existed.
+func (backend *autoBackend) CompileWithGrantAuthority(authority any, base, p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+	if backend == nil || backend.elevated == nil || backend.restricted == nil {
+		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, errors.New("sandbox: invalid Windows auto backend")
+	}
+	if _, restricted := authority.(*restrictedGrantAuthority); restricted {
+		compiler, ok := backend.restricted.(interface {
+			CompileWithGrantAuthority(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
+		})
+		if !ok {
+			return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, errors.New("sandbox: Windows auto restricted tier cannot compile grants")
+		}
+		return compiler.CompileWithGrantAuthority(authority, base, p, handles)
+	}
+	return backend.Compile(p)
 }
 
 // SupportsGrantClass answers the executor's side-effect-free grant preflight
@@ -152,26 +268,10 @@ func (backend *restrictedBackend) Compile(p policy.Effective) (enforce.Spec, pro
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits,
 			errors.Join(errors.New("sandbox: restricted compile returned an invalid lease"), err)
 	}
-	backend.mu.Lock()
-	if backend.baseActive {
-		backend.mu.Unlock()
-		_ = lease.release()
-		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, errors.New("sandbox: restricted backend base lease is already active")
-	}
-	backend.baseSID, backend.journal, backend.baseActive = lease.sid, lease.journal, true
-	backend.mu.Unlock()
-
-	var releaseOnce sync.Once
-	var releaseErr error
-	release := func() error {
-		releaseOnce.Do(func() {
-			backend.mu.Lock()
-			backend.baseActive = false
-			backend.mu.Unlock()
-			releaseErr = lease.release()
-		})
-		return releaseErr
-	}
+	// One lease per Compile, i.e. per executor: the authority below carries
+	// it to this executor's grant compiles and its retire is this spec's
+	// Release.
+	authority := newRestrictedGrantAuthority(p, lease)
 	configure := backend.deps.configure
 	spec := enforce.Spec{
 		Wrap: func(_ string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
@@ -190,7 +290,8 @@ func (backend *restrictedBackend) Compile(p policy.Effective) (enforce.Spec, pro
 					})
 				}
 		},
-		Release: release,
+		Release:        authority.retire,
+		GrantAuthority: authority,
 	}
 	return spec, restrictedCompileReport(p), profile.LevelNone, bits, nil
 }
@@ -219,10 +320,14 @@ func formatGuaranteeBits(bits uint64) string {
 	return strings.Join(result, ",")
 }
 
-// CompileWithPathHandles compiles transient grant authority against the base
-// executor lease. It borrows each caller-owned handle and never reacquires a
-// grant target by path.
-func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+// CompileWithGrantAuthority compiles transient grant authority against the
+// base lease of the executor whose spec issued rawAuthority (its
+// enforce.Spec.GrantAuthority), with base the policy that executor compiled.
+// It is used for every grant compile, with or without path handles: a grant
+// with none still runs under the executor's base SID and projections. It
+// borrows each caller-owned handle and never reacquires a grant target by
+// path.
+func (backend *restrictedBackend) CompileWithGrantAuthority(rawAuthority any, base, p policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 	bits := uint64(0)
 	if !p.Env.Inherit {
 		bits = profile.GuaranteeEnvScrub
@@ -236,16 +341,15 @@ func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, han
 	if err := validateRestrictedGrantClassesWithoutReopen(p); err != nil {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, err
 	}
-	backend.mu.Lock()
-	base, journal, active := backend.baseSID, backend.journal, backend.baseActive
-	backend.mu.Unlock()
-	if !active || journal == nil {
-		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, errors.New("sandbox: restricted base lease is unavailable")
+	authority, _ := rawAuthority.(*restrictedGrantAuthority)
+	baseSID, journal, giveBack, err := authority.borrow(base)
+	if err != nil {
+		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, err
 	}
 	resources := &restrictedLeaseResources{}
-	sids := []SID{base}
+	sids := []SID{baseSID}
 	fail := func(cause error) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
-		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, errors.Join(cause, resources.close())
+		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, errors.Join(cause, resources.close(), giveBack())
 	}
 	var generator *OneShotSIDGenerator
 	if len(handles) != 0 {
@@ -294,7 +398,13 @@ func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, han
 					})
 				}
 		},
-		Release: func() error { releaseOnce.Do(func() { releaseErr = resources.close() }); return releaseErr },
+		// The grant's own projections go first, then the borrow: if the base
+		// spec was released meanwhile, giving the borrow back is what finally
+		// releases the base lease.
+		Release: func() error {
+			releaseOnce.Do(func() { releaseErr = errors.Join(resources.close(), giveBack()) })
+			return releaseErr
+		},
 	}, restrictedCompileReport(p), profile.LevelNone, bits, nil
 }
 
@@ -600,8 +710,20 @@ func configureRestrictedSpawn(cmd *exec.Cmd, sids []SID) (func(), error) {
 			return nil, errors.New("sandbox: invalid restricted Windows spawn SID")
 		}
 	}
+	// TOKEN_ASSIGN_PRIMARY is required although this process never assigns
+	// the SOURCE token: CreateRestrictedToken returns the new token's handle
+	// with the same access rights as the source handle, and
+	// CreateProcessAsUser (syscall.StartProcess with SysProcAttr.Token, and
+	// the ConPTY launch) requires TOKEN_QUERY, TOKEN_DUPLICATE and
+	// TOKEN_ASSIGN_PRIMARY on the token it launches with. Without it
+	// CreateProcessAsUser refuses every restricted-tier launch with
+	// ERROR_ACCESS_DENIED whatever the image — the documented explanation for
+	// the first Windows CI run's "fork/exec ...policy-enforcement.test.exe:
+	// Access is denied.".
+	// (internal/exec now wraps such a refusal with the token handle's granted
+	// access, so a recurrence names the missing right.)
 	var source win.Token
-	if err := win.OpenProcessToken(win.CurrentProcess(), win.TOKEN_DUPLICATE|win.TOKEN_QUERY, &source); err != nil {
+	if err := win.OpenProcessToken(win.CurrentProcess(), win.TOKEN_DUPLICATE|win.TOKEN_QUERY|win.TOKEN_ASSIGN_PRIMARY, &source); err != nil {
 		return nil, fmt.Errorf("open source token for restricted spawn: %w", err)
 	}
 	token, err := CreateRestrictedToken(source, sids)
