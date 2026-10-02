@@ -243,3 +243,89 @@ func mustProfile(t *testing.T, config ProfileConfig) *Profile {
 	}
 	return p
 }
+
+// TestRestrictKeepsNestedRootsEqualToHost pins H4: a root whose access equals
+// the host access but which is nested under the workspace or another root is
+// NOT redundant — dropping it lets the enclosing allow take over its subtree.
+func TestRestrictKeepsNestedRootsEqualToHost(t *testing.T) {
+	workspace := mustCanonicalTestRoot(t, t.TempDir())
+	secret := mustMkdir(t, filepath.Join(workspace, "secret"))
+	shared := mustCanonicalTestRoot(t, t.TempDir())
+	sharedSecret := mustMkdir(t, filepath.Join(shared, "secret"))
+	redundant := mustMkdir(t, filepath.Join(workspace, "redundant"))
+	p := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+		AdditionalRoots: []RootAccess{
+			{Path: secret, Read: Deny, Write: Deny},
+			{Path: shared, Read: Allow, Write: Gated},
+			{Path: sharedSecret, Read: Deny, Write: Deny},
+		},
+	})
+	got, err := Restrict(p, p)
+	if err != nil {
+		t.Fatalf("Restrict: %v", err)
+	}
+	probes := []string{
+		workspace, filepath.Join(workspace, "file"),
+		secret, filepath.Join(secret, "key"),
+		shared, filepath.Join(shared, "file"),
+		sharedSecret, filepath.Join(sharedSecret, "key"),
+		filepath.Dir(workspace), "/",
+	}
+	for _, path := range probes {
+		for _, kind := range []string{"filesystem.read", "filesystem.write"} {
+			want, err := p.AccessFor(kind, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			have, err := got.AccessFor(kind, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if have != want {
+				t.Errorf("Restrict(p, p).AccessFor(%s, %s) = %d, want %d", kind, path, have, want)
+			}
+		}
+	}
+	if got.Fingerprint() != p.Fingerprint() {
+		t.Errorf("Restrict(p, p) fingerprint = %s, want %s", got.Fingerprint(), p.Fingerprint())
+	}
+
+	// A root that resolves to exactly what its enclosing scope already grants
+	// is still pruned, so a redundant root does not perturb the fingerprint.
+	withRedundant := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
+		AdditionalRoots: []RootAccess{
+			{Path: secret, Read: Deny, Write: Deny},
+			{Path: redundant, Read: Allow, Write: Allow},
+			{Path: shared, Read: Allow, Write: Gated},
+			{Path: sharedSecret, Read: Deny, Write: Deny},
+		},
+	})
+	pruned, err := Restrict(withRedundant, withRedundant)
+	if err != nil {
+		t.Fatalf("Restrict: %v", err)
+	}
+	if pruned.Fingerprint() != p.Fingerprint() {
+		t.Errorf("Restrict with a redundant root fingerprint = %s, want %s", pruned.Fingerprint(), p.Fingerprint())
+	}
+}
+
+func mustCanonicalTestRoot(t *testing.T, path string) string {
+	t.Helper()
+	canonical, err := CanonicalRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
+}
+
+func mustMkdir(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
