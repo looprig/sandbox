@@ -75,8 +75,9 @@ type Proxy struct {
 }
 
 type proxyTunnel struct {
-	child    net.Conn
-	upstream net.Conn
+	child         net.Conn
+	upstream      net.Conn
+	authorization *proxyAuthorization
 }
 
 func NewProxy(route Route) (*Proxy, error) {
@@ -191,6 +192,8 @@ func (proxy *Proxy) URL(executionID, credential string) string {
 	return (&url.URL{Scheme: "http", Host: proxy.Addr(), User: url.UserPassword(executionID, credential)}).String()
 }
 
+// Release revokes the execution's authorization, cancels in-flight requests,
+// and closes its registered CONNECT tunnels before returning.
 func (proxy *Proxy) Release(executionID string) {
 	if proxy == nil {
 		return
@@ -198,9 +201,24 @@ func (proxy *Proxy) Release(executionID string) {
 	proxy.mu.Lock()
 	authorization := proxy.executions[executionID]
 	delete(proxy.executions, executionID)
+	var revoked []*proxyTunnel
+	if authorization != nil {
+		for pair := range proxy.tunnels {
+			if pair.authorization == authorization {
+				revoked = append(revoked, pair)
+			}
+		}
+	}
 	proxy.mu.Unlock()
 	if authorization != nil {
 		authorization.cancel()
+	}
+	// Context callbacks run asynchronously. Close registered tunnels before
+	// returning so they cannot forward newly submitted bytes after Release.
+	// Close outside mu: custom connections may call back into the proxy.
+	for _, pair := range revoked {
+		_ = pair.child.Close()
+		_ = pair.upstream.Close()
 	}
 }
 
@@ -280,7 +298,7 @@ func (proxy *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 	}
 	request.Header.Del("Proxy-Authorization")
 	if request.Method == http.MethodConnect {
-		proxy.serveConnect(writer, request, executionID, target)
+		proxy.serveConnect(writer, request, executionID, authorization, target)
 		return
 	}
 	proxy.serveHTTP(writer, request, executionID, target)
@@ -377,7 +395,7 @@ func (proxy *Proxy) serveHTTP(writer http.ResponseWriter, request *http.Request,
 	_, _ = io.Copy(writer, response.Body)
 }
 
-func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, target Target) {
+func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, authorization *proxyAuthorization, target Target) {
 	upstream, err := proxy.dialTunnel(request.Context(), target)
 	if err != nil {
 		if errors.Is(err, ErrAddressDenied) {
@@ -402,7 +420,10 @@ func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Reque
 		_ = upstream.Close()
 		return
 	}
-	pair := &proxyTunnel{child: &idleTimeoutConn{Conn: child, timeout: proxyIdleTimeout}, upstream: &idleTimeoutConn{Conn: upstream, timeout: proxyIdleTimeout}}
+	pair := &proxyTunnel{
+		child: &idleTimeoutConn{Conn: child, timeout: proxyIdleTimeout}, upstream: &idleTimeoutConn{Conn: upstream, timeout: proxyIdleTimeout},
+		authorization: authorization,
+	}
 	stopRelease := context.AfterFunc(request.Context(), func() {
 		_ = pair.child.Close()
 		_ = pair.upstream.Close()
@@ -412,7 +433,9 @@ func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Reque
 		proxy.beforeTunnelRegister()
 	}
 	proxy.mu.Lock()
-	if proxy.closing {
+	// Release and registration share this lock. An execution ID can be
+	// authorized again, so compare the authorization's identity, not its name.
+	if proxy.closing || proxy.executions[executionID] != authorization {
 		proxy.mu.Unlock()
 		_ = pair.child.Close()
 		_ = pair.upstream.Close()

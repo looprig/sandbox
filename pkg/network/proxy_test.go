@@ -356,18 +356,33 @@ func TestProxyReleaseTerminatesOnlyMatchingCONNECTTunnel(t *testing.T) {
 	target := mustTarget(t, "tcp:release-connect.test:"+port)
 	credentialA, _ := proxy.Authorize("exec-a", []Target{target})
 	credentialB, _ := proxy.Authorize("exec-b", []Target{target})
+	// Delay context cancellation entirely: Release must close registered
+	// sockets itself rather than depend on scheduling two AfterFunc callbacks.
+	proxy.mu.Lock()
+	cancelA := proxy.executions["exec-a"].cancel
+	proxy.executions["exec-a"].cancel = func() {}
+	proxy.mu.Unlock()
+	defer cancelA()
 	connA, readerA := openProxyTunnel(t, proxy, "exec-a", credentialA, "release-connect.test", port)
 	defer connA.Close()
 	connB, readerB := openProxyTunnel(t, proxy, "exec-b", credentialB, "release-connect.test", port)
 	defer connB.Close()
+	// The 200 response precedes registration. A round trip proves the
+	// forwarding loop has started, so Release must close a registered pair.
+	_ = connA.SetDeadline(time.Now().Add(time.Second))
+	if _, err := connA.Write([]byte("ready")); err != nil {
+		t.Fatal(err)
+	}
+	ready := make([]byte, len("ready"))
+	if _, err := io.ReadFull(readerA, ready); err != nil || string(ready) != "ready" {
+		t.Fatalf("tunnel readiness = %q, %v", ready, err)
+	}
 
 	proxy.Release("exec-a")
-	_ = connA.SetDeadline(time.Now().Add(300 * time.Millisecond))
-	if _, err := connA.Write([]byte("revoked")); err == nil {
-		one := make([]byte, 1)
-		if _, err := readerA.Read(one); err == nil {
-			t.Fatal("released execution's CONNECT tunnel remained active")
-		}
+	_ = connA.SetReadDeadline(time.Now().Add(time.Second))
+	var timeout net.Error
+	if _, err := readerA.Read(make([]byte, 1)); err == nil || errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatalf("released execution's CONNECT tunnel remained active: %v", err)
 	}
 
 	_ = connB.SetDeadline(time.Now().Add(time.Second))
@@ -400,17 +415,25 @@ func TestProxyReleaseWinsCONNECTAuthorizationRegisterRace(t *testing.T) {
 		<-resume
 	}
 	credential, _ := proxy.Authorize("exec-register-race", []Target{mustTarget(t, "tcp:register-race.test:"+port)})
+	proxy.mu.Lock()
+	cancelOld := proxy.executions["exec-register-race"].cancel
+	proxy.executions["exec-register-race"].cancel = func() {}
+	proxy.mu.Unlock()
+	defer cancelOld()
 	connection, reader := openProxyTunnel(t, proxy, "exec-register-race", credential, "register-race.test", port)
 	defer connection.Close()
 	<-reached
 	proxy.Release("exec-register-race")
+	// Reusing the ID must not revive the authenticated request that is still
+	// paused before registration; its authorization object has been retired.
+	if _, err := proxy.Authorize("exec-register-race", []Target{mustTarget(t, "tcp:register-race.test:"+port)}); err != nil {
+		t.Fatal(err)
+	}
 	close(resume)
-	_ = connection.SetDeadline(time.Now().Add(time.Second))
-	if _, err := connection.Write([]byte("revoked")); err == nil {
-		one := make([]byte, 1)
-		if _, err := reader.Read(one); err == nil {
-			t.Fatal("CONNECT registered after Release and survived revocation")
-		}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	var timeout net.Error
+	if _, err := reader.Read(make([]byte, 1)); err == nil || errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatalf("CONNECT registered after Release and survived revocation: %v", err)
 	}
 }
 

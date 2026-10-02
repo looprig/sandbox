@@ -484,3 +484,17 @@ and a nonempty SID retirement ledger; it still fails on leaked executor
 directories. This is a platform-specific test expectation, not a cleanup bug
 or an unavailable runner capability. The dedicated ConPTY step was not reached
 in either failed run because the preceding whole-suite step failed.
+
+Run `37044322505` (head `3e2f258`) passed `windows-hosted`: the full default-tag
+race suite and all 12 tests in the separate ConPTY skip-is-failure selector.
+No new Windows skips were added during this follow-up. The same run exposed
+an intermittent Linux rung-2 CONNECT revocation bug: `Proxy.Release` only
+cancelled a context, and two asynchronous `AfterFunc` callbacks could allow
+post-release forwarding or a late tunnel registration. Local repetition
+reproduced both paths. Registered tunnels now carry the exact authorization
+object, Release closes matching sockets before returning, and registration
+under the same mutex refuses a retired authorization even if the execution ID
+has been authorized again. Deterministic regressions delay the cancellation
+callback and require actual connection closure (a timeout fails); both fail
+against the old implementation and pass with the fix. An unrelated execution's
+tunnel must remain usable.
