@@ -308,6 +308,30 @@ func (a *rawNetFwAutomation) LocalPolicyModifyState() (state int32, err error) {
 	return state, err
 }
 
+func (a *rawNetFwAutomation) FirewallEnabled(profileType int32) (enabled bool, err error) {
+	err = a.withApartment(func() error {
+		policy, createErr := a.create(&clsidNetFwPolicy2)
+		if createErr != nil {
+			return createErr
+		}
+		defer policy.release()
+		enabled, createErr = readNetFwFirewallEnabled(policy, profileType)
+		return createErr
+	})
+	return enabled, err
+}
+
+// readNetFwFirewallEnabled reads the parameterized FirewallEnabled property:
+// a property get whose single positional argument is the profile type.
+func readNetFwFirewallEnabled(policy *oleDispatch, profileType int32) (bool, error) {
+	value, err := policy.invokeMember("FirewallEnabled", dispatchPropertyGet, []oleVariant{{Type: vtI4, Value: uint64(uint32(profileType))}})
+	defer clearVariant(&value)
+	if err != nil {
+		return false, err
+	}
+	return value.boolValue("FirewallEnabled")
+}
+
 func (a *rawNetFwAutomation) ReadRule(name string) (record netFwRuleRecord, found bool, err error) {
 	err = a.withApartment(func() error {
 		policy, rules, createErr := a.policyAndRules()

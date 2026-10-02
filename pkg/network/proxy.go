@@ -75,8 +75,9 @@ type Proxy struct {
 }
 
 type proxyTunnel struct {
-	child    net.Conn
-	upstream net.Conn
+	child         net.Conn
+	upstream      net.Conn
+	authorization *proxyAuthorization
 }
 
 func NewProxy(route Route) (*Proxy, error) {
@@ -191,6 +192,8 @@ func (proxy *Proxy) URL(executionID, credential string) string {
 	return (&url.URL{Scheme: "http", Host: proxy.Addr(), User: url.UserPassword(executionID, credential)}).String()
 }
 
+// Release revokes the execution's authorization, cancels in-flight requests,
+// and closes its registered CONNECT tunnels before returning.
 func (proxy *Proxy) Release(executionID string) {
 	if proxy == nil {
 		return
@@ -198,9 +201,24 @@ func (proxy *Proxy) Release(executionID string) {
 	proxy.mu.Lock()
 	authorization := proxy.executions[executionID]
 	delete(proxy.executions, executionID)
+	var revoked []*proxyTunnel
+	if authorization != nil {
+		for pair := range proxy.tunnels {
+			if pair.authorization == authorization {
+				revoked = append(revoked, pair)
+			}
+		}
+	}
 	proxy.mu.Unlock()
 	if authorization != nil {
 		authorization.cancel()
+	}
+	// Context callbacks run asynchronously. Close registered tunnels before
+	// returning so they cannot forward newly submitted bytes after Release.
+	// Close outside mu: custom connections may call back into the proxy.
+	for _, pair := range revoked {
+		_ = pair.child.Close()
+		_ = pair.upstream.Close()
 	}
 }
 
@@ -273,9 +291,14 @@ func (proxy *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 		http.Error(writer, "network target denied", http.StatusForbidden)
 		return
 	}
+	if request.Method != http.MethodConnect && !hostHeaderNamesTarget(request, target) {
+		proxy.recordDenial(executionID, target)
+		http.Error(writer, "network target denied: Host header does not match the request target", http.StatusForbidden)
+		return
+	}
 	request.Header.Del("Proxy-Authorization")
 	if request.Method == http.MethodConnect {
-		proxy.serveConnect(writer, request, executionID, target)
+		proxy.serveConnect(writer, request, executionID, authorization, target)
 		return
 	}
 	proxy.serveHTTP(writer, request, executionID, target)
@@ -300,10 +323,47 @@ func targetForRequest(request *http.Request) (Target, error) {
 	return ParseTarget("tcp:" + net.JoinHostPort(host, port))
 }
 
+// hostHeaderNamesTarget reports whether a plain-HTTP request's Host names
+// the same target as its absolute request-URI (review L4). The proxy
+// authorizes and dials the request-URI's authority; a Host naming a
+// different site would ask an approved address for an unapproved virtual
+// host behind a shared front end.
+//
+// Measured: through this proxy's own http.Server that request cannot be
+// formed. For an absolute-form request-URI net/http's server sets
+// Request.Host to the URI authority and DELETES the Host line before the
+// handler runs (RFC 7230 §5.4: the Host line is then ignored), and
+// Request.Write never emits Header["Host"], so the upstream always received
+// the authorized authority. serveHTTP now sets that explicitly instead of
+// inheriting it, and this check refuses a Request.Host that disagrees with
+// the target — unreachable through net/http/1 today, it keeps the guarantee
+// from depending on that server behaviour (a handler reused behind another
+// server, or a future HTTP/2 path). An empty Host is accepted; host names
+// compare case-insensitively and an omitted port means :80, through
+// ParseTarget's normalization.
+func hostHeaderNamesTarget(request *http.Request, target Target) bool {
+	if request.Host == "" {
+		return true
+	}
+	host, port, err := net.SplitHostPort(request.Host)
+	if err != nil {
+		if strings.Contains(strings.Trim(request.Host, "[]"), ":") && !strings.HasPrefix(request.Host, "[") {
+			return false
+		}
+		host, port = strings.Trim(request.Host, "[]"), "80"
+	}
+	named, err := ParseTarget("tcp:" + net.JoinHostPort(host, port))
+	return err == nil && named.String() == target.String()
+}
+
 func (proxy *Proxy) serveHTTP(writer http.ResponseWriter, request *http.Request, executionID string, target Target) {
 	outbound := request.Clone(request.Context())
 	outbound.RequestURI = ""
 	outbound.Header = request.Header.Clone()
+	// The upstream Host is exactly the authorized request-URI authority,
+	// never a client-supplied line (see hostHeaderNamesTarget).
+	outbound.Host = request.URL.Host
+	outbound.Header.Del("Host")
 	removeHopHeaders(outbound.Header)
 	transport := &http.Transport{DisableKeepAlives: false, IdleConnTimeout: proxyIdleTimeout}
 	if proxy.route.kind == routeDirect {
@@ -335,7 +395,7 @@ func (proxy *Proxy) serveHTTP(writer http.ResponseWriter, request *http.Request,
 	_, _ = io.Copy(writer, response.Body)
 }
 
-func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, target Target) {
+func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Request, executionID string, authorization *proxyAuthorization, target Target) {
 	upstream, err := proxy.dialTunnel(request.Context(), target)
 	if err != nil {
 		if errors.Is(err, ErrAddressDenied) {
@@ -360,7 +420,10 @@ func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Reque
 		_ = upstream.Close()
 		return
 	}
-	pair := &proxyTunnel{child: &idleTimeoutConn{Conn: child, timeout: proxyIdleTimeout}, upstream: &idleTimeoutConn{Conn: upstream, timeout: proxyIdleTimeout}}
+	pair := &proxyTunnel{
+		child: &idleTimeoutConn{Conn: child, timeout: proxyIdleTimeout}, upstream: &idleTimeoutConn{Conn: upstream, timeout: proxyIdleTimeout},
+		authorization: authorization,
+	}
 	stopRelease := context.AfterFunc(request.Context(), func() {
 		_ = pair.child.Close()
 		_ = pair.upstream.Close()
@@ -370,7 +433,9 @@ func (proxy *Proxy) serveConnect(writer http.ResponseWriter, request *http.Reque
 		proxy.beforeTunnelRegister()
 	}
 	proxy.mu.Lock()
-	if proxy.closing {
+	// Release and registration share this lock. An execution ID can be
+	// authorized again, so compare the authorization's identity, not its name.
+	if proxy.closing || proxy.executions[executionID] != authorization {
 		proxy.mu.Unlock()
 		_ = pair.child.Close()
 		_ = pair.upstream.Close()

@@ -83,9 +83,15 @@ func TestIntegrationConPTYRestricted(t *testing.T) {
 		t.Fatalf("remove outside write positive control: %v", err)
 	}
 
+	// Network: Allow, exactly as newWindowsRestrictedAcceptanceExecutor
+	// (acceptance_windows_test.go) builds it: the restricted-token tier cannot
+	// deliver NetworkBoundary, so it refuses any profile that would require
+	// it, and a Network: Deny profile here could never reach the ConPTY spawn
+	// this test exists to prove. Write containment, the property under test,
+	// does not depend on the network setting.
 	prof := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
-		HostRead: Allow, HostWrite: Allow, Network: Deny, Command: Allow,
+		HostRead: Allow, HostWrite: Allow, Network: Allow, Command: Allow,
 	})
 	set, err := NewExecutorSet(prof, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
 		WithWindowsSandboxMode(windows.RestrictedToken))

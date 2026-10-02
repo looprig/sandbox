@@ -11,6 +11,16 @@ import (
 
 const netFwModifyStateOK int32 = 0
 
+// NET_FW_PROFILE_TYPE2 values. The offline rules are installed for all three
+// profiles, so each must have Windows Firewall switched on.
+const (
+	netFwProfileDomain  int32 = 1
+	netFwProfilePrivate int32 = 2
+	netFwProfilePublic  int32 = 4
+)
+
+var netFwEnforcedProfiles = []int32{netFwProfileDomain, netFwProfilePrivate, netFwProfilePublic}
+
 type netFwRuleRecord struct {
 	Name, Grouping                  string
 	Enabled                         bool
@@ -28,6 +38,9 @@ type netFwRuleRecord struct {
 // apartment setup but not a safe Automation/VARIANT invocation layer.
 type netFwAutomation interface {
 	LocalPolicyModifyState() (int32, error)
+	// FirewallEnabled is INetFwPolicy2.FirewallEnabled for one
+	// NET_FW_PROFILE_TYPE2 profile.
+	FirewallEnabled(profileType int32) (bool, error)
 	ReadRule(string) (netFwRuleRecord, bool, error)
 	WriteRule(netFwRuleRecord) error
 	DeleteRule(string) error
@@ -35,9 +48,26 @@ type netFwAutomation interface {
 
 type windowsFirewallPolicy struct{ api netFwAutomation }
 
+// LocalRulesEffective reports whether the locally installed offline rules
+// actually filter traffic. LocalPolicyModifyState alone answers only whether
+// Group Policy overrides local rules; with the firewall switched off for a
+// profile the rules exist, read back exactly, and block nothing. Every
+// profile the rules name must therefore be enabled as well.
 func (p windowsFirewallPolicy) LocalRulesEffective() (bool, error) {
 	state, err := p.api.LocalPolicyModifyState()
-	return state == netFwModifyStateOK, err
+	if err != nil || state != netFwModifyStateOK {
+		return false, err
+	}
+	for _, profile := range netFwEnforcedProfiles {
+		enabled, err := p.api.FirewallEnabled(profile)
+		if err != nil {
+			return false, fmt.Errorf("read Windows Firewall enabled state for profile %d: %w", profile, err)
+		}
+		if !enabled {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (p windowsFirewallPolicy) Get(name string) (offlineFirewallRule, bool, error) {

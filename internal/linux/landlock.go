@@ -53,13 +53,34 @@ import (
 // selecting host this always enforces. Every rule is IgnoreIfMissing so a path
 // removed between enumeration and application (TOCTOU) is skipped (narrower)
 // rather than aborting the whole ruleset.
-func applyLandlockRules(rules []policy.FSRule) error {
+//
+// Two optional handled sets depend on the running kernel:
+//
+//   - LANDLOCK_ACCESS_FS_IOCTL_DEV (ABI >= 5, review M12) is HANDLED and
+//     granted to no rule, so a device ioctl on a character/block device the
+//     target opens itself is refused (EACCES) — a /dev/tty or /dev/pts/N it
+//     reaches through a host-read grant cannot be driven. The kernel ties the
+//     right to the file at open time, so descriptors the target INHERITS (the
+//     executor's PTY slave on a TTY spawn, stdio pipes) keep every ioctl, and
+//     the always-allowed set (FIOCLEX, FIONCLEX, FIONBIO, FIOASYNC, FIONREAD,
+//     FIOQSIZE, the FS_IOC_* and FI* file ioctls) stays available on every
+//     file. A program that opens /dev/tty itself to tcgetattr (a password
+//     prompt, a pager) sees EACCES rather than a terminal — narrower, by
+//     design. Below ABI 5 the right does not exist and the Seccomp TIOCSTI /
+//     TIOCLINUX rule plus setsid are the defence (seccomp.go, init.go).
+//   - scoped (ABI >= 6) is the caller's LANDLOCK_SCOPE_* mask
+//     (landlockScopes): the abstract-unix-socket scope when the backend admits
+//     AF_UNIX. A non-zero request on an older kernel fails closed here, since
+//     the compile report already claimed it.
+func applyLandlockRules(rules []policy.FSRule, scoped uint64) error {
 	abi, err := llsys.LandlockGetABIVersion()
 	if err != nil || abi < 4 {
 		return fmt.Errorf("Landlock ABI v4 unavailable: ABI=%d err=%w", abi, err)
 	}
-	const handledAccessFS = (1 << 15) - 1
-	ruleset, err := llsys.LandlockCreateRuleset(&llsys.RulesetAttr{HandledAccessFS: handledAccessFS}, 0)
+	if scoped != 0 && abi < 6 {
+		return fmt.Errorf("Landlock scope %#x requested but ABI=%d has no scopes (needs >= 6)", scoped, abi)
+	}
+	ruleset, err := llsys.LandlockCreateRuleset(&llsys.RulesetAttr{HandledAccessFS: landlockHandledAccessFS(abi), Scoped: scoped}, 0)
 	if err != nil {
 		return fmt.Errorf("landlock_create_ruleset: %w", err)
 	}
@@ -89,6 +110,23 @@ func applyLandlockRules(rules []policy.FSRule) error {
 		return fmt.Errorf("landlock_restrict_self: %w", err)
 	}
 	return nil
+}
+
+// landlockHandledAccessBase is the ABI v3/v4 filesystem access set (bits 0-14:
+// execute through truncate) every ruleset handles.
+const landlockHandledAccessBase = (1 << 15) - 1
+
+// landlockHandledAccessFS is the filesystem access set the ruleset HANDLES on a
+// kernel at abi: the v4 base plus IOCTL_DEV from ABI 5 (applyLandlockRules'
+// doc). It never adds RESOLVE_UNIX (ABI 9): no rule here would grant it, and
+// handling it would change what an admitted AF_UNIX reaches without the
+// compile report knowing — a separate, reported decision.
+func landlockHandledAccessFS(abi int) uint64 {
+	handled := uint64(landlockHandledAccessBase)
+	if abi >= 5 {
+		handled |= llsys.AccessFSIoctlDev
+	}
+	return handled
 }
 
 func addLandlockFSRule(ruleset int, rule policy.FSRule) error {

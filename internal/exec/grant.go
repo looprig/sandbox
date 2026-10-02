@@ -46,7 +46,11 @@ const (
 	GrantClassFilesystemHostWrite = "filesystem.host.write.v1"
 )
 
-var grantEnc = base64.RawURLEncoding
+// grantEnc is strict: a non-strict decoder ignores the unused pad bits of a
+// segment's final character, so several token spellings would decode to one
+// body and MAC. decodeGrantSegment additionally re-encodes and compares, so
+// exactly one spelling of each token authenticates.
+var grantEnc = base64.RawURLEncoding.Strict()
 
 var (
 	ErrGrantMalformed             = policy.ErrMalformed
@@ -111,12 +115,12 @@ func authenticateGrant(key []byte, token string) (grantPayload, error) {
 	if len(parts) != 3 || parts[0] != grantTokenPrefix {
 		return grantPayload{}, ErrGrantMalformed
 	}
-	body, err := grantEnc.DecodeString(parts[1])
-	if err != nil {
+	body, ok := decodeGrantSegment(parts[1])
+	if !ok {
 		return grantPayload{}, ErrGrantMalformed
 	}
-	mac, err := grantEnc.DecodeString(parts[2])
-	if err != nil {
+	mac, ok := decodeGrantSegment(parts[2])
+	if !ok || len(mac) != sha256.Size {
 		return grantPayload{}, ErrGrantMalformed
 	}
 	if !hmac.Equal(mac, grantMAC(key, body)) {
@@ -129,7 +133,32 @@ func authenticateGrant(key []byte, token string) (grantPayload, error) {
 	return payload, nil
 }
 
-func grantID(token string) [32]byte { return sha256.Sum256([]byte(token)) }
+// decodeGrantSegment decodes one token segment and accepts it only when it is
+// the canonical encoding of the bytes it decodes to.
+func decodeGrantSegment(segment string) ([]byte, bool) {
+	decoded, err := grantEnc.DecodeString(segment)
+	if err != nil || grantEnc.EncodeToString(decoded) != segment {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// grantID is the one replay identity for a token, used for usedGrants and the
+// retained path registry alike. It is the decoded MAC, not the token text: the
+// MAC covers the nonce, so it is unique per minted grant, and every spelling
+// that decodes to it names the same grant. The MAC segment is decoded
+// leniently here so a pad-bit variant collides with its original even before
+// authenticateGrant refuses it. A token with no decodable 32-byte MAC cannot
+// authenticate; it is keyed by a domain-separated hash of its text so it can
+// never alias a real MAC.
+func grantID(token string) [32]byte {
+	if parts := strings.Split(token, "."); len(parts) == 3 {
+		if mac, err := base64.RawURLEncoding.DecodeString(parts[2]); err == nil && len(mac) == sha256.Size {
+			return [32]byte(mac)
+		}
+	}
+	return sha256.Sum256([]byte("sandbox-grant-unauthenticatable\x00" + token))
+}
 
 func canonicalWorkingDirectory(path string) (string, error) {
 	return profile.CanonicalRoot(path)
@@ -277,3 +306,69 @@ func verifyGrantBinding(payload grantPayload, now time.Time, executionID, comman
 }
 
 func expiryFromMillis(value int64) time.Time { return time.UnixMilli(value) }
+
+// newMonotonicClock returns the executor's default monotonic clock: elapsed
+// time since construction, read through time.Since, which uses the monotonic
+// reading time.Now attaches and is therefore immune to wall-clock steps.
+func newMonotonicClock() func() time.Duration {
+	origin := time.Now()
+	return func() time.Duration { return time.Since(origin) }
+}
+
+// Grant expiry on two clocks (review L6). A token carries ExpiryUnixMilli,
+// a wall-clock instant the caller chose and the HMAC binds; that remains the
+// caller-facing contract and verifyGrantBinding still enforces it. But the
+// wall clock can step BACKWARD after issuance, and judging expiry by it alone
+// let such a step silently extend a grant's life by however far the clock
+// went back. Issuance therefore also records, per grant ID, a deadline on
+// the executor's monotonic clock: monotonic-now-at-issue plus the remaining
+// wall-clock window at issue (never more than the TTL cap issueGrant already
+// enforces). A grant is live only while BOTH hold. A forward step can only
+// shorten a grant (the wall check fires first), which is the fail-closed
+// direction.
+//
+// The deadline registry is also the record of what this executor issued: a
+// token with no entry — consumed, pruned after its deadline, or never issued
+// here — is expired. That keeps replay protection monotonic too: a used
+// grant's wall-clock replay entry may be pruned early by a forward step and
+// its token then re-presented after a backward one, but the deadline entry
+// was deleted at consumption, so the second presentation is refused.
+
+// recordGrantDeadlineLocked registers token's monotonic deadline. Caller
+// holds grantMu; remaining is the wall-clock window left at issue.
+func (e *Executor) recordGrantDeadlineLocked(token string, remaining time.Duration) {
+	if e.grantDeadlines == nil {
+		e.grantDeadlines = make(map[[32]byte]time.Duration)
+	}
+	e.grantDeadlines[grantID(token)] = e.monotonicNow() + remaining
+}
+
+// checkGrantDeadlineLocked reports ErrGrantExpired for a grant ID whose
+// monotonic deadline has passed or that this executor holds no live issuance
+// record for. Caller holds grantMu.
+func (e *Executor) checkGrantDeadlineLocked(id [32]byte) error {
+	deadline, ok := e.grantDeadlines[id]
+	if !ok || e.monotonicNow() > deadline {
+		return ErrGrantExpired
+	}
+	return nil
+}
+
+// pruneGrantDeadlinesLocked drops issuance records whose monotonic deadline
+// has passed; such grants are expired whether or not an entry remains, so
+// this only bounds memory. Caller holds grantMu.
+func (e *Executor) pruneGrantDeadlinesLocked() {
+	now := e.monotonicNow()
+	for id, deadline := range e.grantDeadlines {
+		if deadline < now {
+			delete(e.grantDeadlines, id)
+		}
+	}
+}
+
+func (e *Executor) monotonicNow() time.Duration {
+	if e.monotonic == nil {
+		e.monotonic = newMonotonicClock()
+	}
+	return e.monotonic()
+}

@@ -58,6 +58,8 @@ type ProfileConfig struct {
 	Isolation       Isolation
 	AdditionalRoots []RootAccess
 	AckUnconfined   bool
+	// UnixSockets is the explicit AF_UNIX escape hatch; the zero value denies.
+	UnixSockets UnixSocketPolicy
 }
 
 // ErrInvalidProfile identifies malformed, unconstructed, or inconsistent
@@ -78,6 +80,7 @@ type Profile struct {
 	isolation          Isolation
 	additionalRoots    []RootAccess
 	ackUnconfined      bool
+	unixSockets        UnixSocketPolicy
 	requiredGuarantees uint64
 	fingerprint        string
 }
@@ -135,6 +138,10 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		}
 	}
 	sort.Slice(roots, func(i, j int) bool { return canonicalPathLess(roots[i].Path, roots[j].Path) })
+	unixSockets, err := normalizeUnixSockets(config.UnixSockets)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &Profile{
 		version:         currentAccessVersion,
@@ -149,6 +156,7 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		isolation:       config.Isolation,
 		additionalRoots: roots,
 		ackUnconfined:   config.AckUnconfined,
+		unixSockets:     unixSockets,
 	}
 	if err := p.validateUnconfined(); err != nil {
 		return nil, err
@@ -290,6 +298,14 @@ func (p *Profile) accessAtPath(write bool, path string) Access {
 }
 
 // PathWithin reports whether path is root itself or lies beneath it.
+// UnixSockets returns a copy of the profile's AF_UNIX escape-hatch policy.
+func (p *Profile) UnixSockets() UnixSocketPolicy {
+	if p == nil {
+		return UnixSocketPolicy{}
+	}
+	return p.unixSockets.clone()
+}
+
 func PathWithin(path, root string) bool {
 	return canonicalPathWithin(path, root)
 }
@@ -317,10 +333,18 @@ func profileFingerprint(p *Profile) (string, error) {
 		AdditionalRoots    []RootAccess
 		AckUnconfined      bool
 		RequiredGuarantees uint64
+		// UnixSockets is omitted when zero so every profile minted before the
+		// escape hatch existed keeps its fingerprint; any non-default policy is
+		// authority and changes it.
+		UnixSockets *UnixSocketPolicy `json:",omitempty"`
 	}{
 		p.version, p.workspaceRoot, p.workspaceRead, p.workspaceWrite,
 		p.hostRead, p.hostWrite, p.network, p.command, p.home, p.isolation,
-		p.additionalRoots, p.ackUnconfined, p.requiredGuarantees,
+		p.additionalRoots, p.ackUnconfined, p.requiredGuarantees, nil,
+	}
+	if !p.unixSockets.isZero() {
+		policy := p.unixSockets.clone()
+		payload.UnixSockets = &policy
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -353,7 +377,14 @@ func Restrict(base, ceiling *Profile) (*Profile, error) {
 		Isolation:      minIsolation(base.isolation, ceiling.isolation),
 	}
 	config.AckUnconfined = config.Isolation == Unconfined && base.ackUnconfined && ceiling.ackUnconfined
+	config.UnixSockets = restrictUnixSockets(base.unixSockets, ceiling.unixSockets)
 
+	// Every path that is a root of either input is a candidate root of the
+	// result, carrying the intersection of what each input resolves there.
+	// Because the candidate set contains every root of both inputs, the
+	// longest candidate enclosing any path is at least as deep as each input's
+	// own longest root for it, so the result resolves every path to exactly
+	// min(base, ceiling).
 	paths := make(map[string]struct{}, len(base.additionalRoots)+len(ceiling.additionalRoots))
 	for _, root := range base.additionalRoots {
 		paths[root.Path] = struct{}{}
@@ -361,17 +392,47 @@ func Restrict(base, ceiling *Profile) (*Profile, error) {
 	for _, root := range ceiling.additionalRoots {
 		paths[root.Path] = struct{}{}
 	}
+	candidates := make([]RootAccess, 0, len(paths))
 	for path := range paths {
-		root := RootAccess{
+		candidates = append(candidates, RootAccess{
 			Path:  path,
 			Read:  minAccess(base.accessAtPath(false, path), ceiling.accessAtPath(false, path)),
 			Write: minAccess(base.accessAtPath(true, path), ceiling.accessAtPath(true, path)),
+		})
+	}
+	config.AdditionalRoots = pruneRedundantRoots(config, candidates)
+	return NewProfile(config)
+}
+
+// pruneRedundantRoots drops a candidate root only when the roots kept so far,
+// the workspace and the host access already resolve its path to the same
+// access, so removing it changes no path's resolution. Redundancy is judged
+// against the enclosing scope, not the host access alone: a Deny root nested
+// under an Allow workspace equals a Deny host but is not redundant, and
+// dropping it would hand its subtree the enclosing Allow. Candidates are
+// visited shortest first, so every root that could enclose a candidate has
+// already been decided. The result depends only on the candidate set, which
+// keeps the restricted profile's fingerprint deterministic.
+func pruneRedundantRoots(config ProfileConfig, candidates []RootAccess) []RootAccess {
+	sort.Slice(candidates, func(i, j int) bool {
+		if len(candidates[i].Path) != len(candidates[j].Path) {
+			return len(candidates[i].Path) < len(candidates[j].Path)
 		}
-		if root.Read != config.HostRead || root.Write != config.HostWrite {
-			config.AdditionalRoots = append(config.AdditionalRoots, root)
+		return canonicalPathLess(candidates[i].Path, candidates[j].Path)
+	})
+	resolved := &Profile{
+		workspaceRoot:  config.WorkspaceRoot,
+		workspaceRead:  config.WorkspaceRead,
+		workspaceWrite: config.WorkspaceWrite,
+		hostRead:       config.HostRead,
+		hostWrite:      config.HostWrite,
+	}
+	for _, root := range candidates {
+		if resolved.accessAtPath(false, root.Path) != root.Read || resolved.accessAtPath(true, root.Path) != root.Write {
+			resolved.additionalRoots = append(resolved.additionalRoots, root)
 		}
 	}
-	return NewProfile(config)
+	return resolved.additionalRoots
 }
 
 func minAccess(a, b Access) Access {

@@ -4,6 +4,7 @@ package exec
 
 import (
 	"context"
+	"fmt"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"net"
@@ -199,7 +200,7 @@ func TestIfname(t *testing.T) {
 func TestBuildRung1Ruleset(t *testing.T) {
 	conn, err := nftables.New()
 	if err != nil {
-		t.Skipf("nftables netlink socket unavailable on this host (no flush attempted): %v", err)
+		skipMissingRung1Cap(t, fmt.Sprintf("nftables netlink socket unavailable on this host (no flush attempted): %v", err))
 	}
 	spec := linux.NftSpec{
 		Confined:      true,

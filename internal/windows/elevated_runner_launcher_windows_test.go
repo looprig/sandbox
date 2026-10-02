@@ -50,9 +50,36 @@ type fakeElevatedRunnerAPI struct {
 	resumeErr          error
 
 	mu sync.Mutex
+	// eventsMu guards events alone. It is deliberately separate from mu:
+	// WaitJobEmpty and ReleaseLease already hold mu while they record an
+	// event, so event() taking mu would self-deadlock. A second lock is still
+	// required because events is genuinely appended from two goroutines once
+	// a launch fails after its Job exists — settleFailedJobLaunch hands the
+	// capsule to reapUnprovedElevatedExecution's goroutine (WaitJobEmpty)
+	// while Launch's own deferred inherited.Close() (CreateRequest's close
+	// hook, "close-inherited") is still to run on the launching goroutine.
+	// The first hosted Windows -race run caught exactly that pair. Production
+	// shares no such state: nativeElevatedRunnerProcessAPI is a stateless
+	// struct{}, its inherited-handle close only closes the four duplicated
+	// handles it created, and the reaper touches only the *Job, whose own
+	// mutex already serialises Terminate/Close.
+	eventsMu sync.Mutex
 }
 
-func (api *fakeElevatedRunnerAPI) event(value string) { api.events = append(api.events, value) }
+func (api *fakeElevatedRunnerAPI) event(value string) {
+	api.eventsMu.Lock()
+	defer api.eventsMu.Unlock()
+	api.events = append(api.events, value)
+}
+
+// recorded returns a snapshot of the events recorded so far. Tests read
+// events through it rather than the field so a read that happens while a
+// quarantine reaper goroutine may still be recording is race-free too.
+func (api *fakeElevatedRunnerAPI) recorded() []string {
+	api.eventsMu.Lock()
+	defer api.eventsMu.Unlock()
+	return append([]string(nil), api.events...)
+}
 func (api *fakeElevatedRunnerAPI) VerifyHost(path, hash string) error {
 	api.event("verify-host")
 	if path == "" || hash == "" {
@@ -169,8 +196,8 @@ func TestElevatedRunnerLaunchOrdersAllAuthorityBoundaries(t *testing.T) {
 		"create-suspended", "close-token", "close-inherited", "assign", "resume",
 		"close-thread",
 	}
-	if !reflect.DeepEqual(api.events, wantLaunch) {
-		t.Fatalf("launch events = %v, want %v", api.events, wantLaunch)
+	if !reflect.DeepEqual(api.recorded(), wantLaunch) {
+		t.Fatalf("launch events = %v, want %v", api.recorded(), wantLaunch)
 	}
 	if api.createToken != 7 || api.createHost != `C:\ProgramData\Looprig\slots\one\sandbox-host.exe` ||
 		api.createDesk != `SandboxStation\SandboxDesktop` {
@@ -187,15 +214,15 @@ func TestElevatedRunnerLaunchOrdersAllAuthorityBoundaries(t *testing.T) {
 	wantAll := append(wantLaunch,
 		"wait-process", "wait-job-empty", "release", "close-process",
 	)
-	if !reflect.DeepEqual(api.events, wantAll) {
-		t.Fatalf("all events = %v, want %v", api.events, wantAll)
+	if !reflect.DeepEqual(api.recorded(), wantAll) {
+		t.Fatalf("all events = %v, want %v", api.recorded(), wantAll)
 	}
 	if !api.released {
 		t.Fatal("lease was not released after Job-empty")
 	}
 	again, err := execution.Wait(context.Background())
-	if err != nil || again != 42 || !reflect.DeepEqual(api.events, wantAll) {
-		t.Fatalf("idempotent Wait = (%d, %v), events %v", again, err, api.events)
+	if err != nil || again != 42 || !reflect.DeepEqual(api.recorded(), wantAll) {
+		t.Fatalf("idempotent Wait = (%d, %v), events %v", again, err, api.recorded())
 	}
 }
 
@@ -210,8 +237,8 @@ func TestElevatedRunnerLaunchRejectsBeforeDesktopAndConsumesToken(t *testing.T) 
 	// No Job was ever created for this failure, so ReleaseLease (which
 	// records a "release" event here) must have retired synchronously,
 	// before the token is closed by the deferred cleanup.
-	if want := []string{"release", "close-token"}; !reflect.DeepEqual(api.events, want) {
-		t.Fatalf("events = %v, want %v", api.events, want)
+	if want := []string{"release", "close-token"}; !reflect.DeepEqual(api.recorded(), want) {
+		t.Fatalf("events = %v, want %v", api.recorded(), want)
 	}
 	if !api.released {
 		t.Fatal("pre-Job launch failure did not retire the broker lease/active registration")

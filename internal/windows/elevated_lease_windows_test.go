@@ -155,8 +155,28 @@ func TestElevatedRuntimeVocabularyFailsClosed(t *testing.T) {
 	}
 }
 
+// canonicalTestDir returns t.TempDir() in the handle-resolved canonical form
+// the policy layer hands every backend. compileElevatedBrokerObjects names
+// each object by its handle's final DOS path and resolves the object's
+// authority with policy.ResolveFS(effective.FS, thatPath), so it relies on
+// the Effective it receives already being canonical (the profile layer
+// canonicalises before compile). A raw t.TempDir() is not: on a GitHub-hosted
+// runner %TEMP% is the 8.3 short form C:\Users\RUNNER~1\..., while the
+// handle resolves to C:\Users\runneradmin\.... Feeding the short form made
+// ResolveFS match nothing, so the object compiled to Access=0/Denied=3 and
+// the grant object could not even be found by path — a fixture defect, not
+// a compiler one.
+func canonicalTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := policy.CanonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCompileElevatedBrokerObjectsPinsExactIdentityAndPolicy(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "input.txt")
+	target := filepath.Join(canonicalTestDir(t), "input.txt")
 	if err := os.WriteFile(target, []byte("input"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -184,8 +204,8 @@ func TestCompileElevatedBrokerObjectsPinsExactIdentityAndPolicy(t *testing.T) {
 }
 
 func TestElevatedGrantLeaseRetainsValidatedHandleAndComposesBaseObjects(t *testing.T) {
-	basePath := filepath.Join(t.TempDir(), "base.txt")
-	grantPath := filepath.Join(t.TempDir(), "grant.txt")
+	basePath := filepath.Join(canonicalTestDir(t), "base.txt")
+	grantPath := filepath.Join(canonicalTestDir(t), "grant.txt")
 	for _, path := range []string{basePath, grantPath} {
 		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 			t.Fatal(err)
@@ -329,5 +349,32 @@ func TestExactBrokerRestrictingSIDSetRequiresRuntimeInstallationAndExecution(t *
 	groups = append(groups, win.SIDAndAttributes{Sid: parse("S-1-1-0")})
 	if exactBrokerRestrictingSIDSet(groups, installationSID) {
 		t.Fatal("restricting SID superset accepted")
+	}
+}
+
+func TestBrokerBackedElevatedLeaseRefusesWhileBrokerRecoveryPending(t *testing.T) {
+	client := &fakeElevatedLeaseClient{generation: 7, lease: ACLLeaseID{9}, err: brokerClientResultError{result: brokerResultRecoveryPending}}
+	closed := 0
+	deps := elevatedBrokerLeaseDependencies{
+		connect: func(context.Context, string, string) (elevatedBrokerLeaseSession, error) {
+			return elevatedBrokerLeaseSession{client: client, close: func() error { closed++; return nil }}, nil
+		},
+		objects: func(policy.Effective) ([]brokerObjectReference, func() error, []string, error) {
+			return []brokerObjectReference{testBrokerLeaseObject()}, func() error { return nil }, nil, nil
+		},
+		token: func(raw uint64, _ elevatedBrokerLeaseConfig, _ brokerAccountKind) (win.Token, error) {
+			return win.Token(raw), nil
+		},
+	}
+	factory, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer factory.Release()
+	if _, err := factory.Acquire(context.Background()); !errors.Is(err, ErrSetupStale) || !errors.Is(err, errBrokerLeaseRecoveryPending) {
+		t.Fatalf("acquire during broker quarantine = %v", err)
+	}
+	if client.acquireCalls != 0 || closed != 1 {
+		t.Fatalf("acquire calls = %d, closed = %d", client.acquireCalls, closed)
 	}
 }

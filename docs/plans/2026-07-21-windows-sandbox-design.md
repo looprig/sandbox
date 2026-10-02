@@ -502,7 +502,21 @@ dangerous groups, and calls `CreateRestrictedToken` with:
 - `DISABLE_MAX_PRIVILEGE`;
 - `LUA_TOKEN`;
 - `WRITE_RESTRICTED`; and
-- the executor and grant capability SIDs as restricting SIDs.
+- the executor and grant capability SIDs, plus the session's logon SID
+  (`S-1-5-5-X-Y`), as restricting SIDs.
+
+The logon SID permits access to session objects whose DACL grants it rights,
+including the window station and desktop. It does **not** fix implicit console
+host initialization: hosted run `37042438148` observed `0xC0000142` with
+`CREATE_NO_WINDOW` both with and without the logon SID, while detached children
+succeeded. Pipe-backed spawns now use `DETACHED_PROCESS` with explicit stdio
+pipes; console-dependent programs must request TTY (ConPTY).
+Under `WRITE_RESTRICTED`
+it widens only writes, and only to objects whose DACL names the logon SID
+(the session's window station, desktop and per-session objects; a token's
+default DACL gives it read/execute only). It is taken from the source token,
+never treated as a module trustee or an ACL-projection trustee, and a source
+token without exactly one logon SID (a service session) fails closed.
 
 The backend does not lower integrity because doing so would require invasive
 low-integrity labels on normal workspaces. It denies raw-device and dangerous

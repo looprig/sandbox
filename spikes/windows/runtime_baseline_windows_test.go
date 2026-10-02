@@ -99,6 +99,24 @@ func (b *limitedBuffer) String() string {
 	return result
 }
 
+// Live-gate environment. The traced baseline invocation is declared by the
+// run nonce and the manifest it writes (ci.yml windows-restricted sets both;
+// docs/spikes/windows-restricted-runtime.md "Disposable-worker trace
+// procedure"); the two offline evidence steps are declared by their
+// input/output paths.
+const (
+	envRunNonce           = "LOOPRIG_RUNTIME_RUN_NONCE"
+	envRunManifestOut     = "LOOPRIG_RUNTIME_RUN_MANIFEST_OUT"
+	envInvocationManifest = "LOOPRIG_RUNTIME_INVOCATION_MANIFEST"
+	envRawTrace           = "LOOPRIG_RUNTIME_RAW_TRACE"
+	envCollectorName      = "LOOPRIG_RUNTIME_COLLECTOR_NAME"
+	envCollectorVersion   = "LOOPRIG_RUNTIME_COLLECTOR_VERSION"
+	envCollectorCommand   = "LOOPRIG_RUNTIME_COLLECTOR_COMMAND"
+	envFinalManifestOut   = "LOOPRIG_RUNTIME_FINAL_MANIFEST_OUT"
+	envFinalManifest      = "LOOPRIG_RUNTIME_FINAL_MANIFEST"
+	envTraceJSON          = "LOOPRIG_RUNTIME_TRACE_JSON"
+)
+
 func TestRestrictedRuntimeBaseline(t *testing.T) {
 	startedUTC := time.Now().UTC()
 	requireDisposableStandardSourceToken(t)
@@ -146,31 +164,89 @@ func TestRestrictedRuntimeBaseline(t *testing.T) {
 	t.Log("exact_token_gate_passed=true failure_selection_evidence_complete=false")
 }
 
+// requireDisposableStandardSourceToken decides whether this process may run
+// the exact-token baseline at all. The restricted token is derived from the
+// caller's own token, so only a genuine non-administrator standard-user source
+// yields evidence (docs/spikes/windows-restricted-runtime.md: "Never run the
+// baseline command from the elevated collector shell").
+//
+// Two cases, deliberately asymmetric:
+//
+//   - Requested (the run nonce or manifest path is set — the traced
+//     invocation ci.yml windows-restricted and the documented ProcMon
+//     procedure make): every ineligibility FAILS. A requested gate on the
+//     wrong token, or with half its environment, is a broken gate, not an
+//     inapplicable one. Both variables are then required together, so a
+//     manifest is never written without the nonce that binds it to a trace.
+//   - Not requested, and the token is ineligible (a GitHub-hosted
+//     windows-latest runner runs as an elevated Administrator; a developer's
+//     UAC split-token shell is the same class): the test SKIPS, quoting the
+//     validator's exact reason. That run could only ever produce invalid
+//     evidence, and the default-tag `go test ./...` there is not this gate.
+//     A skip is never a pass for the gate itself: windows-restricted parses
+//     `go test -json` and fails the job on any Action=skip.
+//
+// Not requested on an ELIGIBLE token still runs the live baseline (the plain
+// command at the top of the spike document), so a standard-user worker never
+// skips it.
 func requireDisposableStandardSourceToken(t *testing.T) {
 	t.Helper()
+	nonce, manifestOut := os.Getenv(envRunNonce), os.Getenv(envRunManifestOut)
+	requested := nonce != "" || manifestOut != ""
+	if requested && (nonce == "" || manifestOut == "") {
+		t.Fatalf("traced baseline invocation requires both %s and %s (got nonce set=%t, manifest path set=%t)",
+			envRunNonce, envRunManifestOut, nonce != "", manifestOut != "")
+	}
 	var token windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
 		t.Fatalf("inspect disposable-worker source token: %v", err)
 	}
 	defer token.Close()
 	if err := sandboxwindows.ValidateDisposableStandardUserToken(token); err != nil {
-		t.Fatalf("validate disposable-worker source token: %v", err)
+		if requested {
+			t.Fatalf("validate disposable-worker source token for the requested traced invocation (%s set): %v", envRunNonce, err)
+		}
+		t.Skipf("exact-token runtime baseline needs a genuine non-administrator standard-user source token and this process cannot provide one (%v); "+
+			"no traced invocation was requested (%s/%s unset), so there is no gate to fail here. "+
+			"The gate is ci.yml windows-restricted on the self-hosted standard-user worker, which treats any skip as a failure",
+			err, envRunNonce, envRunManifestOut)
 	}
+}
+
+// requireEvidenceStep gates the two offline evidence steps that follow a
+// traced baseline invocation (finalize against the raw ProcMon trace, then
+// validate the hand-built trace evidence). They consume files only that
+// procedure produces, so with none of their inputs set there is nothing to
+// finalize or validate and the test SKIPS, naming the variables. With ANY of
+// them set the step was requested, and every missing input fails through
+// mustEnv — a partially configured evidence step must not pass by skipping.
+func requireEvidenceStep(t *testing.T, step string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if os.Getenv(name) != "" {
+			return
+		}
+	}
+	t.Skipf("%s is an offline evidence step of the traced Task 5 procedure (docs/spikes/windows-restricted-runtime.md) and none of its inputs is set (%s); it runs only against that procedure's manifests",
+		step, strings.Join(names, ", "))
 }
 
 func TestFinalizeRestrictedRuntimeRunManifest(t *testing.T) {
-	manifest := mustLoadRunManifestEnv(t, "LOOPRIG_RUNTIME_INVOCATION_MANIFEST")
-	collector := baseline.TraceCollector{Name: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_NAME"), Version: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_VERSION"), Command: mustEnv(t, "LOOPRIG_RUNTIME_COLLECTOR_COMMAND")}
-	finalized, err := baseline.FinalizeRunManifest(manifest, collector, mustEnv(t, "LOOPRIG_RUNTIME_RAW_TRACE"))
+	requireEvidenceStep(t, "finalizing the run manifest", envInvocationManifest, envRawTrace,
+		envCollectorName, envCollectorVersion, envCollectorCommand, envFinalManifestOut)
+	manifest := mustLoadRunManifestEnv(t, envInvocationManifest)
+	collector := baseline.TraceCollector{Name: mustEnv(t, envCollectorName), Version: mustEnv(t, envCollectorVersion), Command: mustEnv(t, envCollectorCommand)}
+	finalized, err := baseline.FinalizeRunManifest(manifest, collector, mustEnv(t, envRawTrace))
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeJSONFile(t, mustEnv(t, "LOOPRIG_RUNTIME_FINAL_MANIFEST_OUT"), finalized)
+	writeJSONFile(t, mustEnv(t, envFinalManifestOut), finalized)
 }
 
 func TestValidateRestrictedRuntimeTraceEvidence(t *testing.T) {
-	manifest := mustLoadRunManifestEnv(t, "LOOPRIG_RUNTIME_FINAL_MANIFEST")
-	evidence, err := baseline.LoadTraceEvidence(mustEnv(t, "LOOPRIG_RUNTIME_TRACE_JSON"))
+	requireEvidenceStep(t, "validating trace evidence", envFinalManifest, envTraceJSON)
+	manifest := mustLoadRunManifestEnv(t, envFinalManifest)
+	evidence, err := baseline.LoadTraceEvidence(mustEnv(t, envTraceJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,9 +258,9 @@ func TestValidateRestrictedRuntimeTraceEvidence(t *testing.T) {
 
 func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText string, matrix []byte, results []runtimeResult, passed bool, started, finished time.Time) baseline.RunManifest {
 	t.Helper()
-	nonce := os.Getenv("LOOPRIG_RUNTIME_RUN_NONCE")
-	if os.Getenv("LOOPRIG_RUNTIME_RUN_MANIFEST_OUT") != "" && nonce == "" {
-		t.Fatal("LOOPRIG_RUNTIME_RUN_NONCE is required when emitting a traced invocation manifest")
+	nonce := os.Getenv(envRunNonce)
+	if os.Getenv(envRunManifestOut) != "" && nonce == "" {
+		t.Fatal(envRunNonce + " is required when emitting a traced invocation manifest")
 	}
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = repositoryRoot(t)
@@ -201,7 +277,7 @@ func createRunManifest(t *testing.T, platform baseline.RunPlatform, tokenText st
 
 func writeInvocationManifest(t *testing.T, manifest baseline.RunManifest) {
 	t.Helper()
-	if path := os.Getenv("LOOPRIG_RUNTIME_RUN_MANIFEST_OUT"); path != "" {
+	if path := os.Getenv(envRunManifestOut); path != "" {
 		writeJSONFile(t, path, manifest)
 		t.Logf("run_manifest=%s run_nonce=%s", path, manifest.RunNonce)
 	}
@@ -562,7 +638,7 @@ func runRuntimeCase(token windows.Token, testCase runtimeCase) runtimeResult {
 		Status:          "FAIL",
 		ExitCode:        -1,
 		CallerPID:       os.Getpid(),
-		AttemptID:       os.Getenv("LOOPRIG_RUNTIME_RUN_NONCE") + "/" + testCase.name,
+		AttemptID:       os.Getenv(envRunNonce) + "/" + testCase.name,
 		LookupEvidence:  append([]string(nil), testCase.lookupEvidence...),
 	}
 	result.ObjectIdentity, result.Owner, result.DACL = objectSecurity(testCase.path)

@@ -167,3 +167,24 @@ func TestAuthenticatedBrokerGreetingFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestBrokerClientSurfacesRecoveryPendingAsTypedError(t *testing.T) {
+	var nonce [brokerNonceSize]byte
+	nonce[0] = 1
+	result := brokerResultRecoveryPending
+	transport := &brokerTestTransport{respond: func(request brokerFrame) (brokerFrame, error) {
+		return brokerFrame{Kind: request.Kind, Direction: brokerResponse, Nonce: request.Nonce, Result: result, Generation: 6}, nil
+	}}
+	client, err := newBrokerClient(transport, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := client.Status()
+	if !errors.Is(err, errBrokerLeaseRecoveryPending) || generation != 6 {
+		t.Fatalf("status = %d, %v; want generation 6 and recovery pending", generation, err)
+	}
+	result = brokerResultUnavailable
+	if _, err := client.Status(); err == nil || errors.Is(err, errBrokerLeaseRecoveryPending) {
+		t.Fatalf("unavailable result classified as recovery pending: %v", err)
+	}
+}

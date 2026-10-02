@@ -42,7 +42,8 @@ same type) is one of:
 |---|---|---|---|
 | Linux | Rung 1 | `Enforced` | Fresh PID namespace; the namespace's init process exiting tears down every process still inside it, kernel-guaranteed. |
 | Linux | Rung 2 (delegated cgroup v2) | `Enforced` | `cgroup.kill` plus a proven-empty `cgroup.procs` read. If no delegated cgroup v2 `pids` ancestor is available to delegate from, the spawn is rejected before it starts with `enforce.ErrLifetimeContainmentUnavailable` instead of silently downgrading — Rung 2 has no best-effort fallback of its own. |
-| Windows | Elevated/broker backend | `Enforced` | The process runs inside a Job object; an unassigned or already-terminated Job makes teardown unconditional and kernel-guaranteed, matching the Linux rungs. |
+| Windows | Elevated/broker backend | `Enforced` | The process runs inside a kill-on-close Job object with no breakaway; the dedicated account and broker-owned private desktop close the COM/WMI/shell broker channels that could otherwise create a process outside the Job, so teardown is unconditional and kernel-guaranteed, matching the Linux rungs. |
+| Windows | Restricted-token tier | `BestEffort` | The same Job, but the child runs as the interactive user on the shared desktop: a same-user COM/WMI/shell broker (`Win32_Process.Create`, Explorer `ShellExecute`) can create a process outside the Job, exactly the class of escape that makes macOS best-effort. This is why the tier also withholds `ProcessBoundary`. |
 | macOS | Seatbelt | `BestEffort` | Process-group SIGKILL-and-poll plus a proc-table-closure descendant tracker (below). No kernel-enforced tree-teardown primitive is available to an unentitled process on this platform — see "Why macOS is best-effort" below. |
 | macOS / any | `Unconfined` or a test-double backend | `Unspecified` | No containment claim is made; not applicable. |
 

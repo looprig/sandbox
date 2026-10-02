@@ -47,12 +47,60 @@ func PlatformBackend(config Config, runtime *RestrictedRuntime) (enforce.Backend
 }
 
 func Inspect(ctx context.Context, config SetupConfig) (SetupStatus, error) {
-	return inspectSetup(ctx, config, productionSetupDependencyInspector())
+	return inspectSetup(ctx, config, brokerLeaseRecoverySetupInspector{
+		base: productionSetupDependencyInspector(), probe: probeInstalledBrokerLeaseRecovery,
+	})
 }
 
 type setupDependencyReadiness struct {
 	service, accounts, credentials, firewallEffective, firewallUnchanged, runtimeBaseline bool
-	portPID                                                                               map[uint16]uint32
+	// leaseRecovery: the running broker reports a quarantined ACL lease.
+	leaseRecovery bool
+	portPID       map[uint16]uint32
+}
+
+// brokerLeaseRecoverySetupInspector decorates the installed-state inspector
+// with the one fact only the running broker knows: whether it retains a lease
+// it could not roll back (design §13). It asks only a service the base
+// inspector already found running. A probe failure is not turned into a
+// setup problem here: the broker refuses new work itself while quarantined,
+// and service health is the base inspector's fact to report.
+type brokerLeaseRecoverySetupInspector struct {
+	base  setupDependencyInspector
+	probe func(context.Context, setupManifest) (bool, error)
+}
+
+func (i brokerLeaseRecoverySetupInspector) Inspect(ctx context.Context, setup validatedSetup, manifest setupManifest) (setupDependencyReadiness, error) {
+	if i.base == nil || i.probe == nil {
+		return setupDependencyReadiness{}, errors.New("sandbox: incomplete Windows broker lease inspector")
+	}
+	readiness, err := i.base.Inspect(ctx, setup, manifest)
+	if err != nil || !readiness.service {
+		return readiness, err
+	}
+	if pending, probeErr := i.probe(ctx, manifest); probeErr == nil {
+		readiness.leaseRecovery = pending
+	}
+	return readiness, nil
+}
+
+// probeInstalledBrokerLeaseRecovery asks the authenticated installed broker
+// for its status; a recovery-pending result is the quarantine signal.
+func probeInstalledBrokerLeaseRecovery(ctx context.Context, manifest setupManifest) (bool, error) {
+	pipe, err := installedBrokerPipeName(manifest.InstallationID)
+	if err != nil {
+		return false, err
+	}
+	client, transport, err := connectAuthenticatedBrokerClient(ctx, pipe, filepath.Clean(manifest.HostPath))
+	if err != nil {
+		return false, err
+	}
+	defer transport.Close()
+	_, err = client.Status()
+	if errors.Is(err, errBrokerLeaseRecoveryPending) {
+		return true, nil
+	}
+	return false, err
 }
 
 type setupDependencyInspector interface {
@@ -215,8 +263,11 @@ func inspectSetup(ctx context.Context, config SetupConfig, dependencies setupDep
 			facts.CredentialsReady = readiness.credentials
 			facts.FirewallEffective = readiness.firewallEffective
 			facts.FirewallUnchanged = readiness.firewallUnchanged
-			facts.PortPID = readiness.portPID
+			// The inspecting process's own reserved listeners are not a
+			// foreign owner (see foreignProxyPortOwners).
+			facts.PortPID = foreignProxyPortOwners(readiness.portPID, win.GetCurrentProcessId())
 			facts.RuntimeBaselineReady = readiness.runtimeBaseline
+			facts.LeaseRecovery = readiness.leaseRecovery
 		}
 	}
 	select {
@@ -377,9 +428,15 @@ func (realBrokerInstallPathVerifier) Verify(path string, expectation installedPa
 			seenSystem = true
 		case sid.IsWellKnown(win.WinBuiltinAdministratorsSid) && mask == setupFileAllAccess && ace.Header.AceFlags == 0:
 			seenAdministrators = true
-		case sid.Equals(wantOwner) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+		// The owner and sandbox trustee must hold exactly the specific
+		// read/execute mask protectSetupPath writes (see setupReadExecuteMask
+		// for why it is specific rather than GENERIC_READ|GENERIC_EXECUTE:
+		// setting a file DACL maps generic rights on effective ACEs through
+		// the file generic mapping, so the generic form written was not the
+		// form read back here, and a protected object was rejected).
+		case sid.Equals(wantOwner) && mask == setupReadExecuteMask && ace.Header.AceFlags == wantFlags:
 			seenOwner = true
-		case sid.Equals(wantSandbox) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+		case sid.Equals(wantSandbox) && mask == setupReadExecuteMask && ace.Header.AceFlags == wantFlags:
 			seenSandbox = true
 		default:
 			return errors.New("sandbox: installed broker object DACL grants unexpected authority")
@@ -474,7 +531,7 @@ func loadBrokerRuntimeConfigWithVerifier(executable, programData string, verifie
 		ManifestState: manifest.State, GenerationManifestPath: manifestPath, ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
 		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID, ServiceIdentity: manifest.ServiceIdentity,
 		OfflineAccount: names.Offline, OnlineAccount: names.Online, OfflineCredential: filepath.Join(credentials, "offline.dpapi"), OnlineCredential: filepath.Join(credentials, "online.dpapi"),
-		PipeName: `\\.\pipe\looprig-sandbox-` + suffix, JournalPath: filepath.Join(stateRoot, "broker-leases.journal")}, nil
+		PipeName: `\\.\pipe\looprig-sandbox-` + suffix, JournalPath: filepath.Join(stateRoot, brokerLeaseJournalName)}, nil
 }
 
 type setupRemovalMechanisms struct {
@@ -484,6 +541,9 @@ type setupRemovalMechanisms struct {
 	firewall          offlineFirewallPolicy
 	removeDir         func(string) error
 	validateArtifacts func(validatedSetup, setupManifest) error
+	// leases reconciles the stopped broker's lease journal and reports every
+	// object whose lease ACE it could not roll back (design §12).
+	leases func(validatedSetup) ([]SetupProblem, error)
 }
 
 func Remove(ctx context.Context, config SetupConfig) error {
@@ -539,6 +599,7 @@ func Remove(ctx context.Context, config SetupConfig) error {
 		firewall:          windowsFirewallPolicy{api: newNetFwAutomation()},
 		removeDir:         removeOwnedSetupTree,
 		validateArtifacts: validateOwnedSetupArtifacts,
+		leases:            reconcileInstalledBrokerLeases,
 	}
 	return removeInstalledSetup(ctx, validated, manifest, mechanisms)
 }
@@ -579,10 +640,30 @@ func removeOwnedSetupTreeWith(root string, removeAll, remove func(string) error)
 	return nil
 }
 
+// removeInstalledSetup removes one manifest-owned installation in an order
+// chosen so that no step widens a running sandbox (review M14):
+//
+//  1. stop the broker, so no token can be issued from here on and the
+//     service loop retires the leases its live connections still hold;
+//     a failure here aborts removal with every rule, account and file intact;
+//  2. reconcile the journal: roll back every lease the broker left
+//     unreleased, collecting residue instead of stopping at the first;
+//  3. remove the offline firewall rules, then the service, accounts and
+//     credentials (as before);
+//  4. delete the protected state root only when step 2 left no residue. A
+//     journal that still names an unreleased lease is never deleted without
+//     reporting it: removal returns *SetupResidueError and keeps the state
+//     root, so a later Remove (which converges on everything else already
+//     removed) retries exactly those leases.
+//
+// What stopping cannot do is reach a process that is already running: a
+// sandbox launched before Remove keeps its token after its account is
+// deleted, and loses its outbound block when step 3 removes the rules. Close
+// every executor before removing an installation.
 func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest setupManifest, mechanisms setupRemovalMechanisms) error {
 	if mechanisms.accounts == nil || mechanisms.services == nil || mechanisms.credentials == nil ||
 		mechanisms.firewall == nil || mechanisms.removeDir == nil ||
-		mechanisms.validateArtifacts == nil {
+		mechanisms.validateArtifacts == nil || mechanisms.leases == nil {
 		return errors.New("sandbox: incomplete Windows setup removal mechanisms")
 	}
 	if manifest.InstallationID != setup.config.InstallationID || manifest.OwnerSID != setup.ownerSID ||
@@ -603,6 +684,19 @@ func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest se
 	if err != nil {
 		return err
 	}
+	if err := stopBrokerServiceForRemoval(mechanisms.services, names.Service, manifest.ServiceIdentity); err != nil {
+		return fmt.Errorf("stop Windows broker before removal: %w", err)
+	}
+	residue, leaseErr := mechanisms.leases(setup)
+	if leaseErr != nil {
+		// An unreadable journal cannot be accounted for at all; it is
+		// residue in its own right and keeps the state root.
+		residue = append(residue, SetupProblem{
+			Code: SetupProblemLeaseRecoveryPending, Resource: "broker-lease-journal",
+			Path:   filepath.Join(setup.stateRoot, brokerLeaseJournalName),
+			Detail: "the broker lease journal could not be reconciled",
+		})
+	}
 	var result error
 	result = errors.Join(result, removeOfflineFirewall(mechanisms.firewall, rules))
 	result = errors.Join(result, removeBrokerIdentityState(mechanisms.accounts, mechanisms.services, brokerOwnedIdentity{
@@ -612,6 +706,9 @@ func removeInstalledSetup(ctx context.Context, setup validatedSetup, manifest se
 	}))
 	result = errors.Join(result, mechanisms.credentials.RemoveProtected("offline"))
 	result = errors.Join(result, mechanisms.credentials.RemoveProtected("online"))
+	if len(residue) != 0 {
+		return errors.Join(result, leaseErr, &SetupResidueError{Problems: residue})
+	}
 	if result != nil {
 		return result
 	}
@@ -640,7 +737,7 @@ func validateOwnedSetupArtifacts(setup validatedSetup, manifest setupManifest) e
 		name := strings.ToLower(entry.Name())
 		switch name {
 		case strings.ToLower(readyManifestName), runtimeEvidenceName, runtimeEvidenceName + ".tmp",
-			"broker-leases.journal", ".ready.tmp":
+			brokerLeaseJournalName, brokerLeaseJournalName + brokerLeaseJournalCompactSuffix, ".ready.tmp":
 			if entry.IsDir() {
 				return errors.New("sandbox: owned Windows state file is a directory")
 			}

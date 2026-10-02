@@ -31,7 +31,7 @@ func TestSeccompAuditArchMatchesGOARCH(t *testing.T) {
 	if seccompGuardX32 != (runtime.GOARCH == "amd64") {
 		t.Fatalf("seccompGuardX32 on %s = %v, want it only on amd64", runtime.GOARCH, seccompGuardX32)
 	}
-	filter := BuildSeccompFilter()
+	filter := BuildSeccompFilter(SeccompPolicy{})
 	if filter[1].K != arch {
 		t.Fatalf("arch guard compares %#x, want %#x", filter[1].K, arch)
 	}
@@ -39,7 +39,7 @@ func TestSeccompAuditArchMatchesGOARCH(t *testing.T) {
 		if ProbeSeccompFilter() {
 			t.Fatal("ProbeSeccompFilter() = true on an architecture with no filter binding")
 		}
-		if err := installSeccompFilter(); !errors.Is(err, errUnsupportedSeccompArch) {
+		if err := installSeccompFilter(SeccompPolicy{}); !errors.Is(err, errUnsupportedSeccompArch) {
 			t.Fatalf("installSeccompFilter() = %v, want errUnsupportedSeccompArch", err)
 		}
 	}

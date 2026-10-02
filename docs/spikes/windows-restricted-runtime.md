@@ -25,7 +25,11 @@ go test -count=1 -v ./spikes/windows -run TestRestrictedRuntimeBaseline
 ```
 
 The command must finish with `PASS`; `SKIP`, a compile-only result, or a result
-copied from a different Windows image does not satisfy the gate. Preserve the
+copied from a different Windows image does not satisfy the gate. Without
+`LOOPRIG_RUNTIME_RUN_NONCE`/`LOOPRIG_RUNTIME_RUN_MANIFEST_OUT`, an ineligible
+(elevated, Administrators or UAC split) token such as a GitHub-hosted runner's
+makes the baseline skip with the validator's reason; with either set, the same
+ineligibility fails. Preserve the
 complete verbose log as CI evidence. If a worker-level timeout is available,
 set it above the harness's per-process 20-second watchdog so the harness can
 terminate and report a stuck target first.

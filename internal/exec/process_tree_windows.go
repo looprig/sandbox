@@ -29,6 +29,13 @@ type processTree struct {
 	cmd      *exec.Cmd
 	job      *winjob.Job
 	assigned bool
+	// lifetime is fixed at construction; see lifetimeContainment.
+	lifetime LifetimeContainment
+	// privateConsole is fixed at construction: a sandboxed pipe-backed
+	// child is launched with no console (pipeLaunchCreationFlags)
+	// instead of sharing this process's, and cooperative interrupt is therefore
+	// unavailable for it (sendInterrupt). See privateConsoleForSpawn.
+	privateConsole bool
 
 	// conPTY, once set by openTerminal (terminal_windows.go), is the pending
 	// ConPTY launch start must drive through startConPTY instead of the plain
@@ -67,12 +74,14 @@ func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, er
 	// CREATE_NEW_PROCESS_GROUP makes the child's own PID its console process-
 	// group ID, distinct from this sandbox's own group: sendInterrupt (below)
 	// needs that so a targeted CTRL_BREAK_EVENT reaches only this run's tree,
-	// never this process's own console session. It also means a Ctrl+C
+	// never this process's own console session. (A sandboxed pipe-backed
+	// child additionally detaches from the console at start; see
+	// privateConsoleForSpawn.) It also means a Ctrl+C
 	// delivered to the sandbox's own console no longer implicitly reaches a
 	// confined child — teardown for this tree is only ever the explicit
 	// Job/signal machinery below, exactly as intended.
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP
-	tree := &processTree{cmd: cmd, job: job}
+	tree := &processTree{cmd: cmd, job: job, lifetime: windowsProcessTreeLifetime(options), privateConsole: privateConsoleForSpawn(options)}
 	cmd.Cancel = tree.terminate
 	return tree, nil
 }
@@ -93,8 +102,12 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 		// unconfined containment mechanism.
 		return tree.startConPTY(cmd, pending)
 	}
+	// The console decision is made here, on the pipe-backed path only:
+	// DETACHED_PROCESS must never reach a ConPTY launch (above), where
+	// the child must attach to the pseudo console in the attribute list.
+	cmd.SysProcAttr.CreationFlags = pipeLaunchCreationFlags(cmd.SysProcAttr.CreationFlags, tree.privateConsole)
 	if err := cmd.Start(); err != nil {
-		return err
+		return describeWindowsStartFailure(cmd, cmd.Path, err)
 	}
 	var setupErr error
 	err := cmd.Process.WithHandle(func(processHandle uintptr) {
@@ -333,15 +346,21 @@ func (launch *conPTYLaunch) createSuspended() error {
 	if err != nil {
 		return err
 	}
-	cmdLine, err := conPTYCommandLine(cmd.Args)
-	if err != nil {
-		return err
+	// A raw command line pinned on SysProcAttr (applyShellCommandLine, for
+	// cmd.exe) wins exactly as it does in syscall.StartProcess; only an argv
+	// without one is escaped CommandLineToArgvW-style.
+	cmdLine := cmd.SysProcAttr.CmdLine
+	if cmdLine == "" {
+		cmdLine, err = conPTYCommandLine(cmd.Args)
+		if err != nil {
+			return err
+		}
 	}
 	cmdLine16, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
 		return err
 	}
-	envBlock, err := conPTYEnvBlock(cmd.Env)
+	envBlock, err := conPTYLaunchEnvBlock(cmd)
 	if err != nil {
 		return err
 	}
@@ -358,26 +377,40 @@ func (launch *conPTYLaunch) createSuspended() error {
 		return fmt.Errorf("sandbox: allocate ConPTY process attribute list: %w", err)
 	}
 	defer attributes.Delete()
-	pconsole := conPTYAttributeHandle(launch.pending.attribute)
-	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&pconsole), unsafe.Sizeof(pconsole)); err != nil {
+	if err := attachPseudoConsoleAttribute(attributes, conPTYAttributeHandle(launch.pending.attribute)); err != nil {
 		return fmt.Errorf("sandbox: attach ConPTY attribute: %w", err)
 	}
 
 	// EXTENDED_STARTUPINFO_PRESENT is required for ProcThreadAttributeList to
 	// take effect at all; CREATE_UNICODE_ENVIRONMENT is required because
-	// envBlock above is UTF-16. cmd.SysProcAttr.CreationFlags already carries
-	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above),
-	// exactly like the plain path, preserving sendInterrupt's own
-	// CTRL_BREAK_EVENT targeting unchanged for a ConPTY-backed Process too.
-	flags := cmd.SysProcAttr.CreationFlags | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
-	// StartupInfo.Flags deliberately does NOT include STARTF_USESTDHANDLES: a
-	// ConPTY-attached child's console I/O routes entirely through the
-	// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute above, never through
-	// inherited stdio handles — Microsoft's own ConPTY sample code uses the
-	// identical bInheritHandles=FALSE, no-STARTF_USESTDHANDLES shape this
-	// call mirrors.
+	// envBlock above is UTF-16. cmd.SysProcAttr.CreationFlags carries
+	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above);
+	// conPTYLaunchCreationFlags keeps CREATE_SUSPENDED and drops the process
+	// group, which would disable the in-band ^C that is a ConPTY child's only
+	// interrupt (see its doc comment).
+	flags := conPTYLaunchCreationFlags(cmd.SysProcAttr.CreationFlags)
+	// StartupInfo.Flags carries STARTF_USESTDHANDLES with all three standard
+	// handles set to INVALID_HANDLE_VALUE. Without it, CreateProcess hands the
+	// child THIS process's standard handles, and when this process's stdio is
+	// redirected (a service, a CI runner, `go test` — none of them has a
+	// console) the console client keeps those instead of the pseudo console's
+	// handles: the child reads this process's stdin and writes to its stdout,
+	// and the pseudo console sees nothing. With explicit invalid handles the
+	// console client takes all three from the pseudo console it attaches to.
+	// This is exactly the shape wezterm's portable-pty launches ConPTY clients
+	// with, for the same reason (a daemonized host whose stdio is a log file).
+	// bInheritHandles stays FALSE, so nothing is inherited either way. (The
+	// first Windows CI run's ConPTY symptoms are explained by the attribute
+	// bug fixed in attachPseudoConsoleAttribute; this closes the
+	// redirected-host case that bug was masking.)
 	startup := windows.StartupInfoEx{
-		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
+		StartupInfo: windows.StartupInfo{
+			Cb:        uint32(unsafe.Sizeof(windows.StartupInfoEx{})),
+			Flags:     windows.STARTF_USESTDHANDLES,
+			StdInput:  windows.InvalidHandle,
+			StdOutput: windows.InvalidHandle,
+			StdErr:    windows.InvalidHandle,
+		},
 		ProcThreadAttributeList: attributes.List(),
 	}
 	// cmd.SysProcAttr.Token, when non-zero, is the restricted token
@@ -404,9 +437,54 @@ func (launch *conPTYLaunch) createSuspended() error {
 		err = windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi)
 	}
 	if err != nil {
-		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", err)
+		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", describeWindowsStartFailure(cmd, appPath, err))
 	}
 	launch.pi = pi
+	return nil
+}
+
+// updateProcThreadAttribute is called directly, not through
+// windows.ProcThreadAttributeListContainer.Update, for the one attribute
+// whose lpValue is not a pointer to the value: see
+// attachPseudoConsoleAttribute.
+var updateProcThreadAttribute = windows.NewLazySystemDLL("kernel32.dll").NewProc("UpdateProcThreadAttribute")
+
+// attachPseudoConsoleAttribute adds PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE to
+// attributes. For this attribute lpValue IS the HPCON — Microsoft's
+// "Creating a Pseudoconsole session" passes `hPC` itself, with
+// cbSize = sizeof(HPCON) — unlike HANDLE_LIST or PARENT_PROCESS, whose
+// lpValue points AT the handle(s).
+//
+// The first Windows CI run passed the ADDRESS of a local HPCON variable
+// (Update(attr, unsafe.Pointer(&pconsole), ...)). kernelbase then read that
+// stack slot as the pseudo console's internal record (signal pipe, reference
+// handle, host process), so the child was launched against garbage handle
+// values: depending on what the slot's neighbours held, the console client
+// either failed to connect and died in DLL initialisation (exit 0xC0000142,
+// STATUS_DLL_INIT_FAILED — TestProcessConPTYResize) or never attached to the
+// pseudo console at all and fell back to the parent's standard handles
+// (findstr blocked on the runner's stdin — TestProcessConPTYEOF hung for
+// 8m46s).
+//
+// Update cannot express the correct call without converting the handle to an
+// unsafe.Pointer and retaining a non-Go pointer in a Go pointer slice, so the
+// documented call is made directly with the handle as a plain integer.
+func attachPseudoConsoleAttribute(attributes *windows.ProcThreadAttributeListContainer, console windows.Handle) error {
+	if attributes == nil || attributes.List() == nil || console == 0 {
+		return errors.New("sandbox: invalid ConPTY attribute list or pseudo console")
+	}
+	ok, _, callErr := updateProcThreadAttribute.Call(
+		uintptr(unsafe.Pointer(attributes.List())),
+		0,
+		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+		uintptr(console),
+		unsafe.Sizeof(console),
+		0,
+		0,
+	)
+	if ok == 0 {
+		return fmt.Errorf("UpdateProcThreadAttribute(PSEUDOCONSOLE): %w", callErr)
+	}
 	return nil
 }
 
@@ -546,17 +624,92 @@ func (tree *processTree) close() {
 	}
 }
 
-// lifetimeContainment: a Windows supervised spawn lives in a Job with
-// kill-on-close (newProcessTree above always creates one, and start always
-// assigns the child to it before resuming — see start's own setup-failure
-// handling, which terminates rather than ever leaving a resumed process
-// unassigned); teardown is therefore kernel-enforced unconditionally for
-// every *processTree this type produces, so this never needs to
-// distinguish an assigned/unassigned case the way tree.assigned's other
-// uses do.
-func (tree *processTree) lifetimeContainment() LifetimeContainment {
-	return LifetimeContainmentEnforced
+// windowsProcessTreeLifetime is the containment answer for a spawn built
+// through this exec-side process tree. The Job (kill-on-close, no breakaway)
+// tears down every process that is still IN it, but a Wrap-backed Windows
+// spawn runs under the caller's own account: the restricted tier's token is
+// the same user with a write-restricted SID list, and an Unconfined spawn is
+// the unmodified user. Such a child can ask a same-user out-of-process broker
+// (Win32_Process.Create over WMI, a COM local server, the Task Scheduler) to
+// create a process outside the Job (design §8), which is exactly why the
+// restricted tier withholds ProcessBoundary. So:
+//
+//   - Sandboxed (the restricted tier) is LifetimeContainmentBestEffort;
+//   - Unconfined makes no containment claim at all
+//     (LifetimeContainmentUnspecified, as on every other platform).
+//
+// The elevated tier never reaches this type: its spec carries a backend-owned
+// Launch (a dedicated non-admin account on a private desktop, which closes
+// the same-user broker channels), and process.go reports that path as
+// LifetimeContainmentEnforced. Auto resolves to one of the two per Compile,
+// so its answer follows whichever path the compiled spec takes.
+func windowsProcessTreeLifetime(options processTreeOptions) LifetimeContainment {
+	if !options.Sandboxed {
+		return LifetimeContainmentUnspecified
+	}
+	return LifetimeContainmentBestEffort
 }
+
+// lifetimeContainment reports the answer fixed by newProcessTree; see
+// windowsProcessTreeLifetime.
+func (tree *processTree) lifetimeContainment() LifetimeContainment {
+	if tree == nil {
+		return LifetimeContainmentUnspecified
+	}
+	return tree.lifetime
+}
+
+// privateConsoleForSpawn decides whether a pipe-backed spawn must avoid
+// inheriting the host's console (review H8). Sandboxed children start detached
+// and use only their explicit stdio pipes. CREATE_NO_WINDOW creates an implicit
+// console host whose initialization fails with the restricted token on hosted
+// Windows (0xC0000142), even with the logon SID in the restricting list; the
+// launch matrix in internal/windows proves DETACHED_PROCESS succeeds instead.
+// Console-dependent programs must request TTY. Unconfined spawns retain their
+// shared console and targeted CTRL_BREAK interrupt.
+func privateConsoleForSpawn(options processTreeOptions) bool {
+	return options.Sandboxed
+}
+
+// pipeLaunchCreationFlags selects exactly one console mode. A sandboxed
+// pipe-backed child needs neither a console window nor an implicit conhost.
+func pipeLaunchCreationFlags(base uint32, privateConsole bool) uint32 {
+	base &^= windows.CREATE_NO_WINDOW | windows.DETACHED_PROCESS | windows.CREATE_NEW_CONSOLE
+	if privateConsole {
+		return base | windows.DETACHED_PROCESS
+	}
+	return base
+}
+
+// conPTYLaunchCreationFlags is the creation-flag set for a ConPTY launch.
+// Strip other console modes so the pseudo-console attribute controls attachment.
+//
+// CREATE_NEW_PROCESS_GROUP (which newProcessTree sets for every spawn) is
+// stripped too. CreateProcess documents that the root of a new process group
+// starts with CTRL+C DISABLED — as if it had called
+// SetConsoleCtrlHandler(NULL, TRUE) — and that this is inherited by its
+// descendants. A ConPTY child's only interrupt is the in-band ^C
+// conPTYSignaler writes, which the console host turns into a CTRL_C_EVENT;
+// with the flag, every process on the pseudo console ignored that event and
+// the second Windows CI run's TestProcessConPTYInterrupt waited out its
+// whole timeout. The group exists only for the pipe-backed path's targeted
+// GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid), which can never reach a
+// pseudo console anyway (it reaches only the caller's own console), and the
+// child is the only client of its pseudo console, so no isolation is lost.
+func conPTYLaunchCreationFlags(base uint32) uint32 {
+	return (base &^ (windows.CREATE_NO_WINDOW | windows.DETACHED_PROCESS | windows.CREATE_NEW_CONSOLE | windows.CREATE_NEW_PROCESS_GROUP)) | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
+}
+
+// errPrivateConsoleInterruptUnsupported is sendInterrupt's answer for a
+// sandboxed pipe-backed child (privateConsoleForSpawn). It wraps
+// ErrProcessSignalUnsupported, so Signal's documented fail-closed contract
+// holds: interrupt is never silently mapped onto a forceful primitive, and
+// ProcessSignalTerminate / ProcessSignalKill still terminate the whole Job.
+//
+// GenerateConsoleCtrlEvent cannot reach a detached child: it has no console.
+// Allocating or attaching a console would mutate process-global state. TTY
+// requests use conPTYSignaler instead; Kill/Terminate still end the whole Job.
+var errPrivateConsoleInterruptUnsupported = fmt.Errorf("%w: a sandboxed Windows pipe child has no console; request TTY for cooperative interrupt, or terminate or kill it instead", ErrProcessSignalUnsupported)
 
 // sendInterrupt requests cooperative interruption by delivering a
 // CTRL_BREAK_EVENT console control event to this run's own process group —
@@ -570,7 +723,14 @@ func (tree *processTree) lifetimeContainment() LifetimeContainment {
 // group ID. Like every ProcessSignalInterrupt dispatch, this never itself
 // decides the process is terminal — only Process.Wait's own confirmed exit
 // does that.
+//
+// It applies only to an Unconfined spawn, which shares this process's
+// console. A sandboxed pipe-backed spawn has no console and answers
+// errPrivateConsoleInterruptUnsupported.
 func (tree *processTree) sendInterrupt() error {
+	if tree != nil && tree.privateConsole {
+		return errPrivateConsoleInterruptUnsupported
+	}
 	if tree == nil || tree.cmd == nil || tree.cmd.Process == nil {
 		return nil
 	}

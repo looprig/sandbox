@@ -52,6 +52,13 @@ const (
 	SetupProblemRuntimeBaselineGap
 	SetupProblemLeaseRecoveryPending
 	SetupProblemProtocolMismatch
+	// SetupProblemProxyPortsStale: the requested proxy-port set differs from
+	// the one the installation's manifest (and therefore its firewall rules)
+	// pins (design §12: a changed proxy-port set makes setup stale). The
+	// installed rules are not "changed" (FirewallRuleChanged) and no port is
+	// necessarily "in use" (PortInUse); a refresh is what is owed. Appended
+	// last so every existing code keeps its value.
+	SetupProblemProxyPortsStale
 )
 
 // SetupProblem describes one problem found while inspecting setup state.

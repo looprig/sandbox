@@ -320,3 +320,98 @@ func TestCompileCgroupPolicyNeverConflatesWithLifetimeScope(t *testing.T) {
 		t.Fatalf("lifetime scope unaffected by a Disabled resource-limit policy still failed: %v", err)
 	}
 }
+
+// TestLifetimeCgroupPlanCarriesCompiledLimits pins review H3 without needing a
+// delegated cgroup: a supervised Rung-2 spawn's lifetime scope displaces the
+// backend's resource-limit scope at the single CLONE_INTO_CGROUP join, so the
+// lifetime plan must carry exactly what CompileCgroupPolicy compiles for the
+// same policy — pids.max, memory.max and cpu.max — and must still exist (with
+// the default pids cap) when the policy Disables resource limits.
+func TestLifetimeCgroupPlanCarriesCompiledLimits(t *testing.T) {
+	t.Parallel()
+	const ancestor = "/sys/fs/cgroup/lrsb-test-ancestor"
+	tests := []struct {
+		name   string
+		limits policy.Limits
+		want   CompiledCgroup
+	}{
+		{
+			name:   "no policy limits: default pids cap only",
+			limits: policy.Limits{},
+			want:   CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs},
+		},
+		{
+			name:   "custom pids, memory and cpu limits are carried",
+			limits: policy.Limits{MaxPIDs: 37, MaxMemBytes: 64 << 20, MaxCPUPct: 150},
+			want:   CompiledCgroup{Ancestor: ancestor, PidsMax: 37, MemMax: 64 << 20, CPUPct: 150},
+		},
+		{
+			name:   "memory only keeps the default pids cap",
+			limits: policy.Limits{MaxMemBytes: 1 << 30},
+			want:   CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs, MemMax: 1 << 30},
+		},
+		{
+			name:   "disabled limits still yield a containment scope",
+			limits: policy.Limits{Disabled: true, MaxPIDs: 9, MaxMemBytes: 1 << 20},
+			want:   CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := lifetimeCgroupPlan(ancestor, tt.limits)
+			if got != tt.want {
+				t.Fatalf("lifetimeCgroupPlan = %+v, want %+v", got, tt.want)
+			}
+			if !got.Enforced() {
+				t.Fatal("lifetime plan does not create a scope")
+			}
+			if compiled := CompileCgroupPolicy(tt.limits, ancestor); compiled.Enforced() && compiled != got {
+				t.Fatalf("lifetime plan %+v drifted from the resource-limit plan %+v for the same policy", got, compiled)
+			}
+		})
+	}
+}
+
+// TestNewLifetimeScopeWithLimitsFailsClosedWithoutDelegation keeps the
+// fail-closed contract on the limits-carrying constructor.
+func TestNewLifetimeScopeWithLimitsFailsClosedWithoutDelegation(t *testing.T) {
+	t.Parallel()
+	scope, err := NewLifetimeScopeWithLimits("", policy.Limits{MaxPIDs: 5})
+	if scope != nil || !errors.Is(err, enforce.ErrLifetimeContainmentUnavailable) {
+		t.Fatalf("NewLifetimeScopeWithLimits(\"\") = (%v, %v), want (nil, ErrLifetimeContainmentUnavailable)", scope, err)
+	}
+}
+
+// TestNewLifetimeScopeWithLimitsWritesLimits proves on a delegated host that
+// the real scope's control files carry the policy's limits (review H3).
+// memory.max is asserted only where the memory controller is enabled for the
+// scope (the file exists); pids.max is mandatory.
+func TestNewLifetimeScopeWithLimitsWritesLimits(t *testing.T) {
+	ancestor := requireLifetimeCgroup(t)
+	const pids, mem = 41, 96 << 20
+	scope, err := NewLifetimeScopeWithLimits(ancestor, policy.Limits{MaxPIDs: pids, MaxMemBytes: mem})
+	if err != nil {
+		t.Fatalf("NewLifetimeScopeWithLimits: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = scope.KillAndWait(ctx)
+	})
+	dir := scopeDir(t, scope)
+	got, err := os.ReadFile(filepath.Join(dir, "pids.max"))
+	if err != nil {
+		t.Fatalf("read pids.max: %v", err)
+	}
+	if string(got) != strconv.Itoa(pids)+"\n" {
+		t.Errorf("pids.max = %q, want %d", got, pids)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "memory.max")); err == nil {
+		if string(got) != strconv.Itoa(mem)+"\n" {
+			t.Errorf("memory.max = %q, want %d", got, mem)
+		}
+	} else {
+		t.Logf("memory controller not enabled for the scope (%v); memory.max not asserted", err)
+	}
+}

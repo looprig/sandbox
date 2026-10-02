@@ -23,14 +23,6 @@ type aclDirectoryEntry struct {
 	reparse   bool
 }
 
-// ACLTreeEntry is one deterministic, no-follow enumeration result. Reparse
-// entries are represented for planning and audit, but never retained or
-// traversed. RelativePath is descriptive only and is never used for mutation.
-type ACLTreeEntry struct {
-	Object       ACLObjectIdentity
-	RelativePath string
-}
-
 // RetainedACLTree owns one ACL-capable handle for the root and each distinct
 // ordinary descendant identity. Multiple names for one hard-linked file are
 // represented by one entry and one retained handle.
@@ -42,8 +34,29 @@ type RetainedACLTree struct {
 
 // EnumerateRetainedACLTree walks an already pinned directory without following
 // reparses. Directory listing and child opens are relative to retained handles;
-// a journal path is never used to reacquire a live mutation target.
+// a journal path is never used to reacquire a live mutation target. Every
+// child is opened with read sharing only, which freezes data writes and
+// namespace changes for as long as the tree is retained; the elevated tier's
+// broker references depend on that and keep this mode.
 func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error) {
+	return enumerateRetainedACLTree(root, win.FILE_SHARE_READ, true)
+}
+
+// EnumerateSharedACLTree is the restricted tier's enumeration (review M16):
+// every child is opened granting read, write AND delete sharing, so a file
+// another process holds open for writing (an editor, .git/index.lock) never
+// fails the compile, and enumeration itself never blocks a rename or delete.
+// The handles that must exclude deletion for the lease — the root, the
+// carveouts and their ancestors — are re-opened without delete sharing by
+// the projection before any mutation (planPinnedACLTreeObjects,
+// ACLProjection.pinRetainedTree); everything else is released after its
+// read-back. A rename or delete that races enumeration is caught by the
+// final-path and identity checks every snapshot performs and fails closed.
+func EnumerateSharedACLTree(root *policy.PathHandle) (*RetainedACLTree, error) {
+	return enumerateRetainedACLTree(root, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, false)
+}
+
+func enumerateRetainedACLTree(root *policy.PathHandle, childShare uint32, freezeRoot bool) (*RetainedACLTree, error) {
 	if root == nil || root.NativeHandle() == 0 || root.Exact() || !root.IsDir() {
 		return nil, errors.New("sandbox: retained ACL tree requires an open directory handle")
 	}
@@ -59,7 +72,7 @@ func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error)
 		// Restricted-mode policy handles intentionally carry only identity
 		// authority; their established projection path performs the separately
 		// identity-checked ACL open.
-		rootObject, err = openBoundWin32ACLObject(source, root.Target(), true, true)
+		rootObject, err = openBoundWin32ACLObject(source, root.Target(), true, freezeRoot)
 	}
 	if err != nil {
 		return nil, err
@@ -75,7 +88,7 @@ func EnumerateRetainedACLTree(root *policy.PathHandle) (*RetainedACLTree, error)
 			identityKey(rootSnapshot.identity): rootObject,
 		},
 	}
-	if err := tree.walkDirectory(rootObject, ""); err != nil {
+	if err := tree.walkDirectory(rootObject, "", childShare); err != nil {
 		_ = tree.Close()
 		return nil, err
 	}
@@ -146,10 +159,18 @@ func NewRestrictedACLTreeProjection(plan ACLPlan, tree *RetainedACLTree, journal
 		paths:   make(map[aclIdentityKey]string),
 		keys:    make(map[string][]string),
 	}
+	// Decide retention before NewACLTreeProjection consumes the tree's
+	// entries (review M16): only the root, the plan's deny targets and their
+	// ancestor directories keep a no-delete-sharing handle for the lease.
+	var pinned map[aclIdentityKey]struct{}
+	if tree != nil {
+		pinned = planPinnedACLTreeObjects(tree.root, tree.entries, plan)
+	}
 	projection, err := NewACLTreeProjection(plan, tree, recorder)
 	if err != nil {
 		return nil, err
 	}
+	projection.pinned = pinned
 	for key, object := range projection.objects {
 		win32Object, ok := object.(*win32ACLObject)
 		if !ok {
@@ -161,7 +182,7 @@ func NewRestrictedACLTreeProjection(plan ACLPlan, tree *RetainedACLTree, journal
 	return projection, nil
 }
 
-func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative string) error {
+func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative string, share uint32) error {
 	before, err := directory.snapshot()
 	if err != nil || before.identity.Kind != ACLObjectDirectory {
 		return errors.Join(fmt.Errorf("%w: enumerated directory changed", policy.ErrTargetChanged), err)
@@ -171,7 +192,7 @@ func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative s
 		return fmt.Errorf("enumerate retained directory handle: %w", err)
 	}
 	for _, entry := range entries {
-		child, identity, err := openRelativeACLChild(directory.handle, entry)
+		child, identity, err := openRelativeACLChild(directory.handle, entry, share)
 		if err != nil {
 			return err
 		}
@@ -198,7 +219,7 @@ func (tree *RetainedACLTree) walkDirectory(directory *win32ACLObject, relative s
 		tree.entries = append(tree.entries, entry)
 		tree.objects[key] = child
 		if identity.Kind == ACLObjectDirectory {
-			if err := tree.walkDirectory(child, childRelative); err != nil {
+			if err := tree.walkDirectory(child, childRelative, share); err != nil {
 				return err
 			}
 		}
@@ -277,7 +298,7 @@ func parseFileIDBothDirectoryInfo(buffer []byte) ([]aclDirectoryEntry, error) {
 	}
 }
 
-func openRelativeACLChild(parent win.Handle, entry aclDirectoryEntry) (*win32ACLObject, ACLObjectIdentity, error) {
+func openRelativeACLChild(parent win.Handle, entry aclDirectoryEntry, share uint32) (*win32ACLObject, ACLObjectIdentity, error) {
 	objectName, err := win.NewNTUnicodeString(entry.name)
 	if err != nil {
 		return nil, ACLObjectIdentity{}, err
@@ -297,7 +318,7 @@ func openRelativeACLChild(parent win.Handle, entry aclDirectoryEntry) (*win32ACL
 		options |= win.FILE_DIRECTORY_FILE
 	}
 	err = win.NtCreateFile(&candidate, desired, &attributes, &status, nil, 0,
-		win.FILE_SHARE_READ, win.FILE_OPEN, options, 0, 0)
+		share, win.FILE_OPEN, options, 0, 0)
 	if err != nil {
 		return nil, ACLObjectIdentity{}, fmt.Errorf("open retained relative ACL child %q: %w", entry.name, err)
 	}

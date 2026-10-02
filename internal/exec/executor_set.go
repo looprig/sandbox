@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,9 @@ type executorSetConfig struct {
 type ExecutorSetOption func(*executorSetConfig)
 
 // WithScratchRoot supplies the caller-owned parent for the set's owned child.
+// On Windows the restricted backend also retains its recovery journal and
+// permanent SID retirement ledger here across sets. Close removes the owned
+// child, but does not remove this persistent safety state.
 func WithScratchRoot(path string) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.scratchRoot = path }
 }
@@ -228,8 +232,9 @@ func (set *ExecutorSet) For(key string) (*Executor, error) {
 	if pol.Env.Set == nil {
 		pol.Env.Set = make(map[string]string)
 	}
-	pol.Env.Set["HOME"] = home
-	pol.Env.Set["TMPDIR"] = tmp
+	for name, value := range executorOwnedEnv(home, tmp) {
+		pol.Env.Set[name] = value
+	}
 	if ownedHome {
 		pol.FS = append(pol.FS, policy.FSEntry{Path: home, Access: policy.ReadAccess | policy.WriteAccess | policy.ExecAccess})
 		pol.ProjectionRoots = append(pol.ProjectionRoots, home)
@@ -449,4 +454,32 @@ func callRelease(release func() error) error {
 		return nil
 	}
 	return release()
+}
+
+// executorOwnedEnv returns the variables ExecutorSet.For forces onto every
+// executor's environment so they name its owned HOME and tmp directories. It
+// returns a fresh map. The platform split lives in executorOwnedEnvFor so a
+// test on any host can pin both mappings.
+func executorOwnedEnv(home, tmp string) map[string]string {
+	return executorOwnedEnvFor(runtime.GOOS, home, tmp)
+}
+
+// executorOwnedEnvFor is executorOwnedEnv for an explicit GOOS. On darwin and
+// Linux HOME and TMPDIR are the only names POSIX tools consult for the home
+// and temp directories. Windows ignores TMPDIR: GetTempPath reads TMP, then
+// TEMP, then USERPROFILE, and falls back to the Windows directory, so without
+// TEMP/TMP a scrubbed child would write its temp files into C:\Windows (or
+// fail). USERPROFILE is what Windows-native code reads as the home directory.
+// HOME and TMPDIR are still set there for the POSIX-flavoured tools (Git for
+// Windows, MSYS2) that consult them. None of these is inherited by the Windows
+// baseline (policy.BaselineEnvAllowlist), so every one names an executor-owned
+// directory, never the caller's profile.
+func executorOwnedEnvFor(goos, home, tmp string) map[string]string {
+	env := map[string]string{"HOME": home, "TMPDIR": tmp}
+	if goos == "windows" {
+		env["TEMP"] = tmp
+		env["TMP"] = tmp
+		env["USERPROFILE"] = home
+	}
+	return env
 }

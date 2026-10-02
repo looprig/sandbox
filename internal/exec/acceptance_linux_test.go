@@ -104,7 +104,7 @@ func acceptLinuxRung2Write(t *testing.T) {
 // guarantees rung 2 cannot provide.
 func acceptLinuxRung1Write(t *testing.T) {
 	if !linux.ProbeCaps().Userns {
-		t.Skip("RECORDED SKIP: linux.Rung 1 needs a usable user namespace (Userns+Mountns/Netns for the bind-mount view + in-Netns nftables); this host reports linux.ProbeCaps().Userns=false (Userns BLOCKED), so the linux.Rung-1 write-mode row — restricted-read in zerotrust, metadata IP unreachable under trusted, Level=Full, all guarantee bits — cannot run here. Exercised in CI on a Userns-enabled host.")
+		skipMissingRung1Cap(t, "RECORDED SKIP: linux.Rung 1 needs a usable user namespace (Userns+Mountns/Netns for the bind-mount view + in-Netns nftables); this host reports linux.ProbeCaps().Userns=false (Userns BLOCKED), so the linux.Rung-1 write-mode row — restricted-read in zerotrust, metadata IP unreachable under trusted, Level=Full, all guarantee bits — cannot run here. Exercised in CI on a Userns-enabled host.")
 	}
 	requireLandlockV4(t)
 	requireSeccomp(t)
@@ -200,7 +200,7 @@ func acceptLinuxCgroupUnavailable(t *testing.T) {
 // SKIP with a recorded reason on both counts.
 func acceptLinuxMetadataUnderTrusted(t *testing.T) {
 	if !linux.ProbeCaps().Userns {
-		t.Skip("RECORDED SKIP: the metadata hard-deny is linux.Enforced by linux.Rung-1 in-Netns nftables (§5.2, §5.4); Userns is BLOCKED on this host (linux.ProbeCaps().Userns=false), so there is no Netns to install the 169.254.0.0/16 deny into. Rung 2 cannot address-scope, so metadata is only vacuously denied (:80 not in the default trusted port set). Live metadata/external reachability is exercised in the CI integration environment on a Userns-enabled host.")
+		skipMissingRung1Cap(t, "RECORDED SKIP: the metadata hard-deny is linux.Enforced by linux.Rung-1 in-Netns nftables (§5.2, §5.4); Userns is BLOCKED on this host (linux.ProbeCaps().Userns=false), so there is no Netns to install the 169.254.0.0/16 deny into. Rung 2 cannot address-scope, so metadata is only vacuously denied (:80 not in the default trusted port set). Live metadata/external reachability is exercised in the CI integration environment on a Userns-enabled host.")
 	}
 	t.Skip("RECORDED SKIP: even on a Userns host this row requires live external egress (reach 169.254.169.254 and example.com), which is not available/deterministic in the unit-test environment; asserted by the CI integration suite.")
 }

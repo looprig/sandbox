@@ -51,17 +51,31 @@ type restrictedACLRecorder struct {
 // NewRestrictedACLProjection couples handle-bound mutation to the restricted
 // tier's durable write-ahead journal. The journal path is descriptive cleanup
 // data only; every live mutation still uses the retained handle.
+//
+// The restricted tier's exact projections carry allow ACEs only, so they need
+// no no-delete-sharing handle (review M16): each object is opened by file ID
+// with every sharing mode for the mutation and its read-back, and the handle
+// is closed as soon as Apply succeeds. Rollback then reopens it by file ID
+// (reopenableACLObject), wherever the object has moved on its volume.
 func NewRestrictedACLProjection(plan ACLPlan, handles []*policy.PathHandle, journal *RestrictedJournal) (*ACLProjection, error) {
 	if journal == nil {
 		return nil, errors.New("sandbox: restricted ACL projection requires a journal")
 	}
+	for _, mutation := range plan.Mutations() {
+		if mutation.ACE().Type != ACEAllow {
+			return nil, errors.New("sandbox: restricted exact ACL projection carries a deny ACE")
+		}
+	}
 	recorder := &restrictedACLRecorder{
 		journal: journal, paths: make(map[aclIdentityKey]string, len(handles)), keys: make(map[string][]string),
 	}
-	projection, err := NewACLProjection(plan, handles, recorder)
+	projection, err := newACLProjectionFromHandles(plan, handles, recorder, func(handle *policy.PathHandle) (aclProjectionObject, error) {
+		return openSharedWin32ACLObject(handle)
+	})
 	if err != nil {
 		return nil, err
 	}
+	projection.closeAfterApply = true
 	for key, object := range projection.objects {
 		win32Object, ok := object.(*win32ACLObject)
 		if !ok {
@@ -123,6 +137,15 @@ type ACLProjection struct {
 	recorder         ACLMutationRecorder
 	applied          []appliedACLMutation
 	relaxTreeSharing bool
+	// pinned, when non-nil, is the narrowed tree retention of review M16
+	// (planPinnedACLTreeObjects): these objects are re-opened with
+	// read/write but no delete sharing BEFORE any mutation and keep that
+	// handle for the lease; every other object is released once the plan's
+	// read-back has passed. nil keeps the legacy relax-everything behaviour.
+	pinned map[aclIdentityKey]struct{}
+	// closeAfterApply releases every handle once Apply succeeds and leaves
+	// rollback to reopenableACLObject (allow-only exact projections, M16).
+	closeAfterApply bool
 }
 
 type aclProjectionObject interface {
@@ -153,20 +176,16 @@ type appliedACLMutation struct {
 	terminalRollbackErr error
 }
 
-type aclIdentityKey struct {
-	volume uint64
-	fileID [16]byte
-	kind   ACLObjectKind
-}
-
-func identityKey(identity ACLObjectIdentity) aclIdentityKey {
-	return aclIdentityKey{volume: identity.VolumeSerial, fileID: identity.FileID, kind: identity.Kind}
-}
-
 // NewACLProjection binds every planned ordinary object to exactly one retained
 // no-follow handle. recorder may be nil only when the caller does not require a
 // crash journal (for example, the broker's own durable lease machinery).
 func NewACLProjection(plan ACLPlan, handles []*policy.PathHandle, recorder ACLMutationRecorder) (*ACLProjection, error) {
+	return newACLProjectionFromHandles(plan, handles, recorder, func(handle *policy.PathHandle) (aclProjectionObject, error) {
+		return newWin32ACLObject(handle)
+	})
+}
+
+func newACLProjectionFromHandles(plan ACLPlan, handles []*policy.PathHandle, recorder ACLMutationRecorder, open func(*policy.PathHandle) (aclProjectionObject, error)) (*ACLProjection, error) {
 	objects := make(map[aclIdentityKey]aclProjectionObject, len(handles))
 	closeObjects := func() {
 		for _, object := range objects {
@@ -178,7 +197,7 @@ func NewACLProjection(plan ACLPlan, handles []*policy.PathHandle, recorder ACLMu
 			closeObjects()
 			return nil, errors.New("sandbox: ACL projection requires an open retained handle")
 		}
-		object, err := newWin32ACLObject(handle)
+		object, err := open(handle)
 		if err != nil {
 			closeObjects()
 			return nil, err
@@ -240,6 +259,15 @@ func (projection *ACLProjection) Apply() error {
 	if len(projection.applied) != 0 {
 		return errors.New("sandbox: ACL projection is already applied")
 	}
+	if projection.pinned != nil {
+		// Pin before the first mutation: from here until rollback no pinned
+		// object (root, carveout, carveout ancestor) can be renamed or
+		// deleted by an ordinary Win32 open, so a deny can never be
+		// renamed out from under its policy path once it is applied.
+		if err := projection.pinRetainedTree(); err != nil {
+			return projection.failApply(err)
+		}
+	}
 	for _, mutation := range projection.plan.Mutations() {
 		object := projection.objects[identityKey(mutation.Object())]
 		snapshot, err := object.snapshot()
@@ -277,8 +305,18 @@ func (projection *ACLProjection) Apply() error {
 	if err := projection.validatePlanReadback(); err != nil {
 		return projection.failApply(err)
 	}
-	if projection.relaxTreeSharing {
+	switch {
+	case projection.pinned != nil:
+		if err := projection.releaseUnpinned(); err != nil {
+			return projection.failApply(err)
+		}
+	case projection.relaxTreeSharing:
 		if err := projection.relaxRetainedTreeSharing(); err != nil {
+			return projection.failApply(err)
+		}
+	}
+	if projection.closeAfterApply {
+		if err := projection.releaseAppliedHandles(); err != nil {
 			return projection.failApply(err)
 		}
 	}
@@ -287,8 +325,17 @@ func (projection *ACLProjection) Apply() error {
 
 func (projection *ACLProjection) validatePlanReadback() error {
 	for _, target := range projection.plan.ValidationTargets() {
-		snapshot, err := projection.objects[identityKey(target.Object)].snapshot()
+		key := identityKey(target.Object)
+		snapshot, err := projection.objects[key].snapshot()
 		if err != nil || snapshot.identity != target.Object {
+			if projection.unpinnedMayChange(key, err, snapshot) {
+				// An ordinary allow-by-inheritance object that was renamed,
+				// moved or deleted while the compile ran is simply no
+				// longer where the plan found it. It carries no deny, holds
+				// no carveout beneath it, and receives no ACE of its own, so
+				// there is nothing at its old path to verify (M16).
+				continue
+			}
 			return fmt.Errorf("%w: ACL validation target changed", policy.ErrTargetChanged)
 		}
 		for _, expected := range target.Required {
@@ -298,6 +345,99 @@ func (projection *ACLProjection) validatePlanReadback() error {
 		}
 	}
 	return nil
+}
+
+// unpinnedMayChange reports whether a validation target that no longer
+// matches may be skipped: only in narrowed (pinned) mode, only for an object
+// outside the pinned set, and only when the mismatch is the object having
+// moved (ErrTargetChanged, or a changed identity from a successful read), not
+// an unreadable DACL.
+func (projection *ACLProjection) unpinnedMayChange(key aclIdentityKey, err error, snapshot aclObjectSnapshot) bool {
+	if projection.pinned == nil {
+		return false
+	}
+	if _, pinned := projection.pinned[key]; pinned {
+		return false
+	}
+	return errors.Is(err, policy.ErrTargetChanged) || (err == nil && identityKey(snapshot.identity) != key)
+}
+
+// pinRetainedTree replaces each pinned object's enumeration handle (which
+// granted every sharing mode) with a read/write-shared, no-delete-shared one
+// opened again by its path, refusing any object whose identity, final path
+// or owner changed since enumeration. It runs before any mutation, so a
+// failure leaves nothing to roll back.
+func (projection *ACLProjection) pinRetainedTree() error {
+	expected := make(map[aclIdentityKey]ACLObjectIdentity, len(projection.pinned))
+	for _, target := range projection.plan.ValidationTargets() {
+		expected[identityKey(target.Object)] = target.Object
+	}
+	for key := range projection.pinned {
+		object, ok := projection.objects[key]
+		if !ok {
+			return errors.New("sandbox: pinned ACL object has no retained handle")
+		}
+		preparer, ok := object.(aclTreeSharingPreparer)
+		if !ok {
+			return errors.New("sandbox: retained ACL tree object cannot be pinned")
+		}
+		replacement, err := preparer.prepareWriteShared()
+		if err != nil {
+			return fmt.Errorf("pin retained ACL tree object: %w", err)
+		}
+		snapshot, err := replacement.snapshot()
+		if err != nil || snapshot.identity != expected[key] || !bytes.Equal(snapshot.owner, projection.owners[key]) {
+			_ = replacement.close()
+			return errors.Join(fmt.Errorf("%w: pinned ACL tree object changed", policy.ErrTargetChanged), err)
+		}
+		projection.objects[key] = replacement
+		if err := object.close(); err != nil {
+			return fmt.Errorf("close enumeration handle of pinned ACL object: %w", err)
+		}
+	}
+	return nil
+}
+
+// releaseUnpinned closes every handle outside the pinned set. Every applied
+// mutation is on a pinned object (the root's allows and the plan's denies),
+// so rollback never needs one of these.
+func (projection *ACLProjection) releaseUnpinned() error {
+	var result error
+	for key, object := range projection.objects {
+		if _, pinned := projection.pinned[key]; pinned {
+			continue
+		}
+		result = errors.Join(result, object.close())
+		delete(projection.objects, key)
+	}
+	if result != nil {
+		return fmt.Errorf("release unpinned ACL tree handles: %w", result)
+	}
+	return nil
+}
+
+// releaseAppliedHandles closes every exact-projection handle and leaves a
+// reopenableACLObject in its place for rollback.
+func (projection *ACLProjection) releaseAppliedHandles() error {
+	reopenable := make(map[aclIdentityKey]aclProjectionObject, len(projection.objects))
+	var result error
+	for key, object := range projection.objects {
+		win32Object, ok := object.(*win32ACLObject)
+		if !ok {
+			return errors.New("sandbox: exact ACL projection object cannot be released")
+		}
+		snapshot, err := win32Object.snapshot()
+		if err != nil {
+			return err
+		}
+		reopenable[key] = &reopenableACLObject{identity: snapshot.identity, target: win32Object.target}
+		result = errors.Join(result, object.close())
+	}
+	projection.objects = reopenable
+	for index := range projection.applied {
+		projection.applied[index].object = reopenable[identityKey(projection.applied[index].record.Object)]
+	}
+	return result
 }
 
 // relaxRetainedTreeSharing prepares every replacement while the original
@@ -370,7 +510,21 @@ func (projection *ACLProjection) Rollback() error {
 			continue
 		}
 		snapshot, err := applied.object.snapshot()
-		if err == nil && (snapshot.identity != applied.record.Object || !bytes.Equal(snapshot.owner, applied.owner)) {
+		if errors.Is(err, errACLObjectGone) {
+			// The object is gone, and its security descriptor (with this
+			// lease's ACE) went with it: the mutation is rolled back.
+			if projection.recorder != nil {
+				err = projection.recorder.AfterACLRollback(applied.record)
+			} else {
+				err = nil
+			}
+			if err != nil {
+				result = errors.Join(result, err)
+				remaining = append(remaining, applied)
+			}
+			continue
+		}
+		if err == nil && (!rollbackIdentityMatches(applied.object, snapshot.identity, applied.record.Object) || !bytes.Equal(snapshot.owner, applied.owner)) {
 			err = fmt.Errorf("%w: refusing ACL rollback after identity or owner change", policy.ErrTargetChanged)
 		}
 		if err == nil {

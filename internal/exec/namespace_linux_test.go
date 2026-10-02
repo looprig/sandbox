@@ -5,6 +5,7 @@ package exec
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"github.com/looprig/sandbox/internal/linux"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
@@ -15,17 +16,38 @@ import (
 	"testing"
 )
 
+// requireRung1Env names the opt-in that turns a missing rung-1 capability from a
+// recorded skip into a test failure (review M8). A CI job that exists to cover
+// Rung 1 sets it, so a runner whose user namespaces, mount namespaces, net
+// namespaces or nftables netlink silently went missing fails loudly instead of
+// passing with zero rung-1 coverage.
+const requireRung1Env = "LRSANDBOX_REQUIRE_RUNG1"
+
+// skipMissingRung1Cap is the ONE place a rung-1 capability gap is turned into a
+// test outcome: a recorded t.Skip by default, a t.Fatalf when
+// LRSANDBOX_REQUIRE_RUNG1=1. Every rung-1 capability gate in this package's
+// Linux tests routes through it so the opt-in cannot be bypassed by a local
+// skip.
+func skipMissingRung1Cap(t *testing.T, reason string) {
+	t.Helper()
+	if os.Getenv(requireRung1Env) == "1" {
+		t.Fatalf("%s=1 but a rung-1 capability is missing: %s", requireRung1Env, reason)
+	}
+	t.Skip(reason)
+}
+
 // requireRung1Caps skips a rung-1 ENFORCEMENT test when the host cannot create
 // the unprivileged user+mount+net namespaces the mechanism needs, recording the
 // exact reason (SPEC §7.2 rung 1). The authoring host has
 // apparmor_restrict_unprivileged_userns=1, so every enforcement test skips HERE
 // and is validated only in CI. Compilation/enumeration unit tests do NOT gate on
-// this — they walk the filesystem and build plans without any namespace.
+// this — they walk the filesystem and build plans without any namespace. With
+// LRSANDBOX_REQUIRE_RUNG1=1 the gap fails the test (skipMissingRung1Cap).
 func requireRung1Caps(t *testing.T) {
 	t.Helper()
 	c := linux.ProbeCaps()
 	if !c.Userns || !c.Mountns || !c.Netns {
-		t.Skip("linux.Rung-1 backend requires unprivileged Userns+Mountns+Netns; blocked on this host by apparmor_restrict_unprivileged_userns=1 — CI-verified")
+		skipMissingRung1Cap(t, fmt.Sprintf("linux.Rung-1 backend requires unprivileged Userns+Mountns+Netns (probed Userns=%t Mountns=%t Netns=%t); blocked on this host, e.g. by apparmor_restrict_unprivileged_userns=1 — CI-verified", c.Userns, c.Mountns, c.Netns))
 	}
 }
 
@@ -476,8 +498,17 @@ func TestCompileRung1LevelAndGuarantees(t *testing.T) {
 			if !reportHas(report, "metadata-deny", linuxReportStatusEnforced) {
 				t.Errorf("report missing Enforced metadata-deny: %+v", report.Entries)
 			}
-			if !reportHas(report, "glob-deny", linuxReportStatusEnforced) {
-				t.Errorf("report missing Enforced glob-deny: %+v", report.Entries)
+			// Review M6: the bounded scan cannot reach a match below
+			// GlobScanMaxDepth or under an unscanned "/" bind, so glob denies
+			// are disclosed narrowed (naming the depth bound), never Enforced.
+			if !reportHas(report, "glob-deny", "narrowed") {
+				t.Errorf("report missing narrowed glob-deny: %+v", report.Entries)
+			}
+			for _, entry := range reportEntriesForFeature(report, "glob-deny") {
+				if !strings.Contains(entry.Detail, fmt.Sprintf("depth of %d", linux.GlobScanMaxDepth)) ||
+					!strings.Contains(entry.Detail, "read-only root") {
+					t.Errorf("glob-deny detail %q does not name the scanned roots and depth bound", entry.Detail)
+				}
 			}
 		})
 	}
@@ -614,6 +645,19 @@ func TestCompileRung2ReportsFilesystemAxisSnapshotNarrowing(t *testing.T) {
 		{
 			name:   "plain writable root",
 			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{{Path: ws, Access: policy.AllAccess}}},
+			wantLegacy: [][2]string{
+				{"allow-paths", "narrowed"},
+			},
+		},
+		{
+			// L9: a HostRead-Deny profile's recursive "/" deny is read-restored
+			// over the workspace by the workspace allow itself, so the write
+			// allow survives (1760f0b) and no snapshot is reported for it.
+			name: "host read deny restored by the writable workspace",
+			policy: policy.Effective{Workspace: ws, FS: []policy.FSEntry{
+				{Path: "/", Denied: policy.AllAccess},
+				{Path: ws, Access: policy.AllAccess},
+			}},
 			wantLegacy: [][2]string{
 				{"allow-paths", "narrowed"},
 			},

@@ -98,6 +98,7 @@ type ProfileConfig struct {
 	Isolation       Isolation
 	AdditionalRoots []RootAccess
 	AckUnconfined   bool
+	UnixSockets     UnixSocketPolicy
 }
 
 profile, err := sandbox.NewProfile(config)
@@ -107,6 +108,37 @@ The zero access value is `Deny`; the zero HOME choice is `IsolatedHome`; and
 the zero isolation choice is `Sandboxed`. A canonical workspace root is always
 required. Invalid enum values, relative or contradictory roots, and an
 unacknowledged or inconsistent unconfined configuration fail validation.
+
+Unix sockets are denied by default: a sandboxed command cannot call
+`socket(AF_UNIX)`, because a pathname or abstract Unix socket reaches
+same-user brokers (the D-Bus session bus, the systemd user manager, a
+container daemon) that start processes outside every other mechanism.
+`socketpair` and the pipe-style IPC Node, Go and Chromium build on it keep
+working. Programs that genuinely need a Unix socket — `ssh` with an agent, the
+`docker` CLI, Python's `multiprocessing` forkserver — need the explicit escape
+hatch:
+
+```go
+config.UnixSockets = sandbox.UnixSocketPolicy{
+	// Sockets the command creates itself beneath its writable roots
+	// (Python's forkserver), anonymous pairs, abstract names in an isolated
+	// namespace. Linux Rung 1 and macOS enforce this exactly; Linux Rung 2
+	// cannot scope pathname sockets and reports the spawn as narrowed.
+	Mode: sandbox.UnixSocketsLocal,
+	// Named host sockets the command may connect to, granted exactly.
+	Paths: []string{os.Getenv("SSH_AUTH_SOCK")},
+}
+if reason, dangerous := sandbox.DangerousUnixSocket("/var/run/docker.sock"); dangerous {
+	// Granting this hands the command the daemon's authority: the backend
+	// still runs it, but withholds GuaranteeProcessBoundary, reports
+	// LevelDegraded and flags the path as unix-sockets.dangerous.
+	log.Println(reason)
+}
+```
+
+`Restrict` takes the narrower mode and only the paths both profiles name; any
+non-default policy changes the fingerprint. Windows refuses a non-default
+policy because neither tier mediates AF_UNIX endpoints.
 
 The module deliberately provides no named profile combinations. Product
 composition roots construct their own product profiles. `Restrict(base, ceiling)`

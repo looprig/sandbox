@@ -76,11 +76,27 @@ func TestBrokerReconcileRollsBackBeforeMarkingReleased(t *testing.T) {
 	// object DACL state remain.
 	broker.leases = make(map[ACLLeaseID]*brokerLease)
 	acl.operations = nil
+	acl.rollbackJournalOps = nil
+	leaseSID := acl.restricting
 	before := len(store.operations)
 	if err := broker.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if len(acl.operations) != 2 || len(store.operations) != before+2 || store.operations[before] != "append" || store.operations[before+1] != "flush" {
+	// Since the H10 fix the ACL plan names only the lease's one-shot SID
+	// (acquire plans []SID{lease.restricting}; the persistent installation
+	// SID is never projected), so the recovered lease carries exactly ONE
+	// mutation and reconcile performs exactly one rollback. The pre-H10
+	// expectation of two rollbacks counted the installation-SID ACE that is
+	// no longer written. The ordering this test owns is unchanged: the
+	// rollback lands before any journal write, and only then is Released
+	// appended and flushed.
+	if want := []string{"rollback:" + leaseSID.String()}; len(acl.operations) != 1 || acl.operations[0] != want[0] {
+		t.Fatalf("reconcile ACL operations = %v, want %v", acl.operations, want)
+	}
+	if len(acl.rollbackJournalOps) != 1 || acl.rollbackJournalOps[0] != before {
+		t.Fatalf("rollback ran after %v journal operations, want before any reconcile journal write (%d)", acl.rollbackJournalOps, before)
+	}
+	if len(store.operations) != before+2 || store.operations[before] != "append" || store.operations[before+1] != "flush" {
 		t.Fatalf("reconcile ordering ACL=%v journal=%v", acl.operations, store.operations[before:])
 	}
 	recovered, err := broker.journal.recover()

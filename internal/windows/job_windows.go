@@ -57,6 +57,74 @@ type jobAssociateCompletionPort struct {
 	CompletionPort winapi.Handle
 }
 
+// procSetInformationJobObject and procQueryInformationJobObject are called
+// through LazyProc.Call (setJobInformation / queryJobInformation, below),
+// never through golang.org/x/sys/windows's SetInformationJobObject and
+// QueryInformationJobObject wrappers. Those wrappers take the information
+// buffer as a bare uintptr, so a caller writes
+// uintptr(unsafe.Pointer(&local)) — and that conversion is only safe in the
+// argument list of a function the compiler knows about (syscall.SyscallN,
+// marked //go:uintptrkeepalive, or LazyProc.Call, marked
+// //go:uintptrescapes). The x/sys wrapper is neither: escape analysis keeps
+// the buffer on the goroutine's STACK, and the wrapper's own prologue is a
+// stack-growth check. When the goroutine's stack is grown (copied) at that
+// point, every typed pointer is adjusted but the uintptr is not, so the
+// kernel reads the old, freed copy (SetInformationJobObject: usually still
+// intact, so it "succeeds") and QueryInformationJobObject WRITES its result
+// into the freed copy while the caller's live buffer stays as it was.
+//
+// That is the second Windows CI run's "Windows Job kill-on-close was not
+// installed" in internal/exec, with internal/windows's own Job tests green on
+// the same runner and the same options: the two packages reach NewJob at
+// different stack depths (internal/exec through newProcessTree), a Windows
+// goroutine's first stack is small (_StackSystem reserves 4 KiB of the 8 KiB),
+// and -race doubles the stack guard, so the read-back query in internal/exec
+// is where the stack first outgrows its initial size. The read-back flags
+// were the zero value the caller declared, not anything the kernel wrote. A
+// freed stack is reused by the next goroutine, so the same bug is also a
+// silent write of up to 144 bytes into an unrelated goroutine's stack.
+//
+// LazyProc.Call's //go:uintptrescapes makes the compiler move every buffer
+// converted in its argument list to the heap (Go's heap never moves) and
+// keep it alive for the call, so neither failure is possible through these
+// helpers.
+var (
+	procSetInformationJobObject   = winapi.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject")
+	procQueryInformationJobObject = winapi.NewLazySystemDLL("kernel32.dll").NewProc("QueryInformationJobObject")
+)
+
+// setJobInformation is SetInformationJobObject(job, class, info,
+// sizeof(*info)). info's pointee is moved to the heap by Call's
+// //go:uintptrescapes; see procSetInformationJobObject.
+func setJobInformation[T any](job winapi.Handle, class uint32, info *T) error {
+	ok, _, callErr := procSetInformationJobObject.Call(uintptr(job), uintptr(class), uintptr(unsafe.Pointer(info)), unsafe.Sizeof(*info))
+	if ok == 0 {
+		return callErr
+	}
+	return nil
+}
+
+// queryJobInformation is QueryInformationJobObject(job, class, info,
+// sizeof(*info), &returned) and reports the byte count the kernel says it
+// wrote, for read-back diagnostics. See procSetInformationJobObject for why
+// it is not the x/sys wrapper.
+func queryJobInformation[T any](job winapi.Handle, class uint32, info *T) (uint32, error) {
+	returned := new(uint32)
+	ok, _, callErr := procQueryInformationJobObject.Call(uintptr(job), uintptr(class), uintptr(unsafe.Pointer(info)), unsafe.Sizeof(*info), uintptr(unsafe.Pointer(returned)))
+	if ok == 0 {
+		return 0, callErr
+	}
+	return *returned, nil
+}
+
+// jobReadbackSentinel pre-fills the LimitFlags a read-back query must
+// overwrite. No JOB_OBJECT_LIMIT_* combination equals it (it sets bits far
+// above JOB_OBJECT_LIMIT_VALID_FLAGS), so finding it after a successful query
+// proves the kernel's write did not land in the buffer this process reads —
+// the exact stale-pointer failure described at procSetInformationJobObject —
+// rather than that Windows dropped a flag.
+const jobReadbackSentinel uint32 = 0xA5A5_0000
+
 // Job owns one configured Windows Job Object.
 type Job struct {
 	mu                      sync.Mutex
@@ -92,27 +160,25 @@ func NewJob(options JobOptions) (_ *Job, err error) {
 		CompletionKey:  job.completionKey,
 		CompletionPort: completionPort,
 	}
-	if _, err := winapi.SetInformationJobObject(handle, winapi.JobObjectAssociateCompletionPortInformation, uintptr(unsafe.Pointer(&association)), uint32(unsafe.Sizeof(association))); err != nil {
+	if err := setJobInformation(handle, winapi.JobObjectAssociateCompletionPortInformation, &association); err != nil {
 		return nil, fmt.Errorf("sandbox: associate Windows Job completion port: %w", err)
 	}
 
 	limits := winapi.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	limits.BasicLimitInformation.LimitFlags = winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	limits.BasicLimitInformation.LimitFlags = requestedJobLimitFlags(options)
 	if options.MaxProcesses > 0 {
-		limits.BasicLimitInformation.LimitFlags |= winapi.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
 		limits.BasicLimitInformation.ActiveProcessLimit = uint32(options.MaxProcesses)
 	}
 	if options.MaxMemoryBytes > 0 {
-		limits.BasicLimitInformation.LimitFlags |= winapi.JOB_OBJECT_LIMIT_JOB_MEMORY
 		limits.JobMemoryLimit = uintptr(options.MaxMemoryBytes)
 	}
-	if _, err := winapi.SetInformationJobObject(handle, winapi.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+	if err := setJobInformation(handle, winapi.JobObjectExtendedLimitInformation, &limits); err != nil {
 		return nil, fmt.Errorf("sandbox: configure Windows Job limits: %w", err)
 	}
 
 	if options.Sandboxed {
 		ui := winapi.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: sandboxUIRestrictions}
-		if _, err := winapi.SetInformationJobObject(handle, winapi.JobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui))); err != nil {
+		if err := setJobInformation(handle, winapi.JobObjectBasicUIRestrictions, &ui); err != nil {
 			return nil, fmt.Errorf("sandbox: configure Windows Job UI restrictions: %w", err)
 		}
 	}
@@ -121,7 +187,7 @@ func NewJob(options JobOptions) (_ *Job, err error) {
 			ControlFlags: jobObjectCPURateControlEnable | jobObjectCPURateControlHardCap,
 			CPURate:      uint32(options.MaxCPUPct * 100),
 		}
-		if _, err := winapi.SetInformationJobObject(handle, winapi.JobObjectCpuRateControlInformation, uintptr(unsafe.Pointer(&cpu)), uint32(unsafe.Sizeof(cpu))); err != nil {
+		if err := setJobInformation(handle, winapi.JobObjectCpuRateControlInformation, &cpu); err != nil {
 			return nil, fmt.Errorf("sandbox: configure Windows Job CPU rate: %w", err)
 		}
 	}
@@ -145,28 +211,57 @@ func validateJobOptions(options JobOptions) error {
 	return nil
 }
 
+// requestedJobLimitFlags is the exact LimitFlags NewJob installs for options:
+// kill-on-close always, plus the active-process and job-memory limits when
+// requested. validateReadback reports it next to what Windows read back.
+func requestedJobLimitFlags(options JobOptions) uint32 {
+	flags := uint32(winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+	if options.MaxProcesses > 0 {
+		flags |= winapi.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+	}
+	if options.MaxMemoryBytes > 0 {
+		flags |= winapi.JOB_OBJECT_LIMIT_JOB_MEMORY
+	}
+	return flags
+}
+
 func (job *Job) validateReadback(options JobOptions) error {
 	var limits winapi.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	if err := winapi.QueryInformationJobObject(job.handle, winapi.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits)), nil); err != nil {
+	limits.BasicLimitInformation.LimitFlags = jobReadbackSentinel
+	returned, err := queryJobInformation(job.handle, winapi.JobObjectExtendedLimitInformation, &limits)
+	if err != nil {
 		return fmt.Errorf("sandbox: read back Windows Job limits: %w", err)
 	}
 	flags := limits.BasicLimitInformation.LimitFlags
-	if flags&winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
-		return errors.New("sandbox: Windows Job kill-on-close was not installed")
+	// Every read-back refusal names what was requested, what Windows
+	// returned and how much it says it wrote, so a CI log alone tells a
+	// dropped flag apart from a write that never reached this buffer.
+	describe := func(problem string) error {
+		sentinel := ""
+		if flags == jobReadbackSentinel {
+			sentinel = " (the pre-query sentinel survived: the kernel's write did not land in this buffer)"
+		}
+		return fmt.Errorf("sandbox: %s: requested LimitFlags %#x ActiveProcessLimit %d JobMemoryLimit %d; read back LimitFlags %#x%s ActiveProcessLimit %d JobMemoryLimit %d (%d of %d bytes returned)",
+			problem, requestedJobLimitFlags(options), options.MaxProcesses, options.MaxMemoryBytes,
+			flags, sentinel, limits.BasicLimitInformation.ActiveProcessLimit, uint64(limits.JobMemoryLimit),
+			returned, unsafe.Sizeof(limits))
+	}
+	if flags == jobReadbackSentinel || flags&winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
+		return describe("Windows Job kill-on-close was not installed")
 	}
 	breakaway := uint32(winapi.JOB_OBJECT_LIMIT_BREAKAWAY_OK | winapi.JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
 	if flags&breakaway != 0 {
-		return fmt.Errorf("sandbox: Windows Job breakaway flags unexpectedly enabled: %#x", flags&breakaway)
+		return describe(fmt.Sprintf("Windows Job breakaway flags unexpectedly enabled (%#x)", flags&breakaway))
 	}
 	if options.MaxProcesses > 0 && (flags&winapi.JOB_OBJECT_LIMIT_ACTIVE_PROCESS == 0 || limits.BasicLimitInformation.ActiveProcessLimit != uint32(options.MaxProcesses)) {
-		return errors.New("sandbox: Windows Job active-process limit read-back mismatch")
+		return describe("Windows Job active-process limit read-back mismatch")
 	}
 	if options.MaxMemoryBytes > 0 && (flags&winapi.JOB_OBJECT_LIMIT_JOB_MEMORY == 0 || uint64(limits.JobMemoryLimit) != uint64(options.MaxMemoryBytes)) {
-		return errors.New("sandbox: Windows Job memory limit read-back mismatch")
+		return describe("Windows Job memory limit read-back mismatch")
 	}
 
 	var ui winapi.JOBOBJECT_BASIC_UI_RESTRICTIONS
-	if err := winapi.QueryInformationJobObject(job.handle, winapi.JobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui)), nil); err != nil {
+	if _, err := queryJobInformation(job.handle, winapi.JobObjectBasicUIRestrictions, &ui); err != nil {
 		return fmt.Errorf("sandbox: read back Windows Job UI restrictions: %w", err)
 	}
 	wantUI := uint32(0)
@@ -178,12 +273,12 @@ func (job *Job) validateReadback(options JobOptions) error {
 	}
 	if options.MaxCPUPct > 0 {
 		var cpu jobObjectCPURateControlInformation
-		if err := winapi.QueryInformationJobObject(job.handle, winapi.JobObjectCpuRateControlInformation, uintptr(unsafe.Pointer(&cpu)), uint32(unsafe.Sizeof(cpu)), nil); err != nil {
+		if _, err := queryJobInformation(job.handle, winapi.JobObjectCpuRateControlInformation, &cpu); err != nil {
 			return fmt.Errorf("sandbox: read back Windows Job CPU rate: %w", err)
 		}
 		wantFlags := uint32(jobObjectCPURateControlEnable | jobObjectCPURateControlHardCap)
 		if cpu.ControlFlags != wantFlags || cpu.CPURate != uint32(options.MaxCPUPct*100) {
-			return errors.New("sandbox: Windows Job CPU rate read-back mismatch")
+			return fmt.Errorf("sandbox: Windows Job CPU rate read-back mismatch: got flags %#x rate %d, want flags %#x rate %d", cpu.ControlFlags, cpu.CPURate, wantFlags, uint32(options.MaxCPUPct*100))
 		}
 	}
 	return nil
@@ -245,7 +340,7 @@ func (job *Job) ActiveProcesses() (uint32, error) {
 		return 0, errors.New("sandbox: inspect closed Windows Job")
 	}
 	var accounting jobBasicAccountingInformation
-	if err := winapi.QueryInformationJobObject(job.handle, winapi.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); err != nil {
+	if _, err := queryJobInformation(job.handle, winapi.JobObjectBasicAccountingInformation, &accounting); err != nil {
 		return 0, err
 	}
 	return accounting.ActiveProcesses, nil

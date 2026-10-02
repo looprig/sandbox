@@ -29,7 +29,19 @@ type brokerClientFacts struct {
 	UserSID        string
 	AppContainer   bool
 	RestrictedSIDs []string
+	// Restricted is IsTokenRestricted's answer: true for any token carrying
+	// restricting SIDs, write-restricted or fully restricted.
+	Restricted bool
+	// IntegrityRID is the final subauthority of the token's mandatory label
+	// (SECURITY_MANDATORY_*_RID).
+	IntegrityRID uint32
 }
+
+// brokerMinimumClientIntegrityRID is SECURITY_MANDATORY_MEDIUM_RID. The
+// broker serves the configured owner's ordinary (or elevated) processes; a
+// Low or Untrusted process of that user is by construction one that was
+// meant to be sandboxed, never a legitimate sandbox host.
+const brokerMinimumClientIntegrityRID = 0x2000
 
 type brokerClientProcess interface {
 	Facts() (brokerClientFacts, error)
@@ -94,7 +106,23 @@ func (process *windowsBrokerClientProcess) Facts() (brokerClientFacts, error) {
 	for _, group := range restricted.groups {
 		restrictedSIDs = append(restrictedSIDs, group.Sid.String())
 	}
-	return brokerClientFacts{PID: process.pid, CreationTime: created, UserSID: user.User.Sid.String(), AppContainer: appContainer != 0, RestrictedSIDs: restrictedSIDs}, nil
+	isRestricted, err := token.IsRestricted()
+	if err != nil {
+		return brokerClientFacts{}, fmt.Errorf("inspect restricted-token state: %w", err)
+	}
+	integrity, err := tokenIntegritySID(token)
+	if err != nil {
+		return brokerClientFacts{}, fmt.Errorf("inspect integrity level: %w", err)
+	}
+	subauthorities := integrity.SubAuthorityCount()
+	if subauthorities == 0 {
+		return brokerClientFacts{}, errors.New("windows sandbox: malformed client integrity label")
+	}
+	return brokerClientFacts{
+		PID: process.pid, CreationTime: created, UserSID: user.User.Sid.String(),
+		AppContainer: appContainer != 0, RestrictedSIDs: restrictedSIDs,
+		Restricted: isRestricted, IntegrityRID: integrity.SubAuthority(uint32(subauthorities - 1)),
+	}, nil
 }
 
 func (process *windowsBrokerClientProcess) CreationTime() (uint64, error) {
@@ -106,6 +134,27 @@ func (process *windowsBrokerClientProcess) CreationTime() (uint64, error) {
 }
 
 func (process *windowsBrokerClientProcess) Close() error { return xwindows.CloseHandle(process.handle) }
+
+// Exited answers brokerClientLiveness from the retained process handle, which
+// OpenClient opened with SYNCHRONIZE: a process object is signalled exactly
+// when the process has terminated, and because the handle pins the object a
+// recycled PID can never make a dead client look alive.
+func (process *windowsBrokerClientProcess) Exited() (bool, error) {
+	if process == nil || process.handle == 0 {
+		return false, errBrokerClientChanged
+	}
+	event, err := xwindows.WaitForSingleObject(process.handle, 0)
+	switch {
+	case err != nil:
+		return false, err
+	case event == xwindows.WAIT_OBJECT_0:
+		return true, nil
+	case event == uint32(xwindows.WAIT_TIMEOUT):
+		return false, nil
+	default:
+		return false, fmt.Errorf("windows sandbox: unexpected client process wait result %#x", event)
+	}
+}
 
 type brokerPipeAuthenticator struct {
 	system                     brokerPipeSystem
@@ -164,13 +213,8 @@ func (authenticator *brokerPipeAuthenticator) Authenticate(pipe xwindows.Handle)
 	if err != nil || pidAfterOpen != pid || facts.PID != pid || facts.CreationTime == 0 {
 		return fail(errBrokerClientChanged)
 	}
-	if !equalSIDText(facts.UserSID, authenticator.ownerSID) || facts.AppContainer {
-		return fail(errBrokerClientUnauthorized)
-	}
-	for _, sid := range facts.RestrictedSIDs {
-		if equalSIDText(sid, authenticator.installationRestrictingSID) {
-			return fail(errBrokerClientUnauthorized)
-		}
+	if err := authorizeBrokerClientFacts(facts, authenticator.ownerSID, authenticator.installationRestrictingSID); err != nil {
+		return fail(err)
 	}
 	var nonce [brokerNonceSize]byte
 	if _, err := io.ReadFull(authenticator.nonceSource, nonce[:]); err != nil {
@@ -181,6 +225,36 @@ func (authenticator *brokerPipeAuthenticator) Authenticate(pipe xwindows.Handle)
 	}
 	binding := brokerLeaseBinding{Nonce: nonce, PID: pid, CreationTime: facts.CreationTime, Process: process}
 	return &authenticatedBrokerConnection{pipe: pipe, system: authenticator.system, process: process, binding: binding}, nil
+}
+
+// authorizeBrokerClientFacts is the token half of pipe authentication. The
+// DACL already limits the pipe to SYSTEM, Administrators and the owner SID;
+// within the owner, only an ordinary, unrestricted process at Medium
+// integrity or above may ask for broker authority (design §7.3, review L8):
+//
+//   - an AppContainer client is refused;
+//   - ANY restricted token is refused, not only one carrying this
+//     installation's SID: a restricted-tier sandbox runs as the owner with a
+//     write-restricted token and its own executor/one-shot SIDs, and before
+//     this check it could open the pipe and ask for leases and elevated
+//     tokens. The installation-SID test is kept as defense in depth;
+//   - a Low or Untrusted integrity token is refused.
+func authorizeBrokerClientFacts(facts brokerClientFacts, ownerSID, installationRestrictingSID string) error {
+	if !equalSIDText(facts.UserSID, ownerSID) || facts.AppContainer {
+		return errBrokerClientUnauthorized
+	}
+	for _, sid := range facts.RestrictedSIDs {
+		if equalSIDText(sid, installationRestrictingSID) {
+			return errBrokerClientUnauthorized
+		}
+	}
+	if facts.Restricted || len(facts.RestrictedSIDs) != 0 {
+		return errBrokerClientUnauthorized
+	}
+	if facts.IntegrityRID < brokerMinimumClientIntegrityRID {
+		return errBrokerClientUnauthorized
+	}
+	return nil
 }
 
 func (connection *authenticatedBrokerConnection) LeaseBinding() brokerLeaseBinding {

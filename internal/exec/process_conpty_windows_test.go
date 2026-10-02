@@ -68,7 +68,14 @@ func startConPTYProcess(t *testing.T, command string) *Process {
 	if err != nil {
 		t.Fatalf("NewExecutorSet: %v", err)
 	}
-	t.Cleanup(func() { _ = set.Close() })
+	// Registered first, so it runs LAST: after the process below has been
+	// killed and reaped. Bounded, because the first Windows CI run's
+	// TestProcessConPTYEOF failed, then hung in exactly this cleanup for
+	// 8m46s (ExecutorSet.Close waits for every active execution lease, and a
+	// child that never attached to its pseudo console was never going to
+	// exit) until the package hit go test's 10-minute timeout and no later
+	// test ran at all.
+	t.Cleanup(func() { closeExecutorSetBounded(t, set, 30*time.Second) })
 	executor, err := set.For("conpty-test")
 	if err != nil {
 		t.Fatalf("For: %v", err)
@@ -84,13 +91,89 @@ func startConPTYProcess(t *testing.T, command string) *Process {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.Close(context.Background()) })
+	// Registered last, so it runs FIRST: whatever the test body did (or
+	// failed to do), the child and its whole Job are killed and reaped before
+	// the Process is closed and the set's lifecycle barrier is awaited.
+	t.Cleanup(func() { stopConPTYProcess(t, proc, 15*time.Second) })
 	return proc
+}
+
+// stopConPTYProcess kills proc's whole Job (a no-op for a process already
+// confirmed terminal) and waits, bounded, for the kill to be observed.
+func stopConPTYProcess(t *testing.T, proc *Process, timeout time.Duration) {
+	t.Helper()
+	_ = proc.Signal(context.Background(), ProcessSignalKill)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := proc.Wait(ctx); err != nil {
+		t.Errorf("ConPTY child did not exit within %s of a Job kill: %v", timeout, err)
+	}
+}
+
+// closeExecutorSetBounded closes set but gives up (failing the test) after
+// timeout instead of hanging the whole package: the goroutine is leaked on
+// purpose, because a stuck Close must not take every later test with it.
+func closeExecutorSetBounded(t *testing.T, set *ExecutorSet, timeout time.Duration) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- set.Close() }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Errorf("ExecutorSet.Close did not return within %s: an execution lease is still active (a ConPTY child or its Job was not reaped)", timeout)
+	}
+}
+
+// conPTYExitSummary says, without blocking for long, whether proc has exited
+// and with what code — decoded, so an NTSTATUS such as 0xC0000142
+// (STATUS_DLL_INIT_FAILED, a console client that could not attach to its
+// console) is named in the failure message instead of printed as 3221225794.
+func conPTYExitSummary(proc *Process) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	result, err := proc.Wait(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "the child is still running"
+	}
+	if err != nil {
+		return fmt.Sprintf("the child's wait failed: %v", err)
+	}
+	return "the child exited with code " + describeExitCode(result.ExitCode)
+}
+
+// conPTYProcessReadUntilContains is conPTYReadUntilContains for a Process: a
+// timeout additionally reports whether the child is still running or has
+// already exited, and how.
+func conPTYProcessReadUntilContains(t *testing.T, proc *Process, substr string, timeout time.Duration) string {
+	t.Helper()
+	return conPTYReadUntil(t, proc.Stdout(), substr, timeout, func() string { return conPTYExitSummary(proc) })
+}
+
+// conPTYProcessWait waits for proc for at most timeout and fails with the
+// decoded exit status when the child did not exit with want.
+func conPTYProcessWait(t *testing.T, proc *Process, timeout time.Duration, want int, why string) ProcessResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result, err := proc.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait did not return within %s (%s): %v", timeout, why, err)
+	}
+	if result.ExitCode != want {
+		t.Fatalf("ExitCode = %s, want %d (%s)", describeExitCode(result.ExitCode), want, why)
+	}
+	return result
 }
 
 // conPTYReadUntilContains mirrors readUntilContains (process_pty_unix_test.go)
 // exactly; duplicated here rather than shared because that file's build tag
 // excludes windows.
 func conPTYReadUntilContains(t *testing.T, r io.Reader, substr string, timeout time.Duration) string {
+	t.Helper()
+	return conPTYReadUntil(t, r, substr, timeout, nil)
+}
+
+func conPTYReadUntil(t *testing.T, r io.Reader, substr string, timeout time.Duration, summary func() string) string {
 	t.Helper()
 	done := make(chan string, 1)
 	go func() {
@@ -118,6 +201,9 @@ func conPTYReadUntilContains(t *testing.T, r io.Reader, substr string, timeout t
 		}
 		return got
 	case <-time.After(timeout):
+		if summary != nil {
+			t.Fatalf("timed out after %s waiting for %q; %s", timeout, substr, summary())
+		}
 		t.Fatalf("timed out after %s waiting for %q", timeout, substr)
 		return ""
 	}
@@ -161,30 +247,25 @@ func conPTYReadUntilEOF(t *testing.T, r io.Reader, timeout time.Duration) (strin
 // this file's own top-of-file doc comment) and its echoed response arrives
 // back on Stdout. It checks ExitCode, not just that Wait returns promptly:
 // closing Stdin here must deliver EOF via conPTYTerminal.Write's veofByte
-// interception — closing the retained input pipe write end (see terminal_
-// windows.go's own "VEOF/EOF design decision" doc comment) — rather than
-// tearing down the pseudo console, so findstr exits 0 by observing EOF on
-// its own read; a torn-down pseudo console killing the child instead would
-// also make Wait return promptly, just with a non-zero/negative exit
-// instead of a clean 0, silently masking a regression in that design
-// decision exactly like the Unix analogue's own doc comment explains for
-// SIGHUP.
+// translation — the console's own Ctrl-Z/Enter end of input, with the input
+// pipe left open (see terminal_windows.go's own "VEOF/EOF design decision"
+// doc comment) — rather than tearing down the pseudo console, so findstr
+// exits 0 by observing EOF on its own read; a torn-down pseudo console
+// killing the child instead would also make Wait return promptly, just with
+// a non-zero exit (0xC000013A, STATUS_CONTROL_C_EXIT: the second Windows CI
+// run, when VEOF closed the input pipe) instead of a clean 0, silently
+// masking a regression in that design decision exactly like the Unix
+// analogue's own doc comment explains for SIGHUP.
 func TestProcessConPTYInteractive(t *testing.T) {
 	proc := startConPTYProcess(t, `findstr "^"`)
 	if _, err := proc.Stdin().Write([]byte("hello-conpty\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "hello-conpty", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "hello-conpty", 10*time.Second)
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (a non-zero exit here means the pseudo console was torn down instead of the child observing a clean EOF)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "a non-zero exit here means the pseudo console was torn down instead of the child observing a clean EOF")
 }
 
 // TestProcessConPTYInput proves multiple successive writes to Stdin all
@@ -196,17 +277,11 @@ func TestProcessConPTYInput(t *testing.T) {
 			t.Fatalf("Stdin.Write(%q): %v", line, err)
 		}
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "third-line", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "third-line", 10*time.Second)
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "findstr should exit cleanly on EOF")
 }
 
 // TestProcessConPTYCombinedOutput proves stdout and stderr are combined into
@@ -217,10 +292,11 @@ func TestProcessConPTYInput(t *testing.T) {
 // synthetic, permanently-empty reader — never a second live pipe.
 func TestProcessConPTYCombinedOutput(t *testing.T) {
 	proc := startConPTYProcess(t, "echo out-marker & echo err-marker 1>&2")
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "two echoes must succeed")
+	// EOF arrives only once the pseudo console is hung up after the Job is
+	// proven empty (conPTYTerminal.hangupAfterExit): the console host holds
+	// the output pipe open for as long as the pseudo console exists.
+	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Stdout drain error = %v, want io.EOF", err)
 	}
@@ -257,75 +333,56 @@ func TestProcessConPTYResize(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("unblock\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "set /p must read the written line and exit cleanly")
 }
 
-// TestProcessConPTYEOF proves closing Stdin delivers EOF to the child by
-// closing the pseudo console's retained input pipe write end (see terminal_
-// windows.go's conPTYTerminal.Write) rather than tearing down the whole
-// pseudo console, and the child observes that as its own read returning EOF
-// and exits cleanly. ExitCode is checked, not just Wait's promptness — see
-// TestProcessConPTYInteractive's own doc comment for why that matters.
+// TestProcessConPTYEOF proves closing Stdin with no input written delivers
+// EOF to the child — conPTYTerminal.Write's translation of VEOF into the
+// console's Ctrl-Z/Enter end-of-input sequence (terminal_windows.go) —
+// rather than tearing down the whole pseudo console, and the child observes
+// that as its own read returning EOF and exits cleanly. ExitCode is checked,
+// not just Wait's promptness — see TestProcessConPTYInteractive's own doc
+// comment for why that matters.
+//
+// The child is `sort`, not this file's usual `findstr "^"`: findstr exits 1
+// when no line matched, which an EMPTY input guarantees, so its exit code
+// cannot tell a clean EOF from a failure here. sort reads standard input to
+// EOF — its documentation is the canonical "type Ctrl-Z, then Enter" — and
+// exits 0 on empty input.
 func TestProcessConPTYEOF(t *testing.T) {
-	proc := startConPTYProcess(t, `findstr "^"`)
+	proc := startConPTYProcess(t, "sort")
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result, err := proc.Wait(ctx)
-	if err != nil {
-		t.Fatalf("Wait after closing Stdin did not return in time (EOF was not really propagated through the pseudo console's input pipe): %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (the child was torn down instead of observing a clean EOF)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "closing Stdin must deliver the console's Ctrl-Z/Enter end of input and the child must observe it cleanly (a timeout means the console did not treat it as EOF; 0xC000013A means the pseudo console was hung up instead)")
 }
 
 // TestProcessConPTYCtrlD proves the exact one-byte veofByte (0x04) write
-// this file's "VEOF/EOF design decision" documents (terminal_windows.go) end
-// the child's own read call — via conPTYTerminal.Write's interception
-// closing the retained input pipe write end — even with NO explicit
+// this file's "VEOF/EOF design decision" documents (terminal_windows.go) ends
+// the child's own read call — via conPTYTerminal.Write's translation into
+// the console's Ctrl-Z/Enter end-of-input sequence — even with NO explicit
 // Stdin.Close() call, mirroring TestProcessPTYCtrlD's own structure exactly
-// (process_pty_unix_test.go). Unlike that Unix test, this does not (and
-// cannot) prove the pseudo console stays open for FURTHER writes afterward:
-// closing the input pipe is, on this platform, an irreversible action for
-// this Process's whole input channel — see this file's own top-of-file doc
-// comment and conPTYTerminal.Write's doc comment for why that one-shot-ness
-// is an accepted, platform-inherent difference from Unix's repeatable VEOF,
-// not exercised by production code, which only ever sends this byte once,
-// via Stdin().Close().
+// (process_pty_unix_test.go). The input pipe stays open, so, as on Unix, VEOF
+// is repeatable and later writes still reach the console;
+// TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput proves
+// that at the pipe level.
 func TestProcessConPTYCtrlD(t *testing.T) {
 	proc := startConPTYProcess(t, `findstr "^"`)
 	if _, err := proc.Stdin().Write([]byte("before-eof\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "before-eof", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "before-eof", 10*time.Second)
 	if _, err := proc.Stdin().Write([]byte{0x04}); err != nil {
 		t.Fatalf("Stdin.Write(Ctrl-D): %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result, err := proc.Wait(ctx)
-	if err != nil {
-		t.Fatalf("Wait after Ctrl-D did not return in time (VEOF was not really delivered): %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (findstr should exit cleanly on EOF, not die of an unexpected teardown)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "VEOF must be delivered and findstr must exit cleanly on EOF, not die of an unexpected teardown")
 }
 
 // TestProcessConPTYInterrupt proves Process.Signal(ProcessSignalInterrupt)
 // actually reaches a ConPTY-attached child, via conPTYSignaler
 // (terminal_windows.go): writing conPTYInterruptByte (0x03) into the pseudo
 // console's own input stream, which the console host translates into a real
-// CTRL_C_EVENT delivered to the attached process — NOT via *processTree's
+// CTRL_C_EVENT delivered to every attached process — NOT via *processTree's
 // own sendInterrupt (GenerateConsoleCtrlEvent), which cannot reach a
 // ConPTY-attached child at all (see conPTYSignaler's own doc comment for
 // exactly why: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attaches the child to the
@@ -339,20 +396,49 @@ func TestProcessConPTYCtrlD(t *testing.T) {
 // itself is what routes through the pseudo console's input stream on
 // Windows, because no terminal-independent primitive can reach a
 // ConPTY-attached child (see conPTYInterruptByte's own doc comment).
-// portableSleepCommand's underlying ping.exe has no custom console-control-
-// event handler, so only a genuinely delivered CTRL_C_EVENT (the console's
-// own default unhandled-event action is termination) explains a prompt exit
-// here.
+//
+// Two things the second Windows CI run's timeout taught this test:
+//
+//   - The launch must not carry CREATE_NEW_PROCESS_GROUP: the root of a new
+//     process group starts with CTRL+C disabled, inherited by its children,
+//     so every process on the pseudo console ignored the ^C
+//     (conPTYLaunchCreationFlags now strips it).
+//   - A console control event reaches only the processes attached to the
+//     console WHEN the host raises it, exactly like a real Ctrl+C typed
+//     before a program has started. The test therefore interrupts only
+//     after ping itself has written its banner through the pseudo console,
+//     which proves ping (and cmd.exe before it) is attached. ping.exe ends on
+//     CTRL_C_EVENT (Ctrl+Break only prints statistics), so a prompt exit is
+//     explained only by a delivered Ctrl+C.
+//
+// A timeout reports the output seen before the interrupt and whether THIS
+// process ignores CTRL+C (RTL_USER_PROCESS_PARAMETERS.ConsoleFlags bit 0),
+// which children inherit and nothing on the child's side can undo.
 func TestProcessConPTYInterrupt(t *testing.T) {
-	proc := startConPTYProcess(t, portableSleepCommand(30))
+	ping := filepath.Join(os.Getenv("SystemRoot"), "System32", "ping.exe")
+	proc := startConPTYProcess(t, ping+" -n 31 127.0.0.1")
+	banner := conPTYProcessReadUntilContains(t, proc, "Pinging", 10*time.Second)
 	if err := proc.Signal(context.Background(), ProcessSignalInterrupt); err != nil {
 		t.Fatalf("Signal(Interrupt): %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := proc.Wait(ctx); err != nil {
-		t.Fatalf("Wait after in-band interrupt did not return in time (Ctrl-C was not really delivered through the pseudo console's input stream): %v", err)
+		t.Fatalf("Wait after in-band interrupt did not return in time (Ctrl-C was not really delivered through the pseudo console's input stream): %v; "+
+			"this test process's ConsoleFlags = %#x (bit 0 set: CTRL+C is ignored here, and children inherit that); output before the interrupt: %q",
+			err, currentConsoleFlags(), banner)
 	}
+}
+
+// currentConsoleFlags is this process's RTL_USER_PROCESS_PARAMETERS
+// ConsoleFlags; bit 0 means CTRL+C is ignored (SetConsoleCtrlHandler(NULL,
+// TRUE), or started as the root of a new process group).
+func currentConsoleFlags() uint32 {
+	peb := windows.RtlGetCurrentPeb()
+	if peb == nil || peb.ProcessParameters == nil {
+		return 0
+	}
+	return peb.ProcessParameters.ConsoleFlags
 }
 
 // TestProcessConPTYOutputEOFNormalization proves Process.Stdout's Read
@@ -367,10 +453,8 @@ func TestProcessConPTYInterrupt(t *testing.T) {
 // OBSERVABLE CONTRACT holds end to end regardless.
 func TestProcessConPTYOutputEOFNormalization(t *testing.T) {
 	proc := startConPTYProcess(t, "echo done")
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	_, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "echo must succeed")
+	_, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("final Stdout Read error = %v, want io.EOF (not a raw platform error)", err)
 	}
@@ -457,10 +541,8 @@ func TestProcessConPTYNoPipeFallback(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "set /p and two echoes must succeed")
+	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Stdout drain error = %v, want io.EOF", err)
 	}
@@ -480,9 +562,7 @@ func TestProcessConPTYNoPipeFallback(t *testing.T) {
 // practice, not merely by inspection of the Close implementation.
 func TestProcessConPTYCloseAfterNaturalExit(t *testing.T) {
 	proc := startConPTYProcess(t, portableSuccessCommand())
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "exit /b 0 must succeed")
 	if err := proc.Close(context.Background()); err != nil {
 		t.Fatalf("Close after natural exit = %v, want nil", err)
 	}
@@ -551,19 +631,22 @@ func TestConPTYPipeReadNormalizesBrokenPipeToEOF(t *testing.T) {
 	}
 }
 
-// TestConPTYTerminalWriteVEOFByteClosesInputIdempotently is a direct
-// unit-level proof of conPTYTerminal.Write's own contract (terminal_
-// windows.go, "The VEOF/EOF design decision"): an ordinary write is passed
-// through unchanged and really reaches the peer; an exact one-byte veofByte
-// write closes the retained input pipe write end instead of forwarding the
-// byte as data, observably (the peer's own read reports io.EOF afterward);
-// and repeating that exact write — or following it with a real Close() —
-// is safe, never a double-close panic/error. It never allocates a pseudo
-// console at all (console stays its zero value): this proves Write/Close's
-// own pipe-handling logic directly, mirroring
-// TestTerminalMasterReadNormalizesEIOToEOF's (process_pty_unix_test.go) own
+// TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput is a
+// direct unit-level proof of conPTYTerminal.Write's own contract
+// (terminal_windows.go, "The VEOF/EOF design decision"): an ordinary write is
+// passed through unchanged; an exact one-byte veofByte write puts the
+// console's own end-of-input sequence (conPTYEOFSequence, Ctrl-Z then Enter,
+// preceded by one Enter after an LF) on the input pipe and reports one byte
+// written; and it does NOT close the
+// input pipe — a second VEOF and an ordinary write after it both still reach
+// the peer, as on Unix, because closing the pipe hangs up the whole pseudo
+// console (the second Windows CI run's 0xC000013A). A longer buffer that
+// merely contains 0x04 is not translated. Only Close ends the input stream.
+// It never allocates a pseudo console (console stays its zero value), so it
+// proves Write/Close's own pipe handling directly, mirroring
+// TestTerminalMasterReadNormalizesEIOToEOF's (process_pty_unix_test.go)
 // "exercise the mechanism itself, not only transitively" precedent.
-func TestConPTYTerminalWriteVEOFByteClosesInputIdempotently(t *testing.T) {
+func TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput(t *testing.T) {
 	var inRead, inWrite, outRead, outWrite windows.Handle
 	if err := windows.CreatePipe(&inRead, &inWrite, nil, 0); err != nil {
 		t.Fatalf("CreatePipe(input): %v", err)
@@ -584,29 +667,51 @@ func TestConPTYTerminalWriteVEOFByteClosesInputIdempotently(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = terminal.Close() })
 
+	expectPeer := func(want string) {
+		t.Helper()
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(inReader, got); err != nil || string(got) != want {
+			t.Fatalf("peer read = (%q, %v), want %q", got, err, want)
+		}
+	}
 	if n, err := terminal.Write([]byte("hi")); err != nil || n != 2 {
 		t.Fatalf("ordinary write = (%d, %v), want (2, nil)", n, err)
 	}
-	ordinary := make([]byte, 2)
-	if _, err := io.ReadFull(inReader, ordinary); err != nil || string(ordinary) != "hi" {
-		t.Fatalf("peer read of ordinary write = (%q, %v), want (\"hi\", nil)", ordinary, err)
+	expectPeer("hi")
+	for round := 1; round <= 2; round++ {
+		if n, err := terminal.Write([]byte{veofByte}); err != nil || n != 1 {
+			t.Fatalf("VEOF write %d = (%d, %v), want (1, nil)", round, n, err)
+		}
+		expectPeer(conPTYEOFSequence)
 	}
+	if n, err := terminal.Write([]byte("after\r")); err != nil || n != 6 {
+		t.Fatalf("write after VEOF = (%d, %v), want (6, nil): VEOF must not close the input pipe", n, err)
+	}
+	expectPeer("after\r")
+	// A Unix-style line end leaves LF last: VEOF then submits whatever the
+	// LF left in the console's line before the Ctrl-Z, so EOF still arrives.
+	for _, line := range []string{"unix\n", "crlf\r\n"} {
+		if _, err := terminal.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+		expectPeer(line)
+		if n, err := terminal.Write([]byte{veofByte}); err != nil || n != 1 {
+			t.Fatalf("VEOF after %q = (%d, %v), want (1, nil)", line, n, err)
+		}
+		expectPeer(conPTYEOFAfterLFSequence)
+	}
+	embedded := []byte{'a', veofByte, 'b'}
+	if n, err := terminal.Write(embedded); err != nil || n != len(embedded) {
+		t.Fatalf("embedded-0x04 write = (%d, %v), want (%d, nil)", n, err, len(embedded))
+	}
+	expectPeer(string(embedded))
 
-	n, err := terminal.Write([]byte{veofByte})
-	if err != nil || n != 1 {
-		t.Fatalf("first VEOF write = (%d, %v), want (1, nil)", n, err)
+	if err := terminal.Close(); err != nil {
+		t.Fatalf("Close = %v, want nil", err)
 	}
-	n, err = terminal.Write([]byte{veofByte})
-	if err != nil || n != 1 {
-		t.Fatalf("second VEOF write = (%d, %v), want (1, nil) — must be idempotent", n, err)
-	}
-
 	buf := make([]byte, 8)
 	if _, err := inReader.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("peer read after VEOF = %v, want io.EOF (the write end should really be closed)", err)
-	}
-	if err := terminal.Close(); err != nil {
-		t.Fatalf("Close after an earlier VEOF write = %v, want nil (input is already closed; Close must not double-close it)", err)
+		t.Fatalf("peer read after Close = %v, want io.EOF (Close, and only Close, ends the input stream)", err)
 	}
 }
 
@@ -651,10 +756,23 @@ func TestProcessTreeConPTYJobBeforeResume(t *testing.T) {
 		t.Fatalf("closeSlave: %v", err)
 	}
 	if !tree.assigned {
+		_ = tree.terminate()
 		t.Fatal("start returned successfully without ever recording Job assignment")
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("payload exited with an error: %v", err)
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			code := -1
+			if cmd.ProcessState != nil {
+				code = cmd.ProcessState.ExitCode()
+			}
+			t.Fatalf("payload exited with an error: %v (exit %s)", err, describeExitCode(code))
+		}
+	case <-time.After(30 * time.Second):
+		_ = tree.terminate()
+		t.Fatal("ConPTY payload did not exit within 30s; its Job was terminated")
 	}
 
 	data, err := os.ReadFile(marker)

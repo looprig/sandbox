@@ -40,43 +40,56 @@ import (
 //
 // ## The VEOF/EOF design decision
 //
-// terminalStdin.Close() (terminal.go, shared, unmodified by this task) is
-// fixed: it writes exactly one byte, veofByte (0x04, ASCII EOT/Ctrl-D), to
-// the terminal, then normalizes syscall.EIO to nil. On Unix this works
-// because a PTY's line discipline, in canonical mode, recognizes 0x04 as its
-// configured VEOF character and delivers EOF to the child's own read call —
-// a KERNEL-level mechanism this codebase's Go code never has to implement
-// itself; terminalMaster.Write (terminal_unix.go) just forwards the byte.
+// terminalStdin.Close() (terminal.go, shared) is fixed: it writes exactly one
+// byte, veofByte (0x04, ASCII EOT/Ctrl-D), to the terminal, then normalizes
+// syscall.EIO to nil. On Unix this works because a PTY's line discipline, in
+// canonical mode, recognizes 0x04 as its configured VEOF character and
+// delivers EOF to the child's own read call — a KERNEL-level mechanism this
+// codebase's Go code never has to implement itself; terminalMaster.Write
+// (terminal_unix.go) just forwards the byte.
 //
-// Windows has no equivalent. A ConPTY-attached child's console input has no
-// POSIX-style line discipline with a configurable EOF character at all: a
-// literal 0x04 byte written into the pseudo console's input pipe is just
-// ordinary input data to whatever reads it (unlike Ctrl-Z, which only some
-// programs treat as EOF, and only as a C-runtime TEXT-MODE-FILE convention —
-// not a universal, kernel-guaranteed signal any child can rely on the way
-// Unix's VEOF is). The one mechanism ConPTY documents as the actual, correct,
-// universal "no more input will ever arrive" signal — and the one that,
-// exactly like Unix's VEOF, does NOT tear down the pseudo console or the
-// child itself — is closing the parent's own retained write end of the
-// pseudo console's input pipe.
+// A Windows console has no configurable VEOF, and 0x04 is ordinary input to
+// it. Its end-of-input convention is Ctrl-Z (0x1A) as the FIRST character of
+// a cooked (ENABLE_LINE_INPUT) line, submitted with Enter: the console host
+// completes the line, and a ReadFile on console input — the read every
+// console program that treats stdin as a stream makes, findstr, sort, more,
+// the C runtime's _read — reports ZERO bytes for a line that begins with
+// Ctrl-Z (the console's ReadConsole message carries ProcessControlZ for a
+// ReadFile-originated read). That is what "type Ctrl-Z, then Enter" ends
+// input with at an interactive Windows console, and it is what this file
+// sends: conPTYTerminal.Write translates the EXACT one-byte veofByte write
+// into conPTYEOFSequence ("\x1a\r") on the pseudo console's input pipe.
 //
-// Given that, and given terminal.go's shared terminalStdin.Close() cannot be
-// changed for this task (it is Unix-reviewed, unmodified, and shared), this
-// file's conPTYTerminal.Write special-cases the EXACT one-byte payload
-// terminalStdin.Close() sends: instead of writing 0x04 as data, it closes the
-// retained input pipe write end, once, idempotently, and reports success.
-// Any other write — including a longer buffer that happens to CONTAIN a 0x04
-// byte somewhere inside it, which on Unix would ALSO be interpreted by the
-// kernel line discipline as VEOF, transparently, regardless of caller intent
-// — is passed straight through unchanged; only an exact single-byte 0x04
-// write is intercepted, because that is the exact, and only, wire shape
-// terminalStdin.Close() itself ever produces. A caller that calls
-// Stdin().Write([]byte{0x04}) directly (bypassing Close) triggers the
-// identical EOF delivery — this is not a Windows-specific ambiguity Close()
-// introduces: it is the same inherent behavior Unix's own VEOF byte already
-// has (that is precisely what "press Ctrl-D to end input" means to a Unix
-// user), just performed by this package's own Go code instead of
-// transparently by the kernel. See conPTYTerminal.Write's own doc comment.
+// It deliberately does NOT close the input pipe. An earlier version did,
+// reasoning that a closed input pipe is ConPTY's "no more input" signal like
+// a closed pipe is for a pipe-backed child. It is not: the console host
+// treats a broken input pipe as its terminal having gone away and shuts the
+// session down — it sends CTRL_CLOSE_EVENT to every attached client, whose
+// default handler exits with STATUS_CONTROL_C_EXIT (0xC000013A). That was the
+// second Windows CI run exactly: every test that ended input through VEOF
+// (Interactive, Input, EOF, CtrlD) saw 0xC000013A, while the two that never
+// sent VEOF (CombinedOutput, Resize) exited 0 through the very same
+// pseudo-console teardown path.
+//
+// The translation keeps Unix's VEOF semantics where they matter. VEOF at the
+// start of a line is EOF for the next read; VEOF after a partial line does
+// not end input on Unix either (it only flushes the partial line), and here
+// the Ctrl-Z simply becomes part of that line. One Windows-specific case is
+// handled: a console line ends with Enter, CR, and a Unix-style LF (alone or
+// after CR) is a Ctrl-J key to the console host, which may stay in its line
+// buffer as content and so occupy the start of the next line. When the last
+// byte this terminal forwarded was LF, VEOF is therefore preceded by one CR
+// (conPTYEOFAfterLFSequence): that submits whatever the LF left behind as a
+// line of its own (at worst one extra empty line) so that the Ctrl-Z is
+// first on a fresh line and EOF is delivered either way. Because nothing is closed,
+// VEOF is repeatable and later writes still reach the child, exactly as on
+// Unix. A raw-mode client (no ENABLE_LINE_INPUT) sees the two bytes as
+// ordinary key input, which is what a real Windows terminal would deliver
+// it. Only an exact single-byte 0x04 write is translated — the exact, and
+// only, wire shape terminalStdin.Close() produces; a longer buffer that
+// contains 0x04 passes through unchanged. A caller that writes
+// Stdin().Write([]byte{0x04}) directly gets the identical EOF delivery, the
+// same inherent behavior Unix's VEOF byte has ("press Ctrl-D to end input").
 const conPTYCreatePseudoConsoleAPI = "CreatePseudoConsole"
 
 // ttySupported is true on Windows: openConfinedTerminal (process.go) reaches
@@ -189,9 +202,13 @@ type conPTYTerminal struct {
 	input  *os.File // ConsoleInputWrite: retained; terminalStdin's write target.
 	output *os.File // ConsoleOutputRead: retained; pumpPTYOutput's read source.
 
-	closeInputOnce sync.Once
-	closeOnce      sync.Once
-	closeErr       error
+	// inputMu guards lastInput, the last byte the input pipe accepted, which
+	// Write consults to translate VEOF (see Write).
+	inputMu   sync.Mutex
+	lastInput byte
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Read drains the pseudo console's output pipe. Go's os package already
@@ -202,20 +219,48 @@ type conPTYTerminal struct {
 // this type needs no equivalent explicit normalization of its own.
 func (t *conPTYTerminal) Read(p []byte) (int, error) { return t.output.Read(p) }
 
+// conPTYEOFSequence is what a veofByte write becomes on a pseudo console:
+// Ctrl-Z then Enter (CR, which the console host's VT input turns into an
+// Enter key event). conPTYEOFAfterLFSequence is the same preceded by one
+// Enter, used when the last forwarded byte was LF. See this file's "VEOF/EOF
+// design decision".
+const (
+	conPTYEOFSequence        = "\x1a\r"
+	conPTYEOFAfterLFSequence = "\r\x1a\r"
+)
+
 // Write writes to the pseudo console's input pipe, with one exception: an
-// exact one-byte write of veofByte (0x04) is translated into Windows' own
-// EOF-delivery primitive — closing this terminal's retained input pipe write
-// end — instead of being forwarded as literal data. See this file's own
-// top-of-file doc comment ("The VEOF/EOF design decision") for the full
-// reasoning. closeInputOnce makes repeated VEOF writes (or a VEOF write
-// followed by Close) safe: closing an *os.File twice would otherwise return
-// os.ErrClosed on the second attempt.
+// exact one-byte write of veofByte (0x04) is translated into the console's
+// own end-of-input convention, conPTYEOFSequence, and reports the caller's
+// one byte written. The input pipe is never closed here — closing it hangs
+// the whole pseudo console up (see this file's "VEOF/EOF design decision");
+// only Close does that, after the child is gone or to tear it down.
+//
+// inputMu serializes writes so lastInput is exactly the last byte the pipe
+// accepted; a concurrent Signal(Interrupt) ^C and a Stdin write would be
+// serialized by the pipe (and *os.File) anyway.
 func (t *conPTYTerminal) Write(p []byte) (int, error) {
+	t.inputMu.Lock()
+	defer t.inputMu.Unlock()
 	if len(p) == 1 && p[0] == veofByte {
-		t.closeInputOnce.Do(func() { _ = t.input.Close() })
+		sequence := conPTYEOFSequence
+		if t.lastInput == '\n' {
+			sequence = conPTYEOFAfterLFSequence
+		}
+		if n, err := t.input.Write([]byte(sequence)); err != nil {
+			if n > 0 {
+				t.lastInput = sequence[n-1]
+			}
+			return 0, err
+		}
+		t.lastInput = sequence[len(sequence)-1]
 		return 1, nil
 	}
-	return t.input.Write(p)
+	n, err := t.input.Write(p)
+	if n > 0 {
+		t.lastInput = p[n-1]
+	}
+	return n, err
 }
 
 // Close performs the genuine hangup Process.Close's terminalCloser seam
@@ -247,10 +292,46 @@ func (t *conPTYTerminal) Close() error {
 			t.console = 0
 		}
 		t.mu.Unlock()
-		t.closeInputOnce.Do(func() { _ = t.input.Close() })
-		t.closeErr = t.output.Close()
+		t.closeErr = errors.Join(t.input.Close(), t.output.Close())
 	})
 	return t.closeErr
+}
+
+// hangupAfterExit implements terminalExitHangup (process.go): it closes the
+// pseudo console once the spawn's whole Job has been proven empty, leaving
+// the input and output pipe ends to Close.
+//
+// This is what lets Stdout reach EOF after the child exits. On Unix the
+// master reports EOF/EIO when the last slave reference closes, which happens
+// by itself when the child (the only slave holder once the parent dropped
+// its copy at Start) exits. A pseudo console has no such moment: the console
+// host (conhost.exe, created by CreatePseudoConsole in THIS process) holds
+// the output pipe's write end for as long as the pseudo console exists, so
+// the pump would block forever on a child that has long exited until
+// something closes it. ClosePseudoConsole makes the host flush its final
+// frame and exit, which closes that write end; the pump drains what remains
+// and observes EOF (ERROR_BROKEN_PIPE, normalised to io.EOF).
+//
+// It runs from spawn cleanup, strictly after supervise's terminateAndWait
+// confirmed no process remains in the Job, so it can never be the thing that
+// kills a client: every process that could still be attached is already gone.
+//
+// t.console is zeroed under t.mu and the handle closed after releasing it.
+// That is safe for exactly the reason Close/resize hold the lock through
+// their syscalls — every user reads the field under the lock and uses it only
+// while still holding it — and it matters here: on Windows releases before
+// Windows 11 24H2, ClosePseudoConsole blocks until the host has written its
+// final frame, which needs the output pipe drained. If nobody reads Stdout,
+// that only ends when Process.Close closes the output read end, and Close
+// takes t.mu first; holding the lock here would deadlock the two.
+func (t *conPTYTerminal) hangupAfterExit() {
+	t.mu.Lock()
+	console := t.console
+	t.console = 0
+	t.mu.Unlock()
+	if console != 0 {
+		windows.ClosePseudoConsole(console)
+	}
 }
 
 // resize changes the pseudo console's buffer/window size via
@@ -393,20 +474,53 @@ func conPTYCommandLine(args []string) (string, error) {
 	return strings.Join(escaped, " "), nil
 }
 
+// conPTYLaunchEnvBlock builds the CreateProcess environment block for a
+// ConPTY launch of cmd. The plain cmd.Start() Windows path never hands cmd.Env
+// to the OS verbatim: os/exec first applies dedupEnv (case-insensitive on
+// Windows, the LAST spelling of a name winning) and addCriticalEnv (appending
+// SYSTEMROOT from the parent when no spelling of it is present), because
+// Winsock, CryptoAPI/CNG and many system DLLs fail to initialise in a process
+// with no SystemRoot. The ConPTY path calls CreateProcess itself, so it must
+// apply the same two steps or a scrubbed ConPTY child starts without
+// SystemRoot. It does so through exec.Cmd.Environ, which is exactly that
+// pipeline (cmd.environ: dedupEnv then addCriticalEnv; its cmd.Dir-based PWD
+// rewrite is POSIX-only and only applies when Env is nil), on a throwaway Cmd
+// carrying only the environment.
+//
+// Two deliberate departures from calling cmd.Environ() directly:
+//
+//   - A nil cmd.Env is treated as EMPTY, never as "inherit": Environ would
+//     substitute the full parent environment for a nil Env, and every ConPTY
+//     launch this package builds sets Env from assembleEnv, so a nil here is a
+//     bug that must fail closed (an empty block plus SYSTEMROOT), not a
+//     secret leak.
+//   - An entry containing NUL is an error, as it always was here: Environ
+//     silently drops such an entry (it ignores dedupEnv's error), and a
+//     silently altered environment is not something a launch should paper
+//     over.
+func conPTYLaunchEnvBlock(cmd *exec.Cmd) ([]uint16, error) {
+	env := cmd.Env
+	if env == nil {
+		env = []string{}
+	}
+	for _, entry := range env {
+		if strings.IndexByte(entry, 0) >= 0 {
+			return nil, errors.New("sandbox: invalid ConPTY launch environment entry: contains NUL")
+		}
+	}
+	return conPTYEnvBlock((&exec.Cmd{Env: env}).Environ())
+}
+
 // conPTYEnvBlock builds the double-NUL-terminated UTF-16 environment block
 // CreateProcess requires when CREATE_UNICODE_ENVIRONMENT is set, mirroring
 // syscall.createEnvBlock's own layout exactly (each entry UTF-16, NUL
-// terminated; one further trailing NUL closes the block). Unlike that
-// unexported stdlib helper, this does not sort entries: sorting is
-// documented Windows convention for a system-provided environment block, not
-// a CreateProcess requirement, and env here is already the exact same
-// cmd.Env value the plain cmd.Start()-driven Windows path already passes
-// through unsorted via syscall.StartProcess's own internal env handling —
-// see that path's own createEnvBlock call, which DOES sort, meaning this is a
-// deliberate, narrow behavioral difference from that path, noted here for a
-// future reader: it has no observed effect on any target this package
-// launches today, since duplicate-key environments are not something this
-// package's own compiled backends produce.
+// terminated; one further trailing NUL closes the block). env must already be
+// the launch environment as os/exec would compute it — conPTYLaunchEnvBlock
+// produces that, deduplicated case-insensitively and carrying SYSTEMROOT — so
+// this function only encodes. Unlike syscall.createEnvBlock it does not sort
+// the entries: sorting is the documented convention for a system-provided
+// block, not a CreateProcess requirement, and with duplicates already removed
+// the order cannot change which value a name resolves to.
 func conPTYEnvBlock(env []string) ([]uint16, error) {
 	if len(env) == 0 {
 		return []uint16{0, 0}, nil

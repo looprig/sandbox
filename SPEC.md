@@ -1,6 +1,7 @@
 # sandbox module specification
 
-Status: canonical implemented contract, 2026-07-19.
+Status: canonical implemented contract, 2026-07-19; Windows tiers, the Linux
+socket allowlist and the accepted macOS limits recorded 2026-10-01.
 
 ## 1. Scope and dependency boundary
 
@@ -52,6 +53,18 @@ type RootAccess struct {
 	Write Access
 }
 
+type UnixSocketMode uint8
+
+const (
+	UnixSocketsDenied UnixSocketMode = iota
+	UnixSocketsLocal
+)
+
+type UnixSocketPolicy struct {
+	Mode  UnixSocketMode
+	Paths []string
+}
+
 type ProfileConfig struct {
 	WorkspaceRoot   string
 	WorkspaceRead   Access
@@ -64,7 +77,10 @@ type ProfileConfig struct {
 	Isolation       Isolation
 	AdditionalRoots []RootAccess
 	AckUnconfined   bool
+	UnixSockets     UnixSocketPolicy
 }
+
+func DangerousUnixSocket(path string) (reason string, dangerous bool)
 
 type Profile struct { /* immutable normalized state */ }
 
@@ -92,8 +108,26 @@ input is mutated.
 
 The profile fingerprint covers the ABI version, normalized access fields,
 workspace and additional roots, HOME and isolation choices, unconfined
-acknowledgement, and required guarantee contract. It excludes permission rules
-and ephemeral grants.
+acknowledgement, required guarantee contract, and any non-default Unix-socket
+policy (the default policy leaves the fingerprint exactly as it was before the
+field existed). It excludes permission rules and ephemeral grants.
+
+`UnixSockets` is the explicit escape hatch from the default AF_UNIX denial.
+The zero value denies `socket(AF_UNIX)`; `socketpair` and the pipe-style IPC
+built on it are never affected. `UnixSocketsLocal` admits sockets whose
+endpoints are the sandbox's own: sockets the target creates beneath its
+writable roots (Python's multiprocessing forkserver), anonymous pairs, and
+abstract names inside an isolated namespace. `Paths` names host pathname
+sockets outside the sandbox the target may connect to (an `SSH_AUTH_SOCK`, a
+GPG agent, a container daemon), each absolute and clean, granted exactly and
+never as a tree; a path need not exist at profile time. Mode and paths
+compose, `Restrict` takes the narrower mode and the intersection of paths,
+and `NewProfile` rejects an unknown mode or a relative, unclean or root path.
+`DangerousUnixSocket` names the known same-user brokers — the D-Bus session
+and system buses, the systemd user and system managers, container daemons,
+X11, Wayland and PipeWire sockets — whose service runs commands or injects
+input on the caller's behalf; granting one is permitted but is a trust
+decision about that daemon, and every backend reports it as such (§7).
 
 ## 3. Validation and isolation
 
@@ -309,20 +343,130 @@ The fixed runtime closure does not grant broad `/usr`, `/etc`, `/System`, or
 `/Library`: executable trees, library/certificate trees, and exact resolver or
 loader configuration files have separate minimum access bits.
 
+Two macOS limits are accepted and reported rather than claimed away. The
+preamble's `process-info*` and `sysctl-read` allows are needed by ordinary
+runtimes and cannot be narrowed to the child itself, so a child can read the
+argument and environment block of any same-user process, including the
+supervisor; `EnvScrub` on macOS therefore means the child's own environment
+carries no secret, not that a same-user reader cannot recover one. The
+`mach-lookup` allow is a measured allowlist of two opendirectoryd identity
+services (plus `com.apple.trustd.agent` only on a profile that grants egress),
+so LaunchServices, cfprefsd, securityd, FSEvents and the pasteboard are not
+reachable and `open` cannot defeat `Network: Deny`; the compatibility cost
+(no keychain, no `defaults` writes, no `open`/AppleEvents) is deliberate. The
+process-info limit cannot be narrowed in SBPL — eight variants were measured
+not to block `KERN_PROCARGS2` — so it is reported as `env-scrub` narrowed and
+booked for a credential-transport revision; it widens no filesystem or
+direct-egress boundary.
+
 Linux preserves its explicit-root mount/Landlock, seccomp, nftables, and cgroup
-mechanisms. A parent proxy listener is not reachable as a target-scoped route in
-v1 and never earns `TargetNetwork`; issuing that target grant fails closed.
-Failure to select a usable Linux rung returns `ErrSandboxUnavailable` rather
-than a null backend. On other operating systems `Sandboxed` is unavailable;
-the null backend accepts only an acknowledged `Unconfined` profile.
+mechanisms. Both rungs install a seccomp filter whose `socket()` rule is an
+allowlist: AF_INET/AF_INET6 stream sockets with protocol 0 or TCP (and UDP only
+where the rung's network mechanism scopes it — Rung 1's nftables, or a policy
+whose network is `Allow`), and AF_NETLINK route sockets. Every other family,
+AF_UNIX included, is refused with `EACCES`, because a pathname or abstract
+Unix socket reaches same-user brokers (a D-Bus session bus, a user systemd
+manager, agent and container sockets) that would run commands outside every
+other mechanism; `socketpair` remains available, so pipe-style IPC is
+unaffected, while programs that need a Unix client socket under confinement
+fail by design. `keyctl`, `add_key` and `request_key` are refused. A parent
+proxy listener is not reachable as a target-scoped route in v1 and never earns
+`TargetNetwork`; issuing that target grant fails closed. Both rungs require
+Landlock ABI 4. Failure to select a usable Linux rung returns
+`ErrSandboxUnavailable` rather than a null backend.
+
+A non-default `UnixSockets` policy admits `socket(AF_UNIX)` (stream, datagram
+and seqpacket, protocol 0) in the seccomp filter and then confines the
+endpoints where the platform can; the compile report carries `unix-sockets`,
+and `unix-sockets.dangerous` for every granted path `DangerousUnixSocket`
+names. The rule every backend follows: admitting an AF_UNIX endpoint that a
+same-user broker answers makes the process boundary a statement about that
+service rather than the kernel, so such a spawn withholds
+`GuaranteeProcessBoundary` and reports `LevelDegraded`; a spawn whose admitted
+endpoints are provably the sandbox's own keeps both. On Linux Rung 1,
+`UnixSocketsLocal` is `Enforced` when the mount view hides host sockets (no
+bound root is `/` or touches `/run`, `/var/run` or `/tmp/.X11-unix`) and
+abstract names are isolated — by the network namespace of a confined policy,
+or by Landlock abstract-socket scoping (ABI 6) on an open one; otherwise it is
+reported narrowed, naming what is exposed, and the process boundary is
+withheld. Each `Paths` entry is resolved at spawn without following symlinks
+and bind-mounted read-only into the view as the exact socket file; a path that
+is missing, symlinked or not a socket is skipped and reported, never widened
+to its directory, and a non-dangerous path keeps the process boundary. Rung 2
+has no namespaces, so both modes admit every same-user pathname socket: the
+spawn runs (an agent must stay usable), abstract names are scoped with
+Landlock where the ABI offers it, the report says precisely that the D-Bus
+session bus and the systemd user manager are reachable, and the process
+boundary is withheld. On macOS Seatbelt mediates Unix sockets by resolved
+path: `UnixSocketsLocal` allows `network-outbound`/`network-bind` on unix
+sockets beneath the writable roots and each `Paths` entry is a `path-literal`
+allow, both `Enforced`; a sandboxed `Network: Allow` profile no longer admits
+host sockets through `(allow network*)` (unix sockets are denied beneath it,
+except the mDNSResponder path); only a dangerous path withholds the process
+boundary. On Windows neither tier mediates AF_UNIX endpoints, so a
+non-default policy is refused (`ErrSandboxUnavailable`, report `unix-sockets`
+unavailable) rather than admitted unmediated.
+
+Three further Linux mechanisms are fixed executor safety behaviour on both
+rungs. Every non-TTY spawn is a session leader (stage 2 fails closed if it is
+not), the seccomp filter refuses `ioctl` `TIOCSTI` and `TIOCLINUX`, and from
+Landlock ABI 5 `IOCTL_DEV` is handled and granted to no rule, so a target
+cannot inject keystrokes into the harness's terminal; a target that opens
+`/dev/tty` itself for `tcgetattr` gets `EACCES`, while inherited descriptors
+keep their ioctls. `/sys/fs/cgroup` is a fixed write carveout
+(`cgroup-write-carveout`), so a host-write-`Allow` target cannot move itself
+out of its delegated scope or raise its own limits and Rung 2's lifetime
+containment stays kernel-enforced. Mount targets inside the Rung 1 view are
+resolved by descriptor (`RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS`), so a symlink
+planted in a writable bind cannot redirect a carveout onto the host; a
+workspace whose own carveout is a symlink fails closed. On operating systems other
+than macOS, Linux and Windows `Sandboxed` is unavailable; the null backend
+accepts only an acknowledged `Unconfined` profile.
+
+Windows offers two tiers, selected by `WithWindowsSandboxMode` and detailed in
+`docs/plans/2026-07-21-windows-sandbox-design.md`. The restricted-token tier
+needs no setup: the target runs under a `WRITE_RESTRICTED` restricted token
+whose restricting SIDs are projected as ACEs onto the configured roots, inside a
+kill-on-close Job with UI limits and no breakaway, launched suspended with an
+explicit inheritable-handle list and the identity-pinned System32 `cmd.exe`.
+Those mechanisms are defense in depth only: the tier reports `LevelNone` and
+`EnvScrub` alone, because a same-user COM/WMI/shell broker can create a process
+outside the Job and token, a same-user child can read the host's memory, and
+`WRITE_RESTRICTED` does not restrict `DELETE`/`WRITE_DAC`. A sandboxed
+pipe-backed child starts with no console (`DETACHED_PROCESS`) and explicit
+stdio pipes, so it does not inherit the host's console. Programs requiring
+console APIs must request TTY (ConPTY); cooperative interrupt of a pipe-backed
+child is unsupported (`ErrProcessSignalUnsupported`) while kill and terminate
+still end the Job. Any profile requiring a read, write or network
+boundary is refused in this tier (`ErrWindowsSetupRequired` under auto
+selection). The elevated tier requires one-time administrative setup
+(`SetupWindowsSandbox`): dedicated local accounts, a LocalSystem broker that
+issues a fully restricted token (reads and writes both pass the restricting-SID
+check; a write-restricted token is refused on both sides of the pipe),
+account-scoped outbound firewall rules verified by read-back and by the
+firewall being enabled on every profile, a protected runner on a private
+desktop, and per-lease ACL projection journalled for rollback. It earns
+`ProcessBoundary`, `WriteBoundary`, `ReadBoundary` (relative to
+`windows.runtime-baseline`), `NetworkBoundary` and, through the authenticated
+proxy, `TargetNetwork`; `network.broad.v1` and `filesystem.host.*` grants are
+unsupported on Windows. The elevated tier has not yet passed its live
+disposable-worker gates and must not be treated as production-ready until it
+has. The scrubbed Windows child environment keeps the loader/CRT baseline
+(`SystemRoot`, `windir`, `SystemDrive`, `PATHEXT`, `Path`, processor and
+program-directory variables) matched case-insensitively, and the executor sets
+`TEMP`, `TMP` and `USERPROFILE` to its owned directories alongside `HOME` and
+`TMPDIR`; `ComSpec` is never inherited.
 
 Supervised spawns (`Executor.PrepareProcess`/`Process.Start`) additionally
 report a per-spawn process-tree teardown contract through
-`Process.LifetimeContainment`. Linux and Windows retain kernel-enforced
-teardown (`Enforced`: Rung 1's PID namespace, Rung 2's delegated cgroup v2, or
-a Windows Job). macOS Supervised spawns instead receive best-effort lifetime
-containment (`BestEffort`: process-group teardown plus process-table-closure
-descendant tracking), with the downgrade reported per spawn rather than
+`Process.LifetimeContainment`. Linux and the Windows elevated tier retain
+kernel-enforced teardown (`Enforced`: Rung 1's PID namespace, Rung 2's
+delegated cgroup v2, or a Windows Job whose broker channels the private
+desktop and dedicated account close). macOS Supervised spawns and the Windows
+restricted tier instead receive best-effort lifetime containment
+(`BestEffort`: on macOS process-group teardown plus process-table-closure
+descendant tracking; on Windows a Job that a same-user broker can create a
+process outside of), with the downgrade reported per spawn rather than
 assumed; Seatbelt access-confinement guarantees are unaffected. This
 supersedes the earlier fail-closed posture (Task 12c), which rejected every
 macOS Supervised spawn before it started; the 2026-08-06 acceptance decision

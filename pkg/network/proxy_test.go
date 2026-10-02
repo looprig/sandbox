@@ -13,6 +13,8 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -354,18 +356,33 @@ func TestProxyReleaseTerminatesOnlyMatchingCONNECTTunnel(t *testing.T) {
 	target := mustTarget(t, "tcp:release-connect.test:"+port)
 	credentialA, _ := proxy.Authorize("exec-a", []Target{target})
 	credentialB, _ := proxy.Authorize("exec-b", []Target{target})
+	// Delay context cancellation entirely: Release must close registered
+	// sockets itself rather than depend on scheduling two AfterFunc callbacks.
+	proxy.mu.Lock()
+	cancelA := proxy.executions["exec-a"].cancel
+	proxy.executions["exec-a"].cancel = func() {}
+	proxy.mu.Unlock()
+	defer cancelA()
 	connA, readerA := openProxyTunnel(t, proxy, "exec-a", credentialA, "release-connect.test", port)
 	defer connA.Close()
 	connB, readerB := openProxyTunnel(t, proxy, "exec-b", credentialB, "release-connect.test", port)
 	defer connB.Close()
+	// The 200 response precedes registration. A round trip proves the
+	// forwarding loop has started, so Release must close a registered pair.
+	_ = connA.SetDeadline(time.Now().Add(time.Second))
+	if _, err := connA.Write([]byte("ready")); err != nil {
+		t.Fatal(err)
+	}
+	ready := make([]byte, len("ready"))
+	if _, err := io.ReadFull(readerA, ready); err != nil || string(ready) != "ready" {
+		t.Fatalf("tunnel readiness = %q, %v", ready, err)
+	}
 
 	proxy.Release("exec-a")
-	_ = connA.SetDeadline(time.Now().Add(300 * time.Millisecond))
-	if _, err := connA.Write([]byte("revoked")); err == nil {
-		one := make([]byte, 1)
-		if _, err := readerA.Read(one); err == nil {
-			t.Fatal("released execution's CONNECT tunnel remained active")
-		}
+	_ = connA.SetReadDeadline(time.Now().Add(time.Second))
+	var timeout net.Error
+	if _, err := readerA.Read(make([]byte, 1)); err == nil || errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatalf("released execution's CONNECT tunnel remained active: %v", err)
 	}
 
 	_ = connB.SetDeadline(time.Now().Add(time.Second))
@@ -398,17 +415,25 @@ func TestProxyReleaseWinsCONNECTAuthorizationRegisterRace(t *testing.T) {
 		<-resume
 	}
 	credential, _ := proxy.Authorize("exec-register-race", []Target{mustTarget(t, "tcp:register-race.test:"+port)})
+	proxy.mu.Lock()
+	cancelOld := proxy.executions["exec-register-race"].cancel
+	proxy.executions["exec-register-race"].cancel = func() {}
+	proxy.mu.Unlock()
+	defer cancelOld()
 	connection, reader := openProxyTunnel(t, proxy, "exec-register-race", credential, "register-race.test", port)
 	defer connection.Close()
 	<-reached
 	proxy.Release("exec-register-race")
+	// Reusing the ID must not revive the authenticated request that is still
+	// paused before registration; its authorization object has been retired.
+	if _, err := proxy.Authorize("exec-register-race", []Target{mustTarget(t, "tcp:register-race.test:"+port)}); err != nil {
+		t.Fatal(err)
+	}
 	close(resume)
-	_ = connection.SetDeadline(time.Now().Add(time.Second))
-	if _, err := connection.Write([]byte("revoked")); err == nil {
-		one := make([]byte, 1)
-		if _, err := reader.Read(one); err == nil {
-			t.Fatal("CONNECT registered after Release and survived revocation")
-		}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	var timeout net.Error
+	if _, err := reader.Read(make([]byte, 1)); err == nil || errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatalf("CONNECT registered after Release and survived revocation: %v", err)
 	}
 }
 
@@ -820,4 +845,131 @@ func newEchoServer(t *testing.T) net.Listener {
 		}
 	}()
 	return listener
+}
+
+// rawProxyRequest writes one request line plus headers to the proxy as a
+// client would (absolute-form request-URI) and returns the response.
+func rawProxyRequest(t *testing.T, proxy *Proxy, executionID, credential, requestLine string, headers ...string) *http.Response {
+	t.Helper()
+	connection, err := net.Dial("tcp", proxy.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	auth := base64.StdEncoding.EncodeToString([]byte(executionID + ":" + credential))
+	message := requestLine + "\r\nProxy-Authorization: Basic " + auth + "\r\nConnection: close\r\n"
+	for _, header := range headers {
+		message += header + "\r\n"
+	}
+	if _, err := io.WriteString(connection, message+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = response.Body.Close() })
+	return response
+}
+
+// TestProxyPlainHTTPUpstreamHostIsTheAuthorizedAuthority is review L4: the
+// proxy authorizes and dials the request-URI's authority, so the upstream
+// Host must be that authority too — never a client-supplied Host line naming
+// another virtual host on the approved address (`GET http://<approved-ip>/`
+// + `Host: internal.example`). Measured: net/http's server already discards
+// the Host line of an absolute-form request before the handler runs, so a
+// mismatching line is re-addressed (the request goes through, to the
+// authorized authority only), and serveHTTP pins that explicitly. Positive
+// controls cover the implicit :80, a differently-cased host and HTTP/1.0
+// without Host.
+func TestProxyPlainHTTPUpstreamHostIsTheAuthorizedAuthority(t *testing.T) {
+	var seenHosts []string
+	var mu sync.Mutex
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenHosts = append(seenHosts, r.Host)
+		mu.Unlock()
+		_, _ = io.WriteString(w, "origin")
+	}))
+	t.Cleanup(origin.Close)
+	route, _ := NewDirectRoute()
+	route.lookup = func(context.Context, string) ([]net.IP, error) { return []net.IP{net.ParseIP("8.8.8.21")}, nil }
+	route.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+	}
+	proxy := newTestProxy(t, route)
+	credential, err := proxy.Authorize("exec-vhost", []Target{mustTarget(t, "tcp:8.8.8.20:80"), mustTarget(t, "tcp:approved.test:80")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []struct{ line, host string }{
+		{"GET http://8.8.8.20/a HTTP/1.1", "Host: 8.8.8.20"},
+		{"GET http://8.8.8.20:80/b HTTP/1.1", "Host: 8.8.8.20:80"},
+		{"GET http://approved.test/c HTTP/1.1", "Host: APPROVED.test"},
+		{"GET http://8.8.8.20/d HTTP/1.0", ""},
+		{"GET http://8.8.8.20/x HTTP/1.1", "Host: internal.example"},
+		{"GET http://8.8.8.20/y HTTP/1.1", "Host: approved.test"}, // another APPROVED target is still a different vhost
+		{"GET http://8.8.8.20/z HTTP/1.1", "Host: 8.8.8.20:8080"},
+	} {
+		var headers []string
+		if request.host != "" {
+			headers = append(headers, request.host)
+		}
+		if response := rawProxyRequest(t, proxy, "exec-vhost", credential, request.line, headers...); response.StatusCode != http.StatusOK {
+			t.Fatalf("%q with %q = %s, want 200", request.line, request.host, response.Status)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"8.8.8.20", "8.8.8.20:80", "approved.test", "8.8.8.20", "8.8.8.20", "8.8.8.20", "8.8.8.20"}
+	if strings.Join(seenHosts, ",") != strings.Join(want, ",") {
+		t.Fatalf("origin saw Hosts %q, want exactly the request-URI authorities %q", seenHosts, want)
+	}
+}
+
+// TestProxyRefusesRequestHostDisagreeingWithTarget drives ServeHTTP directly
+// with a request whose Host disagrees with its request-URI — the shape
+// net/http/1's server never hands a handler, but one a reused handler or
+// another transport could — and requires a 403 and a recorded denial before
+// any dial, with the matching request as the positive control.
+func TestProxyRefusesRequestHostDisagreeingWithTarget(t *testing.T) {
+	route, _ := NewDirectRoute()
+	var dials atomic.Int32
+	origin := newHTTPOrigin(t)
+	route.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+	}
+	proxy := newTestProxy(t, route)
+	credential, err := proxy.Authorize("exec-direct", []Target{mustTarget(t, "tcp:8.8.8.20:80")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(host string) int {
+		request := httptest.NewRequest(http.MethodGet, "http://8.8.8.20/p", nil)
+		request.Host = host
+		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("exec-direct:"+credential)))
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, request)
+		return recorder.Code
+	}
+	if code := serve("8.8.8.20"); code != http.StatusOK {
+		t.Fatalf("matching Host = %d, want 200", code)
+	}
+	if denial := proxy.Denial("exec-direct"); denial != nil {
+		t.Fatalf("matching Host recorded a denial: %v", denial)
+	}
+	before := dials.Load()
+	for _, host := range []string{"internal.example", "8.8.8.20:8080", "[::1]"} {
+		if code := serve(host); code != http.StatusForbidden {
+			t.Errorf("Host %q = %d, want 403", host, code)
+		}
+	}
+	if dials.Load() != before {
+		t.Fatalf("a disagreeing Host reached the upstream dial")
+	}
+	if denial := proxy.Denial("exec-direct"); !errors.Is(denial, ErrTargetDenied) {
+		t.Fatalf("denial = %v, want ErrTargetDenied", denial)
+	}
 }

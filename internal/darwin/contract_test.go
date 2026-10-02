@@ -41,7 +41,7 @@ func TestSeatbeltProfileUsesScopedRuntimeReadExecAndExactProxyListener(t *testin
 		`(allow file-read* (subpath "/private/var/select"))`,
 		`(allow file-read* (subpath "/usr"))`,
 		`(allow process-exec (subpath "/bin"))`,
-		`(allow network-outbound (remote tcp "localhost:43123"))`,
+		`(allow network-outbound (remote tcp4 "localhost:43123"))`,
 	} {
 		if !strings.Contains(sbpl, required) {
 			t.Errorf("Seatbelt profile missing scoped rule %q:\n%s", required, sbpl)
@@ -49,6 +49,22 @@ func TestSeatbeltProfileUsesScopedRuntimeReadExecAndExactProxyListener(t *testin
 	}
 	if level != profile.LevelFull || bits&profile.GuaranteeReadBoundary == 0 || bits&profile.GuaranteeTargetNetwork == 0 || bits&profile.GuaranteeNetworkBoundary == 0 {
 		t.Fatalf("Seatbelt posture = level %d bits %#b report %+v", level, bits, report.Entries)
+	}
+	// Review L2: the listener rule cannot name 127.0.0.1, so it is reported
+	// narrowed exactly like the loopback rule, never silently claimed exact.
+	var reported bool
+	for _, entry := range report.Entries {
+		if entry.Feature == "proxy-listener" && entry.Status == "narrowed" {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("proxy listener rule not reported narrowed: %+v", report.Entries)
+	}
+	// The proxy rule is the IPv4 form (the listener is 127.0.0.1 only), and
+	// the profile must still parse.
+	if strings.Contains(sbpl, `(remote tcp "localhost:43123")`) {
+		t.Fatalf("proxy rule kept the dual-stack tcp form:\n%s", sbpl)
 	}
 }
 
@@ -174,13 +190,58 @@ func TestSeatbeltGuaranteesTrackIndependentDeniedAxes(t *testing.T) {
 // requireSandboxExec capability-skips (with a recorded reason) when
 // /usr/bin/sandbox-exec is absent or not runnable here (e.g. a CI that forbids
 // nested sandboxing), so a locked-down environment yields a skip, not a false
-// failure. These tests are meaningless without a working sandbox-exec.
+// failure. These tests are meaningless without a working sandbox-exec. With
+// SANDBOX_REQUIRE_SEATBELT=1 (the test-macos CI job sets it) the skip becomes
+// a failure instead, so a runner that lost nested sandboxing cannot pass the
+// Seatbelt suite as a set of green skips.
 func requireSandboxExec(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("sandbox-exec"); err != nil {
-		t.Skipf("sandbox-exec not available: %v", err)
+		skipOrFailSeatbelt(t, "sandbox-exec not available: %v", err)
 	}
 	if err := exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true").Run(); err != nil {
-		t.Skipf("sandbox-exec present but not runnable here: %v", err)
+		skipOrFailSeatbelt(t, "sandbox-exec present but not runnable here: %v", err)
+	}
+}
+
+// skipOrFailSeatbelt records a capability skip, or fails when the host has
+// declared (SANDBOX_REQUIRE_SEATBELT=1) that Seatbelt must be exercised.
+func skipOrFailSeatbelt(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("SANDBOX_REQUIRE_SEATBELT") == "1" {
+		t.Fatalf("SANDBOX_REQUIRE_SEATBELT=1 but "+format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// TestSeatbeltRuntimePlumbingSurvivesHostRootDeny: with HostRead/HostWrite
+// Deny the FS section emits (deny file-read*/file-write* (subpath "/")),
+// which under last-match-wins shadowed every fixed runtime allow the
+// preamble had made earlier — the shell selector (/bin/sh then printed
+// "Error opening /private/var/select/sh: Operation not permitted" into every
+// command's output) and the xcrun cache file. Those fixed allows are
+// re-asserted after the FS section, so the production default shape gets
+// them too.
+func TestSeatbeltRuntimePlumbingSurvivesHostRootDeny(t *testing.T) {
+	requireSandboxExec(t)
+	workspace := t.TempDir()
+	pol, err := policy.Compile(mustProfile(t, profile.ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: profile.Allow, WorkspaceWrite: profile.Allow,
+		HostRead: profile.Deny, HostWrite: profile.Deny, Network: profile.Deny, Command: profile.Allow,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbpl, _, _, _ := compileSBPL(pol)
+	hostDeny := strings.Index(sbpl, `(deny file-read* (subpath "/"))`)
+	reasserted := strings.LastIndex(sbpl, `(allow file-read* (subpath "/private/var/select"))`)
+	if hostDeny < 0 || reasserted < hostDeny {
+		t.Fatalf("shell-selector allow is not re-asserted after the host-root deny:\n%s", sbpl)
+	}
+	shell := exec.Command("/usr/bin/sandbox-exec", "-p", sbpl, "--", "/bin/sh", "-c", "echo hi")
+	shell.Dir = workspace
+	out, err := shell.CombinedOutput()
+	if err != nil || string(out) != "hi\n" {
+		t.Fatalf("/bin/sh under HostRead: Deny = %q (err %v), want exactly %q", out, err, "hi\n")
 	}
 }

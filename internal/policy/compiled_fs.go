@@ -154,6 +154,11 @@ func (compiled CompiledFS) HasLiteralDeny() bool { return len(compiled.Denies) >
 // narrower literal deny. It also includes write when read or execute is denied:
 // granting directory write would permit pathname replacement around the denied
 // axis, so recursive denied scopes derive write denial throughout their subtree.
+// The one exception mirrors deniedByRecursiveTopology: a covering recursive
+// read/execute deny whose denied axes a recursive allow restores over the
+// write allow's whole path (readRestoredBetween) keeps that write allow, so
+// write is not withheld there and is not reported as a snapshot axis — the
+// compile report must not claim a write barrier enumeration never builds.
 // Landlock must enumerate existing unaffected children instead of granting the
 // covering allow root on each returned axis.
 func (compiled CompiledFS) SnapshotAxes() FSAccess {
@@ -173,7 +178,8 @@ func (compiled CompiledFS) SnapshotAxes() FSAccess {
 			if allow.Access&WriteAccess != 0 &&
 				((overlappingAccess&deny.Access&(ReadAccess|ExecAccess) != 0 &&
 					(nested || equal && (deny.Exact || deny.Access&WriteAccess == 0))) ||
-					covered && deny.Access&(ReadAccess|ExecAccess) != 0) {
+					covered && deny.Access&(ReadAccess|ExecAccess) != 0 &&
+						!readRestoredBetween(deny, allow.Path, compiled.Allows)) {
 				axes |= WriteAccess
 			}
 		}

@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -46,6 +47,30 @@ const defaultGrantTTL = 15 * time.Minute
 // extra-kill window against promptness for the narrow "Cancel didn't work"
 // case.
 const spawnWaitGrace = time.Second
+
+// outputDrainGrace bounds how long run waits for its stdout/stderr drain to
+// observe EOF AFTER tree.terminateAndWait has already confirmed the run's
+// process group gone. A descendant that left the group with setsid(2) — the
+// one process a group sweep cannot see — may still hold the write end of the
+// output pipe; with nothing else left to end the drain, run would block
+// forever and, through the unfinished execution lease, so would
+// ExecutorSet.Close (review M10). Every writer the group sweep can see is
+// dead by then, so any bytes they wrote are already buffered in the pipe and
+// the drain reaches them immediately; the grace exists only for the read of
+// that remainder and is deliberately generous (twice the cmd.WaitDelay
+// backstop) because exceeding it truncates output.
+const outputDrainGrace = 2 * spawnWaitGrace
+
+// ErrOutputDrainIncomplete reports a synchronous run whose output pipe was
+// still held open, after the run's whole process group was confirmed gone, by
+// a process outside that group (a setsid'd or otherwise detached
+// descendant). The run closed its read ends after outputDrainGrace rather
+// than wait for that process, so the returned output is everything captured
+// up to that point and the descendant itself may still be alive: on darwin
+// the best-effort descendant tracker kills such an escapee when it saw it in
+// time, and this error is what remains when it did not (or when no tracker
+// applies, as for an Unconfined executor).
+var ErrOutputDrainIncomplete = errors.New("sandbox: output pipe held open by a process outside the run's process group; output truncated")
 
 type outputLimitContextKey struct{}
 
@@ -122,19 +147,24 @@ type Executor struct {
 	// Grant wiring (SPEC §9.2). The HMAC key is per-executor and never serialized.
 	// Tokens also bind the immutable profile, route identity, and guarantee bits.
 	// usedGrants provides one-shot replay protection; Close revokes the key.
-	grantKey            []byte
-	clock               func() time.Time
-	grantTTL            time.Duration
-	routeFingerprint    string
-	proxy               *network.Proxy
-	proxyRelease        func() error
-	proxyOwned          bool
-	proxyReleaseOnce    sync.Once
-	proxyReleaseErr     error
-	home                string
-	tmp                 string
-	grantMu             sync.Mutex
-	usedGrants          map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	grantKey         []byte
+	clock            func() time.Time
+	grantTTL         time.Duration
+	routeFingerprint string
+	proxy            *network.Proxy
+	proxyRelease     func() error
+	proxyOwned       bool
+	proxyReleaseOnce sync.Once
+	proxyReleaseErr  error
+	home             string
+	tmp              string
+	grantMu          sync.Mutex
+	usedGrants       map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	// grantDeadlines maps each live issued grant ID to its deadline on the
+	// monotonic clock below (grant.go, review L6): a wall-clock step cannot
+	// move it, so a backward step never extends a grant.
+	grantDeadlines      map[[32]byte]time.Duration
+	monotonic           func() time.Duration
 	retainedGrantPaths  retainedGrantPaths
 	grantExpiryTimer    *time.Timer
 	grantExpiryGen      uint64
@@ -229,6 +259,8 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		grantTTL:            ttlOrDefault(config.grantTTL),
 		routeFingerprint:    defaultRouteIdentity,
 		usedGrants:          make(map[[32]byte]int64),
+		grantDeadlines:      make(map[[32]byte]time.Duration),
+		monotonic:           newMonotonicClock(),
 		retainedGrantPaths:  make(retainedGrantPaths),
 		grantExpiryRealtime: config.clock == nil,
 		lifecycle:           lifecycle,
@@ -464,6 +496,9 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 			return nil, -1, err
 		}
 	}
+	// A Windows shell spawn must reach cmd.exe as a raw command line, not
+	// CommandLineToArgvW-escaped argv (shell_cmdline.go); a no-op elsewhere.
+	applyShellCommandLine(cmd)
 	tree, err := e.processTree(cmd, processTreeOptions{
 		Sandboxed: s.policy.Isolation != profile.Unconfined,
 		Limits:    s.policy.Limits,
@@ -471,6 +506,12 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	if err != nil {
 		return nil, -1, err
 	}
+	// The synchronous path is not Supervised, so newProcessTree attached no
+	// lifetime proof. On darwin a real Seatbelt spawn still gets the
+	// best-effort descendant tracker (a no-op on every other platform and
+	// backend): it is what kills a setsid'd escapee at teardown, rather than
+	// leaving it alive holding this run's output pipe (review M10).
+	attachSynchronousDescendantProof(tree, cmd, e.backend)
 	spawn.prover = tree
 	spawn.cmd = cmd
 
@@ -480,15 +521,22 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	// the shared "prepared process" spawning mechanics this run adopts.
 	// Everything above and below this block — grant verification, path handle
 	// resolution, quarantine, confinement (configure/tree) — is unchanged.
-	outR, outW, errR, errW, err := wireOutputPipes(cmd)
+	rawOutR, outW, rawErrR, errW, err := wireOutputPipes(cmd)
 	if err != nil {
 		return nil, -1, err
 	}
-	handleCleanup, err := configureChildHandleList(cmd)
+	// The read ends are closed from two places on a cut-short drain: by
+	// waitOutputDrain when it has to fall back to Close (Windows pipes take no
+	// deadline) and later by the pipe-backed Process's own Close in spawn
+	// cleanup. drainReadEnd makes the second close a no-op instead of a
+	// spurious os.ErrClosed teardown error.
+	outR, errR := newDrainReadEnd(rawOutR), newDrainReadEnd(rawErrR)
+	configuredCleanup, err := configureChildHandleList(cmd)
 	if err != nil {
 		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
 		return nil, -1, err
 	}
+	handleCleanup := releaseChildHandleList(configuredCleanup)
 	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
 
 	var output bytes.Buffer
@@ -499,6 +547,11 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	exitCode := -1
 
 	err = lease.start(cmd, tree)
+	// Release the handle list's parent-held stream duplicates now, whether or
+	// not Start succeeded: the child (if any) already holds its own copies,
+	// and on Windows a surviving duplicate of an output write end would keep
+	// the drain below from ever observing EOF (releaseChildHandleList).
+	handleCleanup()
 	if err != nil {
 		// Nothing was started: no child holds any of these descriptors, so the
 		// parent's copies of all four must be released here rather than
@@ -561,10 +614,18 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 	// tree.terminateAndWait has now confirmed the entire process group —
 	// including any descendant that forked away from the immediate child and
-	// inherited its pipe ends — is gone, so the drain goroutines are
-	// guaranteed to observe EOF promptly rather than blocking on an orphaned
-	// holder of the write end.
-	drainWG.Wait()
+	// inherited its pipe ends while staying in the group — is gone. That is
+	// NOT every possible holder of the write end: a descendant that called
+	// setsid(2) left the group, so the group sweep never saw it, and on darwin
+	// the best-effort descendant tracker (attachSynchronousDescendantProof)
+	// kills it only when a sample observed it before its parent died. A
+	// surviving holder would keep the drain from ever observing EOF, and an
+	// unbounded drainWG.Wait() here then hangs this run, its execution lease
+	// and ExecutorSet.Close behind it (review M10). exec.Cmd.WaitDelay cannot
+	// bound this: it only manages pipes and copying goroutines exec.Cmd owns,
+	// and this path hands the child its own os.Pipe write ends, so exec.Cmd
+	// owns neither. waitOutputDrain bounds it instead.
+	drainIncomplete := waitOutputDrain(&drainWG, outputDrainGrace, outR, errR)
 
 	// Snapshot cancellation before releasing the execution lease: finish cancels
 	// lease.ctx as part of normal teardown and must not be mistaken for a caller
@@ -583,6 +644,19 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 	if treeErr != nil {
 		return out, -1, treeErr
+	}
+	if drainIncomplete {
+		// The process itself ended (or was cancelled) but its output was cut
+		// short by a detached holder of the pipe. Report the truncation as an
+		// error rather than a clean exit; a concurrent cancellation is joined
+		// so errors.Is still finds it.
+		if executionCtxErr != nil {
+			if callerCtxErr != nil {
+				return out, -1, errors.Join(callerCtxErr, ErrOutputDrainIncomplete)
+			}
+			return out, -1, errors.Join(ErrExecutorClosed, ErrOutputDrainIncomplete)
+		}
+		return out, -1, ErrOutputDrainIncomplete
 	}
 
 	// A context timeout/cancel DURING the run surfaces as a signal kill (an
@@ -603,6 +677,79 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		return out, -1, err
 	}
 	return out, exitCode, nil
+}
+
+// waitOutputDrain waits for run's two drain goroutines to observe EOF, but for
+// at most grace. On expiry it expires the read ends' deadlines, which makes
+// each blocked Read return os.ErrDeadlineExceeded so both goroutines exit
+// with whatever they have already copied, and then joins them. It reports
+// whether the drain had to be cut short.
+//
+// A read deadline is preferred over Close: os.Pipe returns pollable
+// descriptors on darwin and Linux, so the deadline is honoured by a Read
+// already parked in the poller and the descriptor stays valid for the
+// pipe-backed Process that also owns it. On Windows an os.Pipe handle is not
+// pollable and SetReadDeadline answers os.ErrNoDeadline, so the read end is
+// closed instead (internal/poll cancels the pending synchronous ReadFile with
+// CancelIoEx on close, which is what releases the blocked drain). Every read
+// end run passes here is a drainReadEnd, so the Process.Close that runs later
+// in spawn cleanup finds it already closed and reports nothing. Writers are
+// untouched: the detached holder keeps its write end and simply meets
+// EPIPE/SIGPIPE (a broken-pipe error on Windows) on its next write.
+//
+// Reaching the fallback at all means a writer outlived the run's whole
+// process tree, so run reports ErrOutputDrainIncomplete; a run whose writers
+// all exited drains to EOF well inside the grace and never gets here.
+func waitOutputDrain(drainWG *sync.WaitGroup, grace time.Duration, readEnds ...deadlineReadEnd) bool {
+	drained := make(chan struct{})
+	go func() {
+		drainWG.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return false
+	case <-timer.C:
+	}
+	for _, readEnd := range readEnds {
+		if readEnd == nil {
+			continue
+		}
+		if err := readEnd.SetReadDeadline(time.Now()); err != nil {
+			_ = readEnd.Close()
+		}
+	}
+	<-drained
+	return true
+}
+
+// deadlineReadEnd is the slice of *os.File waitOutputDrain needs: expire a
+// blocked Read, or close the read end when the descriptor takes no deadline.
+type deadlineReadEnd interface {
+	SetReadDeadline(time.Time) error
+	Close() error
+}
+
+// drainReadEnd is a synchronous run's output-pipe read end with an idempotent
+// Close. run hands the same read end to its drain goroutine (as the Process's
+// Stdout/Stderr), to waitOutputDrain's close fallback, and to the pipe-backed
+// Process whose Close runs in spawn cleanup; only the first Close reaches the
+// OS and every later one returns that first result, so a cut-short drain on
+// Windows is reported once, as ErrOutputDrainIncomplete, and never again as
+// "close |0: file already closed".
+type drainReadEnd struct {
+	*os.File
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newDrainReadEnd(file *os.File) *drainReadEnd { return &drainReadEnd{File: file} }
+
+func (r *drainReadEnd) Close() error {
+	r.closeOnce.Do(func() { r.closeErr = r.File.Close() })
+	return r.closeErr
 }
 
 // drainCombinedOutput copies everything read from src into dst, serialized by
@@ -953,6 +1100,8 @@ func (e *Executor) issueGrant(ctx context.Context, executionID, command, cwd, ki
 		}
 		return "", err
 	}
+	e.pruneGrantDeadlinesLocked()
+	e.recordGrantDeadlineLocked(token, expiry.Sub(now))
 	if retained != nil {
 		if err := e.retainedGrantPaths.add(grantID(token), retainedGrantPath{
 			binding: *pathBinding, target: delta.entry.Path, exact: delta.entry.Exact,
@@ -1043,6 +1192,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	pol := policy.Clone(e.policy)
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
+	e.pruneGrantDeadlinesLocked()
 	e.retainedGrantPaths.prune(now.UnixMilli())
 	e.rescheduleRetainedGrantExpiryLocked()
 	seen := make(map[[32]byte]int64, len(grants))
@@ -1078,6 +1228,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		}
 		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
 			return nil, -1, ErrGrantGuaranteeMismatch
+		}
+		// The signed wall-clock expiry passed above; the monotonic deadline
+		// recorded at issue must also hold, so a backward wall-clock step can
+		// never extend the grant (review L6).
+		if err := e.checkGrantDeadlineLocked(id); err != nil {
+			return nil, -1, err
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
 			pendingPaths = append(pendingPaths, pendingGrantPath{
@@ -1185,6 +1341,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	for id, expiryUnixMilli := range seen {
 		e.usedGrants[id] = expiryUnixMilli
+		delete(e.grantDeadlines, id)
 	}
 	e.rescheduleRetainedGrantExpiryLocked()
 	if retainedCloseErr != nil {
@@ -1312,7 +1469,23 @@ type retainedGrantPathBackend interface {
 	CompileWithRetainedPathHandles(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
 }
 
+// grantAuthorityBackend is a backend whose base spec carries per-executor
+// state that EVERY grant compile must reuse, with or without path handles —
+// the Windows restricted tier, whose base lease (SID, ACL projections) is one
+// per executor and is found only through the GrantAuthority on that
+// executor's own spec. A backend implementing it is asked for every grant
+// compile that has an authority to present; the others keep the
+// handle-count-based routing below.
+type grantAuthorityBackend interface {
+	CompileWithGrantAuthority(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
+}
+
 func compileBackendWithGrantPaths(b enforce.Backend, authority any, base, pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+	if authority != nil {
+		if authorityBackend, ok := b.(grantAuthorityBackend); ok {
+			return authorityBackend.CompileWithGrantAuthority(authority, policy.Clone(base), pol, handles)
+		}
+	}
 	if len(handles) != 0 {
 		if retained, ok := b.(retainedGrantPathBackend); ok {
 			return retained.CompileWithRetainedPathHandles(authority, policy.Clone(base), pol, handles)
@@ -1386,15 +1559,23 @@ func applyChildProxyEnv(set map[string]string, proxyURL string) {
 	set["no_proxy"] = ""
 }
 
-// assembleEnv builds the child environment from a policy.Effective's policy.EnvPolicy (SPEC §5.5).
+// envNameFold folds an environment variable name to the key under which two
+// names denote the same variable: policy.EnvNameFold, the identity on Unix and
+// upper-casing on Windows (where "Path" and "PATH" are one variable). It is a
+// variable only so a test on any host can substitute the Windows fold and
+// exercise the case-insensitive matching below; production never reassigns it.
+var envNameFold = policy.EnvNameFold
+
+// assembleEnv builds the child environment from a policy.Effective's policy.EnvPolicy (SPEC §3).
 // It is shared by every backend and lives on the executor side because env
 // scrubbing holds regardless of OS mechanism.
 //
 //   - Inherit: start from the full parent environment (os.Environ), then force
 //     the Set overrides. Used by unconfined and explicit opt-in.
 //   - otherwise (the fail-closed default): keep only parent variables whose NAME
-//     matches the §5.5 baseline allowlist or one of policy.EnvPolicy.Allow (name globs
-//     via filepath.Match), then force the Set overrides (including TMPDIR).
+//     matches the platform baseline allowlist (policy.BaselineEnvAllowlist) or
+//     one of policy.EnvPolicy.Allow (name globs via path.Match, compared under
+//     envNameFold), then force the Set overrides (including TMPDIR).
 //     Everything else — GITHUB_TOKEN, AWS_*, LLM keys, SSH_AUTH_SOCK, … — is
 //     absent.
 //
@@ -1430,49 +1611,79 @@ func assembleEnv(p policy.Effective) []string {
 // allowlist patterns, using path.Match on the NAME (so "LC_*" and "CARGO_*"
 // work). path.Match — not filepath.Match — is deliberate: env names are not
 // filesystem paths, and filepath.Match uses "\"-separator semantics on Windows,
-// whereas path.Match is always "/"-based, which is correct for a plain name. A
-// malformed pattern fails closed: path.Match's error is treated as a non-match,
-// so a bad glob never widens the allowlist.
+// whereas path.Match is always "/"-based, which is correct for a plain name.
+// Both the name and the pattern are compared under envNameFold, so on Windows
+// the "Path" spelling os.Environ reports matches the baseline's "PATH" (without
+// the fold a scrubbed Windows child received no PATH at all). A malformed
+// pattern fails closed: path.Match's error is treated as a non-match, so a bad
+// glob never widens the allowlist.
 func envNameMatches(name string, patterns []string) bool {
+	folded := envNameFold(name)
 	for _, pat := range patterns {
-		if ok, err := path.Match(pat, name); err == nil && ok {
+		if ok, err := path.Match(envNameFold(pat), folded); err == nil && ok {
 			return true
 		}
 	}
 	return false
 }
 
-// applySet forces the policy.EnvPolicy.Set values onto an assembled env slice: an
-// existing KEY is overwritten in place (so no duplicate keys), and a new KEY is
-// appended. Newly appended keys are sorted for a deterministic result. env is
-// assumed to be freshly owned by the caller (os.Environ() or a freshly built
-// slice), so overwriting in place is safe.
+// applySet forces the policy.EnvPolicy.Set values onto an assembled env slice,
+// comparing names under envNameFold so that on Windows a Set "TEMP" replaces an
+// inherited "Temp" rather than producing a second spelling of one variable:
+//
+//   - the first existing entry for a forced name is overwritten in place and
+//     KEEPS its existing spelling (the OS does not distinguish the spellings);
+//   - every later existing entry for the same folded name is dropped, so the
+//     result never carries duplicate keys;
+//   - a forced name with no existing entry is appended under its Set spelling,
+//     appended names sorted for a deterministic result;
+//   - two Set keys that fold to one name (applyChildProxyEnv's HTTP_PROXY and
+//     http_proxy on Windows) collapse to the lexically first key and its value.
+//
+// On Unix the fold is the identity, so this is exactly the exact-name
+// overwrite-or-append it has always been. env is assumed to be freshly owned
+// by the caller (os.Environ() or a freshly built slice), so filtering it in
+// place is safe.
 func applySet(env []string, set map[string]string) []string {
 	if len(set) == 0 {
 		return env
 	}
 
-	forced := make(map[string]bool, len(set))
-	for i, kv := range env {
-		name, _, ok := strings.Cut(kv, "=")
-		if !ok {
+	type forcedVar struct {
+		name, value string
+		applied     bool
+	}
+	keys := slices.Sorted(maps.Keys(set))
+	order := make([]*forcedVar, 0, len(keys))
+	byFold := make(map[string]*forcedVar, len(keys))
+	for _, k := range keys {
+		folded := envNameFold(k)
+		if _, taken := byFold[folded]; taken {
 			continue
 		}
-		if v, isForced := set[name]; isForced {
-			env[i] = name + "=" + v
-			forced[name] = true
-		}
+		forced := &forcedVar{name: k, value: set[k]}
+		byFold[folded] = forced
+		order = append(order, forced)
 	}
 
-	var add []string
-	for k := range set {
-		if !forced[k] {
-			add = append(add, k)
+	out := env[:0]
+	for _, kv := range env {
+		name, _, ok := strings.Cut(kv, "=")
+		forced := byFold[envNameFold(name)]
+		if !ok || forced == nil {
+			out = append(out, kv)
+			continue
+		}
+		if forced.applied {
+			continue
+		}
+		out = append(out, name+"="+forced.value)
+		forced.applied = true
+	}
+	for _, forced := range order {
+		if !forced.applied {
+			out = append(out, forced.name+"="+forced.value)
 		}
 	}
-	slices.Sort(add)
-	for _, k := range add {
-		env = append(env, k+"="+set[k])
-	}
-	return env
+	return out
 }

@@ -116,6 +116,34 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 			name:    "plain writable root has no snapshot",
 			entries: []FSEntry{{Path: root, Access: AllAccess}},
 		},
+		{
+			// L9: a recursive host read deny at "/" whose read/execute the
+			// workspace allow restores keeps the workspace write allow
+			// (readRestoredBetween, 1760f0b), so write is NOT withheld there
+			// and must not be reported as a snapshot axis.
+			name: "recursive ancestor read deny restored by the write allow is not a write snapshot",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: AllAccess},
+			},
+		},
+		{
+			name: "read restored by a separate recursive entry is not a write snapshot",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: ReadAccess | ExecAccess},
+				{Path: root, Access: WriteAccess, Canonical: true},
+			},
+		},
+		{
+			name: "restored read still snapshots write around a nested read deny",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: AllAccess},
+				{Path: protected, Denied: ReadAccess},
+			},
+			want: ReadAccess | WriteAccess,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -249,35 +277,6 @@ func TestEnumerateFSRulesSuppressesNestedWriteAllowUnderRecursiveReadDeny(t *tes
 	}
 }
 
-func TestEnumerateFSRulesOmitsDirectHardlinkedFiles(t *testing.T) {
-	root := t.TempDir()
-	public := filepath.Join(root, "public")
-	secret := filepath.Join(root, "secret")
-	if err := os.WriteFile(public, []byte("shared"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(public, secret); err != nil {
-		t.Skipf("hard links unavailable: %v", err)
-	}
-	compiled := CompileFS([]FSEntry{
-		{Path: root, Access: AllAccess},
-		{Path: secret, Denied: ReadAccess | ExecAccess},
-	})
-	rules := enumerateFSRulesForTest(t, compiled)
-	for _, path := range []string{public, secret} {
-		if got := resolveEnumeratedRules(rules, path); got != DenyAccess {
-			t.Fatalf("hardlinked path %q access = %#x, want fail-narrow deny; rules=%+v", path, got, rules)
-		}
-	}
-
-	exact := enumerateFSRulesForTest(t, CompileFS([]FSEntry{{
-		Path: public, Access: ReadAccess, Exact: true,
-	}}))
-	if got := resolveEnumeratedRules(exact, public); got != DenyAccess {
-		t.Fatalf("direct exact hardlink access = %#x, want fail-narrow deny; rules=%+v", got, exact)
-	}
-}
-
 func TestEnumerateFSRulesPreservesDescendantsOfEqualPathExactDeny(t *testing.T) {
 	root := t.TempDir()
 	child := filepath.Join(root, "child")
@@ -397,14 +396,9 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	linkedSource := filepath.Join(root, "linked-source")
-	linked := filepath.Join(root, "linked")
-	if err := os.WriteFile(linkedSource, []byte("shared"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(linkedSource, linked); err != nil {
-		t.Skipf("hard links unavailable: %v", err)
-	}
+	// The multiply-linked case is in compiled_fs_linkcount_test.go: the
+	// single-link rule is observable only where directRegularFileRuleSafe
+	// can read a link count (darwin, Linux).
 	for _, test := range []struct {
 		name    string
 		entries []FSEntry
@@ -414,7 +408,6 @@ func TestValidateLandlockExactPaths(t *testing.T) {
 		{name: "recursive directory", entries: []FSEntry{{Path: root, Access: WriteAccess}}},
 		{name: "exact directory unsupported", entries: []FSEntry{{Path: root, Access: WriteAccess, Exact: true, Canonical: true}}, wantErr: true},
 		{name: "exact nonexistent unsupported", entries: []FSEntry{{Path: filepath.Join(root, "future"), Access: WriteAccess, Exact: true, Canonical: true}}, wantErr: true},
-		{name: "exact multiply-linked file unsupported", entries: []FSEntry{{Path: linked, Access: ReadAccess, Exact: true, Canonical: true}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := ValidateLandlockExactPaths(test.entries, nil)

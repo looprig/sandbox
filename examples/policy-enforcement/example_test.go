@@ -76,6 +76,7 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (gated): %v", err)
 	}
+	t.Cleanup(func() { _ = gatedSet.Close() })
 	gated, err := gatedSet.For("policy-gate")
 	if err != nil {
 		t.Fatalf("ExecutorSet.For (gated): %v", err)
@@ -113,6 +114,7 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (required): %v", err)
 	}
+	t.Cleanup(func() { _ = requiredSet.Close() })
 	requiredExecutor, requiredErr := requiredSet.For("required")
 	switch {
 	case requiredErr == nil:
@@ -153,6 +155,14 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (available): %v", err)
 	}
+	// Close the set on every exit path, before t.TempDir's own cleanup runs
+	// (cleanups run last-registered first). On Windows the restricted tier
+	// retains no-delete-sharing handles on the projected workspace for the
+	// executor's lease, so a test that failed before the explicit Close
+	// below would otherwise leave the workspace undeletable and report a
+	// second, misleading "being used by another process" failure. Close is
+	// idempotent, which the explicit double Close below also asserts.
+	t.Cleanup(func() { _ = set.Close() })
 	executor, err := set.For("worker")
 	if err != nil {
 		t.Fatalf("ExecutorSet.For: %v", err)
@@ -182,12 +192,27 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	}
 	t.Logf("platform capabilities: level=%d guarantees=%+v report=%+v", executor.Level(), guarantees, executor.Report().Entries)
 
+	// On Windows the available profile compiles to the restricted tier when no
+	// elevated setup is installed, so this launches the test binary itself
+	// under a WRITE_RESTRICTED token with Administrators deny-only. A launch
+	// refusal is wrapped by the executor with the API, the token handle's
+	// access and, for ERROR_ACCESS_DENIED, the image's owner/DACL and an open
+	// of the image performed as the launch token, so the error alone says
+	// which of those refused.
 	output, code, err := executor.RunArgv(context.Background(), workspace, []string{os.Args[0], "-test.run=^TestCommandHelper$"})
 	if err != nil {
 		t.Fatalf("RunArgv: %v", err)
 	}
 	if code != 0 || !strings.Contains(string(output), "command ran under selected profile") {
-		t.Fatalf("RunArgv = code %d output %q, want successful helper output", code, output)
+		hint := ""
+		if uint32(code) == 0xC0000142 {
+			// The restricted tier's child died in DLL initialisation before
+			// running (STATUS_DLL_INIT_FAILED), the second Windows CI run's
+			// failure; internal/windows' TestRestrictedTokenChildInitializationMatrix
+			// logs which token/console/Job variant causes it.
+			hint = " (0xC0000142 STATUS_DLL_INIT_FAILED: the helper never ran; check the restricted token and console launch mode)"
+		}
+		t.Fatalf("RunArgv = code %d (%#x) output %q, want successful helper output%s", code, uint32(code), output, hint)
 	}
 
 	if err := set.Close(); err != nil {
@@ -206,8 +231,24 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read scratch root after close: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("scratch root retains %d set-owned entries after close", len(entries))
+	if runtime.GOOS == "windows" && (gated.Level() == sandbox.LevelNone || executor.Level() == sandbox.LevelNone) {
+		// The restricted backend keeps its recovery journal and permanent SID
+		// retirement ledger in the caller-owned scratch root across sets.
+		// Only executor-owned temporary trees are removed by Close.
+		if len(entries) != 1 || entries[0].Name() != "restricted-journal-v1" || !entries[0].IsDir() {
+			t.Fatalf("scratch entries after close = %v, want only restricted-journal-v1", entries)
+		}
+		journal := filepath.Join(scratch, entries[0].Name())
+		records, err := os.ReadDir(filepath.Join(journal, "records"))
+		if err != nil || len(records) != 0 {
+			t.Fatalf("pending ACL recovery records after close = %v, error %v; want none", records, err)
+		}
+		retired, err := os.ReadDir(filepath.Join(journal, "retired-sids"))
+		if err != nil || len(retired) == 0 {
+			t.Fatalf("retired SID ledger after close = %v, error %v; want persistent retirements", retired, err)
+		}
+	} else if len(entries) != 0 {
+		t.Fatalf("scratch root retains %d set-owned entries after close: %v", len(entries), entries)
 	}
 }
 

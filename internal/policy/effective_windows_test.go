@@ -12,14 +12,27 @@ import (
 )
 
 func TestCompileEffectivePolicyUsesWindowsRuntimeVocabulary(t *testing.T) {
-	workspace := t.TempDir()
 	profile := mustProfile(t, ProfileConfig{
-		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		WorkspaceRoot: t.TempDir(), WorkspaceRead: Allow, WorkspaceWrite: Allow,
 		HostRead: Deny, HostWrite: Deny, Network: Deny, Command: Allow,
 	})
+	// Probe with the profile's canonical workspace, never the t.TempDir()
+	// spelling it was built from. NewProfile stores the handle-resolved DOS
+	// path (profile.CanonicalRoot), which expands 8.3 aliases: on a
+	// GitHub-hosted runner %TEMP% is C:\Users\RUNNER~1\... while the stored
+	// root is C:\Users\runneradmin\.... ResolveFS is lexical by contract and
+	// cannot expand a short name without I/O, so the raw spelling is a
+	// different key and resolves under the denied drive-root intent instead.
+	// Its Windows callers pass canonical paths: the backend's ACL planning
+	// joins a handle-resolved target (binding.CanonicalPath,
+	// PathHandle.Target) with names its own directory enumeration returned.
+	workspace := profile.Settings().WorkspaceRoot
 	policy, err := Compile(profile)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !winpath.EqualPath(policy.Workspace, workspace) {
+		t.Fatalf("effective workspace = %q, want the profile's canonical root %q", policy.Workspace, workspace)
 	}
 
 	if len(policy.RuntimeBaselines) != 1 || policy.RuntimeBaselines[0] != WindowsRuntimeBaseline {

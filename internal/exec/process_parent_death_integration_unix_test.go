@@ -78,14 +78,37 @@ func integrationEscapeExecutor(t *testing.T) (*ExecutorSet, *Executor, string) {
 // `-tags integration` build needs to resolve — this file's own callers
 // included — must live somewhere Windows compiles it too, not here.
 
-// requireSettidHelper skips the test on a host/image without the setsid
-// binary (util-linux) — needed for a genuine session-detach escape, rather
-// than approximating it and understating the proof.
+// setsidLauncher is the shell fragment that re-execs the words following it
+// in a NEW session. It is resolved once by requireSetsidHelper: util-linux's
+// `setsid` where the image ships it (Linux), otherwise perl's POSIX::setsid(),
+// which is the same setsid(2) call. macOS ships no setsid binary but every
+// supported image ships /usr/bin/perl, so the darwin escape proof runs for
+// real instead of recording a skip that CI then reports as green (the
+// test-macos job's only Darwin containment selector used to skip on every
+// run for exactly this reason).
+var setsidLauncher string
+
+// requireSetsidHelper resolves setsidLauncher, skipping only when neither a
+// setsid binary nor perl is available — a genuine session-detach escape is
+// needed, rather than approximating it and understating the proof.
 func requireSetsidHelper(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("setsid"); err != nil {
-		t.Skip("setsid binary unavailable on this host/image; cannot exercise a real session-detach escape")
+	if setsidLauncher != "" {
+		return
 	}
+	if _, err := exec.LookPath("setsid"); err == nil {
+		setsidLauncher = "setsid"
+		return
+	}
+	if perl, err := exec.LookPath("perl"); err == nil {
+		// Absolute path: the fragment runs inside the confined target, whose
+		// scrubbed PATH may not resolve a bare "perl". `exec @ARGV` replaces
+		// perl with the grandchild so the escapee's $0 is still the token.
+		setsidLauncher = portableShellQuote(perl) +
+			` -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!"'`
+		return
+	}
+	t.Skip("neither setsid nor perl is available on this host/image; cannot exercise a real session-detach escape")
 }
 
 // pidFileAlive reads a pid previously written to path and reports whether
@@ -163,7 +186,7 @@ func escapeToken(t *testing.T) string {
 func escapeGrandchildLaunch(grandchild, token string) string {
 	head, tail := token[:len("lrsb-esc")], token[len("lrsb-esc"):]
 	return "T=$(printf '%s%s' " + portableShellQuote(head) + " " + portableShellQuote(tail) + "); " +
-		"setsid sh -c " + portableShellQuote(grandchild) + " \"$T\""
+		setsidLauncher + " sh -c " + portableShellQuote(grandchild) + " \"$T\""
 }
 
 // setsidEscapeScript builds a target command: it backgrounds a `setsid`-
@@ -278,9 +301,20 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 	waitForPath(t, started)
 	waitForPath(t, pidPath)
 	// Positive control: the liveness check must see the grandchild while it is
-	// alive, or its "gone" verdict below would prove nothing.
-	if !escapeGrandchildAlive(t, pidPath, token) {
-		t.Fatalf("detached grandchild (token %s) not observed alive before the kill; the liveness check is blind", token)
+	// alive, or its "gone" verdict below would prove nothing. It is POLLED, not
+	// sampled once: the shell writes pidPath and started right after forking
+	// the background job, but the token enters an argv only when that forked
+	// subshell execs the setsid launcher — under CPU contention that exec
+	// lands after both files exist, and a single scan then reported the
+	// grandchild "blind" (the intermittent ~15 s trio failure: this test runs
+	// last, after two 7 s ones). The grandchild sleeps escapeGrandchildDelay,
+	// so a bound well inside that still observes it alive.
+	observeDeadline := time.Now().Add(escapeGrandchildDelay / 2)
+	for !escapeGrandchildAlive(t, pidPath, token) {
+		if time.Now().After(observeDeadline) {
+			t.Fatalf("detached grandchild (token %s) not observed alive before the kill; the liveness check is blind", token)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := proc.Signal(context.Background(), ProcessSignalKill); err != nil {
 		t.Fatalf("Signal(Kill) on the supervising helper: %v", err)

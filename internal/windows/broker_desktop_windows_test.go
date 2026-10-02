@@ -100,13 +100,14 @@ func TestBrokerDesktopRequiresLocalSystemBeforeAuthorityUse(t *testing.T) {
 }
 
 func TestBrokerDesktopDescriptorHasOnlyRequiredTrustees(t *testing.T) {
+	lease := testBrokerRestrictingSID(t)
 	installation := testBrokerInstallationSID(t)
-	descriptor, err := brokerDesktopSecurityDescriptor(testBrokerAccountSID, installation)
+	descriptor, err := brokerDesktopSecurityDescriptor(testBrokerAccountSID, lease)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected, err := win.SecurityDescriptorFromString(
-		"O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + installation.String() + ")",
+		"O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + lease.String() + ")",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -114,9 +115,16 @@ func TestBrokerDesktopDescriptorHasOnlyRequiredTrustees(t *testing.T) {
 	if err := verifyExactDesktopSecurity(descriptor, expected); err != nil {
 		t.Fatalf("descriptor is not exact: %v", err)
 	}
+	// Review L8: the installation SID, which every concurrent lease's token
+	// carries, must not be a desktop trustee, and cannot be passed as one.
+	if _, err := brokerDesktopSecurityDescriptor(testBrokerAccountSID, installation); err == nil {
+		t.Fatal("installation SID accepted as the desktop's restricting trustee")
+	}
 	for name, forbidden := range map[string]string{
-		"Administrators":    "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + installation.String() + ")(A;;GA;;;BA)",
-		"interactive owner": "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + installation.String() + ")(A;;GA;;;S-1-5-21-1-2-3-1002)",
+		"installation SID":       "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + installation.String() + ")",
+		"lease and installation": "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + lease.String() + ")(A;;GA;;;" + installation.String() + ")",
+		"Administrators":         "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + lease.String() + ")(A;;GA;;;BA)",
+		"interactive owner":      "O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + testBrokerAccountSID + ")(A;;GA;;;" + lease.String() + ")(A;;GA;;;S-1-5-21-1-2-3-1002)",
 	} {
 		t.Run(name, func(t *testing.T) {
 			widened, err := win.SecurityDescriptorFromString(forbidden)
@@ -157,9 +165,9 @@ func TestBrokerDesktopSelectsOnlyConfiguredAccountSID(t *testing.T) {
 	if len(specs) != 2 {
 		t.Fatalf("created desktop count = %d, want 2", len(specs))
 	}
-	installation := testBrokerInstallationSID(t)
+	lease := testBrokerRestrictingSID(t)
 	for index, accountSID := range []string{testBrokerAccountSID, testBrokerOnlineAccountSID} {
-		expected, err := brokerDesktopSecurityDescriptor(accountSID, installation)
+		expected, err := brokerDesktopSecurityDescriptor(accountSID, lease)
 		if err != nil {
 			t.Fatal(err)
 		}

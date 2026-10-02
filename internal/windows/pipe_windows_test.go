@@ -35,7 +35,7 @@ func TestBrokerPipeDACLIsClosedToConfiguredTrustees(t *testing.T) {
 }
 
 func TestBrokerPipeAuthenticationUsesKernelClientIdentityAndBindsLease(t *testing.T) {
-	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID}}
+	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: brokerMinimumClientIntegrityRID}}
 	system := &fakeBrokerPipeSystem{pids: []uint32{41, 41, 41}, process: process}
 	authenticator := testBrokerAuthenticator(system)
 	connection, err := authenticator.Authenticate(xwindows.Handle(7))
@@ -66,10 +66,21 @@ func TestBrokerPipeRejectsOwnerAppContainerAndInstallationRestriction(t *testing
 		{"owner mismatch", func(facts *brokerClientFacts) { facts.UserSID = "S-1-5-21-9-9-9-1002" }},
 		{"AppContainer", func(facts *brokerClientFacts) { facts.AppContainer = true }},
 		{"installation restricting SID", func(facts *brokerClientFacts) { facts.RestrictedSIDs = []string{testInstallationSID} }},
+		// Review L8: a restricted-tier sandbox runs as the owner with a
+		// write-restricted token carrying its own executor/one-shot SIDs,
+		// never the installation SID; it must be refused all the same.
+		{"restricted-tier executor SID", func(facts *brokerClientFacts) {
+			facts.RestrictedSIDs = []string{"S-1-5-32-1-2-3-4-5-6-7-8"}
+			facts.Restricted = true
+		}},
+		{"restricted token without restricting SIDs reported", func(facts *brokerClientFacts) { facts.Restricted = true }},
+		{"restricting SIDs without IsRestricted", func(facts *brokerClientFacts) { facts.RestrictedSIDs = []string{"S-1-5-12"} }},
+		{"low integrity", func(facts *brokerClientFacts) { facts.IntegrityRID = 0x1000 }},
+		{"untrusted integrity", func(facts *brokerClientFacts) { facts.IntegrityRID = 0 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			facts := brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID}
+			facts := brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: brokerMinimumClientIntegrityRID}
 			test.mutate(&facts)
 			process := &fakeBrokerClientProcess{facts: facts}
 			system := &fakeBrokerPipeSystem{pids: []uint32{41, 41}, process: process}
@@ -85,7 +96,7 @@ func TestBrokerPipeRejectsOwnerAppContainerAndInstallationRestriction(t *testing
 }
 
 func TestBrokerPipeRejectsPIDReuseBetweenLookupAndOpen(t *testing.T) {
-	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID}}
+	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: brokerMinimumClientIntegrityRID}}
 	system := &fakeBrokerPipeSystem{pids: []uint32{41, 42}, process: process}
 	_, err := testBrokerAuthenticator(system).Authenticate(xwindows.Handle(7))
 	if !errors.Is(err, errBrokerClientChanged) {
@@ -97,7 +108,7 @@ func TestBrokerPipeRejectsPIDReuseBetweenLookupAndOpen(t *testing.T) {
 }
 
 func TestBrokerPipeRejectsCreationTimeChangeAfterAuthentication(t *testing.T) {
-	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID}}
+	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: brokerMinimumClientIntegrityRID}}
 	system := &fakeBrokerPipeSystem{pids: []uint32{41, 41, 41}, process: process}
 	connection, err := testBrokerAuthenticator(system).Authenticate(xwindows.Handle(7))
 	if err != nil {
@@ -111,7 +122,7 @@ func TestBrokerPipeRejectsCreationTimeChangeAfterAuthentication(t *testing.T) {
 }
 
 func TestBrokerPipeDisconnectCleansLeasesBeforeClosingProcessOnce(t *testing.T) {
-	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID}}
+	process := &fakeBrokerClientProcess{facts: brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: brokerMinimumClientIntegrityRID}}
 	system := &fakeBrokerPipeSystem{pids: []uint32{41, 41}, process: process}
 	connection, err := testBrokerAuthenticator(system).Authenticate(xwindows.Handle(7))
 	if err != nil {
@@ -181,3 +192,15 @@ func (process *fakeBrokerClientProcess) CreationTime() (uint64, error) {
 	return process.facts.CreationTime, nil
 }
 func (process *fakeBrokerClientProcess) Close() error { process.closeCount.Add(1); return nil }
+
+// TestBrokerClientFactsAdmitMediumAndHighIntegrityOwners pins the accepting
+// side of the L8 rule: the owner's ordinary Medium process and its elevated
+// High process are both admitted.
+func TestBrokerClientFactsAdmitMediumAndHighIntegrityOwners(t *testing.T) {
+	for _, rid := range []uint32{0x2000, 0x2100, 0x3000} {
+		facts := brokerClientFacts{PID: 41, CreationTime: 9001, UserSID: testOwnerSID, IntegrityRID: rid}
+		if err := authorizeBrokerClientFacts(facts, testOwnerSID, testInstallationSID); err != nil {
+			t.Fatalf("integrity %#x refused: %v", rid, err)
+		}
+	}
+}

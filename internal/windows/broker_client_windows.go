@@ -133,4 +133,15 @@ func (client *brokerClient) call(request brokerFrame) (brokerFrame, error) {
 
 type brokerClientResultError struct{ result brokerResult }
 
-func (err brokerClientResultError) Error() string { return "windows sandbox: broker request failed" }
+func (err brokerClientResultError) Error() string {
+	if err.result == brokerResultRecoveryPending {
+		return errBrokerLeaseRecoveryPending.Error()
+	}
+	return "windows sandbox: broker request failed"
+}
+
+// Is lets a caller distinguish the broker's quarantine refusal, which needs an
+// operator-visible setup problem rather than a generic retry.
+func (err brokerClientResultError) Is(target error) bool {
+	return target == errBrokerLeaseRecoveryPending && err.result == brokerResultRecoveryPending
+}

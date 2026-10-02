@@ -76,13 +76,16 @@ const (
 
 // SelectRung picks the strongest achievable Rung from a capability snapshot,
 // per the SPEC §7.2 ladder. Rung 1 requires the three namespaces plus Landlock
-// (any ABI >= 1, since it scopes network with nftables rather than Landlock TCP
-// rules) plus Seccomp. Rung 2 requires Landlock ABI >= 4 (TCP port rules) plus
-// Seccomp. Anything less is RungNone. It is fail-secure: a missing capability
-// can only ever LOWER the Rung.
+// ABI >= 4 plus Seccomp; Rung 2 requires Landlock ABI >= 4 (TCP port rules)
+// plus Seccomp. Rung 1 scopes network with nftables rather than Landlock TCP
+// rules, but BOTH rungs share the stage-2 Landlock FS allowlist, and
+// applyLandlockRules refuses (fail-closed) below ABI v4 — so selecting Rung 1
+// on an ABI 1-3 kernel would make every spawn fail rather than degrade.
+// Anything less is RungNone. It is fail-secure: a missing capability can only
+// ever LOWER the Rung.
 func (c Caps) SelectRung() Rung {
 	switch {
-	case c.Userns && c.Mountns && c.Netns && c.LandlockABI >= 1 && c.Seccomp:
+	case c.Userns && c.Mountns && c.Netns && c.LandlockABI >= 4 && c.Seccomp:
 		return RungOne
 	case c.LandlockABI >= 4 && c.Seccomp:
 		return RungTwo

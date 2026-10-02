@@ -33,6 +33,12 @@ func (nativeElevatedRunnerProcessAPI) VerifyToken(token win.Token) error {
 	if err != nil || !restricted {
 		return errors.Join(errors.New("broker token is not restricted"), err)
 	}
+	// The launcher repeats the full-restriction check immediately before the
+	// token is used: ReadBoundary is only reported for a token whose
+	// restricting SIDs participate in read access checks.
+	if err := requireTokenRestriction(token, tokenRestrictionFull); err != nil {
+		return fmt.Errorf("broker token: %w", err)
+	}
 	kind, err := tokenUint32Information(token, win.TokenType)
 	if err != nil || kind != win.TokenPrimary {
 		return errors.Join(errors.New("broker token is not primary"), err)

@@ -536,7 +536,41 @@ func TestRestrictedJournalRootReplacementCannotRedirectOperations(t *testing.T) 
 
 	originalRoot := journal.root + "-original"
 	if err := os.Rename(journal.root, originalRoot); err != nil {
-		t.Fatal(err)
+		if runtime.GOOS != "windows" || !errors.Is(err, fs.ErrPermission) {
+			t.Fatal(err)
+		}
+		// On Windows the replacement this test simulates cannot be staged
+		// while the journal is open, and that refusal is itself the
+		// guarantee: the journal retains open directory handles on
+		// journal.root's children (records/, retired-sids/), and NTFS refuses
+		// to rename a directory with any open handle beneath it
+		// (MoveFileEx -> ERROR_ACCESS_DENIED), regardless of the children's
+		// FILE_SHARE_DELETE — which is why the records/ and retired-sids/
+		// replacement tests above CAN rename those leaf directories and this
+		// one cannot rename their parent. So there is no redirection to
+		// observe; instead prove (1) operations still land under the one
+		// root that exists, and (2) the refusal is caused by the journal's
+		// own retained handles, by showing the identical rename succeeds once
+		// the journal is closed. The identity pinning is not weakened: the
+		// handles are what both pin and block.
+		record := restrictedTestRecord(t, "journal-root-replacement")
+		key := prepareRestrictedTestMutation(t, journal, record)
+		if _, err := os.Stat(filepath.Join(journal.root, "records", key+".json")); err != nil {
+			t.Fatalf("record did not land below the pinned journal root: %v", err)
+		}
+		if err := journal.CompleteCleanup(key); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(journal.root, "records", key+".json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanup did not remove record from the pinned root: %v", err)
+		}
+		if err := journal.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(journal.root, originalRoot); err != nil {
+			t.Fatalf("journal root rename still refused after Close, so the refusal was not the journal's retained handles: %v", err)
+		}
+		return
 	}
 	if err := os.Mkdir(journal.root, 0o700); err != nil {
 		t.Fatal(err)

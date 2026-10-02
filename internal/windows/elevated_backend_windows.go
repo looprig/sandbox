@@ -174,6 +174,21 @@ type elevatedInstallationVerifier interface {
 
 type elevatedDependencyHealth struct {
 	Accounts, Credentials, Firewall, RuntimeBaseline bool
+	// The three launch mechanisms below are verified again, fail closed, at
+	// every launch; what inspection can honestly establish beforehand is
+	// narrower, and each field says exactly what (review L8). They used to
+	// be hard-coded true.
+	//
+	// PrivateDesktop: the manifest-owned broker service, the only principal
+	// that creates the per-lease window station and desktop, is running with
+	// its pinned configuration. No desktop exists before a token is issued.
+	PrivateDesktop bool
+	// JobReadback: this host just created a sandboxed, kill-on-close Job and
+	// read every installed limit back (NewJob's own read-back).
+	JobReadback bool
+	// HandleList: this host just built a PROC_THREAD_ATTRIBUTE_LIST, the
+	// prerequisite of the explicit handle list every launch installs.
+	HandleList bool
 }
 
 type elevatedDependencyHealthInspector interface {
@@ -200,11 +215,53 @@ func (productionElevatedDependencyInspector) Inspect(ctx context.Context, stateR
 		return elevatedDependencyHealth{}, err
 	}
 	return elevatedDependencyHealth{
-		Accounts:        readiness.accounts && readiness.service,
-		Credentials:     readiness.credentials,
-		Firewall:        readiness.firewallEffective && readiness.firewallUnchanged && len(readiness.portPID) == 0,
+		Accounts:    readiness.accounts && readiness.service,
+		Credentials: readiness.credentials,
+		// A proxy port held by THIS process is this host's own reserved
+		// listener (ReserveEgressProxy), not a foreign squatter; without
+		// excluding it, every Compile after a reservation saw its own
+		// listener and reported the installation stale (review L8).
+		Firewall: readiness.firewallEffective && readiness.firewallUnchanged &&
+			len(foreignProxyPortOwners(readiness.portPID, win.GetCurrentProcessId())) == 0,
 		RuntimeBaseline: readiness.runtimeBaseline,
+		PrivateDesktop:  readiness.service,
+		JobReadback:     probeElevatedJobReadback() == nil,
+		HandleList:      probeElevatedHandleList() == nil,
 	}, nil
+}
+
+// probeElevatedJobReadback creates and closes one sandboxed Job with a
+// process limit, which NewJob installs and reads back (kill-on-close, no
+// breakaway, UI restrictions, the limit itself) before returning it.
+func probeElevatedJobReadback() error {
+	job, err := NewJob(JobOptions{Sandboxed: true, MaxProcesses: 1})
+	if err != nil {
+		return err
+	}
+	if !job.ResourceLimitsInstalled() {
+		return errors.Join(errors.New("windows sandbox: probe Job limits were not read back"), job.Close())
+	}
+	return job.Close()
+}
+
+// probeElevatedHandleList builds and frees one PROC_THREAD_ATTRIBUTE_LIST.
+func probeElevatedHandleList() error {
+	attributes, err := win.NewProcThreadAttributeList(1)
+	if err != nil {
+		return err
+	}
+	attributes.Delete()
+	return nil
+}
+
+// installedBrokerPipeName derives the broker's pipe from the installation's
+// service name; it is never read from the environment or the manifest.
+func installedBrokerPipeName(installationID string) (string, error) {
+	names, err := deriveInstallationPrincipalNames(installationID)
+	if err != nil {
+		return "", err
+	}
+	return `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"), nil
 }
 
 func inspectElevatedSetup(config Config, effective policy.Effective) (elevatedSetupSnapshot, error) {
@@ -282,7 +339,7 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 	if err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: inspect installed dependencies: %v", ErrSetupStale, err)
 	}
-	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	pipeName, err := installedBrokerPipeName(manifest.InstallationID)
 	if err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: derive broker endpoint: %v", ErrSetupStale, err)
 	}
@@ -293,12 +350,13 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		Protocol: manifest.Protocol, AccountsReady: health.Accounts,
 		CredentialsReady: health.Credentials, FirewallReady: health.Firewall,
 		RuntimeBaselineReady: health.RuntimeBaseline, RunnerHashVerified: true,
-		// Job and handle-list properties are verified by the protected launcher.
-		// The broker owns private desktop creation and returns only its opaque
-		// qualified name with the duplicated restricted token.
-		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
+		// Derived from what inspection established (elevatedDependencyHealth),
+		// never assumed: the protected launcher re-verifies the Job and the
+		// handle list at every launch, and the broker creates the private
+		// desktop per lease and fails token issuance without it.
+		PrivateDesktopReady: health.PrivateDesktop, JobReadbackReady: health.JobReadback, HandleListReady: health.HandleList,
 		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
-		PipeName:   `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"),
+		PipeName:   pipeName,
 		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID,
 	}, nil
 }
@@ -412,9 +470,24 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
 			fmt.Errorf("%w: %v", ErrSetupStale, err)
 	}
+	// AF_UNIX endpoints are file-backed on Windows and no broker lease
+	// projects onto them (unix_sockets.go), so the escape hatch is refused
+	// before any broker authority is consumed.
+	if unixSocketsRequested(p) {
+		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0, refuseUnixSockets("elevated")
+	}
 	if p.Net.Open && p.Net.ProxyPort != 0 {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
 			fmt.Errorf("%w: online Windows policy cannot claim an offline proxy endpoint", enforce.ErrUnavailable)
+	}
+	// The offline account's firewall rules permit exactly the pinned proxy
+	// ports and nothing else, so a narrower-than-open network policy that also
+	// asks for loopback, private ranges, DNS or extra ports cannot be enforced.
+	// Compiling it anyway would report NetworkBoundary for traffic the rules
+	// block, or a boundary the policy did not ask for.
+	if !p.Net.Open && (p.Net.Loopback || p.Net.Private || p.Net.DNS || len(p.Net.Ports) != 0) {
+		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
+			fmt.Errorf("%w: Windows elevated firewall rules cannot express loopback, private-network, DNS or port allowances", enforce.ErrUnavailable)
 	}
 	if p.Net.ProxyPort != 0 && !slices.Contains(snapshot.ProxyPorts, p.Net.ProxyPort) {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
@@ -615,9 +688,25 @@ func validateElevatedSnapshot(snapshot elevatedSetupSnapshot) error {
 	return nil
 }
 
+// elevatedLimitsRequested reports whether the policy asks for any Job limit
+// the launch path will install. Disabled limits are not installed
+// (executeElevatedRunner zeroes them, like the restricted process tree).
+func elevatedLimitsRequested(limits policy.Limits) bool {
+	return !limits.Disabled && (limits.MaxPIDs > 0 || limits.MaxMemBytes > 0 || limits.MaxCPUPct > 0)
+}
+
 func elevatedGuaranteeBits(p policy.Effective) uint64 {
 	bits := uint64(profile.GuaranteeProcessBoundary | profile.GuaranteeWriteBoundary |
-		profile.GuaranteeReadBoundary | profile.GuaranteeResourceLimits)
+		profile.GuaranteeReadBoundary)
+	// ResourceLimits is a claim that requested limits are installed. It is
+	// earned only when limits were requested, because the launch path
+	// installs them through NewJob, which reads every one of them back and
+	// fails the launch on a mismatch (design §8: "all non-zero requested
+	// limits are supported, installed, and read back"). With nothing
+	// requested there is nothing to claim (review L8).
+	if elevatedLimitsRequested(p.Limits) {
+		bits |= profile.GuaranteeResourceLimits
+	}
 	if !p.Env.Inherit {
 		bits |= profile.GuaranteeEnvScrub
 	}
@@ -633,7 +722,10 @@ func elevatedGuaranteeBits(p policy.Effective) uint64 {
 
 func elevatedFullLevel(p policy.Effective, bits uint64) bool {
 	requiredForPolicy := uint64(profile.GuaranteeProcessBoundary | profile.GuaranteeWriteBoundary |
-		profile.GuaranteeReadBoundary | profile.GuaranteeResourceLimits)
+		profile.GuaranteeReadBoundary)
+	if elevatedLimitsRequested(p.Limits) {
+		requiredForPolicy |= profile.GuaranteeResourceLimits
+	}
 	if !p.Env.Inherit {
 		requiredForPolicy |= profile.GuaranteeEnvScrub
 	}
@@ -647,17 +739,31 @@ func elevatedCompileReport(p policy.Effective, snapshot elevatedSetupSnapshot) p
 		}
 		return "Unavailable"
 	}
+	firewall := profile.ReportEntry{Feature: "windows.firewall", Status: status(snapshot.FirewallReady),
+		Detail: "offline-account outbound rules read back enabled, unchanged and effective on every profile, proxy ports held by no foreign process; loopback and system-service (SMB, WebClient, DNS client) egress are not filtered"}
+	if p.Net.Open {
+		firewall = profile.ReportEntry{Feature: "windows.firewall", Status: "unenforced",
+			Detail: "online account: no firewall rule applies to this profile"}
+	}
+	limits := profile.ReportEntry{Feature: "windows.resource-limits", Status: "unenforced", Detail: "no resource limits requested; none installed"}
+	if elevatedLimitsRequested(p.Limits) {
+		limits = profile.ReportEntry{Feature: "windows.resource-limits", Status: status(snapshot.JobReadbackReady),
+			Detail: "requested Job limits installed and read back at every launch; the launch fails on a mismatch"}
+	}
 	entries := []profile.ReportEntry{
 		{Feature: "windows.installed-host", Status: status(snapshot.RunnerHashVerified), Detail: "protected installed runner hash and protocol"},
 		{Feature: "windows.token", Status: status(snapshot.AccountsReady && snapshot.CredentialsReady), Detail: "broker-issued full restricted account token"},
 		{Feature: "windows.filesystem.read", Status: status(snapshot.Ready), Detail: "broker-owned identity-bound ACL lease"},
 		{Feature: "windows.filesystem.write", Status: status(snapshot.Ready), Detail: "broker-owned identity-bound ACL lease"},
-		{Feature: "windows.job", Status: status(snapshot.JobReadbackReady), Detail: "kill-on-close Job with no breakaway"},
-		{Feature: "windows.private-desktop", Status: status(snapshot.PrivateDesktopReady), Detail: "protected non-interactive window station and desktop"},
-		{Feature: "windows.resource-limits", Status: status(snapshot.JobReadbackReady), Detail: "Job limits validated by read-back"},
+		firewall,
+		{Feature: "windows.job", Status: status(snapshot.JobReadbackReady && snapshot.HandleListReady),
+			Detail: "kill-on-close Job with no breakaway and an explicit handle list; probed on this host at compile and verified again at every launch"},
+		{Feature: "windows.private-desktop", Status: status(snapshot.PrivateDesktopReady),
+			Detail: "protected non-interactive window station and desktop created per lease by the running broker, admitting only the lease's own SID; token issuance fails without it"},
+		limits,
 	}
 	for _, baseline := range p.RuntimeBaselines {
 		entries = append(entries, profile.ReportEntry{Feature: baseline, Status: status(snapshot.RuntimeBaselineReady), Detail: "approved installed runtime baseline"})
 	}
-	return profile.CompileReport{Entries: entries}
+	return withUnixSocketsReport(profile.CompileReport{Entries: entries}, p)
 }

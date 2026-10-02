@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/looprig/sandbox/internal/policy"
@@ -45,11 +46,11 @@ func TestTask20ReservedListenerHandoffKeepsEveryOtherPortDenyOnly(t *testing.T) 
 	if got, want := binder.bound, []uint16{39001, 39002, 39003}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("bind order = %v, want all configured ports reserved first as %v", got, want)
 	}
-	if binder.bindings[39002].activations != 1 {
-		t.Fatalf("proxy endpoint activations = %d, want one-way activation", binder.bindings[39002].activations)
+	if binder.bindings[39002].activationCount() != 1 {
+		t.Fatalf("proxy endpoint activations = %d, want one-way activation", binder.bindings[39002].activationCount())
 	}
 	for _, port := range []uint16{39001, 39003} {
-		if !reservation.IsGuard(port) || binder.bindings[port].activations != 0 {
+		if !reservation.IsGuard(port) || binder.bindings[port].activationCount() != 0 {
 			t.Fatalf("unused port %d did not remain a deny-only guard", port)
 		}
 	}
@@ -176,10 +177,11 @@ func TestTask20AutoForwardsReservedProxyCapabilityWithoutEphemeralFallback(t *te
 }
 
 func TestTask20ElevatedGuaranteesDescribeOfflineAndTargetPosture(t *testing.T) {
+	// ResourceLimits is not part of the base: it is earned only for
+	// requested limits (review L8; see TestElevatedResourceLimitsOnlyWhenRequested).
 	const base = profile.GuaranteeProcessBoundary |
 		profile.GuaranteeWriteBoundary |
 		profile.GuaranteeReadBoundary |
-		profile.GuaranteeResourceLimits |
 		profile.GuaranteeEnvScrub
 
 	tests := []struct {
@@ -331,25 +333,48 @@ func TestTask20BroadAndHostWideGrantsRemainUnsupported(t *testing.T) {
 // networkContractBinding is a hermetic listener seam. It proves ownership,
 // activation and release ordering without opening a workstation socket or
 // relying on the live firewall.
+//
+// Close must be idempotent and safe to call concurrently, exactly like the
+// production dualStackGuardBinding (closeOnce) and like any net.Listener. The
+// activated binding has two closers by design: NewProxyWithListener hands it
+// to http.Server.Serve, whose deferred onceCloseListener closes it as soon as
+// Accept fails (this fake's Accept fails immediately), on Serve's own
+// goroutine; and the reservation (proxyPortReservation.Close) or Proxy.Close
+// closes it again from the test goroutine. Neither ordering is fixed, so an
+// unsynchronised closed flag was a genuine data race in the fake (the first
+// hosted Windows -race run flagged all four Task 20 tests on it). mu guards
+// closed and activations; the closed flag stays the observable fact, and a
+// repeated Close returns nil just as the production binding's closeOnce does.
 type networkContractBinding struct {
-	port        uint16
+	port uint16
+
+	mu          sync.Mutex
 	activations int
 	closed      bool
 }
 
 func (b *networkContractBinding) Port() uint16 { return b.port }
 func (b *networkContractBinding) ActivateProxy() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.closed || b.activations != 0 {
 		return errors.New("invalid listener activation")
 	}
 	b.activations++
 	return nil
 }
+func (b *networkContractBinding) activationCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activations
+}
 func (b *networkContractBinding) Accept() (net.Conn, error) { return nil, net.ErrClosed }
 func (b *networkContractBinding) Addr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(b.port)}
 }
 func (b *networkContractBinding) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.closed = true
 	return nil
 }
