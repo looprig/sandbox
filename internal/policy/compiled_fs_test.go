@@ -116,6 +116,34 @@ func TestCompiledFSSnapshotAxes(t *testing.T) {
 			name:    "plain writable root has no snapshot",
 			entries: []FSEntry{{Path: root, Access: AllAccess}},
 		},
+		{
+			// L9: a recursive host read deny at "/" whose read/execute the
+			// workspace allow restores keeps the workspace write allow
+			// (readRestoredBetween, 1760f0b), so write is NOT withheld there
+			// and must not be reported as a snapshot axis.
+			name: "recursive ancestor read deny restored by the write allow is not a write snapshot",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: AllAccess},
+			},
+		},
+		{
+			name: "read restored by a separate recursive entry is not a write snapshot",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: ReadAccess | ExecAccess},
+				{Path: root, Access: WriteAccess, Canonical: true},
+			},
+		},
+		{
+			name: "restored read still snapshots write around a nested read deny",
+			entries: []FSEntry{
+				{Path: string(filepath.Separator), Denied: AllAccess},
+				{Path: root, Access: AllAccess},
+				{Path: protected, Denied: ReadAccess},
+			},
+			want: ReadAccess | WriteAccess,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

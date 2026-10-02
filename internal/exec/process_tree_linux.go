@@ -41,8 +41,8 @@ func (linuxNamespaceProof) terminateAndWait() (error, error) { return nil, nil }
 func (linuxNamespaceProof) close()                           {}
 
 // linuxCgroupProof is the Rung-2 zeroProver: a dedicated delegated cgroup v2
-// lifetime scope (linux.LifetimeScope), independent of any policy.Limits
-// resource-limit cgroup. terminateAndWait defers entirely to
+// lifetime scope (linux.LifetimeScope), separate from the backend's
+// resource-limit cgroup but carrying the same compiled policy.Limits. terminateAndWait defers entirely to
 // LifetimeScope.KillAndWait, the mandatory result-bearing proof (cgroup.kill
 // plus a successful cgroup.procs-empty read); a failed/indeterminate proof
 // keeps the scope's directory and join fd retained (KillAndWait's own
@@ -70,7 +70,9 @@ func (p *linuxCgroupProof) close() {}
 // configure may have set is still visible on cmd.SysProcAttr and gets
 // overridden here for the Rung-2 case (see LifetimeScope.Join's doc: a
 // supervised spawn's lifetime join always wins the single clone3
-// CLONE_INTO_CGROUP slot).
+// CLONE_INTO_CGROUP slot). Because it wins, the lifetime scope is created with
+// the snapshot's policy.Limits (linux.NewLifetimeScopeWithLimits), so the
+// displaced resource-limit scope's memory.max / cpu.max / pids.max still apply.
 //
 // options.Backend not asserting to *linux.Backend (an unconfined executor, or
 // a backend pinned by a non-Linux-backend test seam) attaches nothing and
@@ -85,7 +87,11 @@ func attachSupervisedProof(cmd *exec.Cmd, options processTreeOptions) (zeroProve
 	case linux.RungOne:
 		return linuxNamespaceProof{}, nil
 	case linux.RungTwo:
-		scope, err := linux.NewLifetimeScope(lb.CgroupPids)
+		// The lifetime join displaces the backend's resource-limit scope
+		// (Join's doc), so the lifetime scope must itself carry the policy's
+		// compiled limits or a supervised spawn runs uncapped while
+		// GuaranteeResourceLimits is reported (review H3).
+		scope, err := linux.NewLifetimeScopeWithLimits(lb.CgroupPids, options.Limits)
 		if err != nil {
 			return nil, errors.Join(enforce.ErrLifetimeContainmentUnavailable, err)
 		}

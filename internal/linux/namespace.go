@@ -55,9 +55,10 @@ import (
 // GlobScanMaxDepth bounds the spawn-time glob-deny scan (SPEC §7.5). It mirrors
 // Codex's glob_scan_max_depth precedent: deep enough to reach a repo-local
 // `.env` a few directories down, shallow enough that the per-spawn scan of the
-// workspace + $HOME stays cheap and bounded (a glob mask is spawn-time work on
-// the hot path). A match below this depth is not masked for that spawn; the
-// residual is recorded, never silently widened.
+// workspace, $HOME and the bound roots stays cheap and bounded (a glob mask is
+// spawn-time work on the hot path). A match below this depth is not masked for
+// that spawn; the residual is disclosed (glob-deny "narrowed"), never silently
+// widened.
 const GlobScanMaxDepth = 8
 
 // mountViewOp is the Stage2Error.Op for every Rung-1 mount-view failure, so the
@@ -87,11 +88,11 @@ type MountViewPlan struct {
 	// higher-precedence restoration and can therefore use a coarse empty
 	// read-only mask. Restored literal precedence composes through Landlock.
 	DenyMasks []string
-	// GlobDenies are the glob deny patterns (e.g. **/.env*), Enforced by spawn-time
-	// bounded enumeration (ScanGlobDenies) into empty read-only masks.
+	// GlobDenies are the glob deny patterns (e.g. **/.env*), narrowed to a
+	// spawn-time bounded enumeration (ScanGlobDenies) into empty read-only masks.
 	GlobDenies []string
 	// scanRoots are the roots scanned for GlobDenies (workspace + writable roots +
-	// $HOME, §7.5). Bounded to GlobScanMaxDepth.
+	// read-only roots other than "/" + $HOME, §7.5). Bounded to GlobScanMaxDepth.
 	scanRoots []string
 	// grantBinds maps a granted canonical target to the inherited descriptor
 	// index and type captured atomically by the executor.
@@ -204,8 +205,21 @@ func compileMountViewWithGrantPaths(p policy.Effective, handles []*policy.PathHa
 		}
 	}
 
-	// Glob scan roots: the writable roots plus the workspace and $HOME (§7.5).
+	// Glob scan roots: the writable roots, the read-only roots, the workspace
+	// and $HOME (§7.5). Read-only binds are scanned too (review M6): a `.env`
+	// under a read-only bound root is as visible in the view as one under a
+	// writable root, and an empty read-only mask over a read-only bind is
+	// harmless. The filesystem root "/" (a HostRead-Allow rbind) is the one
+	// read-only bind NOT walked: a depth-bounded walk of the whole host on every
+	// spawn would cost the hot path everything, so a host-wide match outside
+	// the other roots is the disclosed residual (glob-deny is reported
+	// "narrowed", rung1CompileReport).
 	roots := append([]string(nil), plan.RWBinds...)
+	for _, path := range plan.ROBinds {
+		if path != string(filepath.Separator) {
+			roots = appendUniquePath(roots, path)
+		}
+	}
 	if p.Workspace != "" {
 		roots = appendUniquePath(roots, filepath.Clean(p.Workspace))
 	}

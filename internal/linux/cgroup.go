@@ -397,9 +397,11 @@ func (tc *transientCgroup) finishRemoval() error {
 // mechanism the optional resource-limit cgroup already uses (linuxWrap), but
 // this scope's own fd, taking priority over any resource-limit scope's fd
 // already set on attr: a supervised spawn's lifetime-containment join always
-// wins the single available join slot (SPEC Task 12b — resource limiting is
-// containment-of-cost, not a lifetime guarantee, and the two are mutually
-// exclusive at this one kernel join point for a given spawn).
+// wins the single available join slot (SPEC Task 12b — the two are mutually
+// exclusive at this one kernel join point for a given spawn). Because the
+// displaced resource-limit scope never receives the child, a supervised
+// spawn's lifetime scope is created with the same compiled limits
+// (NewLifetimeScopeWithLimits, review H3).
 func (tc *transientCgroup) Join(attr *syscall.SysProcAttr) {
 	if tc == nil || attr == nil || tc.fd < 0 {
 		return
@@ -408,9 +410,10 @@ func (tc *transientCgroup) Join(attr *syscall.SysProcAttr) {
 	attr.CgroupFD = tc.fd
 }
 
-// LifetimeScope is a delegated cgroup v2 scope created purely for exact
-// process-tree containment (SPEC Task 12b) — independent of, and never
-// conflated with, any policy.Limits resource-limit configuration. Join wires
+// LifetimeScope is a delegated cgroup v2 scope created for exact process-tree
+// containment (SPEC Task 12b). Its EXISTENCE never depends on policy.Limits (a
+// Disabled policy still gets one), but it carries the policy's compiled limits
+// because it displaces the resource-limit scope at the join (review H3). Join wires
 // it onto a spawn's SysProcAttr before Start; KillAndWait is the mandatory,
 // result-bearing zero-proof a supervised spawn's confirmed teardown depends
 // on. It is the Rung-2 counterpart to Rung 1's PID-namespace containment
@@ -423,28 +426,68 @@ type LifetimeScope interface {
 
 // NewLifetimeScope creates one supervised spawn's dedicated lifetime cgroup
 // under ancestor — the backend's already-probed delegated pids Ancestor
-// (Backend.CgroupPids). It applies only the load-bearing pids.max safety cap
-// (DefaultMaxPIDs), never a caller-tunable resource limit: this scope's sole
-// purpose is an exact cgroup.kill + cgroup.procs-empty containment proof, not
-// cost control (the separate, policy-driven, best-effort resource-limit
-// cgroup is CompiledCgroup/CreateTransientCgroup, unchanged by this
-// function). ancestor == "" (no delegation) fails closed with
-// enforce.ErrLifetimeContainmentUnavailable — there is no best-effort
-// fallback for a supervised Rung-2 spawn's containment (SPEC Task 12b).
+// (Backend.CgroupPids) — carrying only the default pids.max safety cap
+// (DefaultMaxPIDs). It is NewLifetimeScopeWithLimits with no policy limits;
+// a supervised spawn compiled under a policy must use that function instead,
+// or the policy's limits are lost (review H3). ancestor == "" fails closed
+// with enforce.ErrLifetimeContainmentUnavailable.
 func NewLifetimeScope(ancestor string) (LifetimeScope, error) {
+	return NewLifetimeScopeWithLimits(ancestor, policy.Limits{})
+}
+
+// NewLifetimeScopeWithLimits creates one supervised spawn's dedicated lifetime
+// cgroup under ancestor, carrying the policy's compiled resource limits
+// (lifetimeCgroupPlan): pids.max (the policy's MaxPIDs, else DefaultMaxPIDs),
+// and memory.max / cpu.max when set.
+//
+// It exists because a supervised Rung-2 spawn has ONE clone3
+// CLONE_INTO_CGROUP slot and the lifetime join always wins it (Join's doc):
+// the backend's own resource-limit scope, set by linuxWrap's configure, is
+// overwritten before Start and never receives the child. A pids-only lifetime
+// scope therefore silently dropped every MaxMemBytes / MaxCPUPct / custom
+// MaxPIDs a policy set while GuaranteeResourceLimits was still reported
+// (review H3); carrying the compiled limits on the lifetime scope itself
+// restores them. The backend's now-unjoined scope stays empty and is still
+// removed by linuxWrap's cleanup (transientCgroup.Teardown).
+//
+// The containment contract is unchanged: ancestor == "" (no delegation), or a
+// scope that cannot be created or whose pids.max does not read back, fails
+// closed with enforce.ErrLifetimeContainmentUnavailable — there is no
+// best-effort fallback for a supervised Rung-2 spawn's containment (SPEC Task
+// 12b). memory.max and cpu.max stay best-effort writes exactly as on the
+// resource-limit path (applyCgroupLimits), so an undelegated cpu controller
+// narrows the cost limit but never fails the spawn. A policy that Disables
+// resource limits still gets a scope — containment is not a cost limit — with
+// the DefaultMaxPIDs cap the scope has always carried.
+func NewLifetimeScopeWithLimits(ancestor string, limits policy.Limits) (LifetimeScope, error) {
 	if ancestor == "" {
 		return nil, enforce.ErrLifetimeContainmentUnavailable
 	}
-	tc, err := CreateTransientCgroup(CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs})
+	tc, err := CreateTransientCgroup(lifetimeCgroupPlan(ancestor, limits))
 	if err != nil {
 		return nil, errors.Join(enforce.ErrLifetimeContainmentUnavailable, err)
 	}
 	if tc == nil {
-		// Unreachable given a non-empty Ancestor above (Enforced() is then
-		// always true), but guarded rather than assumed.
+		// Unreachable given a non-empty Ancestor above (lifetimeCgroupPlan
+		// always sets it, so Enforced() is true), but guarded rather than
+		// assumed.
 		return nil, enforce.ErrLifetimeContainmentUnavailable
 	}
 	return tc, nil
+}
+
+// lifetimeCgroupPlan is the CompiledCgroup a supervised spawn's lifetime scope
+// is created from: exactly the plan CompileCgroupPolicy builds for the
+// resource-limit scope, so both paths apply the same values, except that a
+// Disabled policy still yields a scope with the DefaultMaxPIDs cap (the
+// lifetime scope is mandatory containment, not an optional cost limit).
+// ancestor must be non-empty; NewLifetimeScopeWithLimits checks it first.
+func lifetimeCgroupPlan(ancestor string, limits policy.Limits) CompiledCgroup {
+	cg := CompileCgroupPolicy(limits, ancestor)
+	if !cg.Enforced() {
+		return CompiledCgroup{Ancestor: ancestor, PidsMax: DefaultMaxPIDs}
+	}
+	return cg
 }
 
 // FormatCPUMax renders a MaxCPUPct as a cgroup v2 cpu.max value ("<quota>

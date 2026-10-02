@@ -4,11 +4,17 @@ package exec
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/linux"
+	"github.com/looprig/sandbox/internal/policy"
 )
 
 // TestProcessTreeLinuxContainmentPlan is Task 12b's queued phase-gate
@@ -73,6 +79,48 @@ func TestProcessTreeLinuxContainmentPlan(t *testing.T) {
 			t.Fatalf("Rung-2 proof.terminateAndWait() = %v, want nil (nothing was ever joined)", proofErr)
 		}
 		proof.close()
+	})
+
+	t.Run("Rung 2 lifetime scope carries the policy resource limits", func(t *testing.T) {
+		// Review H3: the lifetime join displaces the backend's resource-limit
+		// scope, so the scope the supervised child actually joins must carry
+		// the snapshot's compiled limits.
+		ancestor := requireLifetimeCgroupForExecTest(t)
+		const pids, mem = 43, 80 << 20
+		cmd := exec.Command("true")
+		proof, err := attachSupervisedProof(cmd, processTreeOptions{
+			Supervised: true,
+			Limits:     policy.Limits{MaxPIDs: pids, MaxMemBytes: mem},
+			Backend:    &linux.Backend{Rung: linux.RungTwo, CgroupPids: ancestor},
+		})
+		if err != nil {
+			t.Fatalf("attachSupervisedProof (Rung 2, limits) = %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = proof.terminateAndWait()
+			proof.close()
+		})
+		if cmd.SysProcAttr == nil || !cmd.SysProcAttr.UseCgroupFD {
+			t.Fatal("supervised spawn not joined to its lifetime scope")
+		}
+		dir, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", cmd.SysProcAttr.CgroupFD))
+		if err != nil {
+			t.Fatalf("resolve joined cgroup fd: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(dir, "pids.max"))
+		if err != nil {
+			t.Fatalf("read joined scope pids.max: %v", err)
+		}
+		if strings.TrimSpace(string(got)) != strconv.Itoa(pids) {
+			t.Errorf("joined scope pids.max = %q, want %d (policy MaxPIDs dropped)", got, pids)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, "memory.max")); err == nil {
+			if strings.TrimSpace(string(got)) != strconv.Itoa(mem) {
+				t.Errorf("joined scope memory.max = %q, want %d (policy MaxMemBytes dropped)", got, mem)
+			}
+		} else {
+			t.Logf("memory controller not enabled for the scope (%v); memory.max not asserted", err)
+		}
 	})
 
 	t.Run("Rung 2 without a delegated cgroup rejects the supervised spawn before it starts", func(t *testing.T) {
