@@ -24,7 +24,12 @@ import (
 // the platform path-key normalization used by literal matches plus
 // filepath.Clean. Windows keys fold case and separators; Unix keys remain byte
 // and separator sensitive. Passing an unresolved path could let a deny be
-// bypassed via a symlink or a case variant on macOS.
+// bypassed via a symlink or a case variant on macOS. On Windows "canonical"
+// also means the long-name spelling a handle resolves to (profile.CanonicalRoot,
+// winpath.Object.DOSPath): an 8.3 alias such as C:\Users\RUNNER~1 is a
+// different key from C:\Users\runneradmin and cannot be expanded lexically,
+// so a short-name target misses every entry stored under the long name and
+// resolves under whatever encloses both spellings (typically the drive root).
 func ResolveFS(entries []FSEntry, path string) FSAccess {
 	target := pathKey(filepath.Clean(path))
 	var globDenied FSAccess

@@ -3,7 +3,9 @@ package profile
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -31,9 +33,15 @@ func TestUnixSocketsNormalizeAndFingerprint(t *testing.T) {
 	workspace := t.TempDir()
 	agent := filepath.Join(t.TempDir(), "agent.sock")
 	docker := filepath.Join(t.TempDir(), "docker.sock")
+	// The trailing-separator spelling is the platform's own separator (a
+	// filepath.Join-built path ending in one), plus a literal "/": on Windows
+	// filepath treats '/' as a separator too, so `C:\...\agent.sock/` is the
+	// same tolerated spelling; on darwin and Linux the two cases coincide.
 	a := mustProfile(t, ProfileConfig{
 		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
-		UnixSockets: UnixSocketPolicy{Mode: UnixSocketsLocal, Paths: []string{docker, agent, agent + "/"}},
+		UnixSockets: UnixSocketPolicy{Mode: UnixSocketsLocal, Paths: []string{
+			docker, agent, agent + string(filepath.Separator), agent + "/",
+		}},
 	})
 	got := a.UnixSockets()
 	if got.Mode != UnixSocketsLocal {
@@ -76,6 +84,13 @@ func TestUnixSocketsRejectsInvalidInput(t *testing.T) {
 		"unclean path":  {Paths: []string{"/run/../run/agent.sock"}},
 		"empty path":    {Paths: []string{""}},
 		"root path":     {Paths: []string{"/"}},
+		// The two Unix spellings above are not even absolute on Windows, so
+		// they are refused there for the wrong reason. These are the same
+		// cases spelled for the platform: a ".." under the absolute
+		// workspace, and the root of the volume holding it ("/" again off
+		// Windows), each refused on every GOOS.
+		"platform unclean path": {Paths: []string{strings.Join([]string{workspace, "run", "..", "agent.sock"}, string(filepath.Separator))}},
+		"volume root path":      {Paths: []string{filepath.VolumeName(workspace) + string(filepath.Separator)}},
 	} {
 		_, err := NewProfile(ProfileConfig{
 			WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow, UnixSockets: policy,
@@ -83,6 +98,29 @@ func TestUnixSocketsRejectsInvalidInput(t *testing.T) {
 		if !errors.Is(err, ErrInvalidProfile) {
 			t.Errorf("%s: NewProfile error = %v, want ErrInvalidProfile", name, err)
 		}
+	}
+}
+
+// TestUnixSocketsTrailingBackslashIsPlatformSpecific pins the other half of
+// the trailing-separator rule: only bytes filepath treats as separators are
+// trimmed. On Windows a trailing '\' is the separator and folds into the
+// bare path; on darwin and Linux '\' is an ordinary filename byte, so
+// "agent.sock\" names a different socket and must survive as its own grant
+// rather than being silently re-spelled onto "agent.sock".
+func TestUnixSocketsTrailingBackslashIsPlatformSpecific(t *testing.T) {
+	workspace := t.TempDir()
+	agent := filepath.Join(t.TempDir(), "agent.sock")
+	p := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		UnixSockets: UnixSocketPolicy{Paths: []string{agent, agent + `\`}},
+	})
+	want := []string{agent}
+	if runtime.GOOS != "windows" {
+		want = append(want, agent+`\`)
+	}
+	slices.Sort(want)
+	if got := p.UnixSockets().Paths; !slices.Equal(got, want) {
+		t.Fatalf("Paths = %q, want %q on %s", got, want, runtime.GOOS)
 	}
 }
 

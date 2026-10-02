@@ -266,12 +266,18 @@ func TestRestrictKeepsNestedRootsEqualToHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restrict: %v", err)
 	}
+	// The host-scope probes are the workspace's parent and the root of the
+	// volume holding it, spelled for this platform: "/" is not an absolute
+	// path on Windows (filepath.IsAbs needs a volume), so AccessFor rightly
+	// refuses it there as a malformed scope. VolumeName is "" off Windows, so
+	// the root probe is still "/" on darwin and Linux.
+	volumeRoot := filepath.VolumeName(workspace) + string(filepath.Separator)
 	probes := []string{
 		workspace, filepath.Join(workspace, "file"),
 		secret, filepath.Join(secret, "key"),
 		shared, filepath.Join(shared, "file"),
 		sharedSecret, filepath.Join(sharedSecret, "key"),
-		filepath.Dir(workspace), "/",
+		filepath.Dir(workspace), volumeRoot,
 	}
 	for _, path := range probes {
 		for _, kind := range []string{"filesystem.read", "filesystem.write"} {

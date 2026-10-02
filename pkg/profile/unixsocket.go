@@ -53,6 +53,21 @@ func (policy UnixSocketPolicy) clone() UnixSocketPolicy {
 
 func validUnixSocketMode(mode UnixSocketMode) bool { return mode <= UnixSocketsLocal }
 
+// trailingSeparators is the set of characters normalizeUnixSockets trims from
+// the end of a path: every byte filepath treats as a separator on this
+// platform. On Windows that is both '\' and '/' (filepath.Clean and
+// IsPathSeparator accept either), so `C:\run\agent.sock/` — what a caller
+// joining with a literal "/" produces — is the same tolerated trailing
+// separator as its backslash spelling. On darwin and Linux it is "/" alone:
+// '\' is an ordinary filename byte there, and trimming it would rename the
+// socket.
+var trailingSeparators = func() string {
+	if filepath.Separator != '/' {
+		return string(filepath.Separator) + "/"
+	}
+	return "/"
+}()
+
 // normalizeUnixSockets validates and normalizes a caller's policy: a known
 // mode, and absolute, clean, non-root, deduplicated and sorted paths. A path
 // need not exist yet (an agent socket is often created after the profile),
@@ -67,7 +82,7 @@ func normalizeUnixSockets(policy UnixSocketPolicy) (UnixSocketPolicy, error) {
 		// A trailing separator is tolerated (a caller joining paths produces
 		// one); anything else that Clean would rewrite is refused rather than
 		// silently re-spelled, so a ".." never hides in a grant.
-		trimmed := strings.TrimRight(raw, string(filepath.Separator))
+		trimmed := strings.TrimRight(raw, trailingSeparators)
 		if trimmed == "" || !filepath.IsAbs(trimmed) || filepath.Clean(trimmed) != trimmed {
 			return UnixSocketPolicy{}, fmt.Errorf("%w: unix socket path %d %q is not an absolute clean path", ErrInvalidProfile, i, raw)
 		}
