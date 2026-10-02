@@ -63,6 +63,10 @@ type Effective struct {
 	// ProjectionRoots contains only configured roots eligible for a Windows
 	// restricting-SID ACL projection. Host volumes and runtime baselines are absent.
 	ProjectionRoots []string
+	// UnixSockets is the profile's AF_UNIX escape hatch (profile.UnixSocketPolicy):
+	// the zero value denies socket(AF_UNIX); a backend that admits it must
+	// confine the reachable endpoints or report what it cannot confine.
+	UnixSockets profile.UnixSocketPolicy
 	// RequiredGuarantees is the immutable public-profile requirement snapshot.
 	// Backends use it only for typed mechanism selection errors; achieved bits
 	// remain authoritative and are checked independently by the executor.
@@ -74,6 +78,7 @@ func Clone(p Effective) Effective {
 	clone.FS = append([]FSEntry(nil), p.FS...)
 	clone.RuntimeBaselines = append([]string(nil), p.RuntimeBaselines...)
 	clone.ProjectionRoots = append([]string(nil), p.ProjectionRoots...)
+	clone.UnixSockets.Paths = append([]string(nil), p.UnixSockets.Paths...)
 	clone.Net.Ports = append([]uint16(nil), p.Net.Ports...)
 	clone.Env.Allow = append([]string(nil), p.Env.Allow...)
 	if p.Env.Set != nil {
@@ -99,6 +104,7 @@ func compileWithHostRoots(prof *profile.Profile, roots func() ([]string, error))
 		Isolation:          settings.Isolation,
 		Home:               settings.Home,
 		RequiredGuarantees: settings.RequiredGuarantees,
+		UnixSockets:        settings.UnixSockets,
 	}
 	if settings.Isolation == profile.Unconfined {
 		hostRoots, err := roots()

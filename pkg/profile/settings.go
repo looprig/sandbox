@@ -18,6 +18,7 @@ type Settings struct {
 	Isolation          Isolation
 	AdditionalRoots    []RootAccess
 	AckUnconfined      bool
+	UnixSockets        UnixSocketPolicy
 	RequiredGuarantees uint64
 	Fingerprint        string
 }
@@ -44,6 +45,7 @@ func (p *Profile) Settings() Settings {
 		Isolation:          p.isolation,
 		AdditionalRoots:    roots,
 		AckUnconfined:      p.ackUnconfined,
+		UnixSockets:        p.unixSockets.clone(),
 		RequiredGuarantees: p.requiredGuarantees,
 		Fingerprint:        p.fingerprint,
 	}

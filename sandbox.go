@@ -39,7 +39,23 @@ type (
 	CompileReport = profile.CompileReport
 	// Guarantees reports properties actually enforced by the selected backend.
 	Guarantees = profile.Guarantees
+	// UnixSocketMode is the coarse AF_UNIX posture; the zero value denies.
+	UnixSocketMode = profile.UnixSocketMode
+	// UnixSocketPolicy is the explicit AF_UNIX escape hatch on a ProfileConfig.
+	UnixSocketPolicy = profile.UnixSocketPolicy
 )
+
+// UnixSocketMode values.
+const (
+	UnixSocketsDenied = profile.UnixSocketsDenied
+	UnixSocketsLocal  = profile.UnixSocketsLocal
+)
+
+// DangerousUnixSocket reports whether a socket path names a known same-user
+// broker (D-Bus, systemd, a container daemon, a display server) and why.
+func DangerousUnixSocket(socketPath string) (reason string, dangerous bool) {
+	return profile.DangerousUnixSocket(socketPath)
+}
 
 // Access values.
 const (

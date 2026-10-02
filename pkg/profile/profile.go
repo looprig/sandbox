@@ -58,6 +58,8 @@ type ProfileConfig struct {
 	Isolation       Isolation
 	AdditionalRoots []RootAccess
 	AckUnconfined   bool
+	// UnixSockets is the explicit AF_UNIX escape hatch; the zero value denies.
+	UnixSockets UnixSocketPolicy
 }
 
 // ErrInvalidProfile identifies malformed, unconstructed, or inconsistent
@@ -78,6 +80,7 @@ type Profile struct {
 	isolation          Isolation
 	additionalRoots    []RootAccess
 	ackUnconfined      bool
+	unixSockets        UnixSocketPolicy
 	requiredGuarantees uint64
 	fingerprint        string
 }
@@ -135,6 +138,10 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		}
 	}
 	sort.Slice(roots, func(i, j int) bool { return canonicalPathLess(roots[i].Path, roots[j].Path) })
+	unixSockets, err := normalizeUnixSockets(config.UnixSockets)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &Profile{
 		version:         currentAccessVersion,
@@ -149,6 +156,7 @@ func NewProfile(config ProfileConfig) (*Profile, error) {
 		isolation:       config.Isolation,
 		additionalRoots: roots,
 		ackUnconfined:   config.AckUnconfined,
+		unixSockets:     unixSockets,
 	}
 	if err := p.validateUnconfined(); err != nil {
 		return nil, err
@@ -290,6 +298,14 @@ func (p *Profile) accessAtPath(write bool, path string) Access {
 }
 
 // PathWithin reports whether path is root itself or lies beneath it.
+// UnixSockets returns a copy of the profile's AF_UNIX escape-hatch policy.
+func (p *Profile) UnixSockets() UnixSocketPolicy {
+	if p == nil {
+		return UnixSocketPolicy{}
+	}
+	return p.unixSockets.clone()
+}
+
 func PathWithin(path, root string) bool {
 	return canonicalPathWithin(path, root)
 }
@@ -317,10 +333,18 @@ func profileFingerprint(p *Profile) (string, error) {
 		AdditionalRoots    []RootAccess
 		AckUnconfined      bool
 		RequiredGuarantees uint64
+		// UnixSockets is omitted when zero so every profile minted before the
+		// escape hatch existed keeps its fingerprint; any non-default policy is
+		// authority and changes it.
+		UnixSockets *UnixSocketPolicy `json:",omitempty"`
 	}{
 		p.version, p.workspaceRoot, p.workspaceRead, p.workspaceWrite,
 		p.hostRead, p.hostWrite, p.network, p.command, p.home, p.isolation,
-		p.additionalRoots, p.ackUnconfined, p.requiredGuarantees,
+		p.additionalRoots, p.ackUnconfined, p.requiredGuarantees, nil,
+	}
+	if !p.unixSockets.isZero() {
+		policy := p.unixSockets.clone()
+		payload.UnixSockets = &policy
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -353,6 +377,7 @@ func Restrict(base, ceiling *Profile) (*Profile, error) {
 		Isolation:      minIsolation(base.isolation, ceiling.isolation),
 	}
 	config.AckUnconfined = config.Isolation == Unconfined && base.ackUnconfined && ceiling.ackUnconfined
+	config.UnixSockets = restrictUnixSockets(base.unixSockets, ceiling.unixSockets)
 
 	// Every path that is a root of either input is a candidate root of the
 	// result, carrying the intersection of what each input resolves there.
