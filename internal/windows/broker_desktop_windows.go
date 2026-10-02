@@ -97,7 +97,7 @@ func (manager *localSystemBrokerDesktopManager) Create(
 	default:
 		return brokerManagedDesktop{}, errInvalidBrokerDesktopTrustees
 	}
-	descriptor, err := brokerDesktopSecurityDescriptor(accountSID, context.Installation)
+	descriptor, err := brokerDesktopSecurityDescriptor(accountSID, context.Restricting)
 	if err != nil {
 		return brokerManagedDesktop{}, err
 	}
@@ -132,24 +132,35 @@ func (manager *localSystemBrokerDesktopManager) Create(
 	return brokerManagedDesktop{Name: desktop.Name, close: retained.Close}, nil
 }
 
-func brokerDesktopSecurityDescriptor(accountSIDText string, installationSID SID) (*win.SECURITY_DESCRIPTOR, error) {
+// brokerDesktopSecurityDescriptor admits SYSTEM, the lease's sandbox account
+// and the lease's own one-shot restricting SID. A full restricted-token
+// access check requires both the normal account SID and a restricting SID to
+// allow the requested access, so the restricting trustee decides which
+// sandboxes can open this window station and desktop at all. It used to be
+// the installation SID, which every lease's token carries: two concurrent
+// same-account sandboxes could then open each other's private desktops
+// (review L8). The lease SID is carried by exactly this lease's runner and
+// target, consistent with H10 (per-lease SIDs only on per-lease objects).
+func brokerDesktopSecurityDescriptor(accountSIDText string, leaseSID SID) (*win.SECURITY_DESCRIPTOR, error) {
 	if err := validateBrokerDesktopAccountSID(accountSIDText); err != nil {
 		return nil, err
 	}
 	accountSID, err := win.StringToSid(accountSIDText)
-	if installationSID.kind != sidKindInstallation || !installationSID.isModuleTrustee() {
+	if err != nil {
+		return nil, errors.Join(errInvalidBrokerDesktopTrustees, err)
+	}
+	if leaseSID.kind == sidKindInstallation || !leaseSID.isRestrictedTierTrustee() {
 		return nil, errInvalidBrokerDesktopTrustees
 	}
-	restrictingSID, err := win.StringToSid(installationSID.String())
+	restrictingSID, err := win.StringToSid(leaseSID.String())
 	if err != nil || restrictingSID == nil || !restrictingSID.IsValid() ||
 		win.EqualSid(accountSID, restrictingSID) {
 		return nil, errors.Join(errInvalidBrokerDesktopTrustees, err)
 	}
 
-	// A full restricted-token access check requires both the normal account SID
-	// and a restricting SID to allow the requested access. SYSTEM is the exact
-	// owner and the only service principal. In particular, neither the
-	// installation owner nor BUILTIN\Administrators is admitted.
+	// SYSTEM is the exact owner and the only service principal. In
+	// particular, neither the installation owner, BUILTIN\Administrators nor
+	// the installation SID is admitted.
 	sddl := fmt.Sprintf(
 		"O:SYD:P(A;;GA;;;SY)(A;;GA;;;%s)(A;;GA;;;%s)",
 		accountSID.String(),

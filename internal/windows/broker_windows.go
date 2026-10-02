@@ -105,8 +105,31 @@ type brokerLease struct {
 	desktop     *brokerManagedDesktop
 }
 
+// brokerClientLiveness is the optional half of brokerClientProcess that lets
+// reconcile tell a dead client from a live one. The production process
+// (pipe_windows.go) answers from the retained, SYNCHRONIZE-capable process
+// handle, so a recycled PID can never make a dead binding look alive.
+type brokerClientLiveness interface {
+	Exited() (bool, error)
+}
+
 type windowsBroker struct {
-	mu              sync.Mutex
+	// mu guards every map and counter below. It is held for bookkeeping and
+	// for retirement, but deliberately NOT across a lease's projection: an
+	// acquire may perform thousands of fsynced journal writes and impersonated
+	// opens, and holding mu for all of it stalled every other client's status,
+	// release and token request (review L8). An in-progress acquire is instead
+	// registered in acquiring under mu, projected without it, and published
+	// into leases (or aborted) under mu again.
+	mu sync.Mutex
+	// aclMu serializes every DACL read-modify-write the broker performs
+	// (acl.Plan/Apply/Rollback). Concurrent acquires, releases and reconciles
+	// may touch the same object, and an unserialized snapshot -> setDACL pair
+	// from one could overwrite the other's freshly inserted ACE: losing an
+	// allow only fails closed, but losing a carveout's deny would widen. Lock
+	// order is mu -> aclMu -> the journal store's own mutex; aclMu is never
+	// held while mu is being acquired.
+	aclMu           sync.Mutex
 	installationSID SID
 	sids            *OneShotSIDGenerator
 	leaseEntropy    io.Reader
@@ -115,6 +138,11 @@ type windowsBroker struct {
 	tokens          brokerRestrictedTokenIssuer
 	desktops        brokerDesktopManager
 	leases          map[ACLLeaseID]*brokerLease
+	// acquiring holds leases whose Reserved record is durable but whose
+	// projection is still running outside mu. Each is owned exclusively by its
+	// acquiring goroutine: reconcile, Disconnect and status never touch one,
+	// and that goroutine itself publishes it into leases or aborts it.
+	acquiring map[ACLLeaseID]*brokerLease
 	// quarantined holds leases whose rollback or release record failed. Each
 	// keeps its journal record (Released is never written for it), its SID is
 	// never reissued (the one-shot generator retires every SID it hands out),
@@ -132,16 +160,25 @@ func newWindowsBroker(installationSID SID, sids *OneShotSIDGenerator, journal *b
 	if leaseEntropy == nil {
 		leaseEntropy = rand.Reader
 	}
-	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, desktops: desktops, leases: make(map[ACLLeaseID]*brokerLease), quarantined: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
+	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, desktops: desktops,
+		leases: make(map[ACLLeaseID]*brokerLease), acquiring: make(map[ACLLeaseID]*brokerLease),
+		quarantined: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
 	// Reconciliation is a constructor invariant: no status or token operation
 	// can be served by an instance that has not resolved its durable cleanup
 	// log. A lease that cannot be rolled back yet is resolved by quarantine,
 	// not by refusing to start: a fatal error here would put the service in an
 	// SCM restart loop that can never clear (design §13). An unreadable journal
-	// is still fatal, because then no lease can be accounted for at all.
+	// is still fatal, because then no lease can be accounted for at all. No
+	// connection exists yet, so every journaled lease is an orphan of a
+	// previous service instance and reconcile rolls all of them back.
 	if err := broker.reconcile(); err != nil && !errors.Is(err, errBrokerLeaseRecoveryPending) {
 		return nil, fmt.Errorf("reconcile broker leases at startup: %w", err)
 	}
+	// Compaction follows reconciliation so the rewritten journal carries only
+	// what is still owed (review M14). Its failure is not fatal: the journal it
+	// would have replaced is intact and still authoritative, and the next
+	// Released record past the threshold retries it.
+	_ = broker.journal.compact()
 	return broker, nil
 }
 
@@ -159,28 +196,12 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 		return response
 	}
 
-	broker.mu.Lock()
-	defer broker.mu.Unlock()
 	var err error
-	switch request.Kind {
-	case brokerMessageStatus:
-		err = broker.retryQuarantined()
-		broker.generation++
-		response.Generation = broker.generation
-	case brokerMessageAcquireLease:
+	if request.Kind == brokerMessageAcquireLease {
+		// acquire manages mu itself so that its projection runs unlocked.
 		response.LeaseID, err = broker.acquire(connection, request.Objects)
-	case brokerMessageReleaseLease:
-		err = broker.release(binding, ACLLeaseID(request.LeaseID))
-	case brokerMessageIssueRestrictedToken:
-		issued := brokerIssuedToken{}
-		issued, err = broker.issueToken(binding, ACLLeaseID(request.LeaseID), request.Account)
-		response.TokenHandle, response.Desktop = issued.Handle, issued.Desktop
-	case brokerMessageReconcile:
-		err = broker.reconcile()
-		broker.generation++
-		response.Generation = broker.generation
-	default:
-		err = errBrokerFrameMalformed
+	} else {
+		err = broker.handleLocked(binding, request, &response)
 	}
 	response.Result = brokerResultForError(err)
 	if response.Result != brokerResultOK {
@@ -193,87 +214,172 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 	return response
 }
 
-func (broker *windowsBroker) acquire(connection brokerConnection, references []brokerObjectReference) (ACLLeaseID, error) {
-	if len(broker.quarantined) != 0 {
-		return ACLLeaseID{}, errBrokerLeaseRecoveryPending
+func (broker *windowsBroker) handleLocked(binding brokerLeaseBinding, request brokerFrame, response *brokerFrame) error {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	var err error
+	switch request.Kind {
+	case brokerMessageStatus:
+		err = broker.retryQuarantined()
+		broker.generation++
+		response.Generation = broker.generation
+	case brokerMessageReleaseLease:
+		err = broker.release(binding, ACLLeaseID(request.LeaseID))
+	case brokerMessageIssueRestrictedToken:
+		issued := brokerIssuedToken{}
+		issued, err = broker.issueToken(binding, ACLLeaseID(request.LeaseID), request.Account)
+		response.TokenHandle, response.Desktop = issued.Handle, issued.Desktop
+	case brokerMessageReconcile:
+		// Any authenticated client may ask, so the request is scoped to leases
+		// whose owner is provably gone; see reconcile.
+		err = broker.reconcile()
+		broker.generation++
+		response.Generation = broker.generation
+	default:
+		err = errBrokerFrameMalformed
 	}
-	binding := connection.LeaseBinding()
+	return err
+}
+
+// acquire projects one lease in three phases. Reservation (quarantine and
+// replay checks, identity, one-shot SID, the durable Reserved record) and
+// publication (the durable Active record, the move into leases) run under mu;
+// the projection between them, which is where every impersonated open and
+// every per-mutation fsync happens, does not, so other connections' status,
+// release and token requests are served meanwhile.
+func (broker *windowsBroker) acquire(connection brokerConnection, references []brokerObjectReference) (ACLLeaseID, error) {
+	broker.mu.Lock()
+	lease, err := broker.reserve(connection.LeaseBinding())
+	broker.mu.Unlock()
+	if err != nil {
+		return ACLLeaseID{}, err
+	}
+
+	projectErr := broker.project(connection, lease, references)
+
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	delete(broker.acquiring, lease.id)
+	if projectErr == nil {
+		projectErr = connection.ValidateIdentity()
+	}
+	if projectErr == nil {
+		projectErr = broker.writeEvent(lease, brokerLeaseEventActive, 0, brokerACLMutation{})
+	}
+	if projectErr != nil {
+		return ACLLeaseID{}, broker.abort(lease, projectErr)
+	}
+	broker.leases[lease.id] = lease
+	return lease.id, nil
+}
+
+// reserve must be called with mu held. On success the lease is durably
+// Reserved and registered in acquiring, which both keeps reconcile away from
+// it and keeps nextLeaseID from handing its identity out twice.
+func (broker *windowsBroker) reserve(binding brokerLeaseBinding) (*brokerLease, error) {
+	if len(broker.quarantined) != 0 {
+		return nil, errBrokerLeaseRecoveryPending
+	}
 	if _, replayed := broker.acquiredNonces[binding.Nonce]; replayed {
-		return ACLLeaseID{}, errBrokerLeaseReplay
+		return nil, errBrokerLeaseReplay
 	}
 	broker.acquiredNonces[binding.Nonce] = struct{}{}
 	leaseID, err := broker.nextLeaseID()
 	if err != nil {
-		return ACLLeaseID{}, err
+		return nil, err
 	}
 	restricting, err := broker.sids.Next()
 	if err != nil {
-		return ACLLeaseID{}, err
+		return nil, err
 	}
 	lease := &brokerLease{id: leaseID, binding: binding, restricting: restricting}
 	if err := broker.writeEvent(lease, brokerLeaseEventReserved, 0, brokerACLMutation{}); err != nil {
-		return ACLLeaseID{}, err
+		return nil, err
 	}
+	broker.acquiring[leaseID] = lease
+	return lease, nil
+}
 
+// project runs WITHOUT mu. The lease is owned exclusively by the calling
+// goroutine (see acquiring), so its mutations slice needs no lock; every DACL
+// read-modify-write is serialized by aclMu and every journal append by the
+// journal store. A failure is returned for acquire to abort under mu.
+//
+// Only the lease's own one-shot restricting SID is ever projected onto a user
+// object (design §9.2, review H10). The persistent installation SID stays in
+// the issued token's restricting list, where it reaches the protected runner
+// and the installation-owned state objects whose DACLs setup wrote, but it is
+// never a trustee in a user object's DACL: it is deterministic and re-derived
+// from the InstallationID on every reinstall, so an ACE naming it would be
+// shared by every concurrent lease (each would pass the other's restricting
+// check), and one left behind by a crash or a removal would stay live for
+// every future token of that installation. A full-restricted token's second
+// access check grants what any one of its restricting SIDs is allowed (less
+// any deny naming one of them), so the lease SID's own allow ACE is what lets
+// the lease's token in, and nothing projected for this lease is visible to a
+// token that does not carry this one-shot SID.
+func (broker *windowsBroker) project(connection brokerConnection, lease *brokerLease, references []brokerObjectReference) error {
 	seenObjects := make(map[ACLObjectIdentity]struct{}, len(references))
+	// Distinct leases never share a trustee now, so a byte-identical ACE
+	// collision between two leases is impossible by construction. A duplicate
+	// within one lease is still a malformed plan and is refused here, which
+	// keeps rollback's one-occurrence-above-baseline arithmetic exact.
 	seenMutations := make(map[string]struct{})
 	for _, reference := range references {
 		if err := connection.ValidateIdentity(); err != nil {
-			return ACLLeaseID{}, broker.abort(lease, err)
+			return err
 		}
 		authorized, err := connection.AuthorizeObject(reference)
 		if err != nil || !sameBrokerObject(reference, authorized) {
 			if authorized.Release != nil {
 				_ = authorized.Release()
 			}
-			return ACLLeaseID{}, broker.abort(lease, errors.Join(errBrokerClientUnauthorized, err))
+			return errors.Join(errBrokerClientUnauthorized, err)
 		}
 		if _, duplicate := seenObjects[authorized.Identity]; duplicate {
 			if authorized.Release != nil {
 				_ = authorized.Release()
 			}
-			return ACLLeaseID{}, broker.abort(lease, errBrokerClientUnauthorized)
+			return errBrokerClientUnauthorized
 		}
 		seenObjects[authorized.Identity] = struct{}{}
-		mutations, err := broker.acl.Plan(authorized, []SID{broker.installationSID, restricting})
+		broker.aclMu.Lock()
+		mutations, err := broker.acl.Plan(authorized, []SID{lease.restricting})
+		broker.aclMu.Unlock()
 		if authorized.Release != nil {
 			err = errors.Join(err, authorized.Release())
 		}
 		if err != nil {
-			return ACLLeaseID{}, broker.abort(lease, err)
+			return err
 		}
 		if len(mutations) == 0 {
-			return ACLLeaseID{}, broker.abort(lease, errors.New("windows sandbox: ACL plan contained no mutations"))
+			return errors.New("windows sandbox: ACL plan contained no mutations")
 		}
 		for _, mutation := range mutations {
-			if !broker.allowedMutation(mutation, authorized, restricting) {
-				return ACLLeaseID{}, broker.abort(lease, errBrokerClientUnauthorized)
+			if !broker.allowedMutation(mutation, authorized, lease.restricting) {
+				return errBrokerClientUnauthorized
 			}
 			signature := fmt.Sprintf("%#v/%s/%x", mutation.Object, mutation.SID.String(), mutation.ACE)
 			if _, duplicate := seenMutations[signature]; duplicate {
-				return ACLLeaseID{}, broker.abort(lease, errBrokerClientUnauthorized)
+				return errBrokerClientUnauthorized
 			}
 			seenMutations[signature] = struct{}{}
 			mutationID := uint32(len(lease.mutations))
 			if err := broker.writeEvent(lease, brokerLeaseEventMutationPrepared, mutationID, mutation); err != nil {
-				return ACLLeaseID{}, broker.abort(lease, err)
+				return err
 			}
 			// Record ownership before Apply: rollback must include a mutation even
 			// when the mechanism reports an ambiguous post-write error.
 			lease.mutations = append(lease.mutations, cloneBrokerMutation(mutation))
-			if err := broker.acl.Apply(mutation); err != nil {
-				return ACLLeaseID{}, broker.abort(lease, err)
+			broker.aclMu.Lock()
+			err := broker.acl.Apply(mutation)
+			broker.aclMu.Unlock()
+			if err != nil {
+				return err
 			}
 		}
 	}
-	if err := connection.ValidateIdentity(); err != nil {
-		return ACLLeaseID{}, broker.abort(lease, err)
-	}
-	if err := broker.writeEvent(lease, brokerLeaseEventActive, 0, brokerACLMutation{}); err != nil {
-		return ACLLeaseID{}, broker.abort(lease, err)
-	}
-	broker.leases[leaseID] = lease
-	return leaseID, nil
+	return nil
 }
 
 func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseID, account brokerAccountKind) (brokerIssuedToken, error) {
@@ -287,6 +393,10 @@ func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseI
 	if len(broker.quarantined) != 0 {
 		return brokerIssuedToken{}, errBrokerLeaseRecoveryPending
 	}
+	// The token's restricting list is [Restricted Code, installation, lease]:
+	// the installation SID admits the protected runner and installation-owned
+	// runtime objects, the lease SID admits exactly this lease's projected
+	// objects, and nothing admits another lease's.
 	token, err := broker.tokens.IssueRestricted(account, broker.installationSID, lease.restricting)
 	if err != nil {
 		return brokerIssuedToken{}, err
@@ -331,11 +441,26 @@ func (broker *windowsBroker) release(binding brokerLeaseBinding, id ACLLeaseID) 
 	return broker.retire(lease)
 }
 
-// reconcile rolls back every lease the journal still holds. It continues past
-// a lease that cannot be rolled back, quarantining it, and repeats passes
-// while any lease is released: identical installation-SID ACEs from two
-// leases can only be removed in reverse application order, which one pass in
-// map order cannot guarantee.
+// reconcile must be called with mu held. It rolls back every journaled lease
+// whose owner is provably gone and leaves every other one alone:
+//
+//   - a lease in acquiring belongs to a goroutine that is projecting it right
+//     now and is never touched;
+//   - a lease in leases belongs to a connection; it is rolled back only when
+//     that connection's client process has exited (its retained process
+//     handle is signalled). A live, authenticated client's leases are never
+//     rolled back by a different connection's reconcile request (review M14);
+//     its own Disconnect, or this rule once it dies, retires them;
+//   - a quarantined lease is retried;
+//   - a lease in the journal and in none of those maps is an orphan of a
+//     previous service instance (no connection survives a restart) and is
+//     rolled back.
+//
+// It continues past a lease that cannot be rolled back, quarantining it.
+// Passes repeat while any lease is released; with only one-shot SIDs on user
+// objects there are no cross-lease identical ACEs to unwind in order, but a
+// pass may still free an object a later pass needs (a desktop, a journal
+// record), and the loop stops as soon as a pass releases nothing.
 func (broker *windowsBroker) reconcile() error {
 	recovered, err := broker.journal.recover()
 	if err != nil {
@@ -343,10 +468,17 @@ func (broker *windowsBroker) reconcile() error {
 	}
 	pending := make(map[ACLLeaseID]*brokerLease, len(recovered))
 	for id, record := range recovered {
-		lease := broker.leases[id]
-		if lease == nil {
-			lease = broker.quarantined[id]
+		if broker.acquiring[id] != nil {
+			continue
 		}
+		if lease := broker.leases[id]; lease != nil {
+			if brokerBindingAlive(lease.binding) {
+				continue
+			}
+			pending[id] = lease
+			continue
+		}
+		lease := broker.quarantined[id]
 		if lease == nil {
 			lease = &brokerLease{id: id, binding: record.Binding, restricting: record.SID, mutations: record.Mutations}
 		}
@@ -361,6 +493,21 @@ func (broker *windowsBroker) reconcile() error {
 		}
 	}
 	return broker.retireUntilStable(pending)
+}
+
+// brokerBindingAlive reports whether a lease's client is still running. Only
+// a client whose retained process handle proves it exited counts as dead; a
+// process that cannot answer, or whose answer cannot be read, is treated as
+// alive, because rolling back a live client's lease would revoke the
+// authority its running sandbox was granted. Such a lease is retired by its
+// connection's own Disconnect when the pipe closes.
+func brokerBindingAlive(binding brokerLeaseBinding) bool {
+	liveness, ok := binding.Process.(brokerClientLiveness)
+	if !ok {
+		return true
+	}
+	exited, err := liveness.Exited()
+	return err != nil || !exited
 }
 
 // retryQuarantined retries only the in-memory quarantine. It is cheap enough
@@ -395,9 +542,11 @@ func (broker *windowsBroker) retireUntilStable(pending map[ACLLeaseID]*brokerLea
 	return nil
 }
 
-// retire rolls a lease back and durably records its release. Any failure
-// moves the lease to quarantine instead of leaving it in the live set: the
-// broker keeps serving status and release, refuses new work, and retries.
+// retire must be called with mu held. It rolls a lease back and durably
+// records its release. Any failure moves the lease to quarantine instead of
+// leaving it in the live set: the broker keeps serving status and release,
+// refuses new work, and retries. A successful release may trigger journal
+// compaction (review M14); a compaction failure never fails the release.
 func (broker *windowsBroker) retire(lease *brokerLease) error {
 	err := broker.rollback(lease)
 	if err == nil {
@@ -409,6 +558,7 @@ func (broker *windowsBroker) retire(lease *brokerLease) error {
 		return errors.Join(errBrokerLeaseRecoveryPending, err)
 	}
 	delete(broker.quarantined, lease.id)
+	_ = broker.journal.compactIfLarge()
 	return nil
 }
 
@@ -447,7 +597,10 @@ func (broker *windowsBroker) rollback(lease *brokerLease) error {
 		}
 	}
 	for index := len(lease.mutations) - 1; index >= 0; index-- {
-		result = errors.Join(result, broker.acl.Rollback(lease.mutations[index]))
+		broker.aclMu.Lock()
+		err := broker.acl.Rollback(lease.mutations[index])
+		broker.aclMu.Unlock()
+		result = errors.Join(result, err)
 	}
 	return result
 }
@@ -462,16 +615,19 @@ func (broker *windowsBroker) nextLeaseID() (ACLLeaseID, error) {
 		if _, err := io.ReadFull(broker.leaseEntropy, id[:]); err != nil {
 			return ACLLeaseID{}, fmt.Errorf("generate broker lease identity: %w", err)
 		}
-		if id != (ACLLeaseID{}) && broker.leases[id] == nil {
+		if id != (ACLLeaseID{}) && broker.leases[id] == nil && broker.acquiring[id] == nil && broker.quarantined[id] == nil {
 			return id, nil
 		}
 	}
 	return ACLLeaseID{}, errors.New("windows sandbox: lease identity collision")
 }
 
+// allowedMutation admits exactly the lease's own one-shot SID as the trustee.
+// The installation SID is deliberately not admitted: it is never projected
+// onto a user object (see project).
 func (broker *windowsBroker) allowedMutation(mutation brokerACLMutation, authorized brokerAuthorizedObject, restricting SID) bool {
 	return mutation.Object == authorized.Identity && mutation.Path == authorized.Reference.Path && canonicalBrokerPath(mutation.Path) &&
-		(mutation.SID == broker.installationSID || mutation.SID == restricting) &&
+		mutation.SID == restricting && mutation.SID != broker.installationSID &&
 		brokerReferenceAuthorizesACE(authorized.Reference, mutation.ACE, mutation.SID, authorized.Identity.Kind)
 }
 

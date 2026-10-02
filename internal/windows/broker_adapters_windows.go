@@ -21,35 +21,164 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-const maxBrokerLeaseJournalBytes = 64 << 20
 const maxConcurrentBrokerConnections = 64
+
+// brokerLeaseJournalCompactSuffix names the temporary file a compaction
+// writes beside the journal before renaming it into place. Removal's
+// artifact inventory recognizes it (setup_windows.go), so an interrupted
+// compaction never makes Remove refuse the state root.
+const brokerLeaseJournalCompactSuffix = ".compact"
 
 type brokerJournalFile interface {
 	ReadAll() ([]byte, error)
 	Append([]byte) error
 	Sync() error
 	Truncate(int64) error
+	// Replace atomically and durably substitutes data for the file's whole
+	// content, preserving its SYSTEM/Administrators-only protection, or
+	// leaves the file as it was on any error.
+	Replace([]byte) error
 	Close() error
 }
 
-type osBrokerJournalFile struct{ file *os.File }
+type osBrokerJournalFile struct {
+	path string
+	file *os.File
+}
+
+var errBrokerJournalFileClosed = errors.New("windows sandbox: lease journal file is not open")
 
 func (file *osBrokerJournalFile) ReadAll() ([]byte, error) {
+	if file.file == nil {
+		return nil, errBrokerJournalFileClosed
+	}
 	if _, err := file.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	return io.ReadAll(io.LimitReader(file.file, maxBrokerLeaseJournalBytes+1))
 }
 func (file *osBrokerJournalFile) Append(data []byte) error {
+	if file.file == nil {
+		return errBrokerJournalFileClosed
+	}
 	if _, err := file.file.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	_, err := file.file.Write(data)
 	return err
 }
-func (file *osBrokerJournalFile) Sync() error               { return file.file.Sync() }
-func (file *osBrokerJournalFile) Truncate(size int64) error { return file.file.Truncate(size) }
-func (file *osBrokerJournalFile) Close() error              { return file.file.Close() }
+func (file *osBrokerJournalFile) Sync() error {
+	if file.file == nil {
+		return errBrokerJournalFileClosed
+	}
+	return file.file.Sync()
+}
+func (file *osBrokerJournalFile) Truncate(size int64) error {
+	if file.file == nil {
+		return errBrokerJournalFileClosed
+	}
+	return file.file.Truncate(size)
+}
+func (file *osBrokerJournalFile) Close() error {
+	if file.file == nil {
+		return nil
+	}
+	err := file.file.Close()
+	file.file = nil
+	return err
+}
+
+// Replace writes data to a sibling temporary file inside the same
+// SYSTEM/Administrators-only state directory, gives it the journal's own
+// protected DACL and verifies that protection BEFORE any byte is written,
+// fsyncs it, and only then renames it over the journal with
+// MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH. The rename is atomic on
+// NTFS/ReFS, so a crash leaves either the old journal or the new one, never a
+// mixture; a leftover temporary file is ignored (and replaced) by the next
+// compaction.
+//
+// The live handle is closed before the rename and the journal path reopened
+// after it, whichever file the path then names: os.OpenFile never grants
+// FILE_SHARE_DELETE, and Windows refuses to replace a file another handle has
+// open without it. A reopen failure leaves the file closed, so every later
+// append fails (the broker refuses new leases) rather than writing to a
+// handle that no longer names the journal.
+func (file *osBrokerJournalFile) Replace(data []byte) (result error) {
+	if file.path == "" || file.file == nil {
+		return errBrokerJournalFileClosed
+	}
+	temp := file.path + brokerLeaseJournalCompactSuffix
+	if err := os.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale lease journal compaction: %w", err)
+	}
+	// #nosec G304 -- temp is the journal's own derived sibling inside the
+	// SYSTEM/Administrators-only state root; no caller supplies it.
+	staged, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	keepTemp := false
+	defer func() {
+		if staged != nil {
+			result = errors.Join(result, staged.Close())
+		}
+		if !keepTemp {
+			if err := os.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
+				result = errors.Join(result, err)
+			}
+		}
+	}()
+	if err := protectCredentialFile(temp); err != nil {
+		return fmt.Errorf("protect compacted lease journal: %w", err)
+	}
+	if protection, err := inspectCredentialFileProtection(temp); err != nil || !protection.valid() {
+		return errors.Join(errors.New("windows sandbox: compacted lease journal ACL is not protected"), err)
+	}
+	if _, err := staged.Write(data); err != nil {
+		return err
+	}
+	if err := staged.Sync(); err != nil {
+		return err
+	}
+	closeErr := staged.Close()
+	staged = nil
+	if closeErr != nil {
+		return closeErr
+	}
+	from, err := win.UTF16PtrFromString(temp)
+	if err != nil {
+		return err
+	}
+	to, err := win.UTF16PtrFromString(file.path)
+	if err != nil {
+		return err
+	}
+	if err := file.file.Close(); err != nil {
+		file.file = nil
+		return errors.Join(err, file.reopen())
+	}
+	file.file = nil
+	renameErr := win.MoveFileEx(from, to, win.MOVEFILE_REPLACE_EXISTING|win.MOVEFILE_WRITE_THROUGH)
+	if renameErr == nil {
+		keepTemp = true // it is the journal now
+	}
+	return errors.Join(renameErr, file.reopen())
+}
+
+// reopen opens the journal path again and re-verifies its protection.
+func (file *osBrokerJournalFile) reopen() error {
+	// #nosec G304 -- file.path is the protected journal path this file was
+	// opened from; its protection is re-verified below.
+	reopened, err := os.OpenFile(file.path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("reopen lease journal: %w", err)
+	}
+	if protection, err := inspectCredentialFileProtection(file.path); err != nil || !protection.valid() {
+		return errors.Join(errors.New("windows sandbox: reopened lease journal ACL is not protected"), err, reopened.Close())
+	}
+	file.file = reopened
+	return nil
+}
 
 type protectedBrokerLeaseJournalStore struct {
 	mu   sync.Mutex
@@ -105,7 +234,7 @@ func openProtectedBrokerLeaseJournalStore(path string) (*protectedBrokerLeaseJou
 	if err != nil || !protection.valid() {
 		return fail(errors.Join(errors.New("windows sandbox: lease journal ACL is not protected"), err))
 	}
-	store, err := newProtectedBrokerLeaseJournalStore(&osBrokerJournalFile{file: file})
+	store, err := newProtectedBrokerLeaseJournalStore(&osBrokerJournalFile{path: path, file: file})
 	if err != nil {
 		return fail(err)
 	}
@@ -115,8 +244,11 @@ func openProtectedBrokerLeaseJournalStore(path string) (*protectedBrokerLeaseJou
 func (store *protectedBrokerLeaseJournalStore) Append(data []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.file == nil || len(data) == 0 || data[len(data)-1] != '\n' || len(store.data)+len(data) > maxBrokerLeaseJournalBytes {
+	if store.file == nil || len(data) == 0 || data[len(data)-1] != '\n' {
 		return errors.New("windows sandbox: invalid lease journal append")
+	}
+	if len(store.data)+len(data) > maxBrokerLeaseJournalBytes {
+		return errBrokerLeaseJournalFull
 	}
 	if err := store.file.Append(data); err != nil {
 		return err
@@ -137,6 +269,41 @@ func (store *protectedBrokerLeaseJournalStore) ReadAll() ([]byte, error) {
 	defer store.mu.Unlock()
 	return append([]byte(nil), store.data...), nil
 }
+
+// Size reports the durable journal length (brokerLeaseJournalCompactor).
+func (store *protectedBrokerLeaseJournalStore) Size() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return len(store.data)
+}
+
+// Compact applies rewrite to the exact durable content under the store's
+// lock, so no append can interleave, and replaces the file only when the
+// rewrite actually drops something. The in-memory copy changes only after
+// the file has been replaced.
+func (store *protectedBrokerLeaseJournalStore) Compact(rewrite func([]byte) ([]byte, error)) error {
+	if rewrite == nil {
+		return errors.New("windows sandbox: lease journal compaction is unavailable")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.file == nil {
+		return errors.New("windows sandbox: closed lease journal")
+	}
+	compacted, err := rewrite(append([]byte(nil), store.data...))
+	if err != nil {
+		return err
+	}
+	if len(compacted) >= len(store.data) {
+		return nil
+	}
+	if err := store.file.Replace(compacted); err != nil {
+		return fmt.Errorf("replace compacted lease journal: %w", err)
+	}
+	store.data = append([]byte(nil), compacted...)
+	return nil
+}
+
 func (store *protectedBrokerLeaseJournalStore) Close() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -612,8 +779,14 @@ func writeBrokerFrame(writer io.Writer, encoded []byte) error {
 
 type win32BrokerACLMechanism struct{}
 
+// Plan emits the deny and allow ACEs for exactly one trustee: the lease's own
+// one-shot restricting SID. The persistent installation SID is never a
+// trustee on a user object (design §9.2, review H10; see windowsBroker.project),
+// so a request naming it, or naming more than one SID, is refused here as
+// well as by the broker's own allowedMutation check.
 func (win32BrokerACLMechanism) Plan(authorized brokerAuthorizedObject, trustees []SID) ([]brokerACLMutation, error) {
-	if len(trustees) != 2 || authorized.AuthorityHandle == 0 || !authorized.Identity.valid() {
+	if len(trustees) != 1 || trustees[0].kind == sidKindInstallation || !trustees[0].isRestrictedTierTrustee() ||
+		authorized.AuthorityHandle == 0 || !authorized.Identity.valid() {
 		return nil, errors.New("windows sandbox: invalid broker ACL plan request")
 	}
 	authorityHandle := win.Handle(authorized.AuthorityHandle)
@@ -636,7 +809,7 @@ func (win32BrokerACLMechanism) Plan(authorized brokerAuthorizedObject, trustees 
 		}
 		return result
 	}
-	mutations := make([]brokerACLMutation, 0, len(trustees)*6)
+	mutations := make([]brokerACLMutation, 0, 6)
 	for _, trustee := range trustees {
 		for _, access := range axes(authorized.Reference.Denied) {
 			ace := encodeACE(trustee, authorized.Identity.Kind, ACLACE{Type: ACEDeny, Access: access, Inheritable: authorized.Reference.Scope == brokerScopeTree})
@@ -750,56 +923,26 @@ type fileIDDescriptor struct {
 
 var procOpenFileByID = win.NewLazySystemDLL("kernel32.dll").NewProc("OpenFileById")
 
-func openFileByID(volume win.Handle, id [16]byte) (win.Handle, error) {
-	descriptor := fileIDDescriptor{Size: uint32(unsafe.Sizeof(fileIDDescriptor{})), Type: extendedFileIDType, ID: id}
-	handle, _, callErr := procOpenFileByID.Call(uintptr(volume), uintptr(unsafe.Pointer(&descriptor)),
-		win.FILE_READ_ATTRIBUTES, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, 0,
-		win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
-	if win.Handle(handle) == win.InvalidHandle {
-		return win.InvalidHandle, syscallErr(callErr)
-	}
-	return win.Handle(handle), nil
-}
-
 // brokerObjectExistsByIdentity reports whether the journaled object still
-// exists anywhere on its volume. The volume root must carry the journaled
-// volume serial, and opening the root by its own ID must succeed first, so a
+// exists anywhere on its volume. openVolumeRootForSerial proves the volume
+// first (serial match plus a control open of the root by its own ID), so a
 // malformed descriptor or an unsupported filesystem can never be mistaken for
-// "deleted". NTFS answers an unused file reference with
-// ERROR_INVALID_PARAMETER; ReFS may answer ERROR_FILE_NOT_FOUND.
+// "deleted"; fileIDAbsent then recognizes an unused file reference.
 func brokerObjectExistsByIdentity(path string, identity ACLObjectIdentity) (bool, error) {
 	if !canonicalBrokerPath(path) {
 		return false, errors.New("windows sandbox: rollback path is not canonical")
 	}
-	rootPath, err := win.UTF16PtrFromString(path[:3])
+	root, err := openVolumeRootForSerial(path, identity.VolumeSerial)
 	if err != nil {
-		return false, err
-	}
-	root, err := win.CreateFile(rootPath, win.FILE_READ_ATTRIBUTES,
-		win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, nil, win.OPEN_EXISTING,
-		win.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return false, fmt.Errorf("open rollback volume root: %w", err)
+		return false, fmt.Errorf("open rollback volume: %w", err)
 	}
 	defer win.CloseHandle(root)
-	var rootID fileIDInfo
-	if err := win.GetFileInformationByHandleEx(root, win.FileIdInfo, (*byte)(unsafe.Pointer(&rootID)), uint32(unsafe.Sizeof(rootID))); err != nil {
-		return false, fmt.Errorf("identify rollback volume root: %w", err)
-	}
-	if rootID.VolumeSerialNumber != identity.VolumeSerial {
-		return false, errors.New("windows sandbox: rollback target's volume is no longer mounted at its drive letter")
-	}
-	control, err := openFileByID(root, rootID.FileID)
-	if err != nil {
-		return false, fmt.Errorf("open volume root by file ID: %w", err)
-	}
-	_ = win.CloseHandle(control)
-	handle, err := openFileByID(root, identity.FileID)
+	handle, err := openFileByIDWithAccess(root, identity.FileID, win.FILE_READ_ATTRIBUTES)
 	switch {
 	case err == nil:
 		_ = win.CloseHandle(handle)
 		return true, nil
-	case errors.Is(err, win.ERROR_INVALID_PARAMETER), errors.Is(err, win.ERROR_FILE_NOT_FOUND):
+	case fileIDAbsent(err):
 		return false, nil
 	default:
 		return false, err
@@ -849,11 +992,30 @@ func (win32BrokerLogonNative) LogonService(account string, password []byte) (win
 	return token, nil
 }
 func (win32BrokerLogonNative) DuplicateToProcess(token win.Token, process win.Handle) (win.Handle, error) {
-	var duplicate win.Handle
-	if err := win.DuplicateHandle(win.CurrentProcess(), win.Handle(token), process, &duplicate, 0, false, win.DUPLICATE_SAME_ACCESS); err != nil {
+	return duplicateBrokerTokenToProcess(win.DuplicateHandle, token, process)
+}
+
+// brokerClientTokenAccess is the exact access the client's duplicate of an
+// issued token carries (review L8): TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE and
+// TOKEN_QUERY are what CreateProcessAsUser needs for the runner, and
+// TOKEN_QUERY is what the client's own validateBrokerTokenHandle reads with.
+// DUPLICATE_SAME_ACCESS would hand the client the broker's TOKEN_ALL_ACCESS,
+// including TOKEN_ADJUST_DEFAULT / TOKEN_ADJUST_GROUPS / TOKEN_ADJUST_SESSIONID
+// over a token the broker built and validated.
+const brokerClientTokenAccess = win.TOKEN_ASSIGN_PRIMARY | win.TOKEN_DUPLICATE | win.TOKEN_QUERY
+
+type duplicateHandleFunc func(sourceProcess win.Handle, source win.Handle, targetProcess win.Handle, target *win.Handle, access uint32, inherit bool, options uint32) error
+
+func duplicateBrokerTokenToProcess(duplicate duplicateHandleFunc, token win.Token, process win.Handle) (win.Handle, error) {
+	if duplicate == nil || token == 0 || process == 0 {
+		return 0, errors.New("windows sandbox: invalid restricted token duplication")
+	}
+	var result win.Handle
+	// options 0 (not DUPLICATE_SAME_ACCESS): the requested mask is exact.
+	if err := duplicate(win.CurrentProcess(), win.Handle(token), process, &result, brokerClientTokenAccess, false, 0); err != nil {
 		return 0, err
 	}
-	return duplicate, nil
+	return result, nil
 }
 func (win32BrokerLogonNative) CloseToken(token win.Token) error { return token.Close() }
 

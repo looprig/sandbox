@@ -7,14 +7,23 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
-type brokerTestProcess struct{ id int }
+type brokerTestProcess struct {
+	id     int
+	exited atomic.Bool
+}
 
 func (*brokerTestProcess) Facts() (brokerClientFacts, error) { return brokerClientFacts{}, nil }
 func (*brokerTestProcess) CreationTime() (uint64, error)     { return 9, nil }
 func (*brokerTestProcess) Close() error                      { return nil }
+
+// Exited makes the fake answer brokerClientLiveness, so reconcile's
+// dead-binding rule is exercised exactly as against a real process handle.
+func (process *brokerTestProcess) Exited() (bool, error) { return process.exited.Load(), nil }
 
 type brokerTestConnection struct {
 	binding    brokerLeaseBinding
@@ -64,21 +73,29 @@ func (store *brokerTestJournalStore) ReadAll() ([]byte, error) {
 }
 
 type brokerTestACL struct {
-	store        *brokerTestJournalStore
-	installation SID
-	restricting  SID
-	aces         map[ACLObjectIdentity][][]byte
-	operations   []string
-	forgeSID     SID
-	forgeObject  *ACLObjectIdentity
-	forgeACE     []byte
-	corruptMask  bool
-	rollbackErr  error
+	store       *brokerTestJournalStore
+	restricting SID
+	aces        map[ACLObjectIdentity][][]byte
+	operations  []string
+	forgeSID    SID
+	forgeObject *ACLObjectIdentity
+	forgeACE    []byte
+	corruptMask bool
+	rollbackErr error
+	// applyHook, when set, runs at the start of every Apply; the L8 test uses
+	// it to hold one acquire mid-projection.
+	applyHook func()
+	// trustees records every SID set the broker asked a plan for.
+	trustees [][]SID
 }
 
 func (acl *brokerTestACL) Plan(object brokerAuthorizedObject, trustees []SID) ([]brokerACLMutation, error) {
-	acl.installation, acl.restricting = trustees[0], trustees[1]
-	mutations := make([]brokerACLMutation, 0, 2)
+	acl.trustees = append(acl.trustees, append([]SID(nil), trustees...))
+	if len(trustees) != 1 {
+		return nil, fmt.Errorf("broker asked to project %d trustees, want only the lease SID", len(trustees))
+	}
+	acl.restricting = trustees[0]
+	mutations := make([]brokerACLMutation, 0, 1)
 	for _, sid := range trustees {
 		identity := object.Identity
 		if acl.forgeObject != nil {
@@ -100,7 +117,10 @@ func (acl *brokerTestACL) Plan(object brokerAuthorizedObject, trustees []SID) ([
 	return mutations, nil
 }
 func (acl *brokerTestACL) Apply(mutation brokerACLMutation) error {
-	if !acl.store.flushed {
+	if acl.applyHook != nil {
+		acl.applyHook()
+	}
+	if acl.store != nil && !acl.store.flushed {
 		return errors.New("mutation applied before durable flush")
 	}
 	acl.operations = append(acl.operations, "apply:"+mutation.SID.String())
@@ -175,6 +195,24 @@ func (manager *brokerTestDesktopManager) Create(context brokerDesktopContext) (b
 	}}, nil
 }
 
+// brokerTestEntropy yields a different, never-zero buffer on every read.
+type brokerTestEntropy struct {
+	mu    sync.Mutex
+	seed  byte
+	reads byte
+}
+
+func (entropy *brokerTestEntropy) Read(buffer []byte) (int, error) {
+	entropy.mu.Lock()
+	defer entropy.mu.Unlock()
+	entropy.reads++
+	for index := range buffer {
+		buffer[index] = entropy.seed ^ byte(index)
+	}
+	buffer[0] = entropy.reads
+	return len(buffer), nil
+}
+
 type brokerTestRetirement struct{ seen map[string]bool }
 
 func (retirement *brokerTestRetirement) RetireSID(sid SID) (bool, error) {
@@ -196,13 +234,16 @@ func newBrokerTestRig(t *testing.T) (*windowsBroker, *brokerTestConnection, *bro
 	if err != nil {
 		t.Fatal(err)
 	}
-	sids, err := NewOneShotSIDGenerator(bytes.NewReader(bytes.Repeat([]byte{0x31}, sidEntropyBytes)), &brokerTestRetirement{seen: make(map[string]bool)})
+	// Distinct entropy per read: a fixed buffer yields one SID and one lease
+	// identity only, so a second acquire on the rig failed with EOF (or
+	// ErrSIDReuse) before it reached anything under test.
+	sids, err := NewOneShotSIDGenerator(&brokerTestEntropy{seed: 0x31}, &brokerTestRetirement{seen: make(map[string]bool)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	acl := &brokerTestACL{store: store, aces: make(map[ACLObjectIdentity][][]byte)}
 	tokens := &brokerTestTokenIssuer{}
-	broker, err := newWindowsBroker(installation, sids, journal, acl, tokens, &brokerTestDesktopManager{}, bytes.NewReader(bytes.Repeat([]byte{0x42}, brokerLeaseIDSize)))
+	broker, err := newWindowsBroker(installation, sids, journal, acl, tokens, &brokerTestDesktopManager{}, &brokerTestEntropy{seed: 0x42})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,18 +431,37 @@ func TestBrokerDesktopCreationUsesOnlyValidatedLeaseAuthorityAndRollsBack(t *tes
 	}
 }
 
-func TestBrokerReconcileClosesLiveDesktop(t *testing.T) {
+// TestBrokerReconcileClosesDeadClientsDesktop: a reconcile request retires a
+// lease (desktop included) only once its client process has exited; the same
+// request against a live client's lease leaves it alone (review M14).
+func TestBrokerReconcileClosesDeadClientsDesktop(t *testing.T) {
 	broker, connection, _, _, _, reference := newBrokerTestRig(t)
 	acquire := broker.Handle(connection, brokerFrame{Kind: brokerMessageAcquireLease, Direction: brokerRequest, Nonce: connection.binding.Nonce, Objects: []brokerObjectReference{reference}})
 	issued := broker.Handle(connection, brokerFrame{Kind: brokerMessageIssueRestrictedToken, Direction: brokerRequest, Nonce: connection.binding.Nonce, LeaseID: acquire.LeaseID, Account: brokerAccountOffline})
 	if issued.Result != brokerResultOK {
 		t.Fatalf("issue = %#v", issued)
 	}
-	response := broker.Handle(connection, brokerFrame{Kind: brokerMessageReconcile, Direction: brokerRequest, Nonce: connection.binding.Nonce})
 	manager := broker.desktops.(*brokerTestDesktopManager)
-	if response.Result != brokerResultOK || manager.closed != 1 || len(broker.leases) != 0 {
-		t.Fatalf("reconcile=%#v desktops=%#v leases=%d", response, manager, len(broker.leases))
+	observer := brokerTestObserver(t, connection)
+	if response := broker.Handle(observer, brokerFrame{Kind: brokerMessageReconcile, Direction: brokerRequest, Nonce: observer.binding.Nonce}); response.Result != brokerResultOK || manager.closed != 0 || len(broker.leases) != 1 {
+		t.Fatalf("reconcile against a live client = %#v desktops=%#v leases=%d", response, manager, len(broker.leases))
 	}
+	connection.binding.Process.(*brokerTestProcess).exited.Store(true)
+	response := broker.Handle(observer, brokerFrame{Kind: brokerMessageReconcile, Direction: brokerRequest, Nonce: observer.binding.Nonce})
+	if response.Result != brokerResultOK || manager.closed != 1 || len(broker.leases) != 0 {
+		t.Fatalf("reconcile against a dead client = %#v desktops=%#v leases=%d", response, manager, len(broker.leases))
+	}
+}
+
+// brokerTestObserver is a second, independently bound, live connection that
+// shares the first connection's authorized object table.
+func brokerTestObserver(t *testing.T, first *brokerTestConnection) *brokerTestConnection {
+	t.Helper()
+	binding := first.binding
+	binding.Nonce[2]++
+	binding.PID++
+	binding.Process = &brokerTestProcess{id: 2}
+	return &brokerTestConnection{binding: binding, authorized: first.authorized}
 }
 
 func TestBrokerNeverReusesSIDAndNeverMutatesBeforeJournalFlush(t *testing.T) {
@@ -454,8 +514,8 @@ func TestBrokerQuarantinesUnrollbackableLeaseInsteadOfWedging(t *testing.T) {
 	}
 	leaseID := ACLLeaseID(acquire.LeaseID)
 	identity := connection.authorized[reference.Handle].Identity
-	if len(acl.aces[identity]) != 2 {
-		t.Fatalf("lease ACEs = %d, want 2", len(acl.aces[identity]))
+	if len(acl.aces[identity]) != 1 {
+		t.Fatalf("lease ACEs = %d, want 1 (the lease SID only)", len(acl.aces[identity]))
 	}
 
 	// Service restart with a lease the ACL mechanism cannot roll back (the

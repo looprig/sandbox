@@ -9,15 +9,8 @@ import (
 	"fmt"
 )
 
-type brokerLeaseEventKind uint8
-
-const (
-	brokerLeaseEventInvalid brokerLeaseEventKind = iota
-	brokerLeaseEventReserved
-	brokerLeaseEventMutationPrepared
-	brokerLeaseEventActive
-	brokerLeaseEventReleased
-)
+// brokerLeaseEventKind and its values live in lease_journal_compaction.go so
+// the platform-neutral compaction helper can read them.
 
 // brokerLeaseEvent is cleanup authority only. The exact ACE and object identity
 // are persisted before the corresponding mutation. A path is deliberately not
@@ -48,6 +41,20 @@ type brokerLeaseJournalStore interface {
 	ReadAll() ([]byte, error)
 }
 
+// brokerLeaseJournalCompactor is the optional store capability compaction
+// uses (review M14). Size reports the durable byte count; Compact must apply
+// rewrite to the store's exact current content and atomically and durably
+// replace it with the result, or leave it untouched on any error.
+type brokerLeaseJournalCompactor interface {
+	Size() int
+	Compact(rewrite func([]byte) ([]byte, error)) error
+}
+
+// errBrokerLeaseJournalFull is the store's typed refusal of an append that
+// would push the journal past maxBrokerLeaseJournalBytes. appendAndFlush
+// answers it with one compaction and one retry.
+var errBrokerLeaseJournalFull = errors.New("windows sandbox: lease journal is full")
+
 // brokerLeaseJournal owns framing and validation; the injected store owns only
 // durable bytes. This keeps service policy independent of a filesystem format.
 type brokerLeaseJournal struct{ store brokerLeaseJournalStore }
@@ -63,7 +70,9 @@ func (journal *brokerLeaseJournal) appendAndFlush(event brokerLeaseEvent) error 
 	if journal == nil || journal.store == nil {
 		return errors.New("windows sandbox: lease journal is unavailable")
 	}
-	if err := validateBrokerLeaseEvent(event); err != nil {
+	// Writes are held to the current rule: a mutation's trustee is the lease's
+	// own one-shot SID and nothing else (design §9.2, review H10).
+	if err := validateBrokerLeaseEvent(event, false); err != nil {
 		return err
 	}
 	event.Version = 1
@@ -76,7 +85,18 @@ func (journal *brokerLeaseJournal) appendAndFlush(event brokerLeaseEvent) error 
 		return fmt.Errorf("encode broker lease event: %w", err)
 	}
 	encoded = append(encoded, '\n')
-	if err := journal.store.Append(encoded); err != nil {
+	err = journal.store.Append(encoded)
+	if errors.Is(err, errBrokerLeaseJournalFull) {
+		// A full journal must never be the reason a Released record cannot be
+		// written; that would make the lease permanent. Drop what is no
+		// longer owed and try once more.
+		if compactErr := journal.compact(); compactErr == nil {
+			err = journal.store.Append(encoded)
+		} else {
+			err = errors.Join(err, compactErr)
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("append broker lease journal: %w", err)
 	}
 	if err := journal.store.Flush(); err != nil {
@@ -115,7 +135,10 @@ func (journal *brokerLeaseJournal) recover() (map[ACLLeaseID]recoveredBrokerLeas
 		}
 		event.SID = SID{text: event.SIDText, kind: event.SIDKind}
 		event.Trustee = SID{text: event.TrusteeText, kind: event.TrusteeKind}
-		if err := validateBrokerLeaseEvent(event); err != nil {
+		// Recovery still accepts the installation SID as a trustee, but only so
+		// the ACEs an older broker projected with it can be rolled back; no
+		// current write produces one (see appendAndFlush).
+		if err := validateBrokerLeaseEvent(event, true); err != nil {
 			return nil, fmt.Errorf("validate broker lease journal event %d: %w", index, err)
 		}
 		lease := leases[event.LeaseID]
@@ -148,7 +171,39 @@ func (journal *brokerLeaseJournal) recover() (map[ACLLeaseID]recoveredBrokerLeas
 	return leases, nil
 }
 
-func validateBrokerLeaseEvent(event brokerLeaseEvent) error {
+// compact rewrites the journal down to the records of unreleased leases, if
+// the store supports it. A store that does not is left to grow, exactly as
+// before; a compaction error leaves the store's content untouched.
+func (journal *brokerLeaseJournal) compact() error {
+	if journal == nil || journal.store == nil {
+		return errors.New("windows sandbox: lease journal is unavailable")
+	}
+	compactor, ok := journal.store.(brokerLeaseJournalCompactor)
+	if !ok {
+		return nil
+	}
+	return compactor.Compact(compactBrokerLeaseJournal)
+}
+
+// compactIfLarge is the post-release trigger: compact once the journal has
+// reached brokerLeaseJournalCompactionThreshold.
+func (journal *brokerLeaseJournal) compactIfLarge() error {
+	if journal == nil || journal.store == nil {
+		return nil
+	}
+	compactor, ok := journal.store.(brokerLeaseJournalCompactor)
+	if !ok || !brokerLeaseJournalNeedsCompaction(compactor.Size()) {
+		return nil
+	}
+	return journal.compact()
+}
+
+// validateBrokerLeaseEvent checks one record. legacyInstallationTrustee
+// admits a MutationPrepared whose trustee is an installation SID: brokers
+// before the H10 fix projected the persistent installation SID onto user
+// objects alongside the lease SID, and a journal they left behind must still
+// be recoverable so those ACEs can be removed. Writes never set it.
+func validateBrokerLeaseEvent(event brokerLeaseEvent, legacyInstallationTrustee bool) error {
 	if event.LeaseID == (ACLLeaseID{}) || event.Nonce == ([brokerNonceSize]byte{}) || event.PID == 0 || event.Created == 0 || !event.SID.isRestrictedTierTrustee() {
 		return errors.New("windows sandbox: invalid lease journal event identity")
 	}
@@ -158,7 +213,9 @@ func validateBrokerLeaseEvent(event brokerLeaseEvent) error {
 			return errors.New("windows sandbox: unexpected lease event mutation")
 		}
 	case brokerLeaseEventMutationPrepared:
-		if !event.Object.valid() || !canonicalBrokerPath(event.Path) || (event.Trustee != event.SID && event.Trustee.kind != sidKindInstallation) || !event.Trustee.isModuleTrustee() || !brokerAllowACEForSID(event.ACE, event.Trustee, event.Object.Kind) {
+		trusteeAllowed := event.Trustee == event.SID ||
+			(legacyInstallationTrustee && event.Trustee.kind == sidKindInstallation)
+		if !event.Object.valid() || !canonicalBrokerPath(event.Path) || !trusteeAllowed || !event.Trustee.isModuleTrustee() || !brokerAllowACEForSID(event.ACE, event.Trustee, event.Object.Kind) {
 			return errors.New("windows sandbox: invalid prepared lease mutation")
 		}
 	default:
