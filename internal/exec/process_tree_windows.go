@@ -108,7 +108,7 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 	// pseudo console the attribute list attaches.
 	cmd.SysProcAttr.CreationFlags = pipeLaunchCreationFlags(cmd.SysProcAttr.CreationFlags, tree.privateConsole)
 	if err := cmd.Start(); err != nil {
-		return err
+		return describeWindowsStartFailure(cmd, cmd.Path, err)
 	}
 	var setupErr error
 	err := cmd.Process.WithHandle(func(processHandle uintptr) {
@@ -347,9 +347,15 @@ func (launch *conPTYLaunch) createSuspended() error {
 	if err != nil {
 		return err
 	}
-	cmdLine, err := conPTYCommandLine(cmd.Args)
-	if err != nil {
-		return err
+	// A raw command line pinned on SysProcAttr (applyShellCommandLine, for
+	// cmd.exe) wins exactly as it does in syscall.StartProcess; only an argv
+	// without one is escaped CommandLineToArgvW-style.
+	cmdLine := cmd.SysProcAttr.CmdLine
+	if cmdLine == "" {
+		cmdLine, err = conPTYCommandLine(cmd.Args)
+		if err != nil {
+			return err
+		}
 	}
 	cmdLine16, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
@@ -372,8 +378,7 @@ func (launch *conPTYLaunch) createSuspended() error {
 		return fmt.Errorf("sandbox: allocate ConPTY process attribute list: %w", err)
 	}
 	defer attributes.Delete()
-	pconsole := conPTYAttributeHandle(launch.pending.attribute)
-	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&pconsole), unsafe.Sizeof(pconsole)); err != nil {
+	if err := attachPseudoConsoleAttribute(attributes, conPTYAttributeHandle(launch.pending.attribute)); err != nil {
 		return fmt.Errorf("sandbox: attach ConPTY attribute: %w", err)
 	}
 
@@ -384,14 +389,28 @@ func (launch *conPTYLaunch) createSuspended() error {
 	// exactly like the plain path, preserving sendInterrupt's own
 	// CTRL_BREAK_EVENT targeting unchanged for a ConPTY-backed Process too.
 	flags := conPTYLaunchCreationFlags(cmd.SysProcAttr.CreationFlags)
-	// StartupInfo.Flags deliberately does NOT include STARTF_USESTDHANDLES: a
-	// ConPTY-attached child's console I/O routes entirely through the
-	// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute above, never through
-	// inherited stdio handles — Microsoft's own ConPTY sample code uses the
-	// identical bInheritHandles=FALSE, no-STARTF_USESTDHANDLES shape this
-	// call mirrors.
+	// StartupInfo.Flags carries STARTF_USESTDHANDLES with all three standard
+	// handles set to INVALID_HANDLE_VALUE. Without it, CreateProcess hands the
+	// child THIS process's standard handles, and when this process's stdio is
+	// redirected (a service, a CI runner, `go test` — none of them has a
+	// console) the console client keeps those instead of the pseudo console's
+	// handles: the child reads this process's stdin and writes to its stdout,
+	// and the pseudo console sees nothing. With explicit invalid handles the
+	// console client takes all three from the pseudo console it attaches to.
+	// This is exactly the shape wezterm's portable-pty launches ConPTY clients
+	// with, for the same reason (a daemonized host whose stdio is a log file).
+	// bInheritHandles stays FALSE, so nothing is inherited either way. (The
+	// first Windows CI run's ConPTY symptoms are explained by the attribute
+	// bug fixed in attachPseudoConsoleAttribute; this closes the
+	// redirected-host case that bug was masking.)
 	startup := windows.StartupInfoEx{
-		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
+		StartupInfo: windows.StartupInfo{
+			Cb:        uint32(unsafe.Sizeof(windows.StartupInfoEx{})),
+			Flags:     windows.STARTF_USESTDHANDLES,
+			StdInput:  windows.InvalidHandle,
+			StdOutput: windows.InvalidHandle,
+			StdErr:    windows.InvalidHandle,
+		},
 		ProcThreadAttributeList: attributes.List(),
 	}
 	// cmd.SysProcAttr.Token, when non-zero, is the restricted token
@@ -418,9 +437,54 @@ func (launch *conPTYLaunch) createSuspended() error {
 		err = windows.CreateProcess(appPath16, cmdLine16, nil, nil, false, flags, &envBlock[0], dir16, &startup.StartupInfo, &pi)
 	}
 	if err != nil {
-		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", err)
+		return fmt.Errorf("sandbox: create suspended ConPTY process: %w", describeWindowsStartFailure(cmd, appPath, err))
 	}
 	launch.pi = pi
+	return nil
+}
+
+// updateProcThreadAttribute is called directly, not through
+// windows.ProcThreadAttributeListContainer.Update, for the one attribute
+// whose lpValue is not a pointer to the value: see
+// attachPseudoConsoleAttribute.
+var updateProcThreadAttribute = windows.NewLazySystemDLL("kernel32.dll").NewProc("UpdateProcThreadAttribute")
+
+// attachPseudoConsoleAttribute adds PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE to
+// attributes. For this attribute lpValue IS the HPCON — Microsoft's
+// "Creating a Pseudoconsole session" passes `hPC` itself, with
+// cbSize = sizeof(HPCON) — unlike HANDLE_LIST or PARENT_PROCESS, whose
+// lpValue points AT the handle(s).
+//
+// The first Windows CI run passed the ADDRESS of a local HPCON variable
+// (Update(attr, unsafe.Pointer(&pconsole), ...)). kernelbase then read that
+// stack slot as the pseudo console's internal record (signal pipe, reference
+// handle, host process), so the child was launched against garbage handle
+// values: depending on what the slot's neighbours held, the console client
+// either failed to connect and died in DLL initialisation (exit 0xC0000142,
+// STATUS_DLL_INIT_FAILED — TestProcessConPTYResize) or never attached to the
+// pseudo console at all and fell back to the parent's standard handles
+// (findstr blocked on the runner's stdin — TestProcessConPTYEOF hung for
+// 8m46s).
+//
+// Update cannot express the correct call without converting the handle to an
+// unsafe.Pointer and retaining a non-Go pointer in a Go pointer slice, so the
+// documented call is made directly with the handle as a plain integer.
+func attachPseudoConsoleAttribute(attributes *windows.ProcThreadAttributeListContainer, console windows.Handle) error {
+	if attributes == nil || attributes.List() == nil || console == 0 {
+		return errors.New("sandbox: invalid ConPTY attribute list or pseudo console")
+	}
+	ok, _, callErr := updateProcThreadAttribute.Call(
+		uintptr(unsafe.Pointer(attributes.List())),
+		0,
+		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+		uintptr(console),
+		unsafe.Sizeof(console),
+		0,
+		0,
+	)
+	if ok == 0 {
+		return fmt.Errorf("UpdateProcThreadAttribute(PSEUDOCONSOLE): %w", callErr)
+	}
 	return nil
 }
 

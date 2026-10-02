@@ -253,6 +253,43 @@ func (t *conPTYTerminal) Close() error {
 	return t.closeErr
 }
 
+// hangupAfterExit implements terminalExitHangup (process.go): it closes the
+// pseudo console once the spawn's whole Job has been proven empty, leaving
+// the input and output pipe ends to Close.
+//
+// This is what lets Stdout reach EOF after the child exits. On Unix the
+// master reports EOF/EIO when the last slave reference closes, which happens
+// by itself when the child (the only slave holder once the parent dropped
+// its copy at Start) exits. A pseudo console has no such moment: the console
+// host (conhost.exe, created by CreatePseudoConsole in THIS process) holds
+// the output pipe's write end for as long as the pseudo console exists, so
+// the pump would block forever on a child that has long exited until
+// something closes it. ClosePseudoConsole makes the host flush its final
+// frame and exit, which closes that write end; the pump drains what remains
+// and observes EOF (ERROR_BROKEN_PIPE, normalised to io.EOF).
+//
+// It runs from spawn cleanup, strictly after supervise's terminateAndWait
+// confirmed no process remains in the Job, so it can never be the thing that
+// kills a client: every process that could still be attached is already gone.
+//
+// t.console is zeroed under t.mu and the handle closed after releasing it.
+// That is safe for exactly the reason Close/resize hold the lock through
+// their syscalls — every user reads the field under the lock and uses it only
+// while still holding it — and it matters here: on Windows releases before
+// Windows 11 24H2, ClosePseudoConsole blocks until the host has written its
+// final frame, which needs the output pipe drained. If nobody reads Stdout,
+// that only ends when Process.Close closes the output read end, and Close
+// takes t.mu first; holding the lock here would deadlock the two.
+func (t *conPTYTerminal) hangupAfterExit() {
+	t.mu.Lock()
+	console := t.console
+	t.console = 0
+	t.mu.Unlock()
+	if console != 0 {
+		windows.ClosePseudoConsole(console)
+	}
+}
+
 // resize changes the pseudo console's buffer/window size via
 // ResizePseudoConsole. rows/cols follow processTerminalTarget's documented
 // Rows-then-Cols order (terminal.go); ConPTY's own windows.Coord is

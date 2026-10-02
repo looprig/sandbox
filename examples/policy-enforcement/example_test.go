@@ -76,6 +76,7 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (gated): %v", err)
 	}
+	t.Cleanup(func() { _ = gatedSet.Close() })
 	gated, err := gatedSet.For("policy-gate")
 	if err != nil {
 		t.Fatalf("ExecutorSet.For (gated): %v", err)
@@ -113,6 +114,7 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (required): %v", err)
 	}
+	t.Cleanup(func() { _ = requiredSet.Close() })
 	requiredExecutor, requiredErr := requiredSet.For("required")
 	switch {
 	case requiredErr == nil:
@@ -153,6 +155,14 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExecutorSet (available): %v", err)
 	}
+	// Close the set on every exit path, before t.TempDir's own cleanup runs
+	// (cleanups run last-registered first). On Windows the restricted tier
+	// retains no-delete-sharing handles on the projected workspace for the
+	// executor's lease, so a test that failed before the explicit Close
+	// below would otherwise leave the workspace undeletable and report a
+	// second, misleading "being used by another process" failure. Close is
+	// idempotent, which the explicit double Close below also asserts.
+	t.Cleanup(func() { _ = set.Close() })
 	executor, err := set.For("worker")
 	if err != nil {
 		t.Fatalf("ExecutorSet.For: %v", err)
@@ -182,6 +192,13 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	}
 	t.Logf("platform capabilities: level=%d guarantees=%+v report=%+v", executor.Level(), guarantees, executor.Report().Entries)
 
+	// On Windows the available profile compiles to the restricted tier when no
+	// elevated setup is installed, so this launches the test binary itself
+	// under a WRITE_RESTRICTED token with Administrators deny-only. A launch
+	// refusal is wrapped by the executor with the API, the token handle's
+	// access and, for ERROR_ACCESS_DENIED, the image's owner/DACL and an open
+	// of the image performed as the launch token, so the error alone says
+	// which of those refused.
 	output, code, err := executor.RunArgv(context.Background(), workspace, []string{os.Args[0], "-test.run=^TestCommandHelper$"})
 	if err != nil {
 		t.Fatalf("RunArgv: %v", err)

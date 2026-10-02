@@ -68,7 +68,14 @@ func startConPTYProcess(t *testing.T, command string) *Process {
 	if err != nil {
 		t.Fatalf("NewExecutorSet: %v", err)
 	}
-	t.Cleanup(func() { _ = set.Close() })
+	// Registered first, so it runs LAST: after the process below has been
+	// killed and reaped. Bounded, because the first Windows CI run's
+	// TestProcessConPTYEOF failed, then hung in exactly this cleanup for
+	// 8m46s (ExecutorSet.Close waits for every active execution lease, and a
+	// child that never attached to its pseudo console was never going to
+	// exit) until the package hit go test's 10-minute timeout and no later
+	// test ran at all.
+	t.Cleanup(func() { closeExecutorSetBounded(t, set, 30*time.Second) })
 	executor, err := set.For("conpty-test")
 	if err != nil {
 		t.Fatalf("For: %v", err)
@@ -84,13 +91,89 @@ func startConPTYProcess(t *testing.T, command string) *Process {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.Close(context.Background()) })
+	// Registered last, so it runs FIRST: whatever the test body did (or
+	// failed to do), the child and its whole Job are killed and reaped before
+	// the Process is closed and the set's lifecycle barrier is awaited.
+	t.Cleanup(func() { stopConPTYProcess(t, proc, 15*time.Second) })
 	return proc
+}
+
+// stopConPTYProcess kills proc's whole Job (a no-op for a process already
+// confirmed terminal) and waits, bounded, for the kill to be observed.
+func stopConPTYProcess(t *testing.T, proc *Process, timeout time.Duration) {
+	t.Helper()
+	_ = proc.Signal(context.Background(), ProcessSignalKill)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := proc.Wait(ctx); err != nil {
+		t.Errorf("ConPTY child did not exit within %s of a Job kill: %v", timeout, err)
+	}
+}
+
+// closeExecutorSetBounded closes set but gives up (failing the test) after
+// timeout instead of hanging the whole package: the goroutine is leaked on
+// purpose, because a stuck Close must not take every later test with it.
+func closeExecutorSetBounded(t *testing.T, set *ExecutorSet, timeout time.Duration) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- set.Close() }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Errorf("ExecutorSet.Close did not return within %s: an execution lease is still active (a ConPTY child or its Job was not reaped)", timeout)
+	}
+}
+
+// conPTYExitSummary says, without blocking for long, whether proc has exited
+// and with what code — decoded, so an NTSTATUS such as 0xC0000142
+// (STATUS_DLL_INIT_FAILED, a console client that could not attach to its
+// console) is named in the failure message instead of printed as 3221225794.
+func conPTYExitSummary(proc *Process) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	result, err := proc.Wait(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "the child is still running"
+	}
+	if err != nil {
+		return fmt.Sprintf("the child's wait failed: %v", err)
+	}
+	return "the child exited with code " + describeExitCode(result.ExitCode)
+}
+
+// conPTYProcessReadUntilContains is conPTYReadUntilContains for a Process: a
+// timeout additionally reports whether the child is still running or has
+// already exited, and how.
+func conPTYProcessReadUntilContains(t *testing.T, proc *Process, substr string, timeout time.Duration) string {
+	t.Helper()
+	return conPTYReadUntil(t, proc.Stdout(), substr, timeout, func() string { return conPTYExitSummary(proc) })
+}
+
+// conPTYProcessWait waits for proc for at most timeout and fails with the
+// decoded exit status when the child did not exit with want.
+func conPTYProcessWait(t *testing.T, proc *Process, timeout time.Duration, want int, why string) ProcessResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result, err := proc.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait did not return within %s (%s): %v", timeout, why, err)
+	}
+	if result.ExitCode != want {
+		t.Fatalf("ExitCode = %s, want %d (%s)", describeExitCode(result.ExitCode), want, why)
+	}
+	return result
 }
 
 // conPTYReadUntilContains mirrors readUntilContains (process_pty_unix_test.go)
 // exactly; duplicated here rather than shared because that file's build tag
 // excludes windows.
 func conPTYReadUntilContains(t *testing.T, r io.Reader, substr string, timeout time.Duration) string {
+	t.Helper()
+	return conPTYReadUntil(t, r, substr, timeout, nil)
+}
+
+func conPTYReadUntil(t *testing.T, r io.Reader, substr string, timeout time.Duration, summary func() string) string {
 	t.Helper()
 	done := make(chan string, 1)
 	go func() {
@@ -118,6 +201,9 @@ func conPTYReadUntilContains(t *testing.T, r io.Reader, substr string, timeout t
 		}
 		return got
 	case <-time.After(timeout):
+		if summary != nil {
+			t.Fatalf("timed out after %s waiting for %q; %s", timeout, substr, summary())
+		}
 		t.Fatalf("timed out after %s waiting for %q", timeout, substr)
 		return ""
 	}
@@ -174,17 +260,11 @@ func TestProcessConPTYInteractive(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("hello-conpty\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "hello-conpty", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "hello-conpty", 10*time.Second)
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (a non-zero exit here means the pseudo console was torn down instead of the child observing a clean EOF)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "a non-zero exit here means the pseudo console was torn down instead of the child observing a clean EOF")
 }
 
 // TestProcessConPTYInput proves multiple successive writes to Stdin all
@@ -196,17 +276,11 @@ func TestProcessConPTYInput(t *testing.T) {
 			t.Fatalf("Stdin.Write(%q): %v", line, err)
 		}
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "third-line", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "third-line", 10*time.Second)
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "findstr should exit cleanly on EOF")
 }
 
 // TestProcessConPTYCombinedOutput proves stdout and stderr are combined into
@@ -217,10 +291,11 @@ func TestProcessConPTYInput(t *testing.T) {
 // synthetic, permanently-empty reader — never a second live pipe.
 func TestProcessConPTYCombinedOutput(t *testing.T) {
 	proc := startConPTYProcess(t, "echo out-marker & echo err-marker 1>&2")
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "two echoes must succeed")
+	// EOF arrives only once the pseudo console is hung up after the Job is
+	// proven empty (conPTYTerminal.hangupAfterExit): the console host holds
+	// the output pipe open for as long as the pseudo console exists.
+	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Stdout drain error = %v, want io.EOF", err)
 	}
@@ -257,13 +332,7 @@ func TestProcessConPTYResize(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("unblock\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	result, err := proc.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "set /p must read the written line and exit cleanly")
 }
 
 // TestProcessConPTYEOF proves closing Stdin delivers EOF to the child by
@@ -277,15 +346,7 @@ func TestProcessConPTYEOF(t *testing.T) {
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result, err := proc.Wait(ctx)
-	if err != nil {
-		t.Fatalf("Wait after closing Stdin did not return in time (EOF was not really propagated through the pseudo console's input pipe): %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (the child was torn down instead of observing a clean EOF)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "closing Stdin must propagate EOF through the pseudo console's input pipe and the child must observe it cleanly")
 }
 
 // TestProcessConPTYCtrlD proves the exact one-byte veofByte (0x04) write
@@ -306,19 +367,11 @@ func TestProcessConPTYCtrlD(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("before-eof\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	conPTYReadUntilContains(t, proc.Stdout(), "before-eof", 5*time.Second)
+	conPTYProcessReadUntilContains(t, proc, "before-eof", 10*time.Second)
 	if _, err := proc.Stdin().Write([]byte{0x04}); err != nil {
 		t.Fatalf("Stdin.Write(Ctrl-D): %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result, err := proc.Wait(ctx)
-	if err != nil {
-		t.Fatalf("Wait after Ctrl-D did not return in time (VEOF was not really delivered): %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0 (findstr should exit cleanly on EOF, not die of an unexpected teardown)", result.ExitCode)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "VEOF must be delivered and findstr must exit cleanly on EOF, not die of an unexpected teardown")
 }
 
 // TestProcessConPTYInterrupt proves Process.Signal(ProcessSignalInterrupt)
@@ -367,10 +420,8 @@ func TestProcessConPTYInterrupt(t *testing.T) {
 // OBSERVABLE CONTRACT holds end to end regardless.
 func TestProcessConPTYOutputEOFNormalization(t *testing.T) {
 	proc := startConPTYProcess(t, "echo done")
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	_, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "echo must succeed")
+	_, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("final Stdout Read error = %v, want io.EOF (not a raw platform error)", err)
 	}
@@ -457,10 +508,8 @@ func TestProcessConPTYNoPipeFallback(t *testing.T) {
 	if _, err := proc.Stdin().Write([]byte("\r\n")); err != nil {
 		t.Fatalf("Stdin.Write: %v", err)
 	}
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 5*time.Second)
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "set /p and two echoes must succeed")
+	got, err := conPTYReadUntilEOF(t, proc.Stdout(), 10*time.Second)
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Stdout drain error = %v, want io.EOF", err)
 	}
@@ -480,9 +529,7 @@ func TestProcessConPTYNoPipeFallback(t *testing.T) {
 // practice, not merely by inspection of the Close implementation.
 func TestProcessConPTYCloseAfterNaturalExit(t *testing.T) {
 	proc := startConPTYProcess(t, portableSuccessCommand())
-	if _, err := proc.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "exit /b 0 must succeed")
 	if err := proc.Close(context.Background()); err != nil {
 		t.Fatalf("Close after natural exit = %v, want nil", err)
 	}
@@ -651,10 +698,23 @@ func TestProcessTreeConPTYJobBeforeResume(t *testing.T) {
 		t.Fatalf("closeSlave: %v", err)
 	}
 	if !tree.assigned {
+		_ = tree.terminate()
 		t.Fatal("start returned successfully without ever recording Job assignment")
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("payload exited with an error: %v", err)
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			code := -1
+			if cmd.ProcessState != nil {
+				code = cmd.ProcessState.ExitCode()
+			}
+			t.Fatalf("payload exited with an error: %v (exit %s)", err, describeExitCode(code))
+		}
+	case <-time.After(30 * time.Second):
+		_ = tree.terminate()
+		t.Fatal("ConPTY payload did not exit within 30s; its Job was terminated")
 	}
 
 	data, err := os.ReadFile(marker)
