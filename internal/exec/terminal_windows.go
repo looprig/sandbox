@@ -393,20 +393,53 @@ func conPTYCommandLine(args []string) (string, error) {
 	return strings.Join(escaped, " "), nil
 }
 
+// conPTYLaunchEnvBlock builds the CreateProcess environment block for a
+// ConPTY launch of cmd. The plain cmd.Start() Windows path never hands cmd.Env
+// to the OS verbatim: os/exec first applies dedupEnv (case-insensitive on
+// Windows, the LAST spelling of a name winning) and addCriticalEnv (appending
+// SYSTEMROOT from the parent when no spelling of it is present), because
+// Winsock, CryptoAPI/CNG and many system DLLs fail to initialise in a process
+// with no SystemRoot. The ConPTY path calls CreateProcess itself, so it must
+// apply the same two steps or a scrubbed ConPTY child starts without
+// SystemRoot. It does so through exec.Cmd.Environ, which is exactly that
+// pipeline (cmd.environ: dedupEnv then addCriticalEnv; its cmd.Dir-based PWD
+// rewrite is POSIX-only and only applies when Env is nil), on a throwaway Cmd
+// carrying only the environment.
+//
+// Two deliberate departures from calling cmd.Environ() directly:
+//
+//   - A nil cmd.Env is treated as EMPTY, never as "inherit": Environ would
+//     substitute the full parent environment for a nil Env, and every ConPTY
+//     launch this package builds sets Env from assembleEnv, so a nil here is a
+//     bug that must fail closed (an empty block plus SYSTEMROOT), not a
+//     secret leak.
+//   - An entry containing NUL is an error, as it always was here: Environ
+//     silently drops such an entry (it ignores dedupEnv's error), and a
+//     silently altered environment is not something a launch should paper
+//     over.
+func conPTYLaunchEnvBlock(cmd *exec.Cmd) ([]uint16, error) {
+	env := cmd.Env
+	if env == nil {
+		env = []string{}
+	}
+	for _, entry := range env {
+		if strings.IndexByte(entry, 0) >= 0 {
+			return nil, errors.New("sandbox: invalid ConPTY launch environment entry: contains NUL")
+		}
+	}
+	return conPTYEnvBlock((&exec.Cmd{Env: env}).Environ())
+}
+
 // conPTYEnvBlock builds the double-NUL-terminated UTF-16 environment block
 // CreateProcess requires when CREATE_UNICODE_ENVIRONMENT is set, mirroring
 // syscall.createEnvBlock's own layout exactly (each entry UTF-16, NUL
-// terminated; one further trailing NUL closes the block). Unlike that
-// unexported stdlib helper, this does not sort entries: sorting is
-// documented Windows convention for a system-provided environment block, not
-// a CreateProcess requirement, and env here is already the exact same
-// cmd.Env value the plain cmd.Start()-driven Windows path already passes
-// through unsorted via syscall.StartProcess's own internal env handling —
-// see that path's own createEnvBlock call, which DOES sort, meaning this is a
-// deliberate, narrow behavioral difference from that path, noted here for a
-// future reader: it has no observed effect on any target this package
-// launches today, since duplicate-key environments are not something this
-// package's own compiled backends produce.
+// terminated; one further trailing NUL closes the block). env must already be
+// the launch environment as os/exec would compute it — conPTYLaunchEnvBlock
+// produces that, deduplicated case-insensitively and carrying SYSTEMROOT — so
+// this function only encodes. Unlike syscall.createEnvBlock it does not sort
+// the entries: sorting is the documented convention for a system-provided
+// block, not a CreateProcess requirement, and with duplicates already removed
+// the order cannot change which value a name resolves to.
 func conPTYEnvBlock(env []string) ([]uint16, error) {
 	if len(env) == 0 {
 		return []uint16{0, 0}, nil

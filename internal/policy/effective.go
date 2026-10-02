@@ -4,6 +4,7 @@ import (
 	"github.com/looprig/sandbox/pkg/profile"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type FSAccess uint8
@@ -150,9 +151,66 @@ func appendRootAccess(entries *[]FSEntry, path string, read, write profile.Acces
 	*entries = append(*entries, FSEntry{Path: path, Access: access, Denied: denied})
 }
 
-func BaselineEnvAllowlist() []string {
+// unixBaselineEnvAllowlist is the scrubbed-environment baseline on darwin and
+// Linux (SPEC §3): the variables a POSIX shell and common toolchains need to
+// start and to identify the user and locale. BaselineEnvAllowlist selects it on
+// every !windows build (effective_env_unix.go). Names are matched exactly
+// (EnvNameFold is the identity there).
+func unixBaselineEnvAllowlist() []string {
 	return []string{"PATH", "HOME", "TERM", "LANG", "LC_*", "USER", "LOGNAME", "SHELL", "TZ"}
 }
+
+// windowsBaselineEnvAllowlist is the scrubbed-environment baseline on Windows,
+// selected by effective_env_windows.go. Windows environment names are
+// case-insensitive, so the exec matcher compares them folded (EnvNameFold):
+// "PATH" here admits the "Path" spelling os.Environ reports. Each entry is
+// what the loader, the CRT or common toolchains need to START:
+//
+//   - PATH, PATHEXT: program lookup; PATHEXT is how cmd.exe and
+//     CreateProcess-adjacent lookup resolve an extensionless name.
+//   - SystemRoot, windir, SystemDrive: the Windows directory. Winsock,
+//     CryptoAPI/CNG and many DLLs fail to initialise without SystemRoot.
+//   - OS, PROCESSOR_* (ARCHITECTURE, IDENTIFIER, LEVEL, REVISION and the WOW64
+//     ARCHITEW6432), NUMBER_OF_PROCESSORS: host identification read by build
+//     tools, runtimes (Go, .NET, Node) and installers' architecture probes.
+//   - ProgramData, ProgramFiles, ProgramFiles(x86), ProgramW6432,
+//     CommonProgramFiles, CommonProgramFiles(x86), CommonProgramW6432,
+//     ALLUSERSPROFILE: machine-wide install locations toolchains use to find
+//     themselves (MSVC, Git for Windows, SDKs). They are machine directories,
+//     not per-user ones; whether the child may write beneath them is decided
+//     by the backend's filesystem policy, not by the variable.
+//   - USERNAME, COMPUTERNAME, USERDOMAIN: identity strings, the analogue of
+//     USER/LOGNAME on Unix. They name no location.
+//   - TERM, LANG, LC_*, TZ: terminal and locale, as on Unix.
+//
+// Deliberately EXCLUDED: every variable naming a per-user writable or
+// credential-bearing location — APPDATA, LOCALAPPDATA, USERPROFILE, HOME,
+// HOMEDRIVE/HOMEPATH, TEMP/TMP, PUBLIC — and the network-profile names
+// (LOGONSERVER, USERDOMAIN_ROAMINGPROFILE). ExecutorSet instead SETS HOME,
+// USERPROFILE, TEMP, TMP and TMPDIR to executor-owned directories, so a child
+// that needs them gets a location this executor owns rather than the
+// caller's. ComSpec is excluded because SPEC §4 never trusts %ComSpec%:
+// RunCommand runs the canonical System32 cmd.exe, and a child must not be
+// handed a caller-chosen interpreter path either.
+func windowsBaselineEnvAllowlist() []string {
+	return []string{
+		"PATH", "PATHEXT",
+		"SystemRoot", "windir", "SystemDrive",
+		"OS", "PROCESSOR_*", "NUMBER_OF_PROCESSORS",
+		"ProgramData", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+		"CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+		"ALLUSERSPROFILE",
+		"USERNAME", "COMPUTERNAME", "USERDOMAIN",
+		"TERM", "LANG", "LC_*", "TZ",
+	}
+}
+
+// windowsEnvNameFold folds an environment variable name to the single key
+// Windows treats every spelling of it as: names there are case-insensitive, so
+// "Path", "PATH" and "path" are one variable. Upper-casing matches the
+// kernel's own case-insensitive comparison for the ASCII names environments
+// use in practice.
+func windowsEnvNameFold(name string) string { return strings.ToUpper(name) }
 
 func MetadataDenyCIDRs() []string {
 	return []string{"169.254.0.0/16", "fd00:ec2::254"}

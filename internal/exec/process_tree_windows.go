@@ -341,7 +341,7 @@ func (launch *conPTYLaunch) createSuspended() error {
 	if err != nil {
 		return err
 	}
-	envBlock, err := conPTYEnvBlock(cmd.Env)
+	envBlock, err := conPTYLaunchEnvBlock(cmd)
 	if err != nil {
 		return err
 	}

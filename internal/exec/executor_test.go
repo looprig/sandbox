@@ -3,8 +3,11 @@ package exec
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -400,5 +403,163 @@ func TestPlatformUnconfinedProfileExplicitlyUsesNullBackend(t *testing.T) {
 	}
 	if reflect.TypeOf(executor.backend) != reflect.TypeOf(enforce.NewNull()) {
 		t.Fatalf("backend = %T; want explicit %T", executor.backend, enforce.NewNull())
+	}
+}
+
+// useWindowsEnvFold substitutes the Windows environment-name fold for the
+// duration of t, so the case-insensitive matching assembleEnv and applySet
+// perform on Windows is exercised on every host. Tests using it must not call
+// t.Parallel: envNameFold is package state.
+func useWindowsEnvFold(t *testing.T) {
+	t.Helper()
+	saved := envNameFold
+	envNameFold = strings.ToUpper
+	t.Cleanup(func() { envNameFold = saved })
+}
+
+// TestEnvNameMatchesFoldsCase proves the matcher compares names under the
+// platform fold: with the Windows fold the "Path" spelling os.Environ reports
+// on Windows matches the baseline's "PATH", and a glob matches whatever case
+// either side is spelled in; with the identity (Unix) fold neither does.
+func TestEnvNameMatchesFoldsCase(t *testing.T) {
+	if runtime.GOOS != "windows" && envNameMatches("Path", []string{"PATH"}) {
+		t.Fatal("identity fold: Path matched PATH; Unix names are case-sensitive")
+	}
+
+	useWindowsEnvFold(t)
+	for _, c := range []struct {
+		name    string
+		pattern string
+	}{
+		{"Path", "PATH"},
+		{"SYSTEMROOT", "SystemRoot"},
+		{"windir", "windir"},
+		{"Processor_Architecture", "PROCESSOR_*"},
+		{"cargo_home", "CARGO_*"},
+		{"ProgramFiles(x86)", "ProgramFiles(x86)"},
+	} {
+		if !envNameMatches(c.name, []string{c.pattern}) {
+			t.Errorf("Windows fold: %q did not match %q", c.name, c.pattern)
+		}
+	}
+	if envNameMatches("GITHUB_TOKEN", policy.BaselineEnvAllowlist()) {
+		t.Error("Windows fold widened the baseline to GITHUB_TOKEN")
+	}
+	if envNameMatches("lc_all", []string{"LC_["}) {
+		t.Error("Windows fold: a malformed glob matched; it must fail closed")
+	}
+}
+
+// TestApplySetFoldsCase proves Set overrides an inherited variable under the
+// platform fold instead of appending a second spelling of it. The policy
+// chosen and pinned here: an overwritten entry keeps the INHERITED spelling
+// (Windows does not distinguish them), every further inherited spelling of the
+// same name is dropped so the result carries one entry per variable, and two
+// Set keys that fold together collapse to the lexically first key.
+func TestApplySetFoldsCase(t *testing.T) {
+	// Identity fold (Unix): differently cased names are different variables.
+	unix := applySet([]string{"Temp=old"}, map[string]string{"TEMP": "new"})
+	if !slices.Equal(unix, []string{"Temp=old", "TEMP=new"}) {
+		t.Fatalf("identity fold: applySet = %v, want Temp kept and TEMP appended", unix)
+	}
+
+	useWindowsEnvFold(t)
+	got := applySet([]string{"Temp=old", "Path=/bin", "TEMP=older"}, map[string]string{"TEMP": "new"})
+	if want := []string{"Temp=new", "Path=/bin"}; !slices.Equal(got, want) {
+		t.Fatalf("Windows fold: applySet = %v, want %v", got, want)
+	}
+
+	proxy := map[string]string{}
+	applyChildProxyEnv(proxy, "http://127.0.0.1:1")
+	got = applySet([]string{"https_proxy=http://evil", "PATH=/bin"}, proxy)
+	want := []string{"https_proxy=http://127.0.0.1:1", "PATH=/bin", "HTTP_PROXY=http://127.0.0.1:1", "NO_PROXY="}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Windows fold: proxy applySet = %v, want %v", got, want)
+	}
+}
+
+// TestAssembleEnvWindowsFoldKeepsPath is the M2 regression guard driven on
+// every host: under the Windows fold, a parent variable spelled "Path" (as
+// os.Environ reports it on Windows) survives the scrub, and a Set TEMP
+// replaces an inherited "Temp" rather than duplicating it.
+func TestAssembleEnvWindowsFoldKeepsPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Setenv on Windows cannot hold two spellings of one name")
+	}
+	t.Setenv("Path", `C:\Windows\system32`)
+	t.Setenv("Temp", `C:\Users\someone\AppData\Local\Temp`)
+	t.Setenv("GITHUB_TOKEN", "secret")
+	useWindowsEnvFold(t)
+
+	scrubbed := assembleEnv(policy.Effective{Env: policy.EnvPolicy{Set: map[string]string{"TEMP": `C:\owned\tmp`}}})
+	if !containsEnv(scrubbed, `Path=C:\Windows\system32`) {
+		t.Errorf("Windows fold: scrubbed env dropped Path: %v", scrubbed)
+	}
+	if hasEnvName(scrubbed, "GITHUB_TOKEN") {
+		t.Errorf("Windows fold: scrubbed env leaked GITHUB_TOKEN: %v", scrubbed)
+	}
+
+	inherited := assembleEnv(policy.Effective{Env: policy.EnvPolicy{Inherit: true, Set: map[string]string{"TEMP": `C:\owned\tmp`}}})
+	if !containsEnv(inherited, `Temp=C:\owned\tmp`) {
+		t.Errorf("Windows fold: Set TEMP did not overwrite inherited Temp: %v", inherited)
+	}
+	if n := countEnvName(inherited, "TEMP") + countEnvName(inherited, "Temp"); n != 1 {
+		t.Errorf("Windows fold: TEMP spellings appear %d times, want exactly 1", n)
+	}
+}
+
+// TestExecutorOwnedEnvMapping pins which variables ExecutorSet points at the
+// executor-owned HOME and tmp directories: HOME and TMPDIR everywhere, plus
+// the Windows names Windows itself consults (GetTempPath reads TMP then TEMP;
+// SHGetKnownFolderPath-free code reads USERPROFILE), so a Windows child never
+// falls back to the Windows directory or the caller's profile.
+func TestExecutorOwnedEnvMapping(t *testing.T) {
+	const home, tmp = "/owned/home", "/owned/tmp"
+	unix := map[string]string{"HOME": home, "TMPDIR": tmp}
+	windows := map[string]string{"HOME": home, "TMPDIR": tmp, "TEMP": tmp, "TMP": tmp, "USERPROFILE": home}
+	if got := executorOwnedEnvFor("linux", home, tmp); !maps.Equal(got, unix) {
+		t.Errorf("executorOwnedEnvFor(linux) = %v, want %v", got, unix)
+	}
+	if got := executorOwnedEnvFor("darwin", home, tmp); !maps.Equal(got, unix) {
+		t.Errorf("executorOwnedEnvFor(darwin) = %v, want %v", got, unix)
+	}
+	if got := executorOwnedEnvFor("windows", home, tmp); !maps.Equal(got, windows) {
+		t.Errorf("executorOwnedEnvFor(windows) = %v, want %v", got, windows)
+	}
+	want := unix
+	if runtime.GOOS == "windows" {
+		want = windows
+	}
+	if got := executorOwnedEnv(home, tmp); !maps.Equal(got, want) {
+		t.Errorf("executorOwnedEnv = %v, want %v", got, want)
+	}
+}
+
+// TestExecutorSetForcesExecutorOwnedEnv proves ExecutorSet.For lands every
+// executor-owned variable in the assembled child environment exactly once.
+func TestExecutorSetForcesExecutorOwnedEnv(t *testing.T) {
+	workspace := t.TempDir()
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Deny, Command: Allow,
+	})
+	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeReadBoundary | GuaranteeNetworkBoundary | GuaranteeEnvScrub}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1),
+		withExecutorSetConfig(withBackend(backend)))
+	if err != nil {
+		t.Fatalf("NewExecutorSet: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("owned-env")
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	for name, value := range executorOwnedEnv(executor.home, executor.tmp) {
+		if !containsEnv(executor.env, name+"="+value) {
+			t.Errorf("executor env lacks %s=%s: %v", name, value, executor.env)
+		}
+		if n := countEnvName(executor.env, name); n != 1 {
+			t.Errorf("executor env carries %s %d times, want 1", name, n)
+		}
 	}
 }

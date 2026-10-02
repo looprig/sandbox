@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/network"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -1386,15 +1387,23 @@ func applyChildProxyEnv(set map[string]string, proxyURL string) {
 	set["no_proxy"] = ""
 }
 
-// assembleEnv builds the child environment from a policy.Effective's policy.EnvPolicy (SPEC §5.5).
+// envNameFold folds an environment variable name to the key under which two
+// names denote the same variable: policy.EnvNameFold, the identity on Unix and
+// upper-casing on Windows (where "Path" and "PATH" are one variable). It is a
+// variable only so a test on any host can substitute the Windows fold and
+// exercise the case-insensitive matching below; production never reassigns it.
+var envNameFold = policy.EnvNameFold
+
+// assembleEnv builds the child environment from a policy.Effective's policy.EnvPolicy (SPEC §3).
 // It is shared by every backend and lives on the executor side because env
 // scrubbing holds regardless of OS mechanism.
 //
 //   - Inherit: start from the full parent environment (os.Environ), then force
 //     the Set overrides. Used by unconfined and explicit opt-in.
 //   - otherwise (the fail-closed default): keep only parent variables whose NAME
-//     matches the §5.5 baseline allowlist or one of policy.EnvPolicy.Allow (name globs
-//     via filepath.Match), then force the Set overrides (including TMPDIR).
+//     matches the platform baseline allowlist (policy.BaselineEnvAllowlist) or
+//     one of policy.EnvPolicy.Allow (name globs via path.Match, compared under
+//     envNameFold), then force the Set overrides (including TMPDIR).
 //     Everything else — GITHUB_TOKEN, AWS_*, LLM keys, SSH_AUTH_SOCK, … — is
 //     absent.
 //
@@ -1430,49 +1439,79 @@ func assembleEnv(p policy.Effective) []string {
 // allowlist patterns, using path.Match on the NAME (so "LC_*" and "CARGO_*"
 // work). path.Match — not filepath.Match — is deliberate: env names are not
 // filesystem paths, and filepath.Match uses "\"-separator semantics on Windows,
-// whereas path.Match is always "/"-based, which is correct for a plain name. A
-// malformed pattern fails closed: path.Match's error is treated as a non-match,
-// so a bad glob never widens the allowlist.
+// whereas path.Match is always "/"-based, which is correct for a plain name.
+// Both the name and the pattern are compared under envNameFold, so on Windows
+// the "Path" spelling os.Environ reports matches the baseline's "PATH" (without
+// the fold a scrubbed Windows child received no PATH at all). A malformed
+// pattern fails closed: path.Match's error is treated as a non-match, so a bad
+// glob never widens the allowlist.
 func envNameMatches(name string, patterns []string) bool {
+	folded := envNameFold(name)
 	for _, pat := range patterns {
-		if ok, err := path.Match(pat, name); err == nil && ok {
+		if ok, err := path.Match(envNameFold(pat), folded); err == nil && ok {
 			return true
 		}
 	}
 	return false
 }
 
-// applySet forces the policy.EnvPolicy.Set values onto an assembled env slice: an
-// existing KEY is overwritten in place (so no duplicate keys), and a new KEY is
-// appended. Newly appended keys are sorted for a deterministic result. env is
-// assumed to be freshly owned by the caller (os.Environ() or a freshly built
-// slice), so overwriting in place is safe.
+// applySet forces the policy.EnvPolicy.Set values onto an assembled env slice,
+// comparing names under envNameFold so that on Windows a Set "TEMP" replaces an
+// inherited "Temp" rather than producing a second spelling of one variable:
+//
+//   - the first existing entry for a forced name is overwritten in place and
+//     KEEPS its existing spelling (the OS does not distinguish the spellings);
+//   - every later existing entry for the same folded name is dropped, so the
+//     result never carries duplicate keys;
+//   - a forced name with no existing entry is appended under its Set spelling,
+//     appended names sorted for a deterministic result;
+//   - two Set keys that fold to one name (applyChildProxyEnv's HTTP_PROXY and
+//     http_proxy on Windows) collapse to the lexically first key and its value.
+//
+// On Unix the fold is the identity, so this is exactly the exact-name
+// overwrite-or-append it has always been. env is assumed to be freshly owned
+// by the caller (os.Environ() or a freshly built slice), so filtering it in
+// place is safe.
 func applySet(env []string, set map[string]string) []string {
 	if len(set) == 0 {
 		return env
 	}
 
-	forced := make(map[string]bool, len(set))
-	for i, kv := range env {
-		name, _, ok := strings.Cut(kv, "=")
-		if !ok {
+	type forcedVar struct {
+		name, value string
+		applied     bool
+	}
+	keys := slices.Sorted(maps.Keys(set))
+	order := make([]*forcedVar, 0, len(keys))
+	byFold := make(map[string]*forcedVar, len(keys))
+	for _, k := range keys {
+		folded := envNameFold(k)
+		if _, taken := byFold[folded]; taken {
 			continue
 		}
-		if v, isForced := set[name]; isForced {
-			env[i] = name + "=" + v
-			forced[name] = true
-		}
+		forced := &forcedVar{name: k, value: set[k]}
+		byFold[folded] = forced
+		order = append(order, forced)
 	}
 
-	var add []string
-	for k := range set {
-		if !forced[k] {
-			add = append(add, k)
+	out := env[:0]
+	for _, kv := range env {
+		name, _, ok := strings.Cut(kv, "=")
+		forced := byFold[envNameFold(name)]
+		if !ok || forced == nil {
+			out = append(out, kv)
+			continue
+		}
+		if forced.applied {
+			continue
+		}
+		out = append(out, name+"="+forced.value)
+		forced.applied = true
+	}
+	for _, forced := range order {
+		if !forced.applied {
+			out = append(out, forced.name+"="+forced.value)
 		}
 	}
-	slices.Sort(add)
-	for _, k := range add {
-		env = append(env, k+"="+set[k])
-	}
-	return env
+	return out
 }
