@@ -8,8 +8,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/looprig/sandbox/internal/diskname"
 )
 
+// CanonicalPath resolves symlinks in the longest existing prefix of path and
+// re-joins the missing suffix. On macOS the existing prefix also takes its
+// on-disk spelling (see diskname.Respell), matching profile.CanonicalRoot, so a
+// grant target and a configured root compare equal however the caller spelled
+// them; the missing suffix keeps the caller's spelling because nothing stores
+// one yet.
 func CanonicalPath(path string) (string, error) {
 	if path == "" || !filepath.IsAbs(path) {
 		return "", errors.New("path is not absolute")
@@ -20,6 +28,10 @@ func CanonicalPath(path string) (string, error) {
 	for {
 		resolved, err := filepath.EvalSymlinks(ancestor)
 		if err == nil {
+			resolved, err = diskname.Respell(filepath.Clean(resolved))
+			if err != nil {
+				return "", err
+			}
 			for i := len(suffix) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, suffix[i])
 			}
