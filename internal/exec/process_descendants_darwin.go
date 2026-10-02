@@ -77,6 +77,10 @@ func setHas(set map[int32]struct{}, pid int32) bool {
 //   - arming happens just after cmd.Start(), so a child forked in that
 //     window is caught only by the first sample's closure walk (via its
 //     ppid/pgid link), not by kevents.
+//   - a recorded member (or the root) only anchors a closure join while the
+//     snapshot still shows the same (pid, start-time) process, so a recycled
+//     pid's unrelated children are never adopted (see absorb); a process
+//     reparented away before any sample saw it is simply missed.
 //
 // pid 1 (launchd) is never treated as a closure anchor in sample() even if
 // it is somehow present in members (see sample()'s ppid/pgid != 1 guard):
@@ -94,8 +98,12 @@ type descendantTracker struct {
 	stop     chan struct{}
 	loops    sync.WaitGroup
 	rootPID  int32
-	forkNote bool // NOTE_FORK accepted by this kernel (degrades if not)
-	armed    bool // arm() already called — see arm's single-call contract
+	// rootStart is the root's start-time identity, read by arm; when
+	// rootStartKnown is false the root anchors pgid joins only (see absorb).
+	rootStart      unix.Timeval
+	rootStartKnown bool
+	forkNote       bool // NOTE_FORK accepted by this kernel (degrades if not)
+	armed          bool // arm() already called — see arm's single-call contract
 }
 
 func newDescendantTracker() (*descendantTracker, error) {
@@ -149,9 +157,12 @@ func (tracker *descendantTracker) arm(pid int) error {
 	}
 	tracker.armed = true
 	tracker.mu.Unlock()
+	tracker.mu.Lock()
 	tracker.rootPID = pid32
+	tracker.mu.Unlock()
 	if start, ok := processStartTime(pid32); ok {
 		tracker.mu.Lock()
+		tracker.rootStart, tracker.rootStartKnown = start, true
 		tracker.members[pid32] = descendantMember{pid: pid32, start: start}
 		tracker.mu.Unlock()
 	}
@@ -254,19 +265,70 @@ func (tracker *descendantTracker) runSampler() {
 }
 
 // sample grows the member set to the current transitive closure rooted at
-// the spawn. Iterates to fixpoint within one snapshot so a whole fork chain
-// appearing between samples is captured at once.
+// the spawn from one kern.proc.all snapshot (absorb does the work, so a unit
+// test can drive it with a fabricated snapshot).
 func (tracker *descendantTracker) sample() {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
 		return // sampling is best-effort; the next tick retries
 	}
-	tracker.mu.Lock()
-	memberPIDs := make(map[int32]struct{}, len(tracker.members)+1)
-	for pid := range tracker.members {
-		memberPIDs[pid] = struct{}{}
+	tracker.absorb(procs)
+}
+
+// absorb grows the member set from one process-table snapshot, iterating to
+// fixpoint within it so a whole fork chain appearing between samples is
+// captured at once.
+//
+// An anchor is only as good as its identity (review L3). A member — or the
+// root — that has died may have had its pid recycled by an unrelated
+// same-user process; that newcomer's children then carry the old pid as
+// their ppid, and joining on the bare pid would adopt them, so teardown would
+// SIGKILL processes this run never created. Each recorded anchor is therefore
+// checked against the snapshot's own row for that pid before it may anchor
+// anything:
+//
+//   - present with the recorded start time: the same process, so it anchors
+//     both ppid and pgid joins;
+//   - present with a DIFFERENT start time: a recycled pid, so it anchors
+//     nothing (and kill-time memberAlive already refuses to signal it);
+//   - absent from the snapshot: the process is gone and nothing can name it
+//     as a parent, but its process group may outlive it. XNU never hands out
+//     a pid that is still in use as a process-group (or session) id, so a
+//     group still carrying that id is necessarily the run's own group, and
+//     the pid keeps anchoring pgid joins only.
+//
+// The root is held to the same rule through the start time arm recorded for
+// it; when arm could not read one (the child had already exited), the root
+// anchors pgid joins only, which is exactly the absent case above.
+func (tracker *descendantTracker) absorb(procs []unix.KinfoProc) {
+	byPID := make(map[int32]*unix.KinfoProc, len(procs))
+	for i := range procs {
+		byPID[procs[i].Proc.P_pid] = &procs[i]
 	}
-	memberPIDs[tracker.rootPID] = struct{}{} // root anchors even pre-membership
+
+	tracker.mu.Lock()
+	parentAnchors := make(map[int32]struct{}, len(tracker.members)+1)
+	groupAnchors := make(map[int32]struct{}, len(tracker.members)+1)
+	known := make(map[int32]struct{}, len(tracker.members)+1)
+	classify := func(pid int32, start unix.Timeval, startKnown bool) {
+		known[pid] = struct{}{}
+		row, present := byPID[pid]
+		switch {
+		case !present:
+			groupAnchors[pid] = struct{}{}
+		case startKnown && row.Proc.P_starttime == start:
+			parentAnchors[pid] = struct{}{}
+			groupAnchors[pid] = struct{}{}
+		}
+	}
+	for pid, member := range tracker.members {
+		classify(pid, member.start, true)
+	}
+	if _, isMember := tracker.members[tracker.rootPID]; !isMember && tracker.rootPID > 0 {
+		// The root anchors even before (or after) membership, but only under
+		// its recorded identity: rootStart is set by arm when it could read it.
+		classify(tracker.rootPID, tracker.rootStart, tracker.rootStartKnown)
+	}
 	tracker.mu.Unlock()
 
 	var added []int32
@@ -274,7 +336,7 @@ func (tracker *descendantTracker) sample() {
 		grew := false
 		for i := range procs {
 			pid := procs[i].Proc.P_pid
-			if _, known := memberPIDs[pid]; known {
+			if _, isKnown := known[pid]; isKnown {
 				continue
 			}
 			ppid, pgid := procs[i].Eproc.Ppid, procs[i].Eproc.Pgid
@@ -288,10 +350,14 @@ func (tracker *descendantTracker) sample() {
 			// tracked set — catastrophic if launchdPID is ever a member
 			// (which legitimate discovery never produces, but a test's
 			// injectMemberForTest seam can).
-			parentKnown := ppid != launchdPID && setHas(memberPIDs, ppid)
-			groupKnown := pgid != launchdPID && setHas(memberPIDs, pgid)
+			parentKnown := ppid != launchdPID && setHas(parentAnchors, ppid)
+			groupKnown := pgid != launchdPID && setHas(groupAnchors, pgid)
 			if parentKnown || groupKnown {
-				memberPIDs[pid] = struct{}{}
+				// A process discovered in THIS snapshot is identified by this
+				// snapshot's own row, so it anchors its own children at once.
+				known[pid] = struct{}{}
+				parentAnchors[pid] = struct{}{}
+				groupAnchors[pid] = struct{}{}
 				added = append(added, pid)
 				grew = true
 			}
@@ -304,13 +370,8 @@ func (tracker *descendantTracker) sample() {
 		return
 	}
 	tracker.mu.Lock()
-	for i := range procs {
-		pid := procs[i].Proc.P_pid
-		for _, addedPID := range added {
-			if pid == addedPID {
-				tracker.members[pid] = descendantMember{pid: pid, start: procs[i].Proc.P_starttime}
-			}
-		}
+	for _, pid := range added {
+		tracker.members[pid] = descendantMember{pid: pid, start: byPID[pid].Proc.P_starttime}
 	}
 	tracker.mu.Unlock()
 	for _, pid := range added {

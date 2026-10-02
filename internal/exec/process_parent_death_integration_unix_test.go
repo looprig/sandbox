@@ -301,9 +301,20 @@ func TestIntegrationProcessTreeParentDeath(t *testing.T) {
 	waitForPath(t, started)
 	waitForPath(t, pidPath)
 	// Positive control: the liveness check must see the grandchild while it is
-	// alive, or its "gone" verdict below would prove nothing.
-	if !escapeGrandchildAlive(t, pidPath, token) {
-		t.Fatalf("detached grandchild (token %s) not observed alive before the kill; the liveness check is blind", token)
+	// alive, or its "gone" verdict below would prove nothing. It is POLLED, not
+	// sampled once: the shell writes pidPath and started right after forking
+	// the background job, but the token enters an argv only when that forked
+	// subshell execs the setsid launcher — under CPU contention that exec
+	// lands after both files exist, and a single scan then reported the
+	// grandchild "blind" (the intermittent ~15 s trio failure: this test runs
+	// last, after two 7 s ones). The grandchild sleeps escapeGrandchildDelay,
+	// so a bound well inside that still observes it alive.
+	observeDeadline := time.Now().Add(escapeGrandchildDelay / 2)
+	for !escapeGrandchildAlive(t, pidPath, token) {
+		if time.Now().After(observeDeadline) {
+			t.Fatalf("detached grandchild (token %s) not observed alive before the kill; the liveness check is blind", token)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := proc.Signal(context.Background(), ProcessSignalKill); err != nil {
 		t.Fatalf("Signal(Kill) on the supervising helper: %v", err)

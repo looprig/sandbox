@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/looprig/sandbox/internal/darwin"
+	"github.com/looprig/sandbox/internal/enforce"
 )
 
 // darwinBackendType identifies the real, production Seatbelt-backed
@@ -73,6 +74,40 @@ func (p *darwinBestEffortProof) close() {
 	if p != nil && p.tracker != nil {
 		p.tracker.close()
 	}
+}
+
+// attachSynchronousDescendantProof gives a synchronous (RunCommand/RunArgv/
+// RunCommandWithGrants) Seatbelt spawn the same best-effort prover a
+// Supervised spawn gets. newProcessTree attaches a proof only to Supervised
+// spawns because on Linux that proof is a kernel mechanism the synchronous
+// path does not require; on darwin the prover is just the descendant tracker,
+// and without it run's teardown is a bare process-group sweep that cannot
+// see a descendant which left the group with setsid(2). Such an escapee then
+// survives the run and, if it inherited stdout/stderr, holds the output pipe
+// open after the group is gone (review M10). With the tracker armed, a
+// sample that observed the escapee while its ppid/pgid link still existed
+// makes it a member, and killAndAwaitZero kills it at teardown.
+//
+// It is still best-effort — a descendant that detaches between two samples
+// and loses its link is missed — which is why run additionally bounds its
+// output drain (waitOutputDrain). Scoping matches attachSupervisedProof: only
+// a tree this package built (*processTree) for the real Seatbelt backend,
+// never one that already carries a proof, never an Unconfined (null) or
+// pinned test backend. A tracker that fails to construct leaves the tree
+// exactly as it was, with its plain group sweep.
+func attachSynchronousDescendantProof(tree processTreeBoundary, cmd *exec.Cmd, backend enforce.Backend) {
+	unixTree, ok := tree.(*processTree)
+	if !ok || unixTree == nil || unixTree.cmd != cmd || unixTree.proof != nil {
+		return
+	}
+	if backend == nil || reflect.TypeOf(backend) != darwinBackendType {
+		return
+	}
+	tracker, err := newDescendantTracker()
+	if err != nil {
+		return
+	}
+	unixTree.proof = &darwinBestEffortProof{cmd: cmd, tracker: tracker}
 }
 
 // attachSupervisedProof attaches Darwin's best-effort prover to every real

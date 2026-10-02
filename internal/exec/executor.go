@@ -48,6 +48,30 @@ const defaultGrantTTL = 15 * time.Minute
 // case.
 const spawnWaitGrace = time.Second
 
+// outputDrainGrace bounds how long run waits for its stdout/stderr drain to
+// observe EOF AFTER tree.terminateAndWait has already confirmed the run's
+// process group gone. A descendant that left the group with setsid(2) — the
+// one process a group sweep cannot see — may still hold the write end of the
+// output pipe; with nothing else left to end the drain, run would block
+// forever and, through the unfinished execution lease, so would
+// ExecutorSet.Close (review M10). Every writer the group sweep can see is
+// dead by then, so any bytes they wrote are already buffered in the pipe and
+// the drain reaches them immediately; the grace exists only for the read of
+// that remainder and is deliberately generous (twice the cmd.WaitDelay
+// backstop) because exceeding it truncates output.
+const outputDrainGrace = 2 * spawnWaitGrace
+
+// ErrOutputDrainIncomplete reports a synchronous run whose output pipe was
+// still held open, after the run's whole process group was confirmed gone, by
+// a process outside that group (a setsid'd or otherwise detached
+// descendant). The run closed its read ends after outputDrainGrace rather
+// than wait for that process, so the returned output is everything captured
+// up to that point and the descendant itself may still be alive: on darwin
+// the best-effort descendant tracker kills such an escapee when it saw it in
+// time, and this error is what remains when it did not (or when no tracker
+// applies, as for an Unconfined executor).
+var ErrOutputDrainIncomplete = errors.New("sandbox: output pipe held open by a process outside the run's process group; output truncated")
+
 type outputLimitContextKey struct{}
 
 func withOutputLimit(ctx context.Context, limit int64) context.Context {
@@ -123,19 +147,24 @@ type Executor struct {
 	// Grant wiring (SPEC §9.2). The HMAC key is per-executor and never serialized.
 	// Tokens also bind the immutable profile, route identity, and guarantee bits.
 	// usedGrants provides one-shot replay protection; Close revokes the key.
-	grantKey            []byte
-	clock               func() time.Time
-	grantTTL            time.Duration
-	routeFingerprint    string
-	proxy               *network.Proxy
-	proxyRelease        func() error
-	proxyOwned          bool
-	proxyReleaseOnce    sync.Once
-	proxyReleaseErr     error
-	home                string
-	tmp                 string
-	grantMu             sync.Mutex
-	usedGrants          map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	grantKey         []byte
+	clock            func() time.Time
+	grantTTL         time.Duration
+	routeFingerprint string
+	proxy            *network.Proxy
+	proxyRelease     func() error
+	proxyOwned       bool
+	proxyReleaseOnce sync.Once
+	proxyReleaseErr  error
+	home             string
+	tmp              string
+	grantMu          sync.Mutex
+	usedGrants       map[[32]byte]int64 // grant ID -> signed expiry Unix milliseconds
+	// grantDeadlines maps each live issued grant ID to its deadline on the
+	// monotonic clock below (grant.go, review L6): a wall-clock step cannot
+	// move it, so a backward step never extends a grant.
+	grantDeadlines      map[[32]byte]time.Duration
+	monotonic           func() time.Duration
 	retainedGrantPaths  retainedGrantPaths
 	grantExpiryTimer    *time.Timer
 	grantExpiryGen      uint64
@@ -230,6 +259,8 @@ func newExecutorFromEffective(prof *Profile, p policy.Effective, config executor
 		grantTTL:            ttlOrDefault(config.grantTTL),
 		routeFingerprint:    defaultRouteIdentity,
 		usedGrants:          make(map[[32]byte]int64),
+		grantDeadlines:      make(map[[32]byte]time.Duration),
+		monotonic:           newMonotonicClock(),
 		retainedGrantPaths:  make(retainedGrantPaths),
 		grantExpiryRealtime: config.clock == nil,
 		lifecycle:           lifecycle,
@@ -472,6 +503,12 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	if err != nil {
 		return nil, -1, err
 	}
+	// The synchronous path is not Supervised, so newProcessTree attached no
+	// lifetime proof. On darwin a real Seatbelt spawn still gets the
+	// best-effort descendant tracker (a no-op on every other platform and
+	// backend): it is what kills a setsid'd escapee at teardown, rather than
+	// leaving it alive holding this run's output pipe (review M10).
+	attachSynchronousDescendantProof(tree, cmd, e.backend)
 	spawn.prover = tree
 	spawn.cmd = cmd
 
@@ -562,10 +599,18 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 	// tree.terminateAndWait has now confirmed the entire process group —
 	// including any descendant that forked away from the immediate child and
-	// inherited its pipe ends — is gone, so the drain goroutines are
-	// guaranteed to observe EOF promptly rather than blocking on an orphaned
-	// holder of the write end.
-	drainWG.Wait()
+	// inherited its pipe ends while staying in the group — is gone. That is
+	// NOT every possible holder of the write end: a descendant that called
+	// setsid(2) left the group, so the group sweep never saw it, and on darwin
+	// the best-effort descendant tracker (attachSynchronousDescendantProof)
+	// kills it only when a sample observed it before its parent died. A
+	// surviving holder would keep the drain from ever observing EOF, and an
+	// unbounded drainWG.Wait() here then hangs this run, its execution lease
+	// and ExecutorSet.Close behind it (review M10). exec.Cmd.WaitDelay cannot
+	// bound this: it only manages pipes and copying goroutines exec.Cmd owns,
+	// and this path hands the child its own os.Pipe write ends, so exec.Cmd
+	// owns neither. waitOutputDrain bounds it instead.
+	drainIncomplete := waitOutputDrain(&drainWG, outputDrainGrace, outR, errR)
 
 	// Snapshot cancellation before releasing the execution lease: finish cancels
 	// lease.ctx as part of normal teardown and must not be mistaken for a caller
@@ -584,6 +629,19 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	}
 	if treeErr != nil {
 		return out, -1, treeErr
+	}
+	if drainIncomplete {
+		// The process itself ended (or was cancelled) but its output was cut
+		// short by a detached holder of the pipe. Report the truncation as an
+		// error rather than a clean exit; a concurrent cancellation is joined
+		// so errors.Is still finds it.
+		if executionCtxErr != nil {
+			if callerCtxErr != nil {
+				return out, -1, errors.Join(callerCtxErr, ErrOutputDrainIncomplete)
+			}
+			return out, -1, errors.Join(ErrExecutorClosed, ErrOutputDrainIncomplete)
+		}
+		return out, -1, ErrOutputDrainIncomplete
 	}
 
 	// A context timeout/cancel DURING the run surfaces as a signal kill (an
@@ -604,6 +662,46 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 		return out, -1, err
 	}
 	return out, exitCode, nil
+}
+
+// waitOutputDrain waits for run's two drain goroutines to observe EOF, but for
+// at most grace. On expiry it expires the read ends' deadlines, which makes
+// each blocked Read return os.ErrDeadlineExceeded so both goroutines exit
+// with whatever they have already copied, and then joins them. It reports
+// whether the drain had to be cut short.
+//
+// A read deadline rather than Close: the read ends are also owned by the
+// pipe-backed Process whose own Close runs later in spawn cleanup, and a
+// second Close of the same *os.File would surface as a spurious teardown
+// error. os.Pipe returns pollable descriptors on darwin and Linux, so the
+// deadline is honoured by a Read already parked in the poller. If a
+// descriptor were somehow not pollable, SetReadDeadline fails and the reads
+// are closed instead (that Process.Close may then report ErrClosed, which is
+// preferable to a hang). Writers are untouched: the detached holder keeps
+// its write end and simply meets EPIPE/SIGPIPE on its next write.
+func waitOutputDrain(drainWG *sync.WaitGroup, grace time.Duration, readEnds ...*os.File) bool {
+	drained := make(chan struct{})
+	go func() {
+		drainWG.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return false
+	case <-timer.C:
+	}
+	for _, readEnd := range readEnds {
+		if readEnd == nil {
+			continue
+		}
+		if err := readEnd.SetReadDeadline(time.Now()); err != nil {
+			_ = readEnd.Close()
+		}
+	}
+	<-drained
+	return true
 }
 
 // drainCombinedOutput copies everything read from src into dst, serialized by
@@ -954,6 +1052,8 @@ func (e *Executor) issueGrant(ctx context.Context, executionID, command, cwd, ki
 		}
 		return "", err
 	}
+	e.pruneGrantDeadlinesLocked()
+	e.recordGrantDeadlineLocked(token, expiry.Sub(now))
 	if retained != nil {
 		if err := e.retainedGrantPaths.add(grantID(token), retainedGrantPath{
 			binding: *pathBinding, target: delta.entry.Path, exact: delta.entry.Exact,
@@ -1044,6 +1144,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	pol := policy.Clone(e.policy)
 	now := e.clock()
 	e.pruneUsedGrantsLocked(now.UnixMilli())
+	e.pruneGrantDeadlinesLocked()
 	e.retainedGrantPaths.prune(now.UnixMilli())
 	e.rescheduleRetainedGrantExpiryLocked()
 	seen := make(map[[32]byte]int64, len(grants))
@@ -1079,6 +1180,12 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 		}
 		if requiredBits != 0 && e.guaranteeBits&requiredBits != requiredBits {
 			return nil, -1, ErrGrantGuaranteeMismatch
+		}
+		// The signed wall-clock expiry passed above; the monotonic deadline
+		// recorded at issue must also hold, so a backward wall-clock step can
+		// never extend the grant (review L6).
+		if err := e.checkGrantDeadlineLocked(id); err != nil {
+			return nil, -1, err
 		}
 		if delta.entry != nil && filepath.IsAbs(delta.entry.Path) {
 			pendingPaths = append(pendingPaths, pendingGrantPath{
@@ -1186,6 +1293,7 @@ func (e *Executor) runCommandWithGrants(ctx context.Context, executionID, dir, c
 	}
 	for id, expiryUnixMilli := range seen {
 		e.usedGrants[id] = expiryUnixMilli
+		delete(e.grantDeadlines, id)
 	}
 	e.rescheduleRetainedGrantExpiryLocked()
 	if retainedCloseErr != nil {

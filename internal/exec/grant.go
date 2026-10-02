@@ -306,3 +306,69 @@ func verifyGrantBinding(payload grantPayload, now time.Time, executionID, comman
 }
 
 func expiryFromMillis(value int64) time.Time { return time.UnixMilli(value) }
+
+// newMonotonicClock returns the executor's default monotonic clock: elapsed
+// time since construction, read through time.Since, which uses the monotonic
+// reading time.Now attaches and is therefore immune to wall-clock steps.
+func newMonotonicClock() func() time.Duration {
+	origin := time.Now()
+	return func() time.Duration { return time.Since(origin) }
+}
+
+// Grant expiry on two clocks (review L6). A token carries ExpiryUnixMilli,
+// a wall-clock instant the caller chose and the HMAC binds; that remains the
+// caller-facing contract and verifyGrantBinding still enforces it. But the
+// wall clock can step BACKWARD after issuance, and judging expiry by it alone
+// let such a step silently extend a grant's life by however far the clock
+// went back. Issuance therefore also records, per grant ID, a deadline on
+// the executor's monotonic clock: monotonic-now-at-issue plus the remaining
+// wall-clock window at issue (never more than the TTL cap issueGrant already
+// enforces). A grant is live only while BOTH hold. A forward step can only
+// shorten a grant (the wall check fires first), which is the fail-closed
+// direction.
+//
+// The deadline registry is also the record of what this executor issued: a
+// token with no entry — consumed, pruned after its deadline, or never issued
+// here — is expired. That keeps replay protection monotonic too: a used
+// grant's wall-clock replay entry may be pruned early by a forward step and
+// its token then re-presented after a backward one, but the deadline entry
+// was deleted at consumption, so the second presentation is refused.
+
+// recordGrantDeadlineLocked registers token's monotonic deadline. Caller
+// holds grantMu; remaining is the wall-clock window left at issue.
+func (e *Executor) recordGrantDeadlineLocked(token string, remaining time.Duration) {
+	if e.grantDeadlines == nil {
+		e.grantDeadlines = make(map[[32]byte]time.Duration)
+	}
+	e.grantDeadlines[grantID(token)] = e.monotonicNow() + remaining
+}
+
+// checkGrantDeadlineLocked reports ErrGrantExpired for a grant ID whose
+// monotonic deadline has passed or that this executor holds no live issuance
+// record for. Caller holds grantMu.
+func (e *Executor) checkGrantDeadlineLocked(id [32]byte) error {
+	deadline, ok := e.grantDeadlines[id]
+	if !ok || e.monotonicNow() > deadline {
+		return ErrGrantExpired
+	}
+	return nil
+}
+
+// pruneGrantDeadlinesLocked drops issuance records whose monotonic deadline
+// has passed; such grants are expired whether or not an entry remains, so
+// this only bounds memory. Caller holds grantMu.
+func (e *Executor) pruneGrantDeadlinesLocked() {
+	now := e.monotonicNow()
+	for id, deadline := range e.grantDeadlines {
+		if deadline < now {
+			delete(e.grantDeadlines, id)
+		}
+	}
+}
+
+func (e *Executor) monotonicNow() time.Duration {
+	if e.monotonic == nil {
+		e.monotonic = newMonotonicClock()
+	}
+	return e.monotonic()
+}
