@@ -5,9 +5,10 @@ package windows
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
 	winapi "golang.org/x/sys/windows"
 )
@@ -25,13 +26,7 @@ func TestJobReadbackContainmentAndLimits(t *testing.T) {
 	defer job.Close()
 
 	var limits winapi.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	if err := winapi.QueryInformationJobObject(
-		job.Handle(),
-		winapi.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&limits)),
-		uint32(unsafe.Sizeof(limits)),
-		nil,
-	); err != nil {
+	if _, err := queryJobInformation(job.Handle(), winapi.JobObjectExtendedLimitInformation, &limits); err != nil {
 		t.Fatal(err)
 	}
 	wantFlags := uint32(winapi.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
@@ -52,13 +47,7 @@ func TestJobReadbackContainmentAndLimits(t *testing.T) {
 	}
 
 	var cpu jobObjectCPURateControlInformation
-	if err := winapi.QueryInformationJobObject(
-		job.Handle(),
-		winapi.JobObjectCpuRateControlInformation,
-		uintptr(unsafe.Pointer(&cpu)),
-		uint32(unsafe.Sizeof(cpu)),
-		nil,
-	); err != nil {
+	if _, err := queryJobInformation(job.Handle(), winapi.JobObjectCpuRateControlInformation, &cpu); err != nil {
 		t.Fatal(err)
 	}
 	wantCPUFlags := uint32(jobObjectCPURateControlEnable | jobObjectCPURateControlHardCap)
@@ -73,6 +62,79 @@ func TestJobReadbackContainmentAndLimits(t *testing.T) {
 	}
 }
 
+// TestJobReadbackSurvivesStackGrowthAtEveryDepth pins the second Windows CI
+// run's "Windows Job kill-on-close was not installed" (see
+// procSetInformationJobObject, job_windows.go): NewJob is called from fresh
+// goroutines whose stacks were first consumed by a sweep of depths, so for
+// some depth the goroutine's stack is grown — copied — exactly while a
+// Set/QueryInformationJobObject call is in flight. Through the old x/sys
+// uintptr wrappers that copy left the kernel writing into the freed stack
+// and the read-back seeing the zero value; through setJobInformation /
+// queryJobInformation every buffer is on the heap and every depth must
+// validate. The options are internal/exec's sandboxed restricted-tier shape
+// (UI restrictions plus all three resource limits).
+func TestJobReadbackSurvivesStackGrowthAtEveryDepth(t *testing.T) {
+	options := JobOptions{Sandboxed: true, MaxProcesses: 3, MaxMemoryBytes: 32 << 20, MaxCPUPct: 50}
+	for depth := 0; depth <= 96; depth++ {
+		done := make(chan error, 1)
+		go consumeStackThen(depth, func() {
+			job, err := NewJob(options)
+			if err == nil {
+				err = job.Close()
+			}
+			done <- err
+		})
+		if err := <-done; err != nil {
+			t.Fatalf("NewJob after consuming %d stack frames: %v", depth, err)
+		}
+	}
+}
+
+// stackSweepSink keeps consumeStackThen's frame-local array from being
+// optimised away.
+var stackSweepSink byte
+
+// consumeStackThen recurses depth times through a frame carrying a 96-byte
+// array (about 150 bytes a frame), then calls fn: a sweep of depths moves
+// the point at which the goroutine's stack first has to grow across every
+// call fn makes.
+//
+//go:noinline
+func consumeStackThen(depth int, fn func()) {
+	var pad [96]byte
+	pad[depth%len(pad)] = byte(depth)
+	if depth == 0 {
+		fn()
+	} else {
+		consumeStackThen(depth-1, fn)
+	}
+	stackSweepSink += pad[(depth*7)%len(pad)]
+}
+
+// TestJobReadbackDiagnosticNamesBothSides pins the read-back refusal's
+// content: a CI log must show what was requested and what came back.
+func TestJobReadbackDiagnosticNamesBothSides(t *testing.T) {
+	job, err := NewJob(JobOptions{MaxProcesses: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer job.Close()
+	// Ask the read-back to confirm a limit this Job was not given.
+	err = job.validateReadback(JobOptions{MaxProcesses: 2, MaxMemoryBytes: 1 << 20})
+	if err == nil {
+		t.Fatal("read-back accepted a memory limit the Job was never given")
+	}
+	for _, want := range []string{
+		fmt.Sprintf("requested LimitFlags %#x", requestedJobLimitFlags(JobOptions{MaxProcesses: 2, MaxMemoryBytes: 1 << 20})),
+		"read back LimitFlags",
+		"bytes returned",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("read-back error %q does not contain %q", err, want)
+		}
+	}
+}
+
 func TestJobSandboxedUIRestrictions(t *testing.T) {
 	job, err := NewJob(JobOptions{Sandboxed: true})
 	if err != nil {
@@ -81,13 +143,7 @@ func TestJobSandboxedUIRestrictions(t *testing.T) {
 	defer job.Close()
 
 	var ui winapi.JOBOBJECT_BASIC_UI_RESTRICTIONS
-	if err := winapi.QueryInformationJobObject(
-		job.Handle(),
-		winapi.JobObjectBasicUIRestrictions,
-		uintptr(unsafe.Pointer(&ui)),
-		uint32(unsafe.Sizeof(ui)),
-		nil,
-	); err != nil {
+	if _, err := queryJobInformation(job.Handle(), winapi.JobObjectBasicUIRestrictions, &ui); err != nil {
 		t.Fatal(err)
 	}
 	want := uint32(winapi.JOB_OBJECT_UILIMIT_HANDLES |
@@ -111,13 +167,7 @@ func TestJobUnconfinedHasNoSandboxUIRestrictions(t *testing.T) {
 	defer job.Close()
 
 	var ui winapi.JOBOBJECT_BASIC_UI_RESTRICTIONS
-	if err := winapi.QueryInformationJobObject(
-		job.Handle(),
-		winapi.JobObjectBasicUIRestrictions,
-		uintptr(unsafe.Pointer(&ui)),
-		uint32(unsafe.Sizeof(ui)),
-		nil,
-	); err != nil {
+	if _, err := queryJobInformation(job.Handle(), winapi.JobObjectBasicUIRestrictions, &ui); err != nil {
 		t.Fatal(err)
 	}
 	if ui.UIRestrictionsClass != 0 {
