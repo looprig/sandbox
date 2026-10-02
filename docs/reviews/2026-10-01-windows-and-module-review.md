@@ -387,9 +387,54 @@ quarantine (H11); firewall enabled-state check (H12); `SANDBOX_REQUIRE_SEATBELT`
 (L7); cgroup proof ordering (M17); report wording (H9, L9); SPEC §7 Windows
 section and limits.
 
-## 5. Not fixed (booked)
+## 5. Second round (2026-10-02, owner decisions)
 
-H6, H7, H8, H9 (mechanism), H10, M10-M16, L1-L6, L8, L10. Each needs either a
-design decision (credential transport, mach-lookup allowlist, private
-console, per-lease-only SIDs), a Linux kernel feature (`CLONE_NEWCGROUP`,
-Landlock scopes), or a real Windows host.
+The owner asked for an explicit AF_UNIX escape hatch and for every remaining
+item fixable without a real Windows host or a kernel feature. Status per item:
+
+**Escape hatch (shipped).** `ProfileConfig.UnixSockets UnixSocketPolicy{Mode,
+Paths}`; `UnixSocketsDenied` (zero, unchanged default) / `UnixSocketsLocal`;
+`Paths` are exact host sockets; `DangerousUnixSocket(path)` names D-Bus,
+systemd, container-daemon and display sockets. `Restrict` intersects; the
+fingerprint changes only for a non-default policy. Enforcement: Linux Rung 1
+Local/Paths `Enforced` via the mount view + netns/Landlock abstract scoping,
+narrowed (ProcessBoundary withheld, Degraded) when `/`, `/run`, `/var/run` or
+`/tmp/.X11-unix` is in the view; Rung 2 flagged-not-refused (every same-user
+pathname socket reachable, named in the report, Degraded); macOS Seatbelt
+path-exact (`subpath` for Local roots, `path-literal` per path), and a
+sandboxed `Network: Allow` profile no longer admits host sockets through
+`(allow network*)`; Windows refuses a non-default policy (unmediated). All
+proven live in Docker (Rung 1 and 2) and under sandbox-exec.
+
+| Item | Status | Detail |
+|---|---|---|
+| H6 process-info env read (macOS) | **not fixable in SBPL** | eight variants measured (no process-info/sysctl at all, `(target self)`, pidinfo/listpids only, `deny sysctl-name kern.procargs2` before and after, regex, name-prefix allowlist): the secret leaked under every one; Seatbelt does not mediate `KERN_PROCARGS2`. Reported `env-scrub` narrowed, kept under test (`TestSeatbeltProcargsCrossProcessReadIsReported`), proxy credentials already reach only Allow-network and grant spawns. |
+| H7 mach-lookup | **fixed** | measured allowlist (`opendirectoryd.libinfo`, `.membership`; `trustd.agent` only with egress); `open zzz://` and `open -a` now fail live. Compatibility costs documented in code and SPEC. |
+| H8 shared console (Windows restricted) | **fixed (partial)** | `CREATE_NO_WINDOW` for sandboxed pipe-backed spawns; interrupt returns `ErrProcessSignalUnsupported` (AttachConsole from a Go host is process-wide and cannot re-attach). Whether the child's conhost counts against `MaxPIDs` needs a Windows run. |
+| H10 installation SID on user objects | **fixed** | only the per-lease one-shot SID is projected; older ACEs still rolled back at recovery. |
+| M10 darwin RunCommand hang | **fixed** | synchronous Seatbelt spawns arm the descendant tracker; drain bounded by `outputDrainGrace` with `ErrOutputDrainIncomplete`. |
+| M11 live Seatbelt proxy/TargetNetwork/HostRead Deny | **fixed** | real-backend tests + `CheckClaimedImplications` on darwin. |
+| M12 TIOCSTI / controlling terminal | **fixed** | setsid for every non-TTY spawn, TIOCSTI/TIOCLINUX denied, Landlock `IOCTL_DEV` handled (ABI 5). Cost: a target opening `/dev/tty` itself gets `EACCES`. |
+| M13 Rung-2 lifetime escape via cgroup.procs | **fixed** | `/sys/fs/cgroup` write carveout on both rungs (escape reproduced in Docker with it disabled). `CLONE_NEWCGROUP` not used: needs CAP_SYS_ADMIN in a userns Rung 2 hosts lack (verified `unshare --cgroup` EPERM). |
+| M14 journal compaction / reconcile scope / removal | **fixed** | compaction at start, past 32 MiB and on a full journal; reconcile touches only dead bindings, quarantined and previous-instance orphans; removal stops the service first, reconciles, reports `SetupResidueError`. |
+| M16 no-delete-share handles | **fixed (restricted tier)** | only roots, deny targets and ancestors stay locked; others closed after read-back and reopened by file ID at rollback. The elevated client still retains read-only-share handles (same fix owed there; needs Windows to validate). |
+| L1 controlling terminal | fixed with M12 | |
+| L2 `localhost` proxy rule | **partial** | SBPL rejects IP literals; rule is `tcp4` (refuses ::1), reported `proxy-listener` narrowed. |
+| L3 pid reuse in darwin tracker | **fixed** | anchor valid only while (pid, start time) matches. |
+| L4 Host header vs URI | **fixed** | measured not exploitable (net/http normalises); outbound Host set explicitly, disagreeing Host refused 403. |
+| L5 `localhost` matches all local addresses | documented (same as L2) | |
+| L6 wall-clock grant expiry | **fixed** | monotonic per-grant deadline. |
+| L8 a–f | **fixed** | token dup access mask; pipe auth refuses restricted tokens + Medium integrity; desktop DACL lease SID; `broker.mu` not held across projection; `windows.firewall` entry + derived Ready flags + ResourceLimits only when requested; proxy-port staleness (`WindowsSetupProblemProxyPortsStale`) and own-listener recognition. |
+| L10 mount targets by path before pivot | **fixed** | targets resolved by descriptor with `RESOLVE_IN_ROOT\|RESOLVE_NO_SYMLINKS`; planted `ws/.looprig -> /etc` fails closed with ELOOP (the previous code escaped). |
+| Lost intermittent Docker failure | **found and fixed** | 20/20 plain runs green; reproduced under CPU load (2/15): `TestIntegrationProcessTreeParentDeath`'s positive control scanned argv once, before the forked subshell exec'd `setsid`. The control now polls; 0/30 under load after. |
+
+**Still booked (needs a real Windows host or a kernel feature):** M15 (the
+elevated tier has never run live); the elevated client's retained handles
+(M16, elevated half); H8's conhost/MaxPIDs interaction; H12 (b)–(e) (no
+launch-time firewall recheck, no inbound block, loopback / system-service
+egress); Landlock ABI 9 `RESOLVE_UNIX` for Rung-2 pathname-socket scoping
+(kernel newer than the Docker image); H6 credential-by-fd transport (needs a
+design decision, since proxy-aware clients read the credential from the
+environment); the stricter runtime closure under `HostRead: Deny` on macOS
+(`/usr/bin/curl` needs `/private/etc/ssl/openssl.cnf`, `git` needs
+`/Library/Developer`).
