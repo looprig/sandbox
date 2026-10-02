@@ -46,7 +46,11 @@ const (
 	GrantClassFilesystemHostWrite = "filesystem.host.write.v1"
 )
 
-var grantEnc = base64.RawURLEncoding
+// grantEnc is strict: a non-strict decoder ignores the unused pad bits of a
+// segment's final character, so several token spellings would decode to one
+// body and MAC. decodeGrantSegment additionally re-encodes and compares, so
+// exactly one spelling of each token authenticates.
+var grantEnc = base64.RawURLEncoding.Strict()
 
 var (
 	ErrGrantMalformed             = policy.ErrMalformed
@@ -111,12 +115,12 @@ func authenticateGrant(key []byte, token string) (grantPayload, error) {
 	if len(parts) != 3 || parts[0] != grantTokenPrefix {
 		return grantPayload{}, ErrGrantMalformed
 	}
-	body, err := grantEnc.DecodeString(parts[1])
-	if err != nil {
+	body, ok := decodeGrantSegment(parts[1])
+	if !ok {
 		return grantPayload{}, ErrGrantMalformed
 	}
-	mac, err := grantEnc.DecodeString(parts[2])
-	if err != nil {
+	mac, ok := decodeGrantSegment(parts[2])
+	if !ok || len(mac) != sha256.Size {
 		return grantPayload{}, ErrGrantMalformed
 	}
 	if !hmac.Equal(mac, grantMAC(key, body)) {
@@ -129,7 +133,32 @@ func authenticateGrant(key []byte, token string) (grantPayload, error) {
 	return payload, nil
 }
 
-func grantID(token string) [32]byte { return sha256.Sum256([]byte(token)) }
+// decodeGrantSegment decodes one token segment and accepts it only when it is
+// the canonical encoding of the bytes it decodes to.
+func decodeGrantSegment(segment string) ([]byte, bool) {
+	decoded, err := grantEnc.DecodeString(segment)
+	if err != nil || grantEnc.EncodeToString(decoded) != segment {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// grantID is the one replay identity for a token, used for usedGrants and the
+// retained path registry alike. It is the decoded MAC, not the token text: the
+// MAC covers the nonce, so it is unique per minted grant, and every spelling
+// that decodes to it names the same grant. The MAC segment is decoded
+// leniently here so a pad-bit variant collides with its original even before
+// authenticateGrant refuses it. A token with no decodable 32-byte MAC cannot
+// authenticate; it is keyed by a domain-separated hash of its text so it can
+// never alias a real MAC.
+func grantID(token string) [32]byte {
+	if parts := strings.Split(token, "."); len(parts) == 3 {
+		if mac, err := base64.RawURLEncoding.DecodeString(parts[2]); err == nil && len(mac) == sha256.Size {
+			return [32]byte(mac)
+		}
+	}
+	return sha256.Sum256([]byte("sandbox-grant-unauthenticatable\x00" + token))
+}
 
 func canonicalWorkingDirectory(path string) (string, error) {
 	return profile.CanonicalRoot(path)
