@@ -6,6 +6,7 @@ import (
 	"github.com/looprig/sandbox/internal/enforce"
 	"github.com/looprig/sandbox/internal/policy"
 	"github.com/looprig/sandbox/pkg/profile"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -28,15 +29,116 @@ import (
 // that directory object, not arbitrary descendants. /private/var/select is the
 // system shell-selector read used when sandbox-exec launches /bin/sh. Executable
 // and remaining readable paths are emitted per effective-policy entry below.
-const baseSandboxPreamble = `(version 1)
+//
+// mach-lookup is an allowlist of global service names (review H7), not the
+// former unfiltered (allow mach-lookup). Bootstrap lookup is how a process
+// reaches every launchd-hosted daemon of its user session, and several of
+// those act OUTSIDE the sandbox on the caller's behalf: LaunchServices
+// (com.apple.coreservices.launchservicesd, com.apple.lsd.*,
+// com.apple.CoreServices.coreservicesd) is what `open https://…` uses to
+// launch the unsandboxed default browser — defeating Network: Deny — and
+// `open -a`/AppleEvents start or drive any application; cfprefsd writes any
+// application's preferences; securityd (com.apple.SecurityServer) fronts the
+// login keychain; FSEvents reports file activity in trees the profile cannot
+// read; distributed notifications reach every app. Each name below was kept
+// only because a measured leave-one-out run broke something without it (see
+// darwinMachLookupAllowlist), and the reachable-daemon surface is now those
+// two identity services plus, on a network-granting profile only, trustd.
+//
+// process-info* and sysctl-read stay unfiltered, and that is NOT a choice
+// that narrowing could fix (review H6), measured with a raw
+// sysctl({CTL_KERN, KERN_PROCARGS2, pid}) probe (C and perl) against a
+// same-user, non-platform-binary process holding a planted secret in its
+// environment: the secret was recovered under (deny default) with NO
+// process-info and NO sysctl-read rule at all, under (allow process-info*
+// (target self)), under process-info-pidinfo/-listpids-only variants, under
+// (deny sysctl-read (sysctl-name "kern.procargs2")) and
+// (sysctl-name-regex #"^kern\.procargs") placed after the allow, and under a
+// name-prefix allowlist of only hw./vm./machdep. — Seatbelt does not mediate
+// KERN_PROCARGS2 at all. (Platform binaries such as /bin/sleep or
+// /usr/bin/perl returned argv only, never their environment; an ordinary
+// signed-adhoc binary, a Go program for instance, returned all of it.) So a
+// confined child CAN read the initial environment of any same-user process
+// that is not a platform binary — including the process that embeds this
+// module — and compileGuarantees' EnvScrub bit therefore only ever describes
+// the child's OWN environment; compileSBPL reports that limit as
+// env-scrub/narrowed.
+var baseSandboxPreamble = `(version 1)
 (deny default)
 (allow process-fork)
 (allow process-info*)
 (allow sysctl-read)
-(allow mach-lookup)
-(allow file-read-data (literal "/"))
+` + darwinMachLookupRule + `(allow file-read-data (literal "/"))
 (allow file-read* (subpath "/private/var/select"))
 `
+
+// darwinMachLookupAllowlist is the complete set of bootstrap service names
+// every profile may look up. It was derived by measurement, not copied: the
+// module's whole darwin test corpus (internal/darwin, internal/exec — unit
+// and -tags integration — pkg/..., the root facade) was run under
+// (allow mach-lookup (with report)) with the sandbox log streamed, which
+// observed only libinfo, membership, notification_center, logd and
+// diagnosticd; a tool matrix (sh, perl, whoami, ls -l, git init/add/commit,
+// git ls-remote https, /usr/bin/python3 with pwd and urllib https, make,
+// clang, ssh -V, id -Gn, date, getconf DARWIN_USER_TEMP_DIR, curl http/https,
+// a Go net/http HTTPS client) was then run with each candidate removed in
+// turn. Kept:
+//
+//   - com.apple.system.opendirectoryd.libinfo: getpwuid/getgrgid and
+//     friends. Without it whoami and ls -l print numeric ids, `id -Gn` loses
+//     group names and Python's pwd module raises (breaking expanduser).
+//   - com.apple.system.opendirectoryd.membership: uid<->UUID membership.
+//     Without it confstr(_CS_DARWIN_USER_TEMP_DIR/_CACHE_DIR) fails, so
+//     xcrun-backed /usr/bin shims (git, python3, make, clang) lose their
+//     per-user cache directory (compileXcrunCachePlumbing) and every group
+//     membership check falls back.
+//
+// Measured unnecessary and left out: com.apple.system.notification_center,
+// com.apple.logd and com.apple.diagnosticd (no tool changed behaviour; a
+// confined process's os_log messages are dropped and libinfo answers are not
+// cached across calls). Deliberately excluded although a tool may want them,
+// each a known compatibility consequence: com.apple.cfprefsd.* (Foundation
+// tools read preference plists straight from disk, subject to file rules, and
+// cannot write defaults), com.apple.SecurityServer (no keychain access:
+// `security find-*` fails), com.apple.SystemConfiguration.configd (no system
+// proxy/network-reachability settings; environment-variable proxies, which
+// this module sets, are unaffected), com.apple.FSEvents (file watchers fall
+// back to polling or fail), com.apple.CoreServices.coreservicesd /
+// LaunchServices (`open`, AppleScript `tell application`, and anything
+// resolving an app or URL handler fails), com.apple.bsd.dirhelper,
+// com.apple.distributed_notifications@Uv3, com.apple.mDNSResponder (DNS uses
+// the mDNSResponder unix socket, see compileNet, not this service) and every
+// window-server/pasteboard service (pbcopy/pbpaste fail).
+//
+// com.apple.trustd.agent is NOT here: it is added per profile by
+// compileNetMach, only when the profile grants network egress. Certificate
+// evaluation through Security.framework needs it — Go's crypto/x509 on
+// darwin, URLSession and Swift tooling fail TLS verification without it
+// (curl, git-remote-https and Python's ssl verify with their own bundles and
+// do not) — but trustd fetches AIA intermediates and revocation data over
+// the network itself, unsandboxed, from URLs a crafted certificate names, so
+// a network-denied profile must not be able to ask it to.
+var darwinMachLookupAllowlist = []string{
+	"com.apple.system.opendirectoryd.libinfo",
+	"com.apple.system.opendirectoryd.membership",
+}
+
+// darwinMachLookupRule renders darwinMachLookupAllowlist as one SBPL rule.
+var darwinMachLookupRule = machLookupRule(darwinMachLookupAllowlist)
+
+// darwinNetworkMachLookupAllowlist is added by compileNetMach for a profile
+// that grants any network egress; see darwinMachLookupAllowlist.
+var darwinNetworkMachLookupAllowlist = []string{"com.apple.trustd.agent"}
+
+func machLookupRule(names []string) string {
+	var b strings.Builder
+	b.WriteString("(allow mach-lookup")
+	for _, name := range names {
+		b.WriteString(` (global-name "` + sbplString(name) + `")`)
+	}
+	b.WriteString(")\n")
+	return b.String()
+}
 
 // xcrunCacheRegex matches Xcode's `xcrun`/`git` cache file inside the real
 // per-user Darwin temp directory (both the canonical /private/var/folders
@@ -68,6 +170,29 @@ func compileXcrunCachePlumbing(b *strings.Builder, report *profile.CompileReport
 		Feature: "xcrun-cache", Status: "widened",
 		Detail: "allow-listed Xcode's per-user xcrun/git tool-path cache file (xcrun_db*) in the real Darwin user temp directory, independent of the profile's own read/write grants",
 	})
+}
+
+// compileRuntimePlumbingAfterFS re-asserts the preamble's fixed runtime FILE
+// allows — the root directory object, the /private/var/select shell selector
+// and the xcrun cache file (compileXcrunCachePlumbing) — after the
+// filesystem section. A profile with HostRead or HostWrite Deny compiles its
+// host root to (deny file-read*/file-write* (subpath "/")), and under SBPL's
+// last-match-wins that broad deny silently shadowed every allow the preamble
+// made before it: /bin/sh then printed "Error opening /private/var/select/sh:
+// Operation not permitted" into every command's output, and the xcrun cache
+// rule never took effect for the production default shape. Re-emitting them
+// here keeps them exactly as narrow as before (one directory object, one
+// system directory, one cache-file pattern); the cost is that a caller's own
+// deny of those exact objects cannot remove them either, which is the
+// backend-controlled plumbing contract compileXcrunCachePlumbing already
+// documents. The preamble keeps its copies so that nothing earlier in the
+// profile observes a different closure.
+func compileRuntimePlumbingAfterFS(b *strings.Builder) {
+	b.WriteString("; --- runtime plumbing (re-asserted after host-root denies) ---\n")
+	b.WriteString(`(allow file-read-data (literal "/"))` + "\n")
+	b.WriteString(`(allow file-read* (subpath "/private/var/select"))` + "\n")
+	b.WriteString(`(allow file-read* file-write* (regex #"^/private` + xcrunCacheRegex + `"))` + "\n")
+	b.WriteString(`(allow file-read* file-write* (regex #"^` + xcrunCacheRegex + `"))` + "\n")
 }
 
 // mDNSResponderSocket is the unix-domain socket macOS getaddrinfo hands DNS
@@ -177,7 +302,9 @@ func compileSBPL(p policy.Effective) (sbpl string, report profile.CompileReport,
 	compilePTYSlaveIoctl(&b, &report)
 
 	compileFS(&b, &report, p.FS)
+	compileRuntimePlumbingAfterFS(&b)
 	compileNet(&b, &report, p.Net)
+	unixSocketsDangerous := compileUnixSockets(&b, &report, p)
 
 	level = profile.LevelFull
 
@@ -187,8 +314,26 @@ func compileSBPL(p policy.Effective) (sbpl string, report profile.CompileReport,
 		// policy tops out at Degraded even though everything else is enforced.
 		level = profile.LevelDegraded
 	}
+	if unixSocketsDangerous {
+		// A granted same-user broker socket makes the process boundary a
+		// statement about that daemon, not about Seatbelt (see
+		// compileUnixSockets): ProcessBoundary is withheld below, so the
+		// policy cannot be Full.
+		level = profile.LevelDegraded
+	}
 
-	guaranteeBits = compileGuarantees(p)
+	guaranteeBits = compileGuarantees(p, unixSocketsDangerous)
+	if guaranteeBits&profile.GuaranteeEnvScrub != 0 {
+		// Review H6, measured (see baseSandboxPreamble): Seatbelt does not
+		// mediate sysctl KERN_PROCARGS2, so the scrub is real for the child's
+		// own environment but does not stop it READING another same-user
+		// process's initial environment.
+		report.Entries = append(report.Entries, profile.ReportEntry{
+			Feature: "env-scrub",
+			Status:  "narrowed",
+			Detail:  "the child's own environment is scrubbed, but Seatbelt cannot mediate sysctl(KERN_PROCARGS2): a confined process can read the initial environment (and argv) of any same-user process that is not a platform binary, including the process embedding this sandbox; keep secrets out of that process's environment",
+		})
+	}
 	return b.String(), report, level, guaranteeBits
 }
 
@@ -331,14 +476,30 @@ func compileAncestorMetadata(b *strings.Builder, fs []policy.FSEntry) {
 // preamble does not allow network, so default-deny holds unless rules are added.
 func compileNet(b *strings.Builder, report *profile.CompileReport, net policy.NetPolicy) {
 	b.WriteString("; --- network ---\n")
+	compileNetMach(b, net)
 
 	if net.Open {
-		// profile.Unconfined only. Everything else stays default-deny.
+		// Network: Allow with no egress route (and profile.Unconfined, which
+		// never reaches Seatbelt in production). Everything else stays
+		// default-deny; compileUnixSockets re-denies AF_UNIX after this.
 		b.WriteString("(allow network*)\n")
 		return
 	}
 	if net.ProxyPort != 0 {
-		b.WriteString(`(allow network-outbound (remote tcp "localhost:` + strconv.Itoa(int(net.ProxyPort)) + `"))` + "\n")
+		// Review L2: SBPL refuses an address literal here ("host must be * or
+		// localhost in network address", measured for 127.0.0.1, [::1] and
+		// the ip/tcp forms alike), so the egress proxy's listener cannot be
+		// named exactly. tcp4 is the narrowest expressible form — the proxy
+		// listens on 127.0.0.1 only (network.NewProxy), and tcp4 measurably
+		// refuses ::1 at the same port where tcp admits it — but "localhost"
+		// still matches every IPv4 address of this host's own interfaces at
+		// that port, which is reported rather than claimed.
+		b.WriteString(`(allow network-outbound (remote tcp4 "localhost:` + strconv.Itoa(int(net.ProxyPort)) + `"))` + "\n")
+		report.Entries = append(report.Entries, profile.ReportEntry{
+			Feature: "proxy-listener",
+			Status:  "narrowed",
+			Detail:  "SBPL cannot name 127.0.0.1 exactly: the egress-proxy rule admits IPv4 TCP to the proxy's port on any of this host's own addresses (loopback plus its interface IPs), never a remote host; the proxy itself listens on 127.0.0.1 only",
+		})
 	}
 
 	for _, port := range net.Ports {
@@ -383,14 +544,229 @@ func compileNet(b *strings.Builder, report *profile.CompileReport, net policy.Ne
 	}
 }
 
+// compileNetMach admits the network-only bootstrap services
+// (darwinNetworkMachLookupAllowlist: certificate evaluation) for a profile
+// that grants any egress — the blanket allow, the egress proxy port, an
+// allowed port, or loopback. A DNS-only or fully denied profile gets none:
+// trustd performs its own unsandboxed fetches (AIA, OCSP, CRL) from URLs a
+// presented certificate names, which would otherwise be a way to make a
+// network-denied process's data leave the host.
+func compileNetMach(b *strings.Builder, net policy.NetPolicy) {
+	if net.Open || net.ProxyPort != 0 || len(net.Ports) > 0 || net.Loopback {
+		b.WriteString(machLookupRule(darwinNetworkMachLookupAllowlist))
+	}
+}
+
+// compileUnixSockets writes the AF_UNIX section (profile.UnixSocketPolicy)
+// into b and reports whether the profile admits a same-user broker socket, in
+// which case compileSBPL withholds GuaranteeProcessBoundary and lowers the
+// level. Report feature names ("unix-sockets", "unix-sockets.dangerous") are
+// shared with the Linux and Windows backends.
+//
+// What Seatbelt mediates, measured with /usr/bin/sandbox-exec on macOS 26
+// against perl client/server probes (a pathname server outside every root,
+// one inside a writable root, and a bind probe):
+//
+//   - socket(AF_UNIX) and socketpair() are NOT mediated: both succeed under
+//     (deny default). Anonymous pairs are therefore always available, which
+//     matches the contract (pipe-style IPC built on socketpair is unaffected
+//     by the default denial).
+//   - connect(2) to a pathname socket needs network-outbound with a
+//     (remote unix-socket ...) filter; without one it fails EPERM. That is the
+//     default denial: the base (deny default) already provides it, and the
+//     only unix-socket rule a zero policy carries is compileNet's DNS
+//     exception for mDNSResponder.
+//   - bind(2) needs network-bind with a (local unix-socket ...) filter AND
+//     file-write-create on the socket file: with the network-bind rule but no
+//     file write, or under a carveout's write deny (.git), bind still fails.
+//     So the filesystem section keeps deciding where a socket file can be
+//     created, and these rules only add the socket operation on top.
+//   - listen(2)/accept(2) need nothing further: a server bound under Local
+//     mode accepted a connection from its own sandboxed child.
+//   - every unix-socket path filter (subpath, path-literal, literal) matches
+//     only the FULLY symlink-resolved path: a rule spelled /tmp/... matched
+//     nothing when the socket was reached as /tmp/..., because the kernel
+//     resolves it to /private/tmp/... first. Rules are emitted in the
+//     canonical spelling, and in the public alias too for symmetry with the
+//     file rules (harmless, never matching more than the canonical rule).
+//   - (allow network*) — Net.Open — admits connect and bind to EVERY pathname
+//     socket on the host. A sandboxed profile with Network: Allow therefore
+//     re-denies both operations immediately after it (unfiltered
+//     (remote unix-socket)/(local unix-socket) filters parse and match every
+//     path), re-admits the DNS socket (getaddrinfo fails without it), and
+//     then admits this policy's own grants, all under last-match-wins.
+//
+// Local mode admits connect and bind beneath every writable, non-exact
+// filesystem root of the policy — the workspace when writable, additional
+// writable roots, an executor-owned HOME and the executor's TMPDIR are all
+// such entries in p.FS — in every spelling the file rules use. A writable
+// root of "/" (HostWrite: Allow) would admit every broker socket on the
+// machine, so that is flagged dangerous like a named broker path.
+//
+// Paths mode admits connect (never bind: the endpoint is someone else's) to
+// each named socket exactly, via path-literal. The existing prefix is
+// canonicalized with policy.CanonicalPath (symlinks resolved and, on APFS,
+// each existing component re-spelled with its on-disk case, matching how
+// configured roots are spelled), so a path under /var, /tmp or a symlinked
+// directory still matches the kernel's resolved view. The LEAF is never
+// followed: profile.UnixSocketPolicy promises that a symlinked socket path
+// fails closed, and Seatbelt matching the resolved endpoint means a rule
+// naming the link itself never matches a connect through it. A leaf that is
+// a symlink at compile time is reported so the caller can name the target.
+func compileUnixSockets(b *strings.Builder, report *profile.CompileReport, p policy.Effective) (dangerous bool) {
+	sockets := p.UnixSockets
+	open := p.Net.Open && p.Isolation != profile.Unconfined
+	if p.Isolation == profile.Unconfined {
+		// Unconfined never reaches Seatbelt in production; (allow network*)
+		// stands and no AF_UNIX posture is claimed.
+		return false
+	}
+	if sockets.Mode == profile.UnixSocketsDenied && len(sockets.Paths) == 0 && !open {
+		return false
+	}
+	b.WriteString("; --- unix sockets ---\n")
+	if open {
+		b.WriteString("(deny network-outbound (remote unix-socket))\n")
+		b.WriteString("(deny network-bind (local unix-socket))\n")
+		b.WriteString(`(allow network-outbound (remote unix-socket (path-literal "` + sbplString(mDNSResponderSocket) + `")))` + "\n")
+		if sockets.Mode == profile.UnixSocketsDenied && len(sockets.Paths) == 0 {
+			report.Entries = append(report.Entries, profile.ReportEntry{
+				Feature: "unix-sockets", Status: "enforced",
+				Detail: "denied: network allow does not admit AF_UNIX endpoints (only the mDNSResponder DNS socket)",
+			})
+		}
+	}
+
+	if sockets.Mode == profile.UnixSocketsLocal {
+		roots, wholeHost := unixSocketLocalRoots(p.FS)
+		for _, root := range roots {
+			quoted := sbplString(root)
+			b.WriteString(`(allow network-outbound (remote unix-socket (subpath "` + quoted + `")))` + "\n")
+			b.WriteString(`(allow network-bind (local unix-socket (subpath "` + quoted + `")))` + "\n")
+		}
+		report.Entries = append(report.Entries, profile.ReportEntry{
+			Feature: "unix-sockets", Status: "enforced",
+			Detail: "local: endpoints limited to writable roots",
+		})
+		if wholeHost {
+			dangerous = true
+			report.Entries = append(report.Entries, profile.ReportEntry{
+				Feature: "unix-sockets.dangerous", Status: "narrowed",
+				Detail: "local mode with a writable root at / admits every pathname socket on the host, including same-user brokers (container daemons) that start processes outside the sandbox; ProcessBoundary withheld",
+			})
+		}
+	}
+
+	for _, raw := range sockets.Paths {
+		target, leafIsSymlink := unixSocketGrantPath(raw)
+		for _, spelling := range uniqueStrings(append(seatbeltPathAliases(target, true), filepath.Clean(raw))) {
+			b.WriteString(`(allow network-outbound (remote unix-socket (path-literal "` + sbplString(spelling) + `")))` + "\n")
+		}
+		detail := "path: connect admitted to " + raw
+		if target != filepath.Clean(raw) {
+			detail += " (canonical " + target + ")"
+		}
+		if leafIsSymlink {
+			detail += "; the socket path is a symlink and Seatbelt matches the resolved endpoint, so this grant fails closed — name the target instead"
+		}
+		report.Entries = append(report.Entries, profile.ReportEntry{Feature: "unix-sockets", Status: "enforced", Detail: detail})
+		if reason, isDangerous := dangerousUnixSocketPath(raw, target); isDangerous {
+			dangerous = true
+			report.Entries = append(report.Entries, profile.ReportEntry{
+				Feature: "unix-sockets.dangerous", Status: "narrowed",
+				Detail: raw + ": " + reason + "; ProcessBoundary withheld",
+			})
+		}
+	}
+	return dangerous
+}
+
+// unixSocketLocalRoots returns every spelling of every writable, non-exact,
+// non-glob filesystem root in fs, in first-seen order, and whether one of
+// them is "/" (every socket on the host). Exact entries (an exact grant, the
+// null device) name a single object, not a place sockets are created; glob
+// entries are deny-only in this vocabulary.
+func unixSocketLocalRoots(fs []policy.FSEntry) (roots []string, wholeHost bool) {
+	for _, entry := range fs {
+		if entry.Access&policy.WriteAccess == 0 || entry.Exact || entry.Path == policy.NullDevicePath {
+			continue
+		}
+		if strings.ContainsAny(entry.Path, policy.GlobMeta) {
+			continue
+		}
+		if filepath.Clean(entry.Path) == string(filepath.Separator) {
+			wholeHost = true
+		}
+		roots = append(roots, seatbeltPathAliases(entry.Path, entry.Canonical)...)
+	}
+	return uniqueStrings(roots), wholeHost
+}
+
+// unixSocketGrantPath canonicalizes a named socket path's existing PARENT
+// (policy.CanonicalPath: symlinks resolved, APFS case re-spelled) and
+// re-attaches the leaf unresolved, reporting whether that leaf is currently a
+// symlink. When canonicalization fails the cleaned caller spelling stands —
+// a rule that may match nothing, never one that matches more.
+func unixSocketGrantPath(raw string) (target string, leafIsSymlink bool) {
+	clean := filepath.Clean(raw)
+	target = clean
+	if dir, err := policy.CanonicalPath(filepath.Dir(clean)); err == nil {
+		target = filepath.Join(dir, filepath.Base(clean))
+	}
+	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		leafIsSymlink = true
+	}
+	return target, leafIsSymlink
+}
+
+// darwinDangerousUnixSocketSuffixes are macOS same-user container-daemon
+// sockets that profile.DangerousUnixSocket's (Linux-shaped) list does not
+// name: on macOS the engine runs in a per-user VM and its API socket lives
+// under the user's home, not /run. Each is root-equivalent inside that VM and
+// can bind-mount the user's home, so it starts processes with the user's
+// authority outside Seatbelt. Matched as a path suffix after a home prefix.
+var darwinDangerousUnixSocketSuffixes = []struct{ suffix, reason string }{
+	{"/.docker/run/docker.sock", "Docker Desktop daemon: starts containers with access to the user's files outside the sandbox"},
+	{"/.orbstack/run/docker.sock", "OrbStack container daemon: starts containers outside the sandbox"},
+	{"/.rd/docker.sock", "Rancher Desktop container daemon: starts containers outside the sandbox"},
+}
+
+// dangerousUnixSocketPath applies profile.DangerousUnixSocket to both the
+// caller's spelling and the canonical one (so /var/run/docker.sock is caught
+// even though Seatbelt sees /private/var/run/docker.sock), plus the macOS
+// daemon sockets above and Colima's per-profile sockets
+// (~/.colima/<profile>/docker.sock).
+func dangerousUnixSocketPath(raw, canonical string) (string, bool) {
+	for _, candidate := range []string{filepath.Clean(raw), canonical} {
+		if reason, ok := profile.DangerousUnixSocket(candidate); ok {
+			return reason, true
+		}
+		for _, entry := range darwinDangerousUnixSocketSuffixes {
+			if strings.HasSuffix(candidate, entry.suffix) {
+				return entry.reason, true
+			}
+		}
+		if filepath.Base(candidate) == "docker.sock" && filepath.Base(filepath.Dir(filepath.Dir(candidate))) == ".colima" {
+			return "Colima container daemon: starts containers outside the sandbox", true
+		}
+	}
+	return "", false
+}
+
 // compileGuarantees derives the seam-facing guarantee bitmask from what the
 // Seatbelt profile actually enforces for this policy. Each bit is fail-closed:
-// set only when genuinely enforced.
-func compileGuarantees(p policy.Effective) uint64 {
+// set only when genuinely enforced. unixSocketsDangerous is compileUnixSockets'
+// verdict that the profile admits a same-user broker socket.
+func compileGuarantees(p policy.Effective, unixSocketsDangerous bool) uint64 {
 	var bits uint64
 
-	// sandbox-exec always wraps the spawn in an isolating boundary.
-	bits |= profile.GuaranteeProcessBoundary
+	// sandbox-exec always wraps the spawn in an isolating boundary — unless the
+	// profile hands the target a socket to a daemon that starts processes (or
+	// is root-equivalent) on its behalf, outside Seatbelt entirely. Then the
+	// boundary is only as good as that daemon, and the claim is withheld.
+	if !unixSocketsDangerous {
+		bits |= profile.GuaranteeProcessBoundary
+	}
 
 	// Writes are confined to policy-writable roots unless the policy itself grants
 	// write at "/" (unconfined full access), in which case nothing is confined and
