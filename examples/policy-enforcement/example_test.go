@@ -231,8 +231,24 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read scratch root after close: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("scratch root retains %d set-owned entries after close", len(entries))
+	if runtime.GOOS == "windows" && (gated.Level() == sandbox.LevelNone || executor.Level() == sandbox.LevelNone) {
+		// The restricted backend keeps its recovery journal and permanent SID
+		// retirement ledger in the caller-owned scratch root across sets.
+		// Only executor-owned temporary trees are removed by Close.
+		if len(entries) != 1 || entries[0].Name() != "restricted-journal-v1" || !entries[0].IsDir() {
+			t.Fatalf("scratch entries after close = %v, want only restricted-journal-v1", entries)
+		}
+		journal := filepath.Join(scratch, entries[0].Name())
+		records, err := os.ReadDir(filepath.Join(journal, "records"))
+		if err != nil || len(records) != 0 {
+			t.Fatalf("pending ACL recovery records after close = %v, error %v; want none", records, err)
+		}
+		retired, err := os.ReadDir(filepath.Join(journal, "retired-sids"))
+		if err != nil || len(retired) == 0 {
+			t.Fatalf("retired SID ledger after close = %v, error %v; want persistent retirements", retired, err)
+		}
+	} else if len(entries) != 0 {
+		t.Fatalf("scratch root retains %d set-owned entries after close: %v", len(entries), entries)
 	}
 }
 

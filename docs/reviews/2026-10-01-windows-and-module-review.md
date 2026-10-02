@@ -473,3 +473,14 @@ Hosted ConPTY tests use a fake policy backend with a real Job and pseudo
 console; they do not prove restricted-token ConPTY or elevated broker
 composition. Cooked-console EOF tests cover `findstr` and `sort`, not arbitrary
 raw-mode terminal applications. Windows arm64 is compilation-only.
+
+Run `37043430733` (head `297c781`) passed the root facade, `internal/exec`
+and `internal/windows` race suites. Its sole failure was the policy example's
+post-close assertion that the caller's scratch directory must be empty.
+Windows intentionally retains `restricted-journal-v1` outside executor-owned
+temporary trees for crash recovery and permanent SID retirement. The example
+now requires exactly that journal directory, zero pending recovery records,
+and a nonempty SID retirement ledger; it still fails on leaked executor
+directories. This is a platform-specific test expectation, not a cleanup bug
+or an unavailable runner capability. The dedicated ConPTY step was not reached
+in either failed run because the preceding whole-suite step failed.

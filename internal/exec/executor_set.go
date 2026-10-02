@@ -37,6 +37,9 @@ type executorSetConfig struct {
 type ExecutorSetOption func(*executorSetConfig)
 
 // WithScratchRoot supplies the caller-owned parent for the set's owned child.
+// On Windows the restricted backend also retains its recovery journal and
+// permanent SID retirement ledger here across sets. Close removes the owned
+// child, but does not remove this persistent safety state.
 func WithScratchRoot(path string) ExecutorSetOption {
 	return func(config *executorSetConfig) { config.scratchRoot = path }
 }
