@@ -31,9 +31,13 @@ import (
 //     SOCK_DGRAM — glibc's getaddrinfo enumerates local addresses over it, and
 //     it carries no egress;
 //     AF_INET/AF_INET6 SOCK_DGRAM with protocol 0 or IPPROTO_UDP ONLY when the
-//     filter is built with SeccompPolicy.AllowUDP (below).
+//     filter is built with SeccompPolicy.AllowUDP (below);
+//     AF_UNIX SOCK_STREAM/SOCK_DGRAM/SOCK_SEQPACKET with protocol 0 ONLY when
+//     the filter is built with SeccompPolicy.AllowUnix — the profile's
+//     explicit escape hatch (profile.UnixSocketPolicy), whose endpoints the
+//     backend confines or reports (backend.go unixSocketCompile).
 //     Everything else is refused, including:
-//     AF_UNIX — Landlock (≤ ABI 8) does not mediate a pathname or abstract
+//     AF_UNIX by default — Landlock (≤ ABI 8) does not mediate a pathname
 //     connect(), and Rung 2 has no mount namespace, so a same-user socket
 //     (the D-Bus session bus at /run/user/$UID/bus, the systemd user manager,
 //     ssh/gpg agents, docker.sock, abstract X11) would let `systemd-run --user`
@@ -57,16 +61,25 @@ import (
 //     bypass syscall-based filtering — a well-known Seccomp-evasion surface.
 //   - keyctl / add_key / request_key: Rung 2 has no user namespace, so the
 //     target would otherwise read and use the invoking user's keyrings.
+//   - ioctl(TIOCSTI) and ioctl(TIOCLINUX) (review M12): pushing bytes into a
+//     terminal's input queue. linuxWrap also starts every target in a new
+//     session (SysProcAttr.Setsid), so a non-TTY target has no controlling
+//     terminal to reach; this rule is the second, independent layer for a
+//     terminal fd the target could still name. Every other ioctl is allowed
+//     (Landlock's IOCTL_DEV right, ABI >= 5, narrows device ioctls on files
+//     the target opens itself — landlock.go).
 //
 // Everything else is ALLOWED: the target and the Go runtime must run.
 //
-// COMPATIBILITY CONSEQUENCE, by design: a confined program that needs a
-// pathname or abstract AF_UNIX CLIENT (or server) socket fails with EACCES —
-// D-Bus clients, X11 clients, ssh-agent / gpg-agent, the docker CLI, syslog /
-// journald writers, and Python multiprocessing's forkserver start method
-// (which listens on an AF_UNIX socket; the fork and spawn methods use pipes
-// and are unaffected). Such programs need an unconfined executor; the sandbox
-// will not reopen same-user IPC that it cannot scope.
+// COMPATIBILITY CONSEQUENCE of the default, by design: a confined program
+// that needs a pathname or abstract AF_UNIX CLIENT (or server) socket fails
+// with EACCES — D-Bus clients, X11 clients, ssh-agent / gpg-agent, the docker
+// CLI, syslog / journald writers, and Python multiprocessing's forkserver
+// start method (which listens on an AF_UNIX socket; the fork and spawn
+// methods use pipes and are unaffected). A profile that needs them names them
+// in its UnixSocketPolicy (Mode Local for sandbox-local endpoints, Paths for
+// exact host sockets); the backend then admits AF_UNIX here and reports, per
+// rung, which endpoints that actually reaches.
 //
 // Ordering vs Landlock. Landlock is applied first, Seccomp second. Both survive
 // execve, so the order does not change the confinement the target inherits;
@@ -113,7 +126,7 @@ const IPProtoMPTCP = unix.IPPROTO_MPTCP
 const netlinkRoute = unix.NETLINK_ROUTE
 
 // SeccompPolicy parameterises the filter per spawn. Its zero value is the
-// strictest filter (no UDP).
+// strictest filter (no UDP, no AF_UNIX).
 type SeccompPolicy struct {
 	// AllowUDP admits AF_INET/AF_INET6 SOCK_DGRAM sockets with protocol 0 or
 	// IPPROTO_UDP. linuxWrap sets it when the policy's network is Open at Rung
@@ -121,17 +134,41 @@ type SeccompPolicy struct {
 	// and always at Rung 1 (nftables scopes UDP inside the Netns). It is false
 	// for a Confined Rung-2 spawn, whose Landlock port rules cannot scope UDP.
 	AllowUDP bool
+	// AllowUnix admits socket(AF_UNIX, SOCK_STREAM|SOCK_DGRAM|SOCK_SEQPACKET,
+	// 0) — the profile's AF_UNIX escape hatch (profile.UnixSocketPolicy). It is
+	// set only when the effective policy's UnixSockets is non-zero; the filter
+	// itself admits the socket and nothing more, so the ENDPOINTS it can reach
+	// are confined (or reported unconfined) elsewhere: by the Rung-1 mount view
+	// and network namespace, by Landlock abstract-socket scoping (ABI >= 6) on
+	// both rungs, and by the compile report and guarantee bits everywhere
+	// (backend.go unixSocketCompile). It never admits another AF_UNIX type
+	// (there is none the kernel accepts) or a nonzero protocol.
+	AllowUnix bool
 }
+
+// IoctlTIOCSTI and IoctlTIOCLINUX are the terminal ioctl requests the filter
+// refuses (review M12). TIOCSTI pushes a byte into a terminal's INPUT queue —
+// a target that still reaches the harness's terminal could type commands into
+// the user's shell — and TIOCLINUX's selection subcommands paste the virtual
+// console's selection buffer, the same injection by another name. Both are
+// the asm-generic values, identical on every architecture this filter binds.
+const (
+	IoctlTIOCSTI   = unix.TIOCSTI
+	IoctlTIOCLINUX = unix.TIOCLINUX
+)
 
 // BuildSeccompFilter builds the classic-BPF program for p as a
 // []unix.SockFilter. See the annotated instruction listing inline; the
 // bracketed indices are the amd64 layout, and the x32 guard ([4]-[5]) exists
 // only there, so later instructions sit two earlier on arm64. Every jump is
-// relative, so dropping the guard moves no branch target. The UDP tail
-// ([44]-[50]) is emitted only for p.AllowUDP; otherwise [44] is a single
-// deny. Every syscall number is a golang.org/x/sys/unix SYS_* constant,
-// generated per GOARCH, and the argument offsets assume a little-endian ABI,
-// which both supported architectures are. Structure:
+// relative, so dropping the guard moves no branch target. The program length
+// does not depend on p.AllowUnix — the AF_UNIX block ([29]-[39]) is always
+// emitted and AllowUnix only selects the action of its one admitting return
+// ([38]) — so the listing stays stable. The UDP tail ([61]-[67]) is emitted
+// only for p.AllowUDP; otherwise [61] is a single deny. Every syscall number
+// is a golang.org/x/sys/unix SYS_* constant, generated per GOARCH, and the
+// argument offsets assume a little-endian ABI, which both supported
+// architectures are. Structure:
 //
 //	arch guard  -> KILL_PROCESS on mismatch (stops i386 / AArch32 — a different
 //	               arch value; see SeccompAuditArch)
@@ -140,7 +177,11 @@ type SeccompPolicy struct {
 //	               NOT stop it)
 //	ptrace / io_uring{setup,enter,register} / keyctl / add_key / request_key
 //	            -> ERRNO(EACCES)
+//	ioctl: (request & 0xffffffff) in {TIOCSTI, TIOCLINUX} -> ERRNO(EACCES),
+//	       every other request -> ALLOW
 //	nr != socket -> ALLOW
+//	domain AF_UNIX: (type & 0xff) in {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET}
+//	                && protocol == 0 && AllowUnix -> ALLOW, else ERRNO(EACCES)
 //	domain AF_NETLINK: protocol == NETLINK_ROUTE && (type & 0xff) in
 //	                   {SOCK_RAW, SOCK_DGRAM} -> ALLOW, else ERRNO(EACCES)
 //	domain AF_INET / AF_INET6:
@@ -149,13 +190,20 @@ type SeccompPolicy struct {
 //	    (type & 0xff) == SOCK_DGRAM && AllowUDP: protocol in {0, IPPROTO_UDP}
 //	                                  -> ALLOW, else ERRNO(EACCES)
 //	    anything else -> ERRNO(EACCES)                     (raw, ICMP, UDP)
-//	any other domain -> ERRNO(EACCES)  (AF_UNIX, AF_VSOCK, AF_SMC, AF_RDS, ...)
+//	any other domain -> ERRNO(EACCES)  (AF_VSOCK, AF_SMC, AF_RDS, AF_PACKET, ...)
 func BuildSeccompFilter(p SeccompPolicy) []unix.SockFilter {
 	const (
 		retKill  = unix.SECCOMP_RET_KILL_PROCESS
 		retAllow = unix.SECCOMP_RET_ALLOW
 		retErrno = unix.SECCOMP_RET_ERRNO | (uint32(unix.EACCES) & unix.SECCOMP_RET_DATA)
 	)
+	// unixAction is the one AF_UNIX return the policy selects: a well-formed
+	// AF_UNIX socket() is admitted only for an escape-hatch policy. Every other
+	// AF_UNIX shape (an unknown type, a nonzero protocol) is refused either way.
+	unixAction := uint32(retErrno)
+	if p.AllowUnix {
+		unixAction = retAllow
+	}
 	// --- arch guard ------------------------------------------------------------
 	filter := []unix.SockFilter{
 		// [0] A = seccomp_data.arch
@@ -218,88 +266,141 @@ func BuildSeccompFilter(p SeccompPolicy) []unix.SockFilter {
 		// [19] request_key: deny
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
 
+		// --- ioctl(): terminal input injection (review M12) ---------------------
+		// The request argument is an `unsigned int` in the kernel's ioctl entry
+		// point (SYSCALL_DEFINE3(ioctl, unsigned int fd, unsigned int cmd, ...)),
+		// so the low word IS the whole request the kernel acts on: a caller
+		// cannot dodge the compare with high bits the kernel truncates away.
+		// [20] if A == SYS_ioctl -> fall to the request load [21], else jump +5
+		//      to the socket() check [26]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.SYS_IOCTL, 0, 5),
+		// [21] A = args[1] low word (ioctl request)
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg1),
+		// [22] if A == TIOCSTI -> jump +1 to the deny [24]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, IoctlTIOCSTI, 1, 0),
+		// [23] if A == TIOCLINUX -> fall to the deny [24], else skip to the
+		//      allow [25]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, IoctlTIOCLINUX, 0, 1),
+		// [24] TIOCSTI / TIOCLINUX: deny with EACCES (both rungs, every spawn)
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+		// [25] every other ioctl: allow (A no longer holds nr, so this block
+		//      must return rather than fall through to the socket() compare)
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
+
 		// --- socket(): domain/type/protocol allowlist ---------------------------
-		// [20] if A == SYS_socket -> proceed to the domain load, else allow at [21]
+		// [26] if A == SYS_socket -> proceed to the domain load, else allow at [27]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.SYS_SOCKET, 1, 0),
-		// [21] not socket(): allow (the Go runtime needs its other syscalls;
+		// [27] not socket(): allow (the Go runtime needs its other syscalls;
 		//      socketpair() is a distinct nr and lands here)
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
-		// [22] A = args[0] low word (socket domain)
+		// [28] A = args[0] low word (socket domain)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg0),
-		// [23] if A == AF_INET  -> jump +12 to the inet type load [36]
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_INET, 12, 0),
-		// [24] if A == AF_INET6 -> jump +11 to the inet type load [36]
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_INET6, 11, 0),
-		// [25] if A == AF_NETLINK -> jump +1 to the netlink checks [27], else
-		//      fall to [26]
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_NETLINK, 1, 0),
-		// [26] any other family (AF_UNIX, AF_VSOCK, AF_SMC, AF_RDS, AF_PACKET, ...):
-		//      deny with EACCES
-		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+		// [29] if A == AF_UNIX -> fall to the AF_UNIX type load [30], else jump
+		//      +10 to the inet/netlink dispatch [40]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_UNIX, 0, 10),
 
-		// --- AF_NETLINK: NETLINK_ROUTE datagram/raw only -------------------------
-		// [27] A = args[2] low word (netlink protocol)
-		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
-		// [28] if A == NETLINK_ROUTE -> skip the deny to the type load [30]
-		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, netlinkRoute, 1, 0),
-		// [29] another netlink family (audit, xfrm, netfilter, ...): deny
-		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+		// --- AF_UNIX: the escape hatch (profile.UnixSocketPolicy) ----------------
 		// [30] A = args[1] low word (socket type, may carry SOCK_CLOEXEC/NONBLOCK)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg1),
 		// [31] A = A & 0xff  (strip the flag bits, keep the base type)
 		seccompStmt(unix.BPF_ALU|unix.BPF_AND|unix.BPF_K, seccompSockTypeMask),
-		// [32] if A == SOCK_RAW -> jump +1 to the allow [34]
+		// [32] if A == SOCK_STREAM -> jump +3 to the protocol load [36]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_STREAM), 3, 0),
+		// [33] if A == SOCK_DGRAM -> jump +2 to the protocol load [36]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_DGRAM), 2, 0),
+		// [34] if A == SOCK_SEQPACKET -> jump +1 to the protocol load [36], else
+		//      fall to [35]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_SEQPACKET), 1, 0),
+		// [35] AF_UNIX of any other type: deny
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+		// [36] A = args[2] low word (socket protocol)
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
+		// [37] if A == 0 -> fall to the policy action [38], else skip to the
+		//      deny [39]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, 0, 0, 1),
+		// [38] well-formed AF_UNIX: ALLOW under an escape-hatch policy
+		//      (AllowUnix), ERRNO(EACCES) otherwise — the default refusal that
+		//      keeps D-Bus, the systemd user manager, ssh/gpg agents,
+		//      docker.sock and abstract X11 out of reach
+		seccompStmt(unix.BPF_RET|unix.BPF_K, unixAction),
+		// [39] AF_UNIX with a nonzero protocol: deny
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+
+		// --- inet / netlink dispatch (A still holds the domain) ------------------
+		// [40] if A == AF_INET  -> jump +12 to the inet type load [53]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_INET, 12, 0),
+		// [41] if A == AF_INET6 -> jump +11 to the inet type load [53]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_INET6, 11, 0),
+		// [42] if A == AF_NETLINK -> jump +1 to the netlink checks [44], else
+		//      fall to [43]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.AF_NETLINK, 1, 0),
+		// [43] any other family (AF_VSOCK, AF_SMC, AF_RDS, AF_PACKET, ...):
+		//      deny with EACCES
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+
+		// --- AF_NETLINK: NETLINK_ROUTE datagram/raw only -------------------------
+		// [44] A = args[2] low word (netlink protocol)
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
+		// [45] if A == NETLINK_ROUTE -> skip the deny to the type load [47]
+		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, netlinkRoute, 1, 0),
+		// [46] another netlink family (audit, xfrm, netfilter, ...): deny
+		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
+		// [47] A = args[1] low word (socket type, may carry SOCK_CLOEXEC/NONBLOCK)
+		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg1),
+		// [48] A = A & 0xff  (strip the flag bits, keep the base type)
+		seccompStmt(unix.BPF_ALU|unix.BPF_AND|unix.BPF_K, seccompSockTypeMask),
+		// [49] if A == SOCK_RAW -> jump +1 to the allow [51]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_RAW), 1, 0),
-		// [33] if A == SOCK_DGRAM -> fall to the allow [34], else skip to the
-		//      deny [35]
+		// [50] if A == SOCK_DGRAM -> fall to the allow [51], else skip to the
+		//      deny [52]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_DGRAM), 0, 1),
-		// [34] NETLINK_ROUTE raw/dgram: allow (glibc getaddrinfo address lookup)
+		// [51] NETLINK_ROUTE raw/dgram: allow (glibc getaddrinfo address lookup)
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
-		// [35] NETLINK_ROUTE of another type: deny
+		// [52] NETLINK_ROUTE of another type: deny
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
 
 		// --- AF_INET / AF_INET6 -------------------------------------------------
-		// [36] A = args[1] low word (socket type, may carry SOCK_CLOEXEC/NONBLOCK)
+		// [53] A = args[1] low word (socket type, may carry SOCK_CLOEXEC/NONBLOCK)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg1),
-		// [37] A = A & 0xff  (strip the flag bits, keep the base type)
+		// [54] A = A & 0xff  (strip the flag bits, keep the base type)
 		seccompStmt(unix.BPF_ALU|unix.BPF_AND|unix.BPF_K, seccompSockTypeMask),
-		// [38] if A == SOCK_STREAM -> fall to the protocol load [39], else jump
-		//      +5 to the non-stream branch [44] (A still holds the base type)
+		// [55] if A == SOCK_STREAM -> fall to the protocol load [56], else jump
+		//      +5 to the non-stream branch [61] (A still holds the base type)
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_STREAM), 0, 5),
-		// [39] A = args[2] low word (socket protocol)
+		// [56] A = args[2] low word (socket protocol)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
-		// [40] if A == 0 (the default, TCP) -> jump +2 to the allow [43]
+		// [57] if A == 0 (the default, TCP) -> jump +2 to the allow [60]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, 0, 2, 0),
-		// [41] if A == IPPROTO_TCP -> jump +1 to the allow [43], else fall to [42]
+		// [58] if A == IPPROTO_TCP -> jump +1 to the allow [60], else fall to [59]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.IPPROTO_TCP, 1, 0),
-		// [42] inet stream that is not plain TCP (MPTCP 262, SCTP 132, SMC 256):
+		// [59] inet stream that is not plain TCP (MPTCP 262, SCTP 132, SMC 256):
 		//      deny with EACCES — Landlock's TCP port rules do not cover it
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
-		// [43] plain TCP: allow — the positive control proving the socket rule is
+		// [60] plain TCP: allow — the positive control proving the socket rule is
 		//      an allowlist and not a blanket socket() ban
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
 	}...)
 	if !p.AllowUDP {
 		return append(filter,
-			// [44] inet non-stream (UDP, raw, ICMP, SEQPACKET): deny with EACCES —
+			// [61] inet non-stream (UDP, raw, ICMP, SEQPACKET): deny with EACCES —
 			//      UDP has no Landlock address/port scoping on a Confined spawn
 			seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
 		)
 	}
 	return append(filter, []unix.SockFilter{
-		// [44] if A == SOCK_DGRAM -> skip the deny to the protocol load [46]
+		// [61] if A == SOCK_DGRAM -> skip the deny to the protocol load [63]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, uint32(unix.SOCK_DGRAM), 1, 0),
-		// [45] inet raw / ICMP / SEQPACKET: deny with EACCES
+		// [62] inet raw / ICMP / SEQPACKET: deny with EACCES
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
-		// [46] A = args[2] low word (socket protocol)
+		// [63] A = args[2] low word (socket protocol)
 		seccompStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompOffArg2),
-		// [47] if A == 0 (the default, UDP) -> jump +2 to the allow [50]
+		// [64] if A == 0 (the default, UDP) -> jump +2 to the allow [67]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, 0, 2, 0),
-		// [48] if A == IPPROTO_UDP -> jump +1 to the allow [50], else fall to [49]
+		// [65] if A == IPPROTO_UDP -> jump +1 to the allow [67], else fall to [66]
 		seccompJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.IPPROTO_UDP, 1, 0),
-		// [49] inet datagram that is not UDP (ICMP ping, UDP-Lite): deny
+		// [66] inet datagram that is not UDP (ICMP ping, UDP-Lite): deny
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retErrno),
-		// [50] UDP on an Open-network or Rung-1 spawn: allow
+		// [67] UDP on an Open-network or Rung-1 spawn: allow
 		seccompStmt(unix.BPF_RET|unix.BPF_K, retAllow),
 	}...)
 }

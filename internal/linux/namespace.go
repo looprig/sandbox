@@ -303,6 +303,11 @@ type MaskSpec struct {
 type MountViewSpec struct {
 	Binds []BindSpec
 	Masks []MaskSpec
+	// Sockets are the profile's named AF_UNIX socket paths (review C2) that
+	// were sockets at spawn (enumerateSocketBinds). Each is bound read-only
+	// into the view as that one file — never its directory — after Binds and
+	// before Masks, so a deny covering it still wins (applySocketBind).
+	Sockets []string
 }
 
 // EnumerateMountView turns a compile-time MountViewPlan into a spawn-time
@@ -684,8 +689,15 @@ func ConfigureRung1SysProcAttr(attr *syscall.SysProcAttr, netConfined bool) {
 // escape, so EVERY step fails CLOSED via a Stage2Error{Op: mount-view}.
 //
 // Ordering (load-bearing, §7.2): Private-remount / → new-root tmpfs → binds
-// (rw/ro/ro-remask, parents-first) → masks (empty ro binds, deny wins) → fresh
-// /proc for the new pid ns → pivot_root → detach the old root (invisibility).
+// (rw/ro/ro-remask, parents-first) → named sockets → masks (empty ro binds,
+// deny wins) → fresh /proc for the new pid ns → pivot_root → detach the old
+// root (invisibility).
+//
+// Every mount TARGET is resolved inside the new root by descriptor (viewRoot,
+// review L10), never by a host path string: the new root holds trees the
+// target can write (the workspace, a HostWrite "/" bind), so a symlink planted
+// there by an earlier run must not steer mountpoint creation, or the mount
+// itself, out to the host.
 //
 // CI-verified: the mount syscalls need an effective CAP_SYS_ADMIN in an
 // unprivileged user+mount namespace, blocked on the authoring host.
@@ -716,28 +728,43 @@ func applyMountView(spec MountViewSpec) error {
 		return err
 	}
 	defer closeEmpty()
+	root, err := openViewRoot(newroot)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: err}
+	}
+	defer root.close()
 	// 3. Binds (parents-first, so a nested ro carveout re-masks the rw root under
 	//    it — deny-inside-allow via mount).
 	for _, b := range spec.Binds {
-		if err := applyBind(newroot, b); err != nil {
+		if err := applyBind(root, b); err != nil {
+			return err
+		}
+	}
+	// 3b. Named AF_UNIX sockets (review C2), after every bind so the exact
+	//     socket file lands on top of whatever root covers its path, and
+	//     before the masks so a deny over its directory still hides it.
+	for _, path := range spec.Sockets {
+		if err := applySocketBind(root, path); err != nil {
 			return err
 		}
 	}
 	// 4. Masks (empty ro binds), AFTER binds so a deny always wins over a covering
 	//    allow (fixed-path secrets + glob-deny matches).
 	for _, m := range spec.Masks {
-		if err := applyMask(newroot, emptySource, m); err != nil {
+		if err := applyMask(root, emptySource, m); err != nil {
 			return err
 		}
 	}
 	// 5. A FRESH /proc for the new pid namespace (a bound host /proc would expose
 	//    host pids and mismatch the pidns). This is the child's own-namespace proc,
 	//    not a host-path leak.
-	procTarget := filepath.Join(newroot, "proc")
-	if err := os.MkdirAll(procTarget, 0o555); err != nil {
+	procFD, err := root.openTarget("/proc", mountpointDir)
+	if err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mkdir /proc: %w", err)}
 	}
-	if err := unix.Mount("proc", procTarget, "proc", 0, ""); err != nil {
+	err = unix.Mount("proc", procFDPath(procFD), "proc", 0, "")
+	_ = unix.Close(procFD)
+	if err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mount /proc: %w", err)}
 	}
 	// 6. pivot_root into the new root, then detach the old one so host paths not
@@ -745,23 +772,239 @@ func applyMountView(spec MountViewSpec) error {
 	return pivotInto(newroot)
 }
 
-// applyBind binds one host root into the new view at the same absolute path,
-// creating the mountpoint (a dir or an empty file to bind onto) and, for a
-// read-only bind, remounting it MS_RDONLY. Every step fails closed.
-func applyBind(newroot string, b BindSpec) error {
-	target := filepath.Join(newroot, b.Target)
-	if b.IsDir {
-		if err := os.MkdirAll(target, 0o755); err != nil {
-			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mkdir bind target %s: %w", b.Target, err)}
-		}
-	} else {
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mkdir bind parent %s: %w", b.Target, err)}
-		}
-		if err := touchFile(target); err != nil {
-			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("touch bind target %s: %w", b.Target, err)}
+// mountpointKind is what viewRoot.openTarget creates for a missing target.
+type mountpointKind uint8
+
+const (
+	// mountpointNone creates nothing: a missing target is reported ENOENT.
+	mountpointNone mountpointKind = iota
+	// mountpointDir creates missing components as directories (0755).
+	mountpointDir
+	// mountpointFile creates missing parents as directories and the final
+	// component as an empty regular file (0644) for a non-directory bind.
+	mountpointFile
+)
+
+// viewRoot is the Rung-1 new root, held by descriptor so every mount target is
+// resolved INSIDE it (review L10). The previous code joined newroot with the
+// target and let os.MkdirAll / touch / mount(2) resolve that host path string,
+// so an absolute symlink planted in a writable tree (the workspace, a
+// HostWrite "/" bind) was followed out of the new root: mountpoints were
+// created on the host and binds and masks landed outside the view, where they
+// confine nothing.
+//
+// Two openat2 rules close that:
+//
+//   - RESOLVE_IN_ROOT on every lookup: ".." is clamped at the new root and an
+//     absolute symlink is interpreted relative to it, so resolution can never
+//     leave the view whatever the tree holds. A symlink that is part of the
+//     bound host system (usr-merged /lib64 -> usr/lib64 under a "/" bind) still
+//     resolves, inside the view, exactly as the target will see it.
+//   - RESOLVE_NO_SYMLINKS for a bind or socket target strictly beneath a
+//     writable bind already applied (other than "/"): that content is the
+//     target's own, so a symlink there is untrusted and the spawn fails closed
+//     rather than relocating a read-only carveout. A HostWrite "/" bind is
+//     excluded only because its symlinks include the host's own system links
+//     and the target can already write everywhere it could redirect to; the
+//     IN_ROOT clamp still applies there. Masks resolve with IN_ROOT alone: a
+//     mask only hides, so following a link inside the view hides exactly the
+//     content the denied path names.
+//
+// Missing components are created one at a time with mkdirat/openat on the
+// parent descriptor that IN_ROOT resolution returned, so creation can only
+// ever happen inside the view (on its tmpfs, or in a tree the target can
+// write anyway — a read-only bind refuses it, EROFS, failing closed). Every
+// mount(2) then names its target as /proc/self/fd/N of that descriptor, so the
+// kernel mounts on the inode that was checked rather than re-walking a path.
+type viewRoot struct {
+	path string
+	fd   int
+	// writable are the targets of read-write binds applied so far.
+	writable []string
+}
+
+func openViewRoot(path string) (*viewRoot, error) {
+	r := &viewRoot{path: path, fd: -1}
+	if err := r.reopen(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// reopen re-acquires the root descriptor by path. It is needed once a bind
+// lands ON the new root itself (a "/" policy root): a descriptor opened before
+// that names the covered tmpfs, and lookups from it never cross into the bind.
+func (r *viewRoot) reopen() error {
+	fd, err := unix.Open(r.path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open new root: %w", err)
+	}
+	if r.fd >= 0 {
+		_ = unix.Close(r.fd)
+	}
+	r.fd = fd
+	return nil
+}
+
+func (r *viewRoot) close() {
+	if r.fd >= 0 {
+		_ = unix.Close(r.fd)
+		r.fd = -1
+	}
+}
+
+// resolveFor is the openat2 resolve mask for a bind or socket target (see the
+// viewRoot doc): IN_ROOT always, NO_SYMLINKS beneath an applied writable bind.
+func (r *viewRoot) resolveFor(target string) uint64 {
+	resolve := uint64(unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS)
+	for _, writable := range r.writable {
+		if writable != string(filepath.Separator) && policy.PathUnder(writable, target) {
+			return resolve | unix.RESOLVE_NO_SYMLINKS
 		}
 	}
+	return resolve
+}
+
+// openTarget resolves the absolute view path target inside the root with
+// resolveFor's rules, creating missing components per kind, and returns an
+// O_PATH descriptor the caller owns. With mountpointNone a missing target is
+// ENOENT.
+func (r *viewRoot) openTarget(target string, kind mountpointKind) (int, error) {
+	return r.openTargetResolve(target, kind, r.resolveFor(target))
+}
+
+func (r *viewRoot) openTargetResolve(target string, kind mountpointKind, resolve uint64) (int, error) {
+	rel := strings.TrimPrefix(filepath.Clean(target), string(filepath.Separator))
+	if rel == "" {
+		return unix.Openat2(r.fd, ".", &unix.OpenHow{Flags: uint64(unix.O_PATH | unix.O_CLOEXEC), Resolve: resolve})
+	}
+	components := strings.Split(rel, string(filepath.Separator))
+	parent := -1
+	closeParent := func() {
+		if parent >= 0 {
+			_ = unix.Close(parent)
+		}
+	}
+	for i, component := range components {
+		last := i == len(components)-1
+		wantDir := !last || kind == mountpointDir
+		flags := uint64(unix.O_PATH | unix.O_CLOEXEC)
+		if wantDir {
+			flags |= unix.O_DIRECTORY
+		}
+		how := &unix.OpenHow{Flags: flags, Resolve: resolve}
+		prefix := strings.Join(components[:i+1], string(filepath.Separator))
+		fd, err := unix.Openat2(r.fd, prefix, how)
+		if errors.Is(err, unix.ENOENT) && kind != mountpointNone {
+			dirFD := r.fd
+			if parent >= 0 {
+				dirFD = parent
+			}
+			if wantDir {
+				err = unix.Mkdirat(dirFD, component, 0o755)
+			} else {
+				var created int
+				created, err = unix.Openat(dirFD, component, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
+				if err == nil {
+					_ = unix.Close(created)
+				}
+			}
+			if err != nil && !errors.Is(err, unix.EEXIST) {
+				closeParent()
+				return -1, fmt.Errorf("create %s: %w", prefix, err)
+			}
+			// Re-resolve under the same rules: a component that "existed" as a
+			// dangling or untrusted symlink fails here rather than being used.
+			fd, err = unix.Openat2(r.fd, prefix, how)
+		}
+		if err != nil {
+			closeParent()
+			return -1, fmt.Errorf("resolve %s in the new root: %w", prefix, err)
+		}
+		closeParent()
+		parent = fd
+	}
+	return parent, nil
+}
+
+// procFDPath names a descriptor through /proc/self/fd, the form mount(2)
+// follows to the exact inode the descriptor holds.
+func procFDPath(fd int) string { return procSelfFDPrefix + strconv.Itoa(fd) }
+
+// sameInode reports whether two descriptors name the same inode.
+func sameInode(a, b int) (bool, error) {
+	var sa, sb unix.Stat_t
+	if err := unix.Fstat(a, &sa); err != nil {
+		return false, err
+	}
+	if err := unix.Fstat(b, &sb); err != nil {
+		return false, err
+	}
+	return sa.Dev == sb.Dev && sa.Ino == sb.Ino, nil
+}
+
+// errMountLanded reports that, after a bind, the target path resolved to
+// something other than the bound source — the mount did not land where the
+// view needs it (a concurrent rename), so a remount there would miss it.
+var errMountLanded = errors.New("bind did not land on its target")
+
+// remountReadOnly makes the bind just placed at target read-only. It re-resolves
+// target (now crossing into the new mount), checks that what it finds is the
+// bound source inode (sourceFD), and remounts THAT mount through its
+// descriptor, repeating the flags the user namespace locked on it.
+//
+// A bind mount ignores MS_RDONLY on the initial call; this second MS_REMOUNT
+// pass makes it read-only. It is TOP-mount-only: a submount under a
+// recursively-bound read root (e.g. /sys, /run under a broad "/" read) keeps
+// its own rw state in the mount view. That is NOT a write-boundary hole,
+// because Rung 1 ALSO applies the Landlock FS allowlist on top of this view
+// (stage2Setup: applyMountView -> ... -> applyLandlockRules), and Landlock
+// grants write only on the policy's writable roots — so a rw submount is still
+// write-denied to the target. The mount view's ro-remount is thus
+// defense-in-depth for writes; its load-bearing jobs are invisibility (unbound
+// paths are gone) and the empty deny-masks. (A future recursive
+// mount_setattr(AT_RECURSIVE, MOUNT_ATTR_RDONLY) pass could make the view
+// self-sufficient, but risks EPERM on host-locked submounts under "/", so it is
+// deferred to CI validation.)
+//
+// The remount must carry the flags the bind ALREADY has. A user namespace
+// locks MS_NOSUID/MS_NODEV/MS_NOEXEC and the atime policy on any mount it did
+// not create itself, and a MS_REMOUNT that would clear a locked flag is
+// refused with EPERM -- which is exactly how this failed on /etc/resolv.conf
+// ("remount ro: operation not permitted"), aborting stage 2 and surfacing as
+// exit code 126. Passing MS_RDONLY alone implicitly asks to clear every other
+// flag, so read them back off the fresh bind and preserve them.
+func remountReadOnly(root *viewRoot, target string, sourceFD int, resolve uint64) error {
+	mounted, err := root.openTargetResolve(target, mountpointNone, resolve)
+	if err != nil {
+		return fmt.Errorf("re-resolve bind: %w", err)
+	}
+	defer func() { _ = unix.Close(mounted) }()
+	if sourceFD >= 0 {
+		same, err := sameInode(mounted, sourceFD)
+		if err != nil {
+			return fmt.Errorf("stat bind: %w", err)
+		}
+		if !same {
+			return errMountLanded
+		}
+	}
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(mounted, &st); err != nil {
+		return fmt.Errorf("read bind flags: %w", err)
+	}
+	locked := mapLockedFlags(int64(st.Flags))
+	if err := unix.Mount("", procFDPath(mounted), "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|locked, ""); err != nil {
+		return fmt.Errorf("remount ro: %w", err)
+	}
+	return nil
+}
+
+// applyBind binds one host root into the new view at the same absolute path,
+// creating the mountpoint (a dir or an empty file to bind onto) inside the new
+// root (viewRoot) and, for a read-only bind, remounting it MS_RDONLY. Every
+// step fails closed.
+func applyBind(root *viewRoot, b BindSpec) error {
 	source := b.Source
 	if strings.HasPrefix(source, procSelfFDPrefix) {
 		// A grant-pinned root: the descriptor was opened in the PARENT's mount
@@ -774,68 +1017,133 @@ func applyBind(newroot string, b BindSpec) error {
 			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
 		}
 		defer func() { _ = unix.Close(fd) }()
-		source = procSelfFDPrefix + strconv.Itoa(fd)
+		source = procFDPath(fd)
 	}
-	if err := unix.Mount(source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+	if filepath.Clean(b.Target) == string(filepath.Separator) {
+		// A "/" policy root binds onto the new root itself, which is our own
+		// fresh tmpfs: there is no path inside it to resolve. Afterwards the
+		// root descriptor must be re-acquired to see through the bind.
+		if err := unix.Mount(source, root.path, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
+		}
+		if err := root.reopen(); err != nil {
+			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
+		}
+		if b.ReadOnly {
+			if err := remountReadOnly(root, b.Target, -1, root.resolveFor(b.Target)); err != nil {
+				return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
+			}
+		} else {
+			root.writable = append(root.writable, b.Target)
+		}
+		return nil
+	}
+	// The source is opened ONCE, in this namespace's host coordinates (it
+	// follows symlinks, exactly as mount(2) did when given the path), so the
+	// bind mounts the inode checked here and the read-only remount can verify
+	// it landed.
+	sourceFD, err := unix.Open(source, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("open bind source %s: %w", b.Target, err)}
+	}
+	defer func() { _ = unix.Close(sourceFD) }()
+	kind := mountpointFile
+	if b.IsDir {
+		kind = mountpointDir
+	}
+	resolve := root.resolveFor(b.Target)
+	targetFD, err := root.openTargetResolve(b.Target, kind, resolve)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind target %s: %w", b.Target, err)}
+	}
+	err = unix.Mount(procFDPath(sourceFD), procFDPath(targetFD), "", unix.MS_BIND|unix.MS_REC, "")
+	_ = unix.Close(targetFD)
+	if err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
 	}
 	if b.ReadOnly {
-		// A bind mount ignores MS_RDONLY on the initial call; a second MS_REMOUNT
-		// pass makes it read-only. This is TOP-mount-only: a submount under a
-		// recursively-bound read root (e.g. /sys, /run under a broad "/" read) keeps
-		// its own rw state in the mount view. That is NOT a write-boundary hole,
-		// because Rung 1 ALSO applies the Landlock FS allowlist on top of this view
-		// (stage2Setup: applyMountView -> ... -> applyLandlockRules), and Landlock
-		// grants write only on the policy's writable roots — so a rw submount is
-		// still write-denied to the target. The mount view's ro-remount is thus
-		// defense-in-depth for writes; its load-bearing jobs are invisibility
-		// (unbound paths are gone) and the empty deny-masks. (A future recursive
-		// mount_setattr(AT_RECURSIVE, MOUNT_ATTR_RDONLY) pass could make the view
-		// self-sufficient, but risks EPERM on host-locked submounts under "/", so it
-		// is deferred to CI validation.)
-		//
-		// The remount must carry the flags the bind ALREADY has. A user
-		// namespace locks MS_NOSUID/MS_NODEV/MS_NOEXEC and the atime policy on
-		// any mount it did not create itself, and a MS_REMOUNT that would
-		// clear a locked flag is refused with EPERM -- which is exactly how
-		// this failed on /etc/resolv.conf ("remount ro: operation not
-		// permitted"), aborting stage 2 and surfacing as exit code 126.
-		// Passing MS_RDONLY alone implicitly asks to clear every other flag,
-		// so read them back off the fresh bind and preserve them.
-		locked, err := lockedMountFlags(target)
-		if err != nil {
-			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("read bind flags %s: %w", b.Target, err)}
+		if err := remountReadOnly(root, b.Target, sourceFD, resolve); err != nil {
+			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind %s: %w", b.Target, err)}
 		}
-		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|locked, ""); err != nil {
-			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("remount ro %s: %w", b.Target, err)}
-		}
+		return nil
+	}
+	root.writable = append(root.writable, b.Target)
+	return nil
+}
+
+// applySocketBind binds one named AF_UNIX socket (review C2) into the view at
+// its own path, read-only (connect(2) needs no write on the mount: a socket's
+// write-permission check is on the inode, and a read-only mount refuses only
+// writes to regular files, directories and symlinks). The source is
+// re-resolved here without following any symlink and must still be a socket;
+// one that vanished or changed type since the parent's check is skipped — the
+// grant narrows, it is never widened to the socket's directory. A target that
+// cannot be created inside the view, or a bind that does not land, fails the
+// spawn closed.
+func applySocketBind(root *viewRoot, path string) error {
+	sourceFD, err := openSocketPath(path)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = unix.Close(sourceFD) }()
+	resolve := root.resolveFor(path)
+	targetFD, err := root.openTargetResolve(path, mountpointFile, resolve)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("socket target %s: %w", path, err)}
+	}
+	err = unix.Mount(procFDPath(sourceFD), procFDPath(targetFD), "", unix.MS_BIND, "")
+	_ = unix.Close(targetFD)
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind socket %s: %w", path, err)}
+	}
+	if err := remountReadOnly(root, path, sourceFD, resolve); err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("bind socket %s: %w", path, err)}
 	}
 	return nil
 }
 
-// applyMask hides a path behind an empty read-only mount (SPEC §7.5). A masked
-// DIR gets a fresh empty read-only tmpfs; a masked FILE gets an empty read-only
-// file bind. A mask whose target is not present in the view (never covered by
-// any bind) is a no-op: an unbound host path is already invisible. Fails closed
-// on any real mount error.
-func applyMask(newroot, emptySource string, m MaskSpec) error {
-	target := filepath.Join(newroot, m.Target)
-	if _, err := os.Lstat(target); err != nil {
+// applyMask hides a path behind an empty read-only mount (SPEC §7.5). The
+// target is resolved inside the new root (viewRoot, IN_ROOT without the
+// symlink refusal: a mask only hides, so following a link inside the view
+// hides exactly the content the denied path names). A masked DIRECTORY gets a
+// fresh empty read-only tmpfs; anything else an empty read-only file bind —
+// decided by what the target IS in the view, not by the spawn-time stat, so a
+// link that resolves to a directory still gets a directory mask. A target not
+// present in the view (never covered by any bind) is a no-op: an unbound host
+// path is already invisible. Fails closed on any real mount error.
+func applyMask(root *viewRoot, emptySource string, m MaskSpec) error {
+	resolve := uint64(unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS)
+	targetFD, err := root.openTargetResolve(m.Target, mountpointNone, resolve)
+	if errors.Is(err, unix.ENOENT) {
 		return nil // not visible in the view — nothing to mask (already hidden)
 	}
-	if m.IsDir {
-		if err := unix.Mount("tmpfs", target, "tmpfs", unix.MS_RDONLY, ""); err != nil {
+	if err != nil {
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask %s: %w", m.Target, err)}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(targetFD, &st); err != nil {
+		_ = unix.Close(targetFD)
+		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask %s: %w", m.Target, err)}
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		err := unix.Mount("tmpfs", procFDPath(targetFD), "tmpfs", unix.MS_RDONLY, "")
+		_ = unix.Close(targetFD)
+		if err != nil {
 			return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask dir %s: %w", m.Target, err)}
 		}
 		return nil
 	}
 	if emptySource == "" {
+		_ = unix.Close(targetFD)
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file %s: no empty mask source", m.Target)}
 	}
-	if err := unix.Mount(emptySource, target, "", unix.MS_BIND, ""); err != nil {
+	err = unix.Mount(emptySource, procFDPath(targetFD), "", unix.MS_BIND, "")
+	_ = unix.Close(targetFD)
+	if err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file %s: %w", m.Target, err)}
 	}
-	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+	emptyFD := procFDNumber(emptySource)
+	if err := remountReadOnly(root, m.Target, emptyFD, resolve); err != nil {
 		return &Stage2Error{Op: mountViewOp, Err: fmt.Errorf("mask file ro %s: %w", m.Target, err)}
 	}
 	return nil
@@ -907,9 +1215,11 @@ func pivotInto(newroot string) error {
 	return nil
 }
 
-// touchFile ensures a regular-file bind MOUNTPOINT exists at path. It is only
-// ever a mountpoint: the bind is laid over it immediately and nothing is ever
-// written through this handle.
+// touchFile ensures a regular-file MOUNTPOINT exists at path. It is only ever
+// a mountpoint: a bind is laid over it immediately and nothing is ever written
+// through this handle. Bind and socket targets inside the view are created by
+// viewRoot.openTarget instead (review L10); this path-based helper now only
+// creates the empty mask source on the bare new-root tmpfs, before any bind.
 //
 // It therefore must not demand write permission on a target that already
 // exists. Opening O_WRONLY unconditionally did exactly that, and failed with
@@ -934,23 +1244,14 @@ func touchFile(path string) error {
 	return f.Close()
 }
 
-// lockedMountFlags reports the mount flags already present on path that a user
-// namespace forbids a remount from clearing. The kernel locks these on any
-// mount the namespace did not create, so a MS_REMOUNT must repeat them
-// verbatim or fail with EPERM. statfs is the portable way to read them back;
-// its ST_* bits are a separate vocabulary from MS_*, so map each explicitly
-// rather than assuming the constants coincide.
-func lockedMountFlags(path string) (uintptr, error) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
-		return 0, err
-	}
-	return mapLockedFlags(int64(st.Flags)), nil
-}
-
 // mapLockedFlags translates statfs ST_* bits into the MS_* bits a remount must
-// repeat. Split out from lockedMountFlags so the translation is testable
-// without a mount: the two vocabularies are distinct constants and getting a
+// repeat: the flags already present on a mount that a user namespace forbids a
+// remount from clearing (the kernel locks them on any mount the namespace did
+// not create, so a MS_REMOUNT must repeat them verbatim or fail with EPERM).
+// remountReadOnly reads them with fstatfs on the bind's own descriptor; statfs
+// ST_* bits are a separate vocabulary from MS_*, so each is mapped explicitly
+// rather than assuming the constants coincide. Split out so the translation is
+// testable without a mount: the two vocabularies are distinct constants and getting a
 // pairing wrong silently drops a locked flag, which reappears only as an EPERM
 // on a machine whose mounts happen to carry it.
 func mapLockedFlags(statfsFlags int64) uintptr {

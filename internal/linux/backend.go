@@ -94,8 +94,18 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
 		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, err
 	}
-	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
+	// Review M13: Landlock compiles from the policy's FS axis plus a fixed
+	// write carveout over the cgroup v2 hierarchy whenever the policy would
+	// otherwise grant write there (HostWrite Allow). The guarantee bits and
+	// the mount view below still read p.FS: the carveout narrows Landlock
+	// only and must never manufacture a write-boundary claim the policy did
+	// not make.
+	cgroupCarveouts := cgroupWriteCarveouts(p.FS, b.CgroupPids)
+	cfs := policy.CompileFSWithPathHandles(appendCgroupWriteCarveouts(p.FS, cgroupCarveouts), handles)
 	cnet := CompileNetPolicy(p.Net)
+	// Review C2: the AF_UNIX escape hatch. Rung 2 has no view and no Netns,
+	// so the zero MountViewPlan / netns=false are the honest inputs.
+	cu := compileUnixSockets(p.UnixSockets, RungTwo, ProbeLandlockABI(), MountViewPlan{}, false)
 	// Task 14: resolve the cgroup v2 resource-limit plan against the Ancestor
 	// probed at construction. Enforced() decides the ResourceLimits guarantee at
 	// COMPILE time; each spawn creates the transient scope at SPAWN time (see
@@ -131,14 +141,19 @@ func (b Backend) compileRung2WithGrantPaths(p policy.Effective, handles []*polic
 		bits |= profile.GuaranteeResourceLimits
 	}
 
-	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, cnet, cg, nil, handles), Release: nil}
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, cnet, cg, nil, cu, handles), Release: nil}
 	report := fsCompileReport(p, cfs)
+	report.Entries = append(report.Entries, cgroupCarveoutReport(cgroupCarveouts)...)
 	// Task 12b: record the Rung-2 Seccomp hardening. It does not by itself earn a
 	// guarantee bit — it hardens the confinement by soft-denying dangerous syscalls
 	// in every Rung-2 target, and its socket() allowlist load-bearingly refuses
 	// every non-TCP egress family/protocol so the 12c TCP port allowlist is a
 	// sound, non-bypassable network boundary.
-	report.Entries = append(report.Entries, seccompReportEntry(!cnet.Confined))
+	report.Entries = append(report.Entries, seccompReportEntry(!cnet.Confined, cu.allow))
+	// Review C2: the AF_UNIX escape hatch's outcome (nothing for the default
+	// denial). Rung 2 never claims GuaranteeProcessBoundary and is already
+	// Degraded, so the entries are the whole of its effect here.
+	report.Entries = append(report.Entries, cu.entries...)
 	// Task 12c: record the Rung-2 network compilation (port allowlist Enforced,
 	// DNS narrowed to TCP, address scoping unenforced).
 	report.Entries = append(report.Entries, NetCompileReport(p.Net, cnet)...)
@@ -180,14 +195,26 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 	if err := policy.ValidateLandlockExactPaths(p.FS, handles); err != nil {
 		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, err
 	}
-	cfs := policy.CompileFSWithPathHandles(p.FS, handles)
+	// Review M13: as at Rung 2, Landlock (layered on the view) withholds
+	// write from the cgroup v2 hierarchy a "/" rw bind would expose.
+	cgroupCarveouts := cgroupWriteCarveouts(p.FS, b.CgroupPids)
+	landlockFS := appendCgroupWriteCarveouts(p.FS, cgroupCarveouts)
+	cfs := policy.CompileFSWithPathHandles(landlockFS, handles)
 	cg := CompileCgroupPolicy(p.Limits, b.CgroupPids)
 	mvp := compileMountViewWithGrantPaths(p, handles)
 	nft := CompileNftPlan(p.Net)
+	// Review C2: the AF_UNIX escape hatch, confined by this view and (when
+	// egress is Confined) this spawn's network namespace.
+	cu := compileUnixSockets(p.UnixSockets, RungOne, ProbeLandlockABI(), mvp, nft.Confined)
 
-	// The process boundary is unconditional; filesystem guarantees are reported
-	// only for axes the effective policy actually restricts.
-	bits := uint64(profile.GuaranteeProcessBoundary)
+	// The process boundary holds unless the AF_UNIX escape hatch admits an
+	// endpoint outside it (review C2: an unconfined endpoint namespace or a
+	// dangerous named socket); filesystem guarantees are reported only for
+	// axes the effective policy actually restricts.
+	var bits uint64
+	if !cu.withholdProcessBoundary {
+		bits |= profile.GuaranteeProcessBoundary
+	}
 	if policy.IsAccessRestricted(p.FS, policy.WriteAccess) {
 		bits |= profile.GuaranteeWriteBoundary
 	}
@@ -210,10 +237,17 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 	r1 := &rung1Plan{mount: mvp, nft: nft}
 	// cnet is empty: Rung 1 does NOT use the Landlock TCP-port net (nftables covers
 	// egress), so linuxWrap sets NetConfined=false and injects no RES_OPTIONS.
-	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, CompiledNet{}, cg, r1, handles), Release: nil}
-	report := rung1CompileReport(p, mvp, nft)
+	spec := enforce.Spec{Wrap: linuxWrapTransform(cfs, CompiledNet{}, cg, r1, cu, handles), Release: nil}
+	report := rung1CompileReport(p, landlockFS, mvp, nft, cu)
+	report.Entries = append(report.Entries, cgroupCarveoutReport(cgroupCarveouts)...)
 	report.Entries = append(report.Entries, CgroupCompileReport(cg))
-	return spec, report, profile.LevelFull, bits, nil
+	// An endpoint the view cannot confine lowers the tier: Rung 1's Full
+	// level is a statement about the process boundary it then cannot make.
+	level := uint8(profile.LevelFull)
+	if cu.withholdProcessBoundary {
+		level = profile.LevelDegraded
+	}
+	return spec, report, level, bits, nil
 }
 
 // rung1CompileReport records how the Rung-1 mechanisms compiled each policy
@@ -223,13 +257,18 @@ func (b Backend) compileRung1WithGrantPaths(p policy.Effective, handles []*polic
 // bounded spawn-time scan narrows rather than drops. It also discloses the
 // shared per-axis Landlock snapshot narrowing and the glob-mask residual
 // (§7.5); neither demotes Level.
-func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPlan) profile.CompileReport {
+func rung1CompileReport(p policy.Effective, landlockFS []policy.FSEntry, mvp MountViewPlan, nft compiledNftPlan, cu compiledUnix) profile.CompileReport {
+	processBoundary := profile.ReportEntry{
+		Feature: "process-boundary",
+		Status:  "Enforced",
+		Detail:  "target runs in fresh user+mount+pid+net namespaces via SysProcAttr cloneflags on the stage-2 re-exec (Rung 1, §7.2)",
+	}
+	if cu.withholdProcessBoundary {
+		processBoundary.Status = "narrowed"
+		processBoundary.Detail += "; the AF_UNIX escape hatch admits an endpoint outside it (see unix-sockets), so GuaranteeProcessBoundary is withheld"
+	}
 	entries := []profile.ReportEntry{
-		{
-			Feature: "process-boundary",
-			Status:  "Enforced",
-			Detail:  "target runs in fresh user+mount+pid+net namespaces via SysProcAttr cloneflags on the stage-2 re-exec (Rung 1, §7.2)",
-		},
+		processBoundary,
 		{
 			Feature: "write-boundary",
 			Status:  "Enforced",
@@ -241,7 +280,7 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 			Detail:  "the mount view pivot_roots into a new root holding only the policy's bound roots; host paths not bound are INVISIBLE (not merely unreadable) — the Rung-1 property Rung 2 cannot provide (§7.2, §7.5)",
 		},
 	}
-	if snapshot, ok := filesystemAxisSnapshotEntry(policy.CompileFS(p.FS)); ok {
+	if snapshot, ok := filesystemAxisSnapshotEntry(policy.CompileFS(landlockFS)); ok {
 		entries = append(entries, snapshot)
 	}
 	if mvp.hasLiteralDeny {
@@ -276,25 +315,31 @@ func rung1CompileReport(p policy.Effective, mvp MountViewPlan, nft compiledNftPl
 	entries = append(entries, allowPathsReportEntry())
 	// Rung 1 installs the same stage-2 Seccomp filter, with UDP always admitted
 	// (linuxWrap): nftables scopes UDP in the Netns, or the policy is Open.
-	entries = append(entries, seccompReportEntry(true))
+	entries = append(entries, seccompReportEntry(true, cu.allow))
+	entries = append(entries, cu.entries...)
 	entries = append(entries, rung1NetReport(nft)...)
 	return profile.CompileReport{Entries: entries}
 }
 
-// seccompReportEntry records the stage-2 Seccomp filter (review C2/H1/H2): the
-// socket() allowlist, whether UDP is admitted for this compile, and the
-// nr-only denials. Both rungs install the same filter shape.
-func seccompReportEntry(allowUDP bool) profile.ReportEntry {
+// seccompReportEntry records the stage-2 Seccomp filter (review C2/H1/H2/M12):
+// the socket() allowlist, whether UDP and AF_UNIX are admitted for this
+// compile, and the nr/argument denials. Both rungs install the same filter
+// shape.
+func seccompReportEntry(allowUDP, allowUnix bool) profile.ReportEntry {
 	udp := "UDP is refused (no Landlock address/port scoping for it; DNS is forced over TCP)"
 	if allowUDP {
 		udp = "UDP (protocol 0/IPPROTO_UDP) is admitted because egress is Open or scoped by the Rung-1 nftables filter"
 	}
+	unixSockets := "; AF_UNIX pathname/abstract sockets (D-Bus, ssh-agent, docker.sock) are refused"
+	if allowUnix {
+		unixSockets = "; AF_UNIX stream/datagram/seqpacket sockets are admitted by the profile's UnixSocketPolicy escape hatch, with their reachable endpoints reported under unix-sockets"
+	}
 	return profile.ReportEntry{
 		Feature: "Seccomp-hardening",
 		Status:  "Enforced",
-		Detail: "Seccomp-BPF filter in the stage-2 target allows socket() only for AF_INET/AF_INET6 SOCK_STREAM TCP and AF_NETLINK NETLINK_ROUTE; " + udp +
-			"; every other family or protocol (AF_UNIX pathname/abstract sockets such as D-Bus or ssh-agent, AF_VSOCK, AF_SMC, AF_RDS, MPTCP, SCTP, SMC, raw) is refused, socketpair() stays allowed, " +
-			"and ptrace, io_uring and keyctl/add_key/request_key are denied (EACCES); installed after Landlock, inherited across execve (§7.2)",
+		Detail: "Seccomp-BPF filter in the stage-2 target allows socket() only for AF_INET/AF_INET6 SOCK_STREAM TCP and AF_NETLINK NETLINK_ROUTE; " + udp + unixSockets +
+			"; every other family or protocol (AF_VSOCK, AF_SMC, AF_RDS, MPTCP, SCTP, SMC, raw) is refused, socketpair() stays allowed, " +
+			"ptrace, io_uring and keyctl/add_key/request_key are denied, and ioctl TIOCSTI/TIOCLINUX (terminal input injection) is denied (EACCES); the target also starts in its own session, without the harness's controlling terminal; installed after Landlock, inherited across execve (§7.2)",
 	}
 }
 
@@ -440,9 +485,9 @@ func policyHasGlobDeny(p policy.Effective) bool {
 // load-bearing — each closes over its own (dir, innerArgv), its own enumerated
 // rules, and its own pipe, so concurrent spawns never share per-spawn state or a
 // file descriptor.
-func linuxWrapTransform(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *rung1Plan, handles []*policy.PathHandle) func(string, []string) ([]string, func(*exec.Cmd) error, func()) {
+func linuxWrapTransform(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *rung1Plan, cu compiledUnix, handles []*policy.PathHandle) func(string, []string) ([]string, func(*exec.Cmd) error, func()) {
 	return func(dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
-		return linuxWrap(cfs, cnet, cg, r1, handles, dir, innerArgv)
+		return linuxWrap(cfs, cnet, cg, r1, cu, handles, dir, innerArgv)
 	}
 }
 
@@ -457,7 +502,7 @@ func linuxWrapTransform(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgro
 // applies the mount view + nftables before Landlock. The cloneflags, the spec
 // pipe, and the cgroup UseCgroupFD all coexist on the one SysProcAttr. r1 == nil
 // is the Rung-2 path (no namespaces), unchanged.
-func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *rung1Plan, handles []*policy.PathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
+func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *rung1Plan, cu compiledUnix, handles []*policy.PathHandle, dir string, innerArgv []string) ([]string, func(*exec.Cmd) error, func()) {
 	// Re-exec THIS binary (/proc/self/exe, NOT os.Args[0]): the kernel resolves it
 	// even for a deleted binary, and it is the exact image whose Init() dispatches
 	// the stage-2 child.
@@ -506,9 +551,14 @@ func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *r
 			FSRules:         fsRules,
 			Seccomp:         true,
 			SeccompAllowUDP: !cnet.Confined,
-			NetConfined:     cnet.Confined,
-			NetTCPPorts:     cnet.TcpPorts,
-			Rung:            stage2RungTwo,
+			// Review C2: AF_UNIX only under the profile's escape hatch, with
+			// Landlock's abstract-socket scope whenever the compile found
+			// ABI >= 6 (compileUnixSockets).
+			SeccompAllowUnix:          cu.allow,
+			LandlockScopeAbstractUnix: cu.scopeAbstract,
+			NetConfined:               cnet.Confined,
+			NetTCPPorts:               cnet.TcpPorts,
+			Rung:                      stage2RungTwo,
 		}
 		for index := range handles {
 			spec.GrantFDs = append(spec.GrantFDs, policy.FirstPathHandleChildFD+index)
@@ -529,6 +579,9 @@ func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *r
 				return err
 			}
 			spec.MountView = mountView
+			// Review C2: each named socket that is a socket NOW is bound
+			// into the view as that one file; stage 2 re-resolves it.
+			spec.MountView.Sockets = enumerateSocketBinds(cu.socketBinds)
 			spec.NftRules = r1.nft.toNftSpec()
 			spec.NetConfined = false
 			spec.NetTCPPorts = nil
@@ -566,6 +619,16 @@ func linuxWrap(cfs policy.CompiledFS, cnet CompiledNet, cg CompiledCgroup, r1 *r
 		// Confined (an open policy must keep host networking). These coexist with the
 		// spec pipe and the cgroup fd on the one struct.
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		// Review M12/L1: every target starts in its own session, so it never
+		// holds the harness's controlling terminal: /dev/tty fails ENXIO and a
+		// TIOCSTI aimed at the user's shell has no terminal to reach (the
+		// Seccomp rule refuses the ioctl itself as a second layer). setsid(2)
+		// also makes the child its own process-group leader, the
+		// pgid-equals-pid shape processTree's group signalling keys on, so
+		// newProcessTree sees Setsid and skips Setpgid (POSIX forbids both);
+		// a TTY spawn adds Setctty onto its own PTY after this configure.
+		// Stage 2 re-checks the invariant and fails closed without it.
+		cmd.SysProcAttr.Setsid = true
 		if r1 != nil {
 			ConfigureRung1SysProcAttr(cmd.SysProcAttr, r1.nft.Confined)
 		}

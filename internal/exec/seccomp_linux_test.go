@@ -136,6 +136,11 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 	t.Parallel()
 	confinedProg := linux.BuildSeccompFilter(linux.SeccompPolicy{})
 	openProg := linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUDP: true})
+	// unixProg is the escape-hatch build (profile.UnixSocketPolicy non-zero):
+	// it may differ from confinedProg ONLY on well-formed AF_UNIX socket()
+	// calls; unixOpenProg composes both bits.
+	unixProg := linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUnix: true})
+	unixOpenProg := linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUDP: true, AllowUnix: true})
 
 	// The filter binds the architecture it was built for; x86 below is that
 	// native arch value on every GOARCH (the name predates arm64 support), and
@@ -166,19 +171,29 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 		args         [6]uint64
 		wantConfined uint32 // SeccompPolicy{}
 		wantOpen     uint32 // SeccompPolicy{AllowUDP: true}
+		// wantUnix is the result under SeccompPolicy{AllowUnix: true} (and,
+		// with wantOpen's UDP result, under both bits). Zero means "same as
+		// wantConfined": only AF_UNIX rows set it.
+		wantUnix uint32
 	}
 	same := func(name string, arch, nr uint32, args [6]uint64, want uint32) row {
-		return row{name, arch, nr, args, want, want}
+		return row{name: name, arch: arch, nr: nr, args: args, wantConfined: want, wantOpen: want}
+	}
+	// unixRow is an AF_UNIX socket() row: refused by default, admitted only
+	// by the escape-hatch build.
+	unixRow := func(name string, args [6]uint64, wantUnix uint32) row {
+		return row{name: name, arch: x86, nr: unix.SYS_SOCKET, args: args, wantConfined: retErrno, wantOpen: retErrno, wantUnix: wantUnix}
 	}
 	sock := func(domain, typ, proto uint64) [6]uint64 { return [6]uint64{domain, typ, proto} }
+	ioctlReq := func(request uint64) [6]uint64 { return [6]uint64{0, request} }
 	tests := []row{
 		// Kill guards (anti-fail-open, fail-closed).
 		same("foreign arch killed", foreign, unix.SYS_SOCKET, sock(unix.AF_INET, stream, 0), kill),
 		// UDP: refused on a Confined spawn, admitted (protocol 0/UDP only) when Open.
-		{"AF_INET dgram", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, 0), retErrno, allow},
-		{"AF_INET6 dgram", x86, unix.SYS_SOCKET, sock(unix.AF_INET6, dgram, 0), retErrno, allow},
-		{"AF_INET dgram with CLOEXEC flags (mask)", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram|cloexec, 0), retErrno, allow},
-		{"AF_INET dgram IPPROTO_UDP", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, unix.IPPROTO_UDP), retErrno, allow},
+		{"AF_INET dgram", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, 0), retErrno, allow, 0},
+		{"AF_INET6 dgram", x86, unix.SYS_SOCKET, sock(unix.AF_INET6, dgram, 0), retErrno, allow, 0},
+		{"AF_INET dgram with CLOEXEC flags (mask)", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram|cloexec, 0), retErrno, allow, 0},
+		{"AF_INET dgram IPPROTO_UDP", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, unix.IPPROTO_UDP), retErrno, allow, 0},
 		same("AF_INET dgram ICMP ping socket denied", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, unix.IPPROTO_ICMP), retErrno),
 		same("AF_INET dgram UDP-Lite denied", x86, unix.SYS_SOCKET, sock(unix.AF_INET, dgram, unix.IPPROTO_UDPLITE), retErrno),
 		same("AF_INET raw denied", x86, unix.SYS_SOCKET, sock(unix.AF_INET, raw, unix.IPPROTO_ICMP), retErrno),
@@ -191,10 +206,17 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 		same("AF_INET6 stream SCTP denied", x86, unix.SYS_SOCKET, sock(unix.AF_INET6, stream, unix.IPPROTO_SCTP), retErrno),
 		same("AF_INET stream IPPROTO_SMC denied", x86, unix.SYS_SOCKET, sock(unix.AF_INET, stream, ipprotoSMC), retErrno),
 		// Families outside the allowlist (review C2/H1).
-		same("AF_UNIX stream denied", x86, unix.SYS_SOCKET, sock(unix.AF_UNIX, stream, 0), retErrno),
-		same("AF_UNIX stream with CLOEXEC denied", x86, unix.SYS_SOCKET, sock(unix.AF_UNIX, stream|cloexec, 0), retErrno),
-		same("AF_UNIX dgram denied", x86, unix.SYS_SOCKET, sock(unix.AF_UNIX, dgram, 0), retErrno),
-		same("AF_UNIX seqpacket denied", x86, unix.SYS_SOCKET, sock(unix.AF_UNIX, seqpacket, 0), retErrno),
+		// AF_UNIX: refused by default, admitted by the escape hatch (stream,
+		// datagram, seqpacket; protocol 0 only; flag bits masked).
+		unixRow("AF_UNIX stream", sock(unix.AF_UNIX, stream, 0), allow),
+		unixRow("AF_UNIX stream with CLOEXEC", sock(unix.AF_UNIX, stream|cloexec, 0), allow),
+		unixRow("AF_UNIX dgram", sock(unix.AF_UNIX, dgram, 0), allow),
+		unixRow("AF_UNIX dgram with CLOEXEC", sock(unix.AF_UNIX, dgram|cloexec, 0), allow),
+		unixRow("AF_UNIX seqpacket", sock(unix.AF_UNIX, seqpacket, 0), allow),
+		unixRow("AF_UNIX stream nonzero protocol denied even by the escape hatch", sock(unix.AF_UNIX, stream, 1), retErrno),
+		unixRow("AF_UNIX raw type denied even by the escape hatch", sock(unix.AF_UNIX, raw, 0), retErrno),
+		unixRow("AF_UNIX rdm type denied even by the escape hatch", sock(unix.AF_UNIX, uint64(unix.SOCK_RDM), 0), retErrno),
+		unixRow("AF_UNIX with high domain bits is still AF_UNIX (the kernel takes an int)", sock(1<<32|unix.AF_UNIX, stream, 0), allow),
 		same("AF_VSOCK stream denied", x86, unix.SYS_SOCKET, sock(unix.AF_VSOCK, stream, 0), retErrno),
 		same("AF_SMC stream denied", x86, unix.SYS_SOCKET, sock(afSMC, stream, 0), retErrno),
 		same("AF_RDS seqpacket denied", x86, unix.SYS_SOCKET, sock(unix.AF_RDS, seqpacket, 0), retErrno),
@@ -210,6 +232,14 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 		same("keyctl denied", x86, unix.SYS_KEYCTL, [6]uint64{}, retErrno),
 		same("add_key denied", x86, unix.SYS_ADD_KEY, [6]uint64{}, retErrno),
 		same("request_key denied", x86, unix.SYS_REQUEST_KEY, [6]uint64{}, retErrno),
+		// Terminal input injection (review M12): the request is an unsigned
+		// int in the kernel, so the low-word compare is the whole request.
+		same("ioctl TIOCSTI denied", x86, unix.SYS_IOCTL, ioctlReq(linux.IoctlTIOCSTI), retErrno),
+		same("ioctl TIOCLINUX denied", x86, unix.SYS_IOCTL, ioctlReq(linux.IoctlTIOCLINUX), retErrno),
+		same("ioctl TIOCSTI with high request bits denied (kernel truncates to 32 bits)", x86, unix.SYS_IOCTL, ioctlReq(1<<32|linux.IoctlTIOCSTI), retErrno),
+		same("ioctl TCGETS allowed", x86, unix.SYS_IOCTL, ioctlReq(unix.TCGETS), allow),
+		same("ioctl TIOCGWINSZ allowed", x86, unix.SYS_IOCTL, ioctlReq(unix.TIOCGWINSZ), allow),
+		same("ioctl FIONREAD (TIOCINQ) allowed", x86, unix.SYS_IOCTL, ioctlReq(unix.TIOCINQ), allow),
 		// Positive controls (must ALLOW, else the filter is a blanket ban).
 		same("AF_INET stream TCP allowed", x86, unix.SYS_SOCKET, sock(unix.AF_INET, stream, 0), allow),
 		same("AF_INET stream IPPROTO_TCP allowed", x86, unix.SYS_SOCKET, sock(unix.AF_INET, stream, unix.IPPROTO_TCP), allow),
@@ -240,26 +270,40 @@ func TestBuildSeccompFilterStructure(t *testing.T) {
 			if got := runBPF(t, openProg, data); got != tt.wantOpen {
 				t.Errorf("UDP-admitting filter(%s) = %#x, want %#x", tt.name, got, tt.wantOpen)
 			}
+			wantUnix, wantUnixOpen := tt.wantConfined, tt.wantOpen
+			if tt.wantUnix != 0 {
+				wantUnix, wantUnixOpen = tt.wantUnix, tt.wantUnix
+			}
+			if got := runBPF(t, unixProg, data); got != wantUnix {
+				t.Errorf("AF_UNIX-admitting filter(%s) = %#x, want %#x", tt.name, got, wantUnix)
+			}
+			if got := runBPF(t, unixOpenProg, data); got != wantUnixOpen {
+				t.Errorf("AF_UNIX+UDP-admitting filter(%s) = %#x, want %#x", tt.name, got, wantUnixOpen)
+			}
 		})
 	}
 }
 
 // TestBuildSeccompFilterLayout pins the program length the bracketed
-// instruction indices in seccomp.go document ([0]-[44] strict, [0]-[50] with
+// instruction indices in seccomp.go document ([0]-[61] strict, [0]-[67] with
 // the UDP tail, on amd64; two fewer on arm64 without the x32 guard), so an
-// inserted instruction that is not re-indexed in the listing fails here.
+// inserted instruction that is not re-indexed in the listing fails here. The
+// AF_UNIX escape hatch selects one return action and never changes the
+// length, so the listing holds for both values of AllowUnix.
 func TestBuildSeccompFilterLayout(t *testing.T) {
 	t.Parallel()
 	requireSeccompArch(t)
-	strict, open := 45, 51
+	strict, open := 62, 68
 	if runtime.GOARCH != "amd64" {
 		strict, open = strict-2, open-2
 	}
-	if got := len(linux.BuildSeccompFilter(linux.SeccompPolicy{})); got != strict {
-		t.Errorf("strict filter length = %d, want %d (re-index the seccomp.go listing)", got, strict)
-	}
-	if got := len(linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUDP: true})); got != open {
-		t.Errorf("UDP-admitting filter length = %d, want %d (re-index the seccomp.go listing)", got, open)
+	for _, allowUnix := range []bool{false, true} {
+		if got := len(linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUnix: allowUnix})); got != strict {
+			t.Errorf("strict filter (AllowUnix=%t) length = %d, want %d (re-index the seccomp.go listing)", allowUnix, got, strict)
+		}
+		if got := len(linux.BuildSeccompFilter(linux.SeccompPolicy{AllowUDP: true, AllowUnix: allowUnix})); got != open {
+			t.Errorf("UDP-admitting filter (AllowUnix=%t) length = %d, want %d (re-index the seccomp.go listing)", allowUnix, got, open)
+		}
 	}
 }
 

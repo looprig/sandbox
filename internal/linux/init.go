@@ -13,6 +13,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+
+	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
+	"golang.org/x/sys/unix"
 )
 
 // initWasCalled records that Init() ran on the NORMAL path (not a re-exec'd
@@ -97,6 +100,21 @@ type Stage2Spec struct {
 	// Rung-2 spawn, whose Landlock port rules cannot scope UDP. Its zero value
 	// is the strict filter, so a spec from an older encoder fails narrow.
 	SeccompAllowUDP bool
+	// SeccompAllowUnix admits AF_UNIX stream/datagram/seqpacket sockets in the
+	// filter (SeccompPolicy.AllowUnix): the profile's AF_UNIX escape hatch. The
+	// backend sets it only for a non-zero profile.UnixSocketPolicy; its zero
+	// value keeps the default refusal, so a spec from an older encoder fails
+	// narrow.
+	SeccompAllowUnix bool
+	// LandlockScopeAbstractUnix adds LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET (ABI
+	// >= 6) to the filesystem ruleset: the target may connect only to abstract
+	// sockets created inside its own Landlock domain, so an admitted AF_UNIX
+	// cannot reach a host abstract name (@/tmp/.X11-unix/X0, a D-Bus or
+	// containerd abstract endpoint). The backend requests it only when it
+	// admits AF_UNIX and its compile-time ABI probe found >= 6, and reports
+	// that; stage 2 fails closed if the kernel then cannot honour it, so the
+	// report never claims a scope the target does not run under.
+	LandlockScopeAbstractUnix bool
 	// NetConfined requests the Rung-2 Landlock TCP-port allowlist (Task 12c, SPEC
 	// §7.2, §5.2). When true the stage-2 child calls applyLandlockNet(NetTCPPorts)
 	// AFTER Seccomp and BEFORE chdir/execve, confining TCP connect to NetTCPPorts
@@ -215,6 +233,16 @@ func stage2Setup() error {
 	if err := validateStage2GrantFDs(spec); err != nil {
 		return &Stage2Error{Op: "grant fd", Err: err}
 	}
+	// Review M12/L1: the target must not share the harness's session, or a
+	// target that can open /dev/tty (any HostRead-Allow profile) reaches the
+	// user's terminal — and with dev.tty.legacy_tiocsti=1, TIOCSTI types into
+	// the user's shell. linuxWrap requests SysProcAttr.Setsid, so the fork
+	// already made this process a session leader with no controlling terminal
+	// (a TTY spawn additionally sets Setctty onto its own PTY); this is the
+	// fail-closed check of that invariant, not a second setsid.
+	if err := ensureSessionLeader(); err != nil {
+		return &Stage2Error{Op: "setsid", Err: err}
+	}
 
 	// Apply confinement HERE, before chdir/execve, from the confinement fields on
 	// the sealed spec. Each step fails CLOSED via a Stage2Error so a confinement
@@ -244,7 +272,7 @@ func stage2Setup() error {
 		}
 	}
 
-	if err := applyLandlockRules(spec.FSRules); err != nil {
+	if err := applyLandlockRules(spec.FSRules, landlockScopes(spec)); err != nil {
 		return &Stage2Error{Op: "landlock", Err: err}
 	}
 	for _, fd := range spec.GrantFDs {
@@ -261,7 +289,7 @@ func stage2Setup() error {
 	// filter thread proceeds directly to chdir/execve below on the SAME goroutine
 	// (runtime.LockOSThread), guaranteeing filter-thread == execve-thread.
 	if spec.Seccomp {
-		if err := installSeccompFilter(SeccompPolicy{AllowUDP: spec.SeccompAllowUDP}); err != nil {
+		if err := installSeccompFilter(SeccompPolicy{AllowUDP: spec.SeccompAllowUDP, AllowUnix: spec.SeccompAllowUnix}); err != nil {
 			return &Stage2Error{Op: "Seccomp", Err: err}
 		}
 	}
@@ -303,6 +331,31 @@ func stage2Setup() error {
 		return &Stage2Error{Op: "exec " + spec.Argv[0], Err: err}
 	}
 	return nil // unreachable: a successful syscall.Exec replaces this process
+}
+
+// ensureSessionLeader makes sure stage 2 leads its own session. A process that
+// already does (the configure-requested SysProcAttr.Setsid — the only shape
+// linuxWrap produces) is left alone: setsid(2) on a session leader fails
+// EPERM, and a TTY spawn's controlling terminal must survive. Anything else
+// gets setsid now; a failure (a process-group leader of a group it does not
+// also lead as a session, i.e. a Setpgid'd child) is returned so stage 2 fails
+// closed rather than run the target inside the harness's session.
+func ensureSessionLeader() error {
+	pid := unix.Getpid()
+	if sid, err := unix.Getsid(0); err == nil && sid == pid {
+		return nil
+	}
+	_, err := unix.Setsid()
+	return err
+}
+
+// landlockScopes maps the spec's scope requests onto the ruleset's Scoped
+// mask (ABI >= 6). Zero requests no scoping, which every ABI accepts.
+func landlockScopes(spec Stage2Spec) uint64 {
+	if spec.LandlockScopeAbstractUnix {
+		return llsys.ScopeAbstractUnixSocket
+	}
+	return 0
 }
 
 func validateStage2GrantFDs(spec Stage2Spec) error {
