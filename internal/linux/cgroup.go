@@ -354,6 +354,14 @@ func (tc *transientCgroup) KillAndWait(ctx context.Context) error {
 		return &CgroupProofError{Op: "cgroup.kill", Err: err}
 	}
 	for {
+		// An exhausted context cannot carry a proof: check it BEFORE each read,
+		// not only between polls, so an already-expired ctx retains the scope
+		// for a retry even when cgroup.kill reaped the member faster than the
+		// first read (TestCgroupLifetimeRetainsOnUnprovedEmpty depends on this
+		// ordering, and the production caller always passes a live context).
+		if err := ctx.Err(); err != nil {
+			return &CgroupProofError{Op: "timeout", Err: err}
+		}
 		empty, err := cgroupProcsEmptyChecked(tc.dir)
 		switch {
 		case err != nil && errors.Is(err, os.ErrNotExist):
