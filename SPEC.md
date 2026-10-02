@@ -1,6 +1,7 @@
 # sandbox module specification
 
-Status: canonical implemented contract, 2026-07-19.
+Status: canonical implemented contract, 2026-07-19; Windows tiers, the Linux
+socket allowlist and the accepted macOS limits recorded 2026-10-01.
 
 ## 1. Scope and dependency boundary
 
@@ -309,20 +310,75 @@ The fixed runtime closure does not grant broad `/usr`, `/etc`, `/System`, or
 `/Library`: executable trees, library/certificate trees, and exact resolver or
 loader configuration files have separate minimum access bits.
 
+Two macOS limits are accepted and reported rather than claimed away. The
+preamble's `process-info*` and `sysctl-read` allows are needed by ordinary
+runtimes and cannot be narrowed to the child itself, so a child can read the
+argument and environment block of any same-user process, including the
+supervisor; `EnvScrub` on macOS therefore means the child's own environment
+carries no secret, not that a same-user reader cannot recover one. The
+unfiltered `mach-lookup` allow reaches LaunchServices, so a confined child may
+ask the host to open a URL or document outside the sandbox. Both are booked for
+a credential-transport and bootstrap-allowlist revision; neither widens a
+filesystem or direct-egress boundary.
+
 Linux preserves its explicit-root mount/Landlock, seccomp, nftables, and cgroup
-mechanisms. A parent proxy listener is not reachable as a target-scoped route in
-v1 and never earns `TargetNetwork`; issuing that target grant fails closed.
-Failure to select a usable Linux rung returns `ErrSandboxUnavailable` rather
-than a null backend. On other operating systems `Sandboxed` is unavailable;
-the null backend accepts only an acknowledged `Unconfined` profile.
+mechanisms. Both rungs install a seccomp filter whose `socket()` rule is an
+allowlist: AF_INET/AF_INET6 stream sockets with protocol 0 or TCP (and UDP only
+where the rung's network mechanism scopes it — Rung 1's nftables, or a policy
+whose network is `Allow`), and AF_NETLINK route sockets. Every other family,
+AF_UNIX included, is refused with `EACCES`, because a pathname or abstract
+Unix socket reaches same-user brokers (a D-Bus session bus, a user systemd
+manager, agent and container sockets) that would run commands outside every
+other mechanism; `socketpair` remains available, so pipe-style IPC is
+unaffected, while programs that need a Unix client socket under confinement
+fail by design. `keyctl`, `add_key` and `request_key` are refused. A parent
+proxy listener is not reachable as a target-scoped route in v1 and never earns
+`TargetNetwork`; issuing that target grant fails closed. Both rungs require
+Landlock ABI 4. Failure to select a usable Linux rung returns
+`ErrSandboxUnavailable` rather than a null backend. On operating systems other
+than macOS, Linux and Windows `Sandboxed` is unavailable; the null backend
+accepts only an acknowledged `Unconfined` profile.
+
+Windows offers two tiers, selected by `WithWindowsSandboxMode` and detailed in
+`docs/plans/2026-07-21-windows-sandbox-design.md`. The restricted-token tier
+needs no setup: the target runs under a `WRITE_RESTRICTED` restricted token
+whose restricting SIDs are projected as ACEs onto the configured roots, inside a
+kill-on-close Job with UI limits and no breakaway, launched suspended with an
+explicit inheritable-handle list and the identity-pinned System32 `cmd.exe`.
+Those mechanisms are defense in depth only: the tier reports `LevelNone` and
+`EnvScrub` alone, because a same-user COM/WMI/shell broker can create a process
+outside the Job and token, the host console is shared with the child, a
+same-user child can read the host's memory, and `WRITE_RESTRICTED` does not
+restrict `DELETE`/`WRITE_DAC`. Any profile requiring a read, write or network
+boundary is refused in this tier (`ErrWindowsSetupRequired` under auto
+selection). The elevated tier requires one-time administrative setup
+(`SetupWindowsSandbox`): dedicated local accounts, a LocalSystem broker that
+issues a fully restricted token (reads and writes both pass the restricting-SID
+check; a write-restricted token is refused on both sides of the pipe),
+account-scoped outbound firewall rules verified by read-back and by the
+firewall being enabled on every profile, a protected runner on a private
+desktop, and per-lease ACL projection journalled for rollback. It earns
+`ProcessBoundary`, `WriteBoundary`, `ReadBoundary` (relative to
+`windows.runtime-baseline`), `NetworkBoundary` and, through the authenticated
+proxy, `TargetNetwork`; `network.broad.v1` and `filesystem.host.*` grants are
+unsupported on Windows. The elevated tier has not yet passed its live
+disposable-worker gates and must not be treated as production-ready until it
+has. The scrubbed Windows child environment keeps the loader/CRT baseline
+(`SystemRoot`, `windir`, `SystemDrive`, `PATHEXT`, `Path`, processor and
+program-directory variables) matched case-insensitively, and the executor sets
+`TEMP`, `TMP` and `USERPROFILE` to its owned directories alongside `HOME` and
+`TMPDIR`; `ComSpec` is never inherited.
 
 Supervised spawns (`Executor.PrepareProcess`/`Process.Start`) additionally
 report a per-spawn process-tree teardown contract through
-`Process.LifetimeContainment`. Linux and Windows retain kernel-enforced
-teardown (`Enforced`: Rung 1's PID namespace, Rung 2's delegated cgroup v2, or
-a Windows Job). macOS Supervised spawns instead receive best-effort lifetime
-containment (`BestEffort`: process-group teardown plus process-table-closure
-descendant tracking), with the downgrade reported per spawn rather than
+`Process.LifetimeContainment`. Linux and the Windows elevated tier retain
+kernel-enforced teardown (`Enforced`: Rung 1's PID namespace, Rung 2's
+delegated cgroup v2, or a Windows Job whose broker channels the private
+desktop and dedicated account close). macOS Supervised spawns and the Windows
+restricted tier instead receive best-effort lifetime containment
+(`BestEffort`: on macOS process-group teardown plus process-table-closure
+descendant tracking; on Windows a Job that a same-user broker can create a
+process outside of), with the downgrade reported per spawn rather than
 assumed; Seatbelt access-confinement guarantees are unaffected. This
 supersedes the earlier fail-closed posture (Task 12c), which rejected every
 macOS Supervised spawn before it started; the 2026-08-06 acceptance decision
