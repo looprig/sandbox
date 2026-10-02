@@ -73,6 +73,24 @@ func (backend *autoBackend) ReserveEgressProxy(route network.Route) (*network.Pr
 	return provider.ReserveEgressProxy(route)
 }
 
+// SupportsGrantClass answers the executor's side-effect-free grant preflight
+// with the elevated tier's answer, and refuses everything if the elevated
+// backend cannot answer. Without this method the executor treats Auto as
+// supporting every class and consumes a signed grant (network.broad.v1,
+// filesystem.host.*) that Compile then rejects. Auto picks a tier per Compile,
+// so the preflight cannot know which tier will compile; the elevated answer is
+// the right bound because the restricted fallback never widens it: that tier
+// rejects every network grant in Compile, and the one class the elevated tier
+// accepts that the fallback refuses, network.proxy-target.v1, needs an egress
+// route Auto reserves only through the installed tier (ReserveEgressProxy).
+func (backend *autoBackend) SupportsGrantClass(class string) bool {
+	if backend == nil {
+		return false
+	}
+	support, ok := backend.elevated.(interface{ SupportsGrantClass(string) bool })
+	return ok && support.SupportsGrantClass(class)
+}
+
 func (backend *autoBackend) Compile(p policy.Effective) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
 	if backend == nil || backend.elevated == nil || backend.restricted == nil {
 		return enforce.Spec{}, profile.CompileReport{}, profile.LevelNone, 0, errors.New("sandbox: invalid Windows auto backend")
@@ -282,10 +300,11 @@ func validateRestrictedGrantClassesWithoutReopen(p policy.Effective) error {
 func restrictedCompileReport(p policy.Effective) profile.CompileReport {
 	entries := []profile.ReportEntry{
 		{Feature: "windows.token", Status: "Narrowed", Detail: "restricted-token defense in depth; no end-to-end boundary claimed"},
-		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; broker escape remains possible"},
-		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; broker escape remains possible"},
+		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; a same-user COM/WMI broker can write outside it, and WRITE_RESTRICTED does not restrict an owner's DELETE, WRITE_DAC or WRITE_OWNER"},
+		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; a same-user COM/WMI broker can start a process outside the Job, and a pipe-backed child shares the host console (input injection and console control events)"},
 		{Feature: "windows.private-desktop", Status: "Narrowed", Detail: "Job UI restrictions only; no private desktop in restricted mode"},
 		{Feature: "windows.resource-limits", Status: "Narrowed", Detail: "direct Job limits only; broker escape remains possible"},
+		{Feature: "windows.env-scrub", Status: "Narrowed", Detail: "scrubs only the child's own environment block; a same-user child can read the host process's memory, including its environment"},
 	}
 	for _, baseline := range p.RuntimeBaselines {
 		entries = append(entries, profile.ReportEntry{Feature: baseline, Status: "Narrowed", Detail: "platform runtime baseline; no read boundary claimed"})

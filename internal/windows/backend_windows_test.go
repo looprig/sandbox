@@ -64,11 +64,24 @@ func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
 			t.Fatalf("restricted compile claimed forbidden bit %#x", forbidden)
 		}
 	}
-	wantFeatures := []string{"windows.token", "windows.filesystem.write", "windows.job", "windows.private-desktop", "windows.resource-limits", policy.WindowsRuntimeBaseline}
+	wantFeatures := []string{"windows.token", "windows.filesystem.write", "windows.job", "windows.private-desktop", "windows.resource-limits", "windows.env-scrub", policy.WindowsRuntimeBaseline}
 	for _, feature := range wantFeatures {
 		index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == feature })
 		if index < 0 || report.Entries[index].Status != "Narrowed" {
 			t.Fatalf("report missing narrowed feature %q: %#v", feature, report.Entries)
+		}
+	}
+	// The report names the known channels rather than a generic escape.
+	for feature, fragments := range map[string][]string{
+		"windows.filesystem.write": {"COM/WMI broker", "DELETE", "WRITE_DAC", "WRITE_OWNER"},
+		"windows.job":              {"COM/WMI broker", "console"},
+		"windows.env-scrub":        {"memory", "own environment block"},
+	} {
+		index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == feature })
+		for _, fragment := range fragments {
+			if !strings.Contains(report.Entries[index].Detail, fragment) {
+				t.Fatalf("%s detail %q does not name %q", feature, report.Entries[index].Detail, fragment)
+			}
 		}
 	}
 	for index := 0; index < 2; index++ {

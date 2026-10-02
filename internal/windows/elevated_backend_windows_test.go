@@ -558,3 +558,67 @@ func TestElevatedGrantClassPreflightIsClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestWindowsAutoGrantClassPreflightForwardsElevatedAnswer(t *testing.T) {
+	backend := &autoBackend{elevated: &elevatedBackend{}, restricted: &fixedCompileBackend{}}
+	for _, class := range []string{"command.start.v1", "filesystem.path.write.v1", "network.proxy-target.v1"} {
+		if !backend.SupportsGrantClass(class) {
+			t.Errorf("elevated-supported class %q rejected by Auto", class)
+		}
+	}
+	for _, class := range []string{"network.broad.v1", "filesystem.host.read.v1", "filesystem.host.write.v1", ""} {
+		if backend.SupportsGrantClass(class) {
+			t.Errorf("class %q accepted by Auto although the elevated tier rejects it", class)
+		}
+	}
+	// An elevated backend that cannot answer must not fall back to the
+	// executor's "absent means supported" default.
+	opaque := &autoBackend{elevated: &fixedCompileBackend{}, restricted: &fixedCompileBackend{}}
+	if opaque.SupportsGrantClass("command.start.v1") {
+		t.Fatal("Auto accepted a grant class without an elevated preflight")
+	}
+	var nilBackend *autoBackend
+	if nilBackend.SupportsGrantClass("command.start.v1") {
+		t.Fatal("nil Auto backend accepted a grant class")
+	}
+}
+
+func TestElevatedCompileRefusesNetworkAllowancesTheFirewallCannotExpress(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		net  policy.NetPolicy
+	}{
+		{"loopback", policy.NetPolicy{Loopback: true}},
+		{"private", policy.NetPolicy{Private: true}},
+		{"dns", policy.NetPolicy{DNS: true}},
+		{"ports", policy.NetPolicy{Ports: []uint16{443}}},
+		{"ports with proxy", policy.NetPolicy{Ports: []uint16{443}, ProxyPort: 49152}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &elevatedBackend{deps: elevatedCompileDependencies{
+				inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) { return readyElevatedSnapshot(), nil },
+				acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
+					t.Fatal("unexpressible network policy reached lease acquisition")
+					return nil, nil
+				},
+			}}
+			_, _, level, bits, err := backend.Compile(policy.Effective{Net: test.net})
+			if !errors.Is(err, enforce.ErrUnavailable) || errors.Is(err, ErrSetupRequired) || level != profile.LevelNone || bits != 0 {
+				t.Fatalf("compile = level %d bits %#x err %v", level, bits, err)
+			}
+		})
+	}
+	// An open policy subsumes those allowances; it is not refused for them.
+	lease := &fakeElevatedLease{}
+	backend := &elevatedBackend{deps: elevatedCompileDependencies{
+		inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) { return readyElevatedSnapshot(), nil },
+		acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) { return lease, nil },
+	}}
+	spec, _, _, bits, err := backend.Compile(policy.Effective{Net: policy.NetPolicy{Open: true, Loopback: true, DNS: true, Ports: []uint16{443}}})
+	if err != nil || bits&profile.GuaranteeNetworkBoundary != 0 {
+		t.Fatalf("open policy compile = bits %#x err %v", bits, err)
+	}
+	if err := spec.Release(); err != nil {
+		t.Fatal(err)
+	}
+}

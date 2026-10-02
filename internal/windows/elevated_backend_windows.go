@@ -207,6 +207,16 @@ func (productionElevatedDependencyInspector) Inspect(ctx context.Context, stateR
 	}, nil
 }
 
+// installedBrokerPipeName derives the broker's pipe from the installation's
+// service name; it is never read from the environment or the manifest.
+func installedBrokerPipeName(installationID string) (string, error) {
+	names, err := deriveInstallationPrincipalNames(installationID)
+	if err != nil {
+		return "", err
+	}
+	return `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"), nil
+}
+
 func inspectElevatedSetup(config Config, effective policy.Effective) (elevatedSetupSnapshot, error) {
 	return inspectElevatedSetupWith(config, effective, realBrokerInstallPathVerifier{}, productionElevatedDependencyInspector{})
 }
@@ -282,7 +292,7 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 	if err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: inspect installed dependencies: %v", ErrSetupStale, err)
 	}
-	names, err := deriveInstallationPrincipalNames(manifest.InstallationID)
+	pipeName, err := installedBrokerPipeName(manifest.InstallationID)
 	if err != nil {
 		return elevatedSetupSnapshot{}, fmt.Errorf("%w: derive broker endpoint: %v", ErrSetupStale, err)
 	}
@@ -298,7 +308,7 @@ func inspectElevatedSetupWith(config Config, effective policy.Effective, verifie
 		// qualified name with the duplicated restricted token.
 		PrivateDesktopReady: true, JobReadbackReady: true, HandleListReady: true,
 		ProxyPorts: append([]uint16(nil), manifest.ProxyPorts...),
-		PipeName:   `\\.\pipe\looprig-sandbox-` + strings.TrimPrefix(names.Service, "lsb-svc-"),
+		PipeName:   pipeName,
 		OfflineSID: manifest.OfflineSID, OnlineSID: manifest.OnlineSID,
 	}, nil
 }
@@ -415,6 +425,15 @@ func (backend *elevatedBackend) Compile(p policy.Effective) (enforce.Spec, profi
 	if p.Net.Open && p.Net.ProxyPort != 0 {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
 			fmt.Errorf("%w: online Windows policy cannot claim an offline proxy endpoint", enforce.ErrUnavailable)
+	}
+	// The offline account's firewall rules permit exactly the pinned proxy
+	// ports and nothing else, so a narrower-than-open network policy that also
+	// asks for loopback, private ranges, DNS or extra ports cannot be enforced.
+	// Compiling it anyway would report NetworkBoundary for traffic the rules
+	// block, or a boundary the policy did not ask for.
+	if !p.Net.Open && (p.Net.Loopback || p.Net.Private || p.Net.DNS || len(p.Net.Ports) != 0) {
+		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,
+			fmt.Errorf("%w: Windows elevated firewall rules cannot express loopback, private-network, DNS or port allowances", enforce.ErrUnavailable)
 	}
 	if p.Net.ProxyPort != 0 && !slices.Contains(snapshot.ProxyPorts, p.Net.ProxyPort) {
 		return enforce.Spec{}, elevatedCompileReport(p, snapshot), profile.LevelNone, 0,

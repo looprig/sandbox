@@ -29,6 +29,8 @@ type processTree struct {
 	cmd      *exec.Cmd
 	job      *winjob.Job
 	assigned bool
+	// lifetime is fixed at construction; see lifetimeContainment.
+	lifetime LifetimeContainment
 
 	// conPTY, once set by openTerminal (terminal_windows.go), is the pending
 	// ConPTY launch start must drive through startConPTY instead of the plain
@@ -72,7 +74,7 @@ func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, er
 	// confined child — teardown for this tree is only ever the explicit
 	// Job/signal machinery below, exactly as intended.
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP
-	tree := &processTree{cmd: cmd, job: job}
+	tree := &processTree{cmd: cmd, job: job, lifetime: windowsProcessTreeLifetime(options)}
 	cmd.Cancel = tree.terminate
 	return tree, nil
 }
@@ -546,16 +548,39 @@ func (tree *processTree) close() {
 	}
 }
 
-// lifetimeContainment: a Windows supervised spawn lives in a Job with
-// kill-on-close (newProcessTree above always creates one, and start always
-// assigns the child to it before resuming — see start's own setup-failure
-// handling, which terminates rather than ever leaving a resumed process
-// unassigned); teardown is therefore kernel-enforced unconditionally for
-// every *processTree this type produces, so this never needs to
-// distinguish an assigned/unassigned case the way tree.assigned's other
-// uses do.
+// windowsProcessTreeLifetime is the containment answer for a spawn built
+// through this exec-side process tree. The Job (kill-on-close, no breakaway)
+// tears down every process that is still IN it, but a Wrap-backed Windows
+// spawn runs under the caller's own account: the restricted tier's token is
+// the same user with a write-restricted SID list, and an Unconfined spawn is
+// the unmodified user. Such a child can ask a same-user out-of-process broker
+// (Win32_Process.Create over WMI, a COM local server, the Task Scheduler) to
+// create a process outside the Job (design §8), which is exactly why the
+// restricted tier withholds ProcessBoundary. So:
+//
+//   - Sandboxed (the restricted tier) is LifetimeContainmentBestEffort;
+//   - Unconfined makes no containment claim at all
+//     (LifetimeContainmentUnspecified, as on every other platform).
+//
+// The elevated tier never reaches this type: its spec carries a backend-owned
+// Launch (a dedicated non-admin account on a private desktop, which closes
+// the same-user broker channels), and process.go reports that path as
+// LifetimeContainmentEnforced. Auto resolves to one of the two per Compile,
+// so its answer follows whichever path the compiled spec takes.
+func windowsProcessTreeLifetime(options processTreeOptions) LifetimeContainment {
+	if !options.Sandboxed {
+		return LifetimeContainmentUnspecified
+	}
+	return LifetimeContainmentBestEffort
+}
+
+// lifetimeContainment reports the answer fixed by newProcessTree; see
+// windowsProcessTreeLifetime.
 func (tree *processTree) lifetimeContainment() LifetimeContainment {
-	return LifetimeContainmentEnforced
+	if tree == nil {
+		return LifetimeContainmentUnspecified
+	}
+	return tree.lifetime
 }
 
 // sendInterrupt requests cooperative interruption by delivering a

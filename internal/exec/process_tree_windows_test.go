@@ -41,6 +41,35 @@ func TestProcessTreeOptionsReachConfiguredJob(t *testing.T) {
 	}
 }
 
+// TestProcessTreeLifetimeIsNeverEnforcedForWrapSpawns pins M5: every Windows
+// spawn built through this tree runs as the caller's own user (restricted
+// token or Unconfined), so a same-user broker can create a process outside
+// the Job. The elevated tier's Enforced answer comes from its backend-owned
+// Launch path, which never constructs a processTree.
+func TestProcessTreeLifetimeIsNeverEnforcedForWrapSpawns(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		options processTreeOptions
+		want    LifetimeContainment
+	}{
+		{"restricted tier", processTreeOptions{Sandboxed: true, Supervised: true}, LifetimeContainmentBestEffort},
+		{"restricted tier synchronous", processTreeOptions{Sandboxed: true}, LifetimeContainmentBestEffort},
+		{"unconfined", processTreeOptions{Supervised: true}, LifetimeContainmentUnspecified},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tree, err := newProcessTree(exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$"), test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tree.close()
+			var reporter lifetimeReporter = tree
+			if got := reporter.lifetimeContainment(); got != test.want {
+				t.Fatalf("lifetimeContainment() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestProcessTreeCancellationAndJobClosePreventDelayedGrandchild(t *testing.T) {
 	for _, tc := range []struct {
 		name string
