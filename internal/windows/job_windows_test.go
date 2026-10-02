@@ -77,13 +77,19 @@ func TestJobReadbackSurvivesStackGrowthAtEveryDepth(t *testing.T) {
 	options := JobOptions{Sandboxed: true, MaxProcesses: 3, MaxMemoryBytes: 32 << 20, MaxCPUPct: 50}
 	for depth := 0; depth <= 96; depth++ {
 		done := make(chan error, 1)
-		go consumeStackThen(depth, func() {
-			job, err := NewJob(options)
-			if err == nil {
-				err = job.Close()
-			}
+		go func() {
+			var err error
+			consumeStackThen(depth, func() {
+				var job *Job
+				job, err = NewJob(options)
+				if err == nil {
+					err = job.Close()
+				}
+			})
+			// The unwinding frames still write stackSweepSink. Publish only
+			// after they return, before the next goroutine starts its sweep.
 			done <- err
-		})
+		}()
 		if err := <-done; err != nil {
 			t.Fatalf("NewJob after consuming %d stack frames: %v", depth, err)
 		}

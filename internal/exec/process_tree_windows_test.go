@@ -191,7 +191,8 @@ func TestProcessTreeHelper(t *testing.T) {
 // env-var-dispatched self-exec convention TestProcessTreeCancellationAndJobClosePreventDelayedGrandchild
 // already uses in this file.
 func jobMembershipPayloadCommand(marker string) *exec.Cmd {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$")
+	// newProcessTree replaces CommandContext's Cancel with whole-Job teardown.
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestProcessTreeHelper$")
 	cmd.Env = append(os.Environ(), processTreeHelperMode+"=job-membership", processTreeMarker+"="+marker)
 	return cmd
 }
@@ -373,7 +374,7 @@ func TestProcessTreeSandboxedInterruptIsTypedUnsupported(t *testing.T) {
 // include this test process.
 func TestProcessTreeSandboxedChildDoesNotShareTheHostConsole(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "console-processes")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestProcessTreeHelper$")
 	cmd.Env = append(os.Environ(), processTreeHelperMode+"=console-processes", processTreeMarker+"="+marker)
 	tree, err := newProcessTree(cmd, processTreeOptions{Sandboxed: true})
 	if err != nil {
