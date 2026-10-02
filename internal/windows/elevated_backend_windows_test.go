@@ -142,6 +142,7 @@ func TestInspectElevatedSetupDistinguishesAbsentCorruptAndVerified(t *testing.T)
 	verifier := fakeElevatedVerifier{}
 	dependencies := fakeElevatedDependencyInspector{health: elevatedDependencyHealth{
 		Accounts: true, Credentials: true, Firewall: true, RuntimeBaseline: true,
+		PrivateDesktop: true, JobReadback: true, HandleList: true,
 	}}
 
 	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, verifier, dependencies); !errors.Is(err, ErrSetupRequired) {
@@ -178,6 +179,7 @@ func TestInspectElevatedSetupFailsClosedOnProtectionHashAndDependencyHealth(t *t
 	writeElevatedManifest(t, config, manifest)
 	healthy := fakeElevatedDependencyInspector{health: elevatedDependencyHealth{
 		Accounts: true, Credentials: true, Firewall: true, RuntimeBaseline: true,
+		PrivateDesktop: true, JobReadback: true, HandleList: true,
 	}}
 	if _, err := inspectElevatedSetupWith(config, policy.Effective{}, fakeElevatedVerifier{err: errors.New("unprotected")}, healthy); !errors.Is(err, ErrSetupStale) {
 		t.Fatalf("unprotected installation = %v", err)
@@ -246,6 +248,7 @@ func TestElevatedCompileSelectsAccountAndOwnsLease(t *testing.T) {
 			p := policy.Effective{
 				Net: testNetPolicy(test.open), Env: policy.EnvPolicy{Inherit: false},
 				RuntimeBaselines: []string{policy.WindowsRuntimeBaseline},
+				Limits:           policy.Limits{MaxPIDs: 16},
 				RequiredGuarantees: profile.GuaranteeProcessBoundary |
 					profile.GuaranteeReadBoundary | profile.GuaranteeWriteBoundary |
 					profile.GuaranteeEnvScrub | profile.GuaranteeResourceLimits,
@@ -620,5 +623,154 @@ func TestElevatedCompileRefusesNetworkAllowancesTheFirewallCannotExpress(t *test
 	}
 	if err := spec.Release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestElevatedCompileRefusesUnixSocketEscapeHatch pins Task 1 for the elevated
+// tier: the broker is never asked for authority for a profile that asks for
+// AF_UNIX, the refusal is typed (and not a setup state, so Auto does not fall
+// back), and the report names the unmediated feature.
+func TestElevatedCompileRefusesUnixSocketEscapeHatch(t *testing.T) {
+	for _, unixSockets := range []profile.UnixSocketPolicy{
+		{Mode: profile.UnixSocketsLocal},
+		{Paths: []string{`C:\agent\ssh.sock`}},
+		{Mode: profile.UnixSocketsLocal, Paths: []string{`C:\agent\ssh.sock`}},
+	} {
+		backend := &elevatedBackend{deps: elevatedCompileDependencies{
+			inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) { return readyElevatedSnapshot(), nil },
+			acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) {
+				t.Fatal("AF_UNIX profile reached broker lease acquisition")
+				return nil, nil
+			},
+		}}
+		spec, report, level, bits, err := backend.Compile(policy.Effective{UnixSockets: unixSockets})
+		if !errors.Is(err, enforce.ErrUnavailable) || !errors.Is(err, policy.ErrUnsupportedClass) ||
+			errors.Is(err, ErrSetupRequired) || errors.Is(err, ErrSetupStale) {
+			t.Fatalf("compile error = %v, want typed AF_UNIX refusal", err)
+		}
+		if spec.Launch != nil || spec.Release != nil || level != profile.LevelNone || bits != 0 {
+			t.Fatalf("partial result spec=%#v level=%d bits=%#x", spec, level, bits)
+		}
+		if !slices.Contains(report.Entries, profile.ReportEntry{
+			Feature: "unix-sockets", Status: "unavailable", Detail: "AF_UNIX endpoints are not mediated on Windows",
+		}) {
+			t.Fatalf("report omits unix-sockets: %#v", report.Entries)
+		}
+	}
+	// A default-denial profile compiles and carries no unix-sockets entry.
+	lease := &fakeElevatedLease{}
+	backend := &elevatedBackend{deps: elevatedCompileDependencies{
+		inspect: func(Config, policy.Effective) (elevatedSetupSnapshot, error) { return readyElevatedSnapshot(), nil },
+		acquire: func(elevatedSetupSnapshot, policy.Effective) (elevatedLease, error) { return lease, nil },
+	}}
+	spec, report, _, _, err := backend.Compile(policy.Effective{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == "unix-sockets" }) {
+		t.Fatalf("default-denial report names unix-sockets: %#v", report.Entries)
+	}
+	if err := spec.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestElevatedResourceLimitsOnlyWhenRequested pins L8: ResourceLimits is
+// claimed (and required for LevelFull) only when the policy requests a limit
+// the launch Job installs and reads back; disabled limits are neither
+// installed nor claimed.
+func TestElevatedResourceLimitsOnlyWhenRequested(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		limits policy.Limits
+		want   bool
+	}{
+		{"none requested", policy.Limits{}, false},
+		{"process limit", policy.Limits{MaxPIDs: 4}, true},
+		{"memory limit", policy.Limits{MaxMemBytes: 64 << 20}, true},
+		{"cpu limit", policy.Limits{MaxCPUPct: 50}, true},
+		{"disabled", policy.Limits{MaxPIDs: 4, Disabled: true}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := policy.Effective{Limits: test.limits}
+			bits := elevatedGuaranteeBits(p)
+			if got := bits&profile.GuaranteeResourceLimits != 0; got != test.want {
+				t.Fatalf("ResourceLimits claimed = %v, want %v", got, test.want)
+			}
+			if !elevatedFullLevel(p, bits) {
+				t.Fatal("a policy without requested limits cannot reach LevelFull")
+			}
+			options := elevatedJobOptions(test.limits)
+			installs := options.MaxProcesses > 0 || options.MaxMemoryBytes > 0 || options.MaxCPUPct > 0
+			if installs != test.want || !options.Sandboxed {
+				t.Fatalf("Job options = %#v, want limits installed = %v", options, test.want)
+			}
+			report := elevatedCompileReport(p, readyElevatedSnapshot())
+			index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == "windows.resource-limits" })
+			if index < 0 || (report.Entries[index].Status == "Enforced") != test.want {
+				t.Fatalf("resource-limits row = %#v, want enforced = %v", report.Entries, test.want)
+			}
+		})
+	}
+}
+
+// TestElevatedReportCarriesFirewallAndDerivedReadiness pins L8: the report
+// names windows.firewall from the verified snapshot (and as unenforced for an
+// online profile), and the job / private-desktop rows follow the snapshot
+// facts instead of being assumed.
+func TestElevatedReportCarriesFirewallAndDerivedReadiness(t *testing.T) {
+	statusOf := func(report profile.CompileReport, feature string) string {
+		index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == feature })
+		if index < 0 {
+			t.Fatalf("report has no %s row: %#v", feature, report.Entries)
+		}
+		return report.Entries[index].Status
+	}
+	ready := readyElevatedSnapshot()
+	if got := statusOf(elevatedCompileReport(policy.Effective{}, ready), "windows.firewall"); got != "Enforced" {
+		t.Fatalf("offline firewall row = %q", got)
+	}
+	if got := statusOf(elevatedCompileReport(policy.Effective{Net: policy.NetPolicy{Open: true}}, ready), "windows.firewall"); got != "unenforced" {
+		t.Fatalf("online firewall row = %q", got)
+	}
+	unverified := ready
+	unverified.FirewallReady, unverified.PrivateDesktopReady, unverified.HandleListReady = false, false, false
+	report := elevatedCompileReport(policy.Effective{}, unverified)
+	for _, feature := range []string{"windows.firewall", "windows.private-desktop", "windows.job"} {
+		if got := statusOf(report, feature); got != "Unavailable" {
+			t.Fatalf("%s row = %q for an unverified snapshot", feature, got)
+		}
+	}
+}
+
+// TestInspectElevatedSetupDerivesLaunchMechanismReadiness: the three launch
+// mechanisms come from inspection facts, never hard-coded, so a host whose
+// probes fail is not ready.
+func TestInspectElevatedSetupDerivesLaunchMechanismReadiness(t *testing.T) {
+	config, manifest := elevatedInspectionFixture(t)
+	writeElevatedManifest(t, config, manifest)
+	for name, flip := range map[string]func(*elevatedDependencyHealth){
+		"private desktop": func(health *elevatedDependencyHealth) { health.PrivateDesktop = false },
+		"job read-back":   func(health *elevatedDependencyHealth) { health.JobReadback = false },
+		"handle list":     func(health *elevatedDependencyHealth) { health.HandleList = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			health := elevatedDependencyHealth{Accounts: true, Credentials: true, Firewall: true, RuntimeBaseline: true,
+				PrivateDesktop: true, JobReadback: true, HandleList: true}
+			flip(&health)
+			snapshot, err := inspectElevatedSetupWith(config, policy.Effective{}, fakeElevatedVerifier{}, fakeElevatedDependencyInspector{health: health})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validateElevatedSnapshot(snapshot) == nil {
+				t.Fatalf("snapshot with an unverified %s validated", name)
+			}
+		})
+	}
+	if err := probeElevatedJobReadback(); err != nil {
+		t.Fatalf("this host cannot install and read back a Job: %v", err)
+	}
+	if err := probeElevatedHandleList(); err != nil {
+		t.Fatalf("this host cannot build a handle list: %v", err)
 	}
 }

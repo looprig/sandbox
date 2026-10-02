@@ -128,6 +128,9 @@ func statusFromInspection(facts setupInspection) SetupStatus {
 	if m.InstallationID != facts.Requested.InstallationID || m.OwnerSID != facts.OwnerSID {
 		add(SetupProblemOwnerMismatch, "owner", "", "installation identity or owner does not match", 0, 0)
 	}
+	if !sameProxyPortSet(m.ProxyPorts, facts.Requested.ProxyPorts) {
+		add(SetupProblemProxyPortsStale, "proxy-ports", "", "requested proxy ports differ from the installed set; refresh setup", 0, 0)
+	}
 	if !strings.EqualFold(m.HostSHA256, facts.HostSHA256) {
 		add(SetupProblemHostBinaryStale, "sandbox-host", m.HostPath, "installed host hash does not match", 0, 0)
 	}

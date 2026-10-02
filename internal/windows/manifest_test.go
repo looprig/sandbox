@@ -65,6 +65,10 @@ func TestSetupStatusStatesAndTypedProblems(t *testing.T) {
 		{"port", func(f *setupInspection) { f.PortPID = map[uint16]uint32{9001: 42} }, SetupProblemPortInUse},
 		{"runtime", func(f *setupInspection) { f.RuntimeBaselineReady = false }, SetupProblemRuntimeBaselineGap},
 		{"protocol", func(f *setupInspection) { f.Protocol = 2 }, SetupProblemProtocolMismatch},
+		// Review L8 / design §12: a changed proxy-port set is stale setup.
+		{"proxy ports added", func(f *setupInspection) { f.Requested.ProxyPorts = []uint16{9001, 9002, 9003} }, SetupProblemProxyPortsStale},
+		{"proxy ports replaced", func(f *setupInspection) { f.Requested.ProxyPorts = []uint16{9001, 9004} }, SetupProblemProxyPortsStale},
+		{"proxy ports removed", func(f *setupInspection) { f.Requested.ProxyPorts = []uint16{9002} }, SetupProblemProxyPortsStale},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -90,5 +94,47 @@ func TestSetupStatusStatesAndTypedProblems(t *testing.T) {
 	}
 	if !statusFromInspection(healthyInspection()).Ready {
 		t.Fatal("healthy setup not ready")
+	}
+}
+
+// TestSetupProblemCodesAreStable pins every existing problem code's value;
+// the stale proxy-port code was appended, never inserted.
+func TestSetupProblemCodesAreStable(t *testing.T) {
+	for want, code := range []WindowsSetupProblemCode{
+		SetupProblemUnknown, SetupProblemManifestMissing, SetupProblemOwnerMismatch, SetupProblemHostBinaryStale,
+		SetupProblemServiceUnavailable, SetupProblemAccountMissing, SetupProblemCredentialUnavailable,
+		SetupProblemFirewallOverridden, SetupProblemFirewallRuleChanged, SetupProblemPortInUse,
+		SetupProblemRuntimeBaselineGap, SetupProblemLeaseRecoveryPending, SetupProblemProtocolMismatch,
+		SetupProblemProxyPortsStale,
+	} {
+		if int(code) != want {
+			t.Fatalf("problem code %d has value %d", want, code)
+		}
+	}
+}
+
+// TestSetupStatusAcceptsTheSamePortSetInAnyOrder: the comparison is a set
+// comparison; ordering never makes an installation stale.
+func TestSetupStatusAcceptsTheSamePortSetInAnyOrder(t *testing.T) {
+	f := healthyInspection()
+	f.Requested.ProxyPorts = []uint16{9002, 9001}
+	if status := statusFromInspection(f); !status.Ready {
+		t.Fatalf("reordered port set reported stale: %+v", status.Problems)
+	}
+}
+
+// TestForeignProxyPortOwnersIgnoresTheInspectingProcess pins L8: a pinned
+// port held by the inspecting host's own reserved listener is not a squatter,
+// while any other process (or an unknown owner) still is.
+func TestForeignProxyPortOwnersIgnoresTheInspectingProcess(t *testing.T) {
+	foreign := foreignProxyPortOwners(map[uint16]uint32{9001: 100, 9002: 200, 9003: 100}, 100)
+	if len(foreign) != 1 || foreign[9002] != 200 {
+		t.Fatalf("foreign owners = %v, want only 9002 -> 200", foreign)
+	}
+	if got := foreignProxyPortOwners(map[uint16]uint32{9001: 100}, 100); len(got) != 0 {
+		t.Fatalf("own listener reported foreign: %v", got)
+	}
+	if got := foreignProxyPortOwners(map[uint16]uint32{9001: 0}, 0); len(got) != 1 {
+		t.Fatalf("unknown self PID must not hide an owner: %v", got)
 	}
 }

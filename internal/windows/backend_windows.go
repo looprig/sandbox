@@ -125,6 +125,11 @@ func (backend *restrictedBackend) Compile(p policy.Effective) (enforce.Spec, pro
 	if !p.Env.Inherit {
 		bits = profile.GuaranteeEnvScrub
 	}
+	// AF_UNIX is refused before anything else: no lease, SID or journal
+	// record may be created for a profile this tier can never honor.
+	if unixSocketsRequested(p) {
+		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, refuseUnixSockets("restricted")
+	}
 	if missing := p.RequiredGuarantees &^ bits; missing != 0 {
 		if backend.config.Mode == Auto {
 			return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits,
@@ -222,6 +227,9 @@ func (backend *restrictedBackend) CompileWithPathHandles(p policy.Effective, han
 	if !p.Env.Inherit {
 		bits = profile.GuaranteeEnvScrub
 	}
+	if unixSocketsRequested(p) {
+		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, refuseUnixSockets("restricted")
+	}
 	if missing := p.RequiredGuarantees &^ bits; missing != 0 {
 		return enforce.Spec{}, restrictedCompileReport(p), profile.LevelNone, bits, fmt.Errorf("%w: Windows restricted grant missing guarantees %s", enforce.ErrUnavailable, formatGuaranteeBits(missing))
 	}
@@ -300,8 +308,10 @@ func validateRestrictedGrantClassesWithoutReopen(p policy.Effective) error {
 func restrictedCompileReport(p policy.Effective) profile.CompileReport {
 	entries := []profile.ReportEntry{
 		{Feature: "windows.token", Status: "Narrowed", Detail: "restricted-token defense in depth; no end-to-end boundary claimed"},
-		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; a same-user COM/WMI broker can write outside it, and WRITE_RESTRICTED does not restrict an owner's DELETE, WRITE_DAC or WRITE_OWNER"},
-		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; a same-user COM/WMI broker can start a process outside the Job, and a pipe-backed child shares the host console (input injection and console control events)"},
+		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; a same-user COM/WMI broker can write outside it, and WRITE_RESTRICTED does not restrict an owner's DELETE, WRITE_DAC or WRITE_OWNER. " +
+			"No-delete-sharing handles are retained only on the projected roots, write-denied carveouts and their ancestor directories; every other workspace file stays renameable and deletable for the lease, and an object the user moves out of a root keeps its inherited allow for this lease's one-shot SID (inert after the lease: that SID is never reissued)"},
+		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; a same-user COM/WMI broker can start a process outside the Job. " +
+			"A pipe-backed child runs on its own hidden console (CREATE_NO_WINDOW), not the host's, so cooperative interrupt is unavailable and Kill terminates the Job; a TTY child has its own pseudo console"},
 		{Feature: "windows.private-desktop", Status: "Narrowed", Detail: "Job UI restrictions only; no private desktop in restricted mode"},
 		{Feature: "windows.resource-limits", Status: "Narrowed", Detail: "direct Job limits only; broker escape remains possible"},
 		{Feature: "windows.env-scrub", Status: "Narrowed", Detail: "scrubs only the child's own environment block; a same-user child can read the host process's memory, including its environment"},
@@ -309,7 +319,7 @@ func restrictedCompileReport(p policy.Effective) profile.CompileReport {
 	for _, baseline := range p.RuntimeBaselines {
 		entries = append(entries, profile.ReportEntry{Feature: baseline, Status: "Narrowed", Detail: "platform runtime baseline; no read boundary claimed"})
 	}
-	return profile.CompileReport{Entries: entries}
+	return withUnixSocketsReport(profile.CompileReport{Entries: entries}, p)
 }
 
 func validateRestrictedGrantClasses(p policy.Effective) error {
@@ -463,7 +473,7 @@ func projectRestrictedRoot(root policy.FSEntry, entries []policy.FSEntry, sid SI
 		return nil, err
 	}
 	defer handle.Close()
-	tree, err := EnumerateRetainedACLTree(handle)
+	tree, err := EnumerateSharedACLTree(handle)
 	if err != nil {
 		return nil, err
 	}
@@ -543,7 +553,7 @@ func projectRestrictedGrant(handle *policy.PathHandle, entries []policy.FSEntry,
 	if !handle.IsDir() {
 		return nil, fmt.Errorf("%w: tree grant is not a directory", policy.ErrUnsupportedClass)
 	}
-	tree, err := EnumerateRetainedACLTree(handle)
+	tree, err := EnumerateSharedACLTree(handle)
 	if err != nil {
 		return nil, err
 	}

@@ -71,10 +71,14 @@ func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
 			t.Fatalf("report missing narrowed feature %q: %#v", feature, report.Entries)
 		}
 	}
-	// The report names the known channels rather than a generic escape.
+	// The report names the known channels rather than a generic escape, and
+	// no longer names the host console as one (H8: the child has its own).
+	if index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == "windows.job" }); strings.Contains(report.Entries[index].Detail, "shares the host console") {
+		t.Fatalf("windows.job still reports a shared host console: %q", report.Entries[index].Detail)
+	}
 	for feature, fragments := range map[string][]string{
-		"windows.filesystem.write": {"COM/WMI broker", "DELETE", "WRITE_DAC", "WRITE_OWNER"},
-		"windows.job":              {"COM/WMI broker", "console"},
+		"windows.filesystem.write": {"COM/WMI broker", "DELETE", "WRITE_DAC", "WRITE_OWNER", "No-delete-sharing handles", "carveouts", "one-shot SID"},
+		"windows.job":              {"COM/WMI broker", "own hidden console", "CREATE_NO_WINDOW", "cooperative interrupt is unavailable"},
 		"windows.env-scrub":        {"memory", "own environment block"},
 	} {
 		index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == feature })
@@ -292,5 +296,48 @@ func TestRestrictedGrantCollisionFailsBeforeProjectionAndRetainsRetirement(t *te
 				t.Fatalf("rejected one-shot SID retirement = %v, want ErrSIDReuse", err)
 			}
 		})
+	}
+}
+
+// TestRestrictedCompileRefusesUnixSocketEscapeHatch pins Task 1 for the
+// restricted tier: any non-default profile.UnixSocketPolicy is refused, typed,
+// before a lease, SID or journal record exists, on both the base compile and
+// the grant compile, and the report names the unmediated feature.
+func TestRestrictedCompileRefusesUnixSocketEscapeHatch(t *testing.T) {
+	for _, unixSockets := range []profile.UnixSocketPolicy{
+		{Mode: profile.UnixSocketsLocal},
+		{Paths: []string{`C:\agent\ssh.sock`}},
+	} {
+		prepareCalls := 0
+		backend := &restrictedBackend{config: Config{Mode: RestrictedToken}, deps: restrictedCompileDependencies{
+			prepare: func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error) {
+				prepareCalls++
+				return restrictedPreparedLease{}, nil
+			},
+			configure: func(*exec.Cmd, []SID) (func(), error) { return nil, nil },
+		}}
+		p := policy.Effective{Env: policy.EnvPolicy{Inherit: false}, UnixSockets: unixSockets}
+		for name, compile := range map[string]func() (enforce.Spec, profile.CompileReport, uint8, uint64, error){
+			"base": func() (enforce.Spec, profile.CompileReport, uint8, uint64, error) { return backend.Compile(p) },
+			"grant": func() (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+				return backend.CompileWithPathHandles(p, nil)
+			},
+		} {
+			spec, report, level, _, err := compile()
+			if !errors.Is(err, enforce.ErrUnavailable) || !errors.Is(err, policy.ErrUnsupportedClass) || errors.Is(err, ErrSetupRequired) {
+				t.Fatalf("%s compile error = %v, want typed AF_UNIX refusal", name, err)
+			}
+			if spec.Wrap != nil || spec.Release != nil || level != profile.LevelNone {
+				t.Fatalf("%s compile returned a partial spec %#v level %d", name, spec, level)
+			}
+			if !slices.Contains(report.Entries, profile.ReportEntry{
+				Feature: "unix-sockets", Status: "unavailable", Detail: "AF_UNIX endpoints are not mediated on Windows",
+			}) {
+				t.Fatalf("%s report omits unix-sockets: %#v", name, report.Entries)
+			}
+		}
+		if prepareCalls != 0 {
+			t.Fatalf("AF_UNIX profile reached lease preparation %d times", prepareCalls)
+		}
 	}
 }

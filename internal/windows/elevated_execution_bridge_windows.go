@@ -68,22 +68,18 @@ func executeElevatedRunner(request enforce.LaunchRequest, snapshot elevatedSetup
 	}
 
 	execution, err := launcher.Launch(elevatedRunnerLaunch{
-		Context:    request.Context,
-		Token:      win.Token(uintptr(issued.Handle)),
-		HostPath:   snapshot.HostPath,
-		HostSHA256: snapshot.HostSHA256,
-		Argv:       append([]string(nil), request.Argv...),
-		CWD:        request.Dir,
-		Env:        append([]string(nil), request.Env...),
-		Desktop:    issued.Desktop,
-		Stdin:      win.Handle(bridge.childStdin.Fd()),
-		Stdout:     win.Handle(bridge.childStdout.Fd()),
-		Stderr:     win.Handle(bridge.childStderr.Fd()),
-		Job: JobOptions{
-			Sandboxed:    true,
-			MaxProcesses: limits.MaxPIDs, MaxMemoryBytes: limits.MaxMemBytes,
-			MaxCPUPct: limits.MaxCPUPct,
-		},
+		Context:      request.Context,
+		Token:        win.Token(uintptr(issued.Handle)),
+		HostPath:     snapshot.HostPath,
+		HostSHA256:   snapshot.HostSHA256,
+		Argv:         append([]string(nil), request.Argv...),
+		CWD:          request.Dir,
+		Env:          append([]string(nil), request.Env...),
+		Desktop:      issued.Desktop,
+		Stdin:        win.Handle(bridge.childStdin.Fd()),
+		Stdout:       win.Handle(bridge.childStdout.Fd()),
+		Stderr:       win.Handle(bridge.childStderr.Fd()),
+		Job:          elevatedJobOptions(limits),
 		ReleaseLease: retire,
 	})
 	// From this point Launch itself owns retiring `retire` on every one of
@@ -268,4 +264,19 @@ func closeBridgeFile(file *os.File) error {
 		return nil
 	}
 	return err
+}
+
+// elevatedJobOptions maps policy limits onto the launch Job. Disabled limits
+// are not installed, exactly as the restricted process tree treats them, so
+// the ResourceLimits guarantee (elevatedGuaranteeBits) is claimed only for
+// limits this mapping actually installs.
+func elevatedJobOptions(limits policy.Limits) JobOptions {
+	if limits.Disabled {
+		return JobOptions{Sandboxed: true}
+	}
+	return JobOptions{
+		Sandboxed:    true,
+		MaxProcesses: limits.MaxPIDs, MaxMemoryBytes: limits.MaxMemBytes,
+		MaxCPUPct: limits.MaxCPUPct,
+	}
 }

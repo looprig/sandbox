@@ -171,6 +171,7 @@ const (
 	WindowsSetupProblemRuntimeBaselineGap    = windows.SetupProblemRuntimeBaselineGap
 	WindowsSetupProblemLeaseRecoveryPending  = windows.SetupProblemLeaseRecoveryPending
 	WindowsSetupProblemProtocolMismatch      = windows.SetupProblemProtocolMismatch
+	WindowsSetupProblemProxyPortsStale       = windows.SetupProblemProxyPortsStale
 )
 
 var (
