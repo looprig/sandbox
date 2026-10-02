@@ -47,15 +47,28 @@ import (
 // requireSandboxExec capability-skips (with a recorded reason) when
 // /usr/bin/sandbox-exec is absent or not runnable here (e.g. a CI that forbids
 // nested sandboxing), so a locked-down environment yields a skip, not a false
-// failure. These tests are meaningless without a working sandbox-exec.
+// failure. These tests are meaningless without a working sandbox-exec. With
+// SANDBOX_REQUIRE_SEATBELT=1 (set by the test-macos CI job) the skip becomes
+// a failure, so a runner image that quietly lost nested sandboxing cannot
+// turn the whole Seatbelt suite into green skips.
 func requireSandboxExec(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("sandbox-exec"); err != nil {
-		t.Skipf("sandbox-exec not available: %v", err)
+		skipOrFailSeatbelt(t, "sandbox-exec not available: %v", err)
 	}
 	if err := exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true").Run(); err != nil {
-		t.Skipf("sandbox-exec present but not runnable here: %v", err)
+		skipOrFailSeatbelt(t, "sandbox-exec present but not runnable here: %v", err)
 	}
+}
+
+// skipOrFailSeatbelt records a capability skip, or fails when the host has
+// declared (SANDBOX_REQUIRE_SEATBELT=1) that Seatbelt must be exercised.
+func skipOrFailSeatbelt(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("SANDBOX_REQUIRE_SEATBELT") == "1" {
+		t.Fatalf("SANDBOX_REQUIRE_SEATBELT=1 but "+format, args...)
+	}
+	t.Skipf(format, args...)
 }
 
 // TestSeatbeltEnforceWriteBoundary proves an in-workspace

@@ -39,20 +39,38 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
+      # SANDBOX_REQUIRE_SEATBELT turns the "sandbox-exec not runnable here"
+      # capability skips into failures: a runner image that quietly lost
+      # nested sandboxing must not pass the Seatbelt suite as green skips.
       - name: go test -race (seatbelt)
         run: go test -race -count=1 ./...
+        env:
+          SANDBOX_REQUIRE_SEATBELT: "1"
       # Darwin's Seatbelt backend no longer rejects async Supervised spawns
       # pre-spawn (the 2026-08-06 best-effort acceptance decision superseded
       # Task 12c's fail-closed contract; see docs/lifetime-containment.md).
       # TestIntegrationProcessPTYLifecycle proves a real Seatbelt-confined
-      # async PTY spawn now runs end-to-end instead of being rejected before
-      # it starts; TestIntegrationProcessTreeDarwinSetsidEscapeContained
-      # proves the best-effort descendant tracker actually catches a
-      # setsid-detached grandchild under real confinement (it self-skips,
-      # rather than approximating the proof, on a runner image with no
-      # setsid binary).
+      # async PTY spawn runs end-to-end; the TestIntegrationProcessTree*
+      # proofs (setsid escape, double fork, parent death, and the Darwin
+      # tracker-specific escape case) detach the grandchild through perl's
+      # POSIX::setsid on this image (macOS ships no setsid binary, which used
+      # to make the only Darwin selector here skip on every run); the
+      # TestDescendantTracker* and TestSupervisedSeatbelt* cases exercise the
+      # best-effort tracker and real Seatbelt supervised teardown directly.
+      # A skip in this step is a failure: these selectors exist to run here.
       - name: go test -tags integration -race (Darwin async best-effort lifetime containment)
-        run: go test -tags integration -race -count=1 ./internal/exec -run 'TestIntegrationProcessTreeDarwinSetsidEscapeContained|TestIntegrationProcessPTYLifecycle'
+        run: |
+          go test -tags integration -race -count=1 -json ./internal/exec \
+            -run 'TestIntegrationProcessTreeDarwinSetsidEscapeContained|TestIntegrationProcessTree(SetsidEscape|DoubleFork|ParentDeath)|TestIntegrationProcessPTYLifecycle|TestDescendantTracker|TestSupervisedSeatbelt' \
+            | tee /tmp/darwin-integration.json
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q '"Action":"skip"' /tmp/darwin-integration.json; then
+            grep '"Action":"skip"' /tmp/darwin-integration.json
+            echo 'Darwin integration selector skipped a test it exists to run'
+            exit 1
+          fi
+        env:
+          SANDBOX_REQUIRE_SEATBELT: "1"
 
   # Linux RUNG 2: the default GitHub runner (or any host where unprivileged
   # userns is unavailable) exercises the Landlock + seccomp + TCP-port path.
@@ -90,14 +108,22 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sudo modprobe nf_conntrack || true
           sudo modprobe nf_tables || true
+      # LRSANDBOX_REQUIRE_RUNG1 turns the rung-1 capability skips into
+      # failures. The `|| true` above means a runner image where the sysctl
+      # no longer takes effect would otherwise make every rung-1 test skip
+      # and this job pass with zero rung-1 coverage.
       - name: go test -race (rung 1 enforcement)
         run: go test -race -count=1 ./...
+        env:
+          LRSANDBOX_REQUIRE_RUNG1: "1"
       # Task 13: same tagged async process-lifecycle selectors as rung 2, run
       # again here so the Rung-1 PID-namespace/nftables containment path
       # (enabled above) is what the parent-death/double-fork/setsid-escape
       # proofs actually exercise on this worker.
       - name: go test -tags integration -race (async process lifecycle - grant, tree)
         run: go test -tags integration -race -count=1 ./internal/exec -run 'TestIntegration(ProcessPipe|ProcessPreparedGrant|ProcessTree)'
+        env:
+          LRSANDBOX_REQUIRE_RUNG1: "1"
 
   # Compile every package's test binary independently. This catches
   # architecture-specific Windows files even when the live worker is x64.
@@ -110,6 +136,43 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - name: windows amd64 + arm64 package/test binaries
         run: make test-windows-build
+
+  # GitHub-hosted Windows: runs the whole default-tag suite for real (live
+  # restricted-token creation, Job Objects, explicit handle lists, ConPTY,
+  # winpath, the non-destructive ACL plan/journal tests). This is NOT the
+  # evidence gate: the hosted runner is an Administrator and is not a
+  # standard-user or disposable elevated image, so every live test behind
+  # SANDBOX_WINDOWS_DISPOSABLE_*/SANDBOX_WINDOWS_ELEVATED_TEST still records
+  # its skip here, and those gates remain the self-hosted jobs below. Before
+  # this job existed no Windows test executed anywhere unless the self-hosted
+  # runners were registered.
+  windows-hosted:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go vet (windows)
+        run: go vet ./...
+      - name: go test -race (default tags)
+        run: go test -race -count=1 ./...
+      # The ConPTY unit tests drive a real pseudo console; they must execute
+      # here rather than skip (they are not behind any live gate).
+      - name: ConPTY interactive terminal (skip is failure)
+        shell: powershell
+        run: |
+          $lines = @(& go test -json -race -count=1 ./internal/exec -run '^TestProcessConPTY')
+          $lines | ForEach-Object { Write-Output $_ }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $skips = @($lines | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+          } | Where-Object { $_.Action -eq 'skip' })
+          if ($skips.Count -ne 0) {
+            $skips | ForEach-Object { Write-Error "requested live test skipped: $($_.Package) $($_.Test)" }
+            throw "ConPTY interactive terminal tests did not execute"
+          }
 
   # The standard-user runner must not have an installed broker. Labels are
   # intentionally deployment-specific: absence of this worker fails/queues the

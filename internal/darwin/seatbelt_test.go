@@ -462,10 +462,10 @@ func equalStrings(a, b []string) bool {
 func sandboxExecParses(t *testing.T, profile string) {
 	t.Helper()
 	if _, err := exec.LookPath("sandbox-exec"); err != nil {
-		t.Skip("sandbox-exec not available")
+		skipOrFailSeatbelt(t, "sandbox-exec not available: %v", err)
 	}
 	if rc := runSandboxExec(t, "(version 1)(allow default)\n"); rc != 0 {
-		t.Skipf("sandbox-exec present but not runnable here (known-good profile exit %d)", rc)
+		skipOrFailSeatbelt(t, "sandbox-exec present but not runnable here (known-good profile exit %d)", rc)
 	}
 	if rc := runSandboxExec(t, profile); rc != 0 {
 		t.Fatalf("generated profile did not parse under sandbox-exec (exit %d):\n%s", rc, profile)

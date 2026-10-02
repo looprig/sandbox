@@ -78,14 +78,37 @@ func integrationEscapeExecutor(t *testing.T) (*ExecutorSet, *Executor, string) {
 // `-tags integration` build needs to resolve — this file's own callers
 // included — must live somewhere Windows compiles it too, not here.
 
-// requireSettidHelper skips the test on a host/image without the setsid
-// binary (util-linux) — needed for a genuine session-detach escape, rather
-// than approximating it and understating the proof.
+// setsidLauncher is the shell fragment that re-execs the words following it
+// in a NEW session. It is resolved once by requireSetsidHelper: util-linux's
+// `setsid` where the image ships it (Linux), otherwise perl's POSIX::setsid(),
+// which is the same setsid(2) call. macOS ships no setsid binary but every
+// supported image ships /usr/bin/perl, so the darwin escape proof runs for
+// real instead of recording a skip that CI then reports as green (the
+// test-macos job's only Darwin containment selector used to skip on every
+// run for exactly this reason).
+var setsidLauncher string
+
+// requireSetsidHelper resolves setsidLauncher, skipping only when neither a
+// setsid binary nor perl is available — a genuine session-detach escape is
+// needed, rather than approximating it and understating the proof.
 func requireSetsidHelper(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("setsid"); err != nil {
-		t.Skip("setsid binary unavailable on this host/image; cannot exercise a real session-detach escape")
+	if setsidLauncher != "" {
+		return
 	}
+	if _, err := exec.LookPath("setsid"); err == nil {
+		setsidLauncher = "setsid"
+		return
+	}
+	if perl, err := exec.LookPath("perl"); err == nil {
+		// Absolute path: the fragment runs inside the confined target, whose
+		// scrubbed PATH may not resolve a bare "perl". `exec @ARGV` replaces
+		// perl with the grandchild so the escapee's $0 is still the token.
+		setsidLauncher = portableShellQuote(perl) +
+			` -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!"'`
+		return
+	}
+	t.Skip("neither setsid nor perl is available on this host/image; cannot exercise a real session-detach escape")
 }
 
 // pidFileAlive reads a pid previously written to path and reports whether
@@ -163,7 +186,7 @@ func escapeToken(t *testing.T) string {
 func escapeGrandchildLaunch(grandchild, token string) string {
 	head, tail := token[:len("lrsb-esc")], token[len("lrsb-esc"):]
 	return "T=$(printf '%s%s' " + portableShellQuote(head) + " " + portableShellQuote(tail) + "); " +
-		"setsid sh -c " + portableShellQuote(grandchild) + " \"$T\""
+		setsidLauncher + " sh -c " + portableShellQuote(grandchild) + " \"$T\""
 }
 
 // setsidEscapeScript builds a target command: it backgrounds a `setsid`-
