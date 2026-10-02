@@ -5,10 +5,10 @@ package exec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -146,19 +146,14 @@ func TestProcessTreeHelper(t *testing.T) {
 		}
 		os.Exit(0)
 	case "console-processes":
-		// Records every process attached to this payload's console, so the
-		// parent can tell a private console from its own (H8).
-		pids, err := currentConsoleProcessList()
-		if err != nil {
-			_ = os.WriteFile(os.Getenv(processTreeMarker), []byte("error: "+err.Error()), 0o600)
+		// A detached pipe child must have no console. Refuse unexpected
+		// errors as well as successful attachment; neither proves isolation.
+		_, err := currentConsoleProcessList()
+		if !errors.Is(err, winapi.ERROR_INVALID_HANDLE) {
+			_ = os.WriteFile(os.Getenv(processTreeMarker), []byte(fmt.Sprintf("console query: %v", err)), 0o600)
 			os.Exit(7)
 		}
-		var builder strings.Builder
-		for _, pid := range pids {
-			builder.WriteString(strconv.FormatUint(uint64(pid), 10))
-			builder.WriteByte('\n')
-		}
-		if err := os.WriteFile(os.Getenv(processTreeMarker), []byte(builder.String()), 0o600); err != nil {
+		if err := os.WriteFile(os.Getenv(processTreeMarker), []byte("no-console\n"), 0o600); err != nil {
 			os.Exit(8)
 		}
 		os.Exit(0)
@@ -311,25 +306,24 @@ func currentConsoleProcessList() ([]uint32, error) {
 	return pids[:count], nil
 }
 
-// TestProcessTreeLaunchFlagsGiveSandboxedPipeSpawnsAPrivateConsole pins H8's
+// TestProcessTreeLaunchFlagsDetachSandboxedPipeSpawns pins H8's
 // flag decisions hermetically: a sandboxed pipe-backed launch adds
-// CREATE_NO_WINDOW (a hidden console of its own, not DETACHED_PROCESS and not
-// a visible CREATE_NEW_CONSOLE), an Unconfined one does not, and a ConPTY
+// DETACHED_PROCESS (no console and no implicit console host), an Unconfined one does not, and a ConPTY
 // launch never carries it whatever it inherited.
-func TestProcessTreeLaunchFlagsGiveSandboxedPipeSpawnsAPrivateConsole(t *testing.T) {
+func TestProcessTreeLaunchFlagsDetachSandboxedPipeSpawns(t *testing.T) {
 	base := uint32(winapi.CREATE_SUSPENDED | winapi.CREATE_NEW_PROCESS_GROUP)
 	private := pipeLaunchCreationFlags(base, true)
-	if private&winapi.CREATE_NO_WINDOW == 0 || private&(winapi.DETACHED_PROCESS|winapi.CREATE_NEW_CONSOLE) != 0 || private&base != base {
+	if private&winapi.DETACHED_PROCESS == 0 || private&(winapi.CREATE_NO_WINDOW|winapi.CREATE_NEW_CONSOLE) != 0 || private&base != base {
 		t.Fatalf("sandboxed pipe flags = %#x", private)
 	}
-	if shared := pipeLaunchCreationFlags(base|winapi.CREATE_NO_WINDOW, false); shared&winapi.CREATE_NO_WINDOW != 0 || shared&base != base {
+	if shared := pipeLaunchCreationFlags(base|winapi.DETACHED_PROCESS, false); shared&winapi.DETACHED_PROCESS != 0 || shared&base != base {
 		t.Fatalf("unconfined pipe flags = %#x", shared)
 	}
 	// A ConPTY launch keeps CREATE_SUSPENDED but drops CREATE_NEW_PROCESS_GROUP,
 	// whose root starts with CTRL+C disabled and would make the in-band ^C
 	// interrupt a no-op (conPTYLaunchCreationFlags).
-	conpty := conPTYLaunchCreationFlags(base | winapi.CREATE_NO_WINDOW)
-	if conpty&winapi.CREATE_NO_WINDOW != 0 || conpty&winapi.CREATE_NEW_PROCESS_GROUP != 0 || conpty&winapi.CREATE_SUSPENDED == 0 ||
+	conpty := conPTYLaunchCreationFlags(base | winapi.CREATE_NO_WINDOW | winapi.DETACHED_PROCESS | winapi.CREATE_NEW_CONSOLE)
+	if conpty&(winapi.CREATE_NO_WINDOW|winapi.DETACHED_PROCESS|winapi.CREATE_NEW_CONSOLE) != 0 || conpty&winapi.CREATE_NEW_PROCESS_GROUP != 0 || conpty&winapi.CREATE_SUSPENDED == 0 ||
 		conpty&winapi.EXTENDED_STARTUPINFO_PRESENT == 0 || conpty&winapi.CREATE_UNICODE_ENVIRONMENT == 0 {
 		t.Fatalf("ConPTY flags = %#x", conpty)
 	}
@@ -370,8 +364,8 @@ func TestProcessTreeSandboxedInterruptIsTypedUnsupported(t *testing.T) {
 }
 
 // TestProcessTreeSandboxedChildDoesNotShareTheHostConsole proves H8 against
-// a real child: the processes attached to the sandboxed child's console never
-// include this test process.
+// a real child: GetConsoleProcessList reports ERROR_INVALID_HANDLE because
+// the pipe-backed child has no console at all.
 func TestProcessTreeSandboxedChildDoesNotShareTheHostConsole(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "console-processes")
 	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestProcessTreeHelper$")
@@ -384,8 +378,8 @@ func TestProcessTreeSandboxedChildDoesNotShareTheHostConsole(t *testing.T) {
 	if err := tree.start(cmd); err != nil {
 		t.Fatal(err)
 	}
-	if cmd.SysProcAttr.CreationFlags&winapi.CREATE_NO_WINDOW == 0 {
-		t.Fatal("sandboxed pipe-backed launch did not request a private console")
+	if cmd.SysProcAttr.CreationFlags&winapi.DETACHED_PROCESS == 0 {
+		t.Fatal("sandboxed pipe-backed launch did not detach from the console")
 	}
 	if err := cmd.Wait(); err != nil {
 		data, _ := os.ReadFile(marker)
@@ -395,10 +389,7 @@ func TestProcessTreeSandboxedChildDoesNotShareTheHostConsole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	self := strconv.Itoa(os.Getpid())
-	for _, line := range strings.Fields(string(data)) {
-		if line == self {
-			t.Fatalf("sandboxed child shares this process's console: attached processes %q", data)
-		}
+	if string(data) != "no-console\n" {
+		t.Fatalf("detached child's console observation = %q, want no-console", data)
 	}
 }

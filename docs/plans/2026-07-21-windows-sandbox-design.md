@@ -505,12 +505,13 @@ dangerous groups, and calls `CreateRestrictedToken` with:
 - the executor and grant capability SIDs, plus the session's logon SID
   (`S-1-5-5-X-Y`), as restricting SIDs.
 
-The logon SID is there because every console client connects to its window
-station and desktop for write-class rights (`DESKTOP_CREATEWINDOW` and the
-like) during DLL initialisation, and the interactive `WinSta0\Default` DACL
-grants those to the logon SID and to none of this module's trustees: without
-it the restricted check refuses and the child dies with
-`STATUS_DLL_INIT_FAILED` (0xC0000142) before running. Under `WRITE_RESTRICTED`
+The logon SID permits access to session objects whose DACL grants it rights,
+including the window station and desktop. It does **not** fix implicit console
+host initialization: hosted run `37042438148` observed `0xC0000142` with
+`CREATE_NO_WINDOW` both with and without the logon SID, while detached children
+succeeded. Pipe-backed spawns now use `DETACHED_PROCESS` with explicit stdio
+pipes; console-dependent programs must request TTY (ConPTY).
+Under `WRITE_RESTRICTED`
 it widens only writes, and only to objects whose DACL names the logon SID
 (the session's window station, desktop and per-session objects; a token's
 default DACL gives it read/execute only). It is taken from the source token,

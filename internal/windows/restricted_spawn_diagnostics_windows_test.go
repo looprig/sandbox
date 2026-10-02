@@ -19,7 +19,9 @@ import (
 // TestRestrictedTokenChildInitializationMatrix decides, from one CI log, why
 // a restricted-tier child dies with STATUS_DLL_INIT_FAILED (0xC0000142) —
 // the second Windows CI run's facade and policy-enforcement failures — and
-// proves the production shape no longer does.
+// proves the production shape no longer does. Run 37042438148 established
+// that CREATE_NO_WINDOW fails with either restricted token, whereas detached
+// children succeed. The production pipe path now uses DETACHED_PROCESS.
 //
 // It launches `cmd.exe /d /c exit 0` once per variant across the three axes
 // that separate the candidate causes, each exactly as the restricted tier
@@ -81,8 +83,8 @@ func TestRestrictedTokenChildInitializationMatrix(t *testing.T) {
 		{"restricted without logon SID, CREATE_NO_WINDOW, sandboxed Job", withoutLogon, xwindows.CREATE_NO_WINDOW, true, false},
 		{"restricted without logon SID, DETACHED_PROCESS, sandboxed Job", withoutLogon, xwindows.DETACHED_PROCESS, true, false},
 		{"restricted without logon SID, CREATE_NO_WINDOW, no Job", withoutLogon, xwindows.CREATE_NO_WINDOW, false, false},
-		{"production (logon SID), CREATE_NO_WINDOW, sandboxed Job", production, xwindows.CREATE_NO_WINDOW, true, true},
-		{"production (logon SID), DETACHED_PROCESS, sandboxed Job", production, xwindows.DETACHED_PROCESS, true, false},
+		{"production token, CREATE_NO_WINDOW, sandboxed Job", production, xwindows.CREATE_NO_WINDOW, true, false},
+		{"production token and console mode, DETACHED_PROCESS, sandboxed Job", production, xwindows.DETACHED_PROCESS, true, true},
 		{"production (logon SID), CREATE_NO_WINDOW, no Job", production, xwindows.CREATE_NO_WINDOW, false, false},
 	}
 	var lines []string

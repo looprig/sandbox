@@ -328,7 +328,7 @@ func restrictedCompileReport(p policy.Effective) profile.CompileReport {
 		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; a same-user COM/WMI broker can write outside it, and WRITE_RESTRICTED does not restrict an owner's DELETE, WRITE_DAC or WRITE_OWNER. " +
 			"No-delete-sharing handles are retained only on the projected roots, write-denied carveouts and their ancestor directories; every other workspace file stays renameable and deletable for the lease, and an object the user moves out of a root keeps its inherited allow for this lease's one-shot SID (inert after the lease: that SID is never reissued)"},
 		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; a same-user COM/WMI broker can start a process outside the Job. " +
-			"A pipe-backed child runs on its own hidden console (CREATE_NO_WINDOW), not the host's, so cooperative interrupt is unavailable and Kill terminates the Job; a TTY child has its own pseudo console"},
+			"A pipe-backed child has no console (DETACHED_PROCESS), so cooperative interrupt is unavailable and Kill terminates the Job; console-dependent programs must request TTY, which supplies a private pseudo console"},
 		{Feature: "windows.private-desktop", Status: "Narrowed", Detail: "Job UI restrictions only; no private desktop in restricted mode"},
 		{Feature: "windows.resource-limits", Status: "Narrowed", Detail: "direct Job limits only; broker escape remains possible"},
 		{Feature: "windows.env-scrub", Status: "Narrowed", Detail: "scrubs only the child's own environment block; a same-user child can read the host process's memory, including its environment"},

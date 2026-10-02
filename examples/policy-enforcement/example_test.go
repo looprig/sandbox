@@ -210,7 +210,7 @@ func TestExamplePolicyAndEnforcement(t *testing.T) {
 			// running (STATUS_DLL_INIT_FAILED), the second Windows CI run's
 			// failure; internal/windows' TestRestrictedTokenChildInitializationMatrix
 			// logs which token/console/Job variant causes it.
-			hint = " (0xC0000142 STATUS_DLL_INIT_FAILED: the helper never ran; under the restricted token this is the window station/desktop or console host refusing the restricting SIDs' write check)"
+			hint = " (0xC0000142 STATUS_DLL_INIT_FAILED: the helper never ran; check the restricted token and console launch mode)"
 		}
 		t.Fatalf("RunArgv = code %d (%#x) output %q, want successful helper output%s", code, uint32(code), output, hint)
 	}

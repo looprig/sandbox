@@ -433,8 +433,9 @@ Those mechanisms are defense in depth only: the tier reports `LevelNone` and
 `EnvScrub` alone, because a same-user COM/WMI/shell broker can create a process
 outside the Job and token, a same-user child can read the host's memory, and
 `WRITE_RESTRICTED` does not restrict `DELETE`/`WRITE_DAC`. A sandboxed
-pipe-backed child runs on its own hidden console (`CREATE_NO_WINDOW`), so it
-cannot inject input into the host's console; cooperative interrupt of such a
+pipe-backed child starts with no console (`DETACHED_PROCESS`) and explicit
+stdio pipes, so it does not inherit the host's console. Programs requiring
+console APIs must request TTY (ConPTY); cooperative interrupt of a pipe-backed
 child is unsupported (`ErrProcessSignalUnsupported`) while kill and terminate
 still end the Job. Any profile requiring a read, write or network
 boundary is refused in this tier (`ErrWindowsSetupRequired` under auto

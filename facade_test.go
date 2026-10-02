@@ -370,5 +370,5 @@ func windowsInitFailureHint(code int) string {
 		return ""
 	}
 	return " (STATUS_DLL_INIT_FAILED: the child's DLL initialisation failed before it ran; under the restricted tier's WRITE_RESTRICTED token, " +
-		"usually the window station/desktop or its console host refusing the restricting SIDs' write check — see internal/windows' TestRestrictedTokenChildInitializationMatrix)"
+		"check the console launch mode and token access — see internal/windows' TestRestrictedTokenChildInitializationMatrix)"
 }

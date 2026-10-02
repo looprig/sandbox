@@ -187,14 +187,9 @@ func windowsExitStatusName(code int) string {
 	case 0xC000013A:
 		return "STATUS_CONTROL_C_EXIT"
 	case 0xC0000142:
-		// Two causes this package has met, distinguishable by launch shape:
-		// a ConPTY client handed a malformed pseudo-console attribute (fixed
-		// in attachPseudoConsoleAttribute), and a restricted-token child whose
-		// WRITE_RESTRICTED restricting list lacks the session logon SID, so
-		// user32/console-host initialisation cannot open WinSta0\Default for
-		// write-class rights (fixed by tokenLogonSID, internal/windows).
-		return "STATUS_DLL_INIT_FAILED (a DLL initialisation routine failed; for a console client, usually the console connection; " +
-			"under a restricted token, usually the window station/desktop (WinSta0\\Default) refusing the restricting SIDs' write check — is the session logon SID among them?)"
+		// The launch matrix distinguishes malformed ConPTY attachment from
+		// implicit console initialization under a restricted token.
+		return "STATUS_DLL_INIT_FAILED (a DLL initialisation routine failed; check console attachment and restricted-token access; see TestRestrictedTokenChildInitializationMatrix)"
 	case 0xC0000409:
 		return "STATUS_STACK_BUFFER_OVERRUN"
 	case 0xC000041D:

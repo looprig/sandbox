@@ -410,7 +410,7 @@ proven live in Docker (Rung 1 and 2) and under sandbox-exec.
 |---|---|---|
 | H6 process-info env read (macOS) | **not fixable in SBPL** | eight variants measured (no process-info/sysctl at all, `(target self)`, pidinfo/listpids only, `deny sysctl-name kern.procargs2` before and after, regex, name-prefix allowlist): the secret leaked under every one; Seatbelt does not mediate `KERN_PROCARGS2`. Reported `env-scrub` narrowed, kept under test (`TestSeatbeltProcargsCrossProcessReadIsReported`), proxy credentials already reach only Allow-network and grant spawns. |
 | H7 mach-lookup | **fixed** | measured allowlist (`opendirectoryd.libinfo`, `.membership`; `trustd.agent` only with egress); `open zzz://` and `open -a` now fail live. Compatibility costs documented in code and SPEC. |
-| H8 shared console (Windows restricted) | **fixed (partial)** | `CREATE_NO_WINDOW` for sandboxed pipe-backed spawns; interrupt returns `ErrProcessSignalUnsupported` (AttachConsole from a Go host is process-wide and cannot re-attach). Whether the child's conhost counts against `MaxPIDs` needs a Windows run. |
+| H8 shared console (Windows restricted) | **fixed (partial)** | `DETACHED_PROCESS` for sandboxed pipe-backed spawns, with explicit stdio pipes; interrupt returns `ErrProcessSignalUnsupported`. Hosted launch diagnostics showed `CREATE_NO_WINDOW` fails during restricted console initialization, so pipe spawns now avoid the implicit conhost. Console-dependent programs need TTY. |
 | H10 installation SID on user objects | **fixed** | only the per-lease one-shot SID is projected; older ACEs still rolled back at recovery. |
 | M10 darwin RunCommand hang | **fixed** | synchronous Seatbelt spawns arm the descendant tracker; drain bounded by `outputDrainGrace` with `ErrOutputDrainIncomplete`. |
 | M11 live Seatbelt proxy/TargetNetwork/HostRead Deny | **fixed** | real-backend tests + `CheckClaimedImplications` on darwin. |
@@ -430,7 +430,7 @@ proven live in Docker (Rung 1 and 2) and under sandbox-exec.
 
 **Still booked (needs a real Windows host or a kernel feature):** M15 (the
 elevated tier has never run live); the elevated client's retained handles
-(M16, elevated half); H8's conhost/MaxPIDs interaction; H12 (b)–(e) (no
+(M16, elevated half); H12 (b)–(e) (no
 launch-time firewall recheck, no inbound block, loopback / system-service
 egress); Landlock ABI 9 `RESOLVE_UNIX` for Rung-2 pathname-socket scoping
 (kernel newer than the Docker image); H6 credential-by-fd transport (needs a
@@ -438,3 +438,38 @@ design decision, since proxy-aware clients read the credential from the
 environment); the stricter runtime closure under `HostRead: Deny` on macOS
 (`/usr/bin/curl` needs `/private/etc/ssl/openssl.cnf`, `git` needs
 `/Library/Developer`).
+
+
+## 5. Hosted Windows follow-up — 2026-10-02
+
+The initial audit above predates Windows execution. The hosted job now runs
+real Windows tests. Run `37017311503` (head `929ac51`) exposed Job read-back,
+console initialization, ConPTY EOF/interrupt and lease-test failures. Run
+`37042438148` (head `ba95cbd`) confirmed the Job, ConPTY and lease fixes, but
+still failed console initialization and exposed a race in the new stack-sweep
+test and three test helpers using `exec.Command` where the process-tree code
+installs a `CommandContext` cancellation callback.
+
+The launch matrix in the second run separates the console failure from Job
+policy: unrestricted children succeed with `CREATE_NO_WINDOW`, restricted
+children fail `0xC0000142` with or without the logon SID and with or without a
+Job, and both restricted token shapes succeed with `DETACHED_PROCESS`.
+Pipe-backed spawns therefore detach and retain explicit stdio pipes. This
+avoids implicit console initialization and host-console inheritance; it is
+not a claim that hostile same-user code cannot explicitly attach elsewhere.
+Console-dependent applications must request TTY. The regression test requires
+an actual detached child to observe `ERROR_INVALID_HANDLE` from
+`GetConsoleProcessList`; unexpected errors fail. The API distinction is
+specified in [Microsoft's console creation documentation](https://learn.microsoft.com/en-us/windows/console/creation-of-a-console).
+
+The stack-sweep race was reproduced on macOS by copying the recursive helper
+and notification order into a standalone `-race` test. Completion now follows
+all recursive unwinding, which still touches the shared test sink. The three
+Job launch tests now use `CommandContext(context.Background(), ...)`, matching
+the production callers. No failing test was converted to a skip.
+
+The self-hosted standard-user and elevated disposable gates remain unproven.
+Hosted ConPTY tests use a fake policy backend with a real Job and pseudo
+console; they do not prove restricted-token ConPTY or elevated broker
+composition. Cooked-console EOF tests cover `findstr` and `sort`, not arbitrary
+raw-mode terminal applications. Windows arm64 is compilation-only.

@@ -78,7 +78,7 @@ func TestRestrictedCompileClaimsOnlyExecutorEnvironmentScrub(t *testing.T) {
 	}
 	for feature, fragments := range map[string][]string{
 		"windows.filesystem.write": {"COM/WMI broker", "DELETE", "WRITE_DAC", "WRITE_OWNER", "No-delete-sharing handles", "carveouts", "one-shot SID"},
-		"windows.job":              {"COM/WMI broker", "own hidden console", "CREATE_NO_WINDOW", "cooperative interrupt is unavailable"},
+		"windows.job":              {"COM/WMI broker", "no console", "DETACHED_PROCESS", "cooperative interrupt is unavailable"},
 		"windows.env-scrub":        {"memory", "own environment block"},
 	} {
 		index := slices.IndexFunc(report.Entries, func(entry profile.ReportEntry) bool { return entry.Feature == feature })

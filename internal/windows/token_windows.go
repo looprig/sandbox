@@ -244,21 +244,12 @@ const logonSIDPrefix = "S-1-5-5-"
 // tokenLogonSID returns a copy of the one logon SID among groups: the group
 // whose attributes carry SE_GROUP_LOGON_ID, which must read S-1-5-5-X-Y.
 //
-// Why the restricted tier's token needs it. A WRITE_RESTRICTED token passes a
-// write-class access check only if BOTH the normal check and a second check
-// over the restricting SIDs alone grant it. Every console client's
-// initialisation connects to its window station and desktop (user32's, and
-// the console host's that Windows starts for a child with no console it can
-// share — the restricted tier's pipe-backed CREATE_NO_WINDOW spawn) and asks
-// for write-class rights such as DESKTOP_CREATEWINDOW. The interactive
-// session's WinSta0 and its Default desktop grant those rights to the logon
-// SID, and to almost nothing else; they never grant this module's
-// executor/grant trustees. With only those trustees in the restricting list,
-// the second check refuses, the client's DLL initialisation fails, and the
-// child dies with STATUS_DLL_INIT_FAILED (0xC0000142) before its first
-// instruction — the second Windows CI run's facade and policy-enforcement
-// failures. Chromium's restricted tokens add the logon SID for the same
-// reason.
+// The logon SID permits the restricting-list check for session objects whose
+// DACL grants it access, including the interactive window station and desktop.
+// It is not sufficient to initialize an implicit console host: hosted run
+// 37042438148 still returned STATUS_DLL_INIT_FAILED with CREATE_NO_WINDOW,
+// both with and without this SID. Pipe-backed spawns therefore use
+// DETACHED_PROCESS; terminal requests use a separately created ConPTY.
 //
 // What it widens. The logon SID gates writes only (WRITE_RESTRICTED), so the
 // child additionally passes the restricted write check exactly where an
