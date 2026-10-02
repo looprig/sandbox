@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/looprig/sandbox/internal/policy"
 	winapi "golang.org/x/sys/windows"
@@ -141,6 +143,23 @@ func TestProcessTreeHelper(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		if err := os.WriteFile(os.Getenv(processTreeMarker), []byte("escaped"), 0o600); err != nil {
 			os.Exit(4)
+		}
+		os.Exit(0)
+	case "console-processes":
+		// Records every process attached to this payload's console, so the
+		// parent can tell a private console from its own (H8).
+		pids, err := currentConsoleProcessList()
+		if err != nil {
+			_ = os.WriteFile(os.Getenv(processTreeMarker), []byte("error: "+err.Error()), 0o600)
+			os.Exit(7)
+		}
+		var builder strings.Builder
+		for _, pid := range pids {
+			builder.WriteString(strconv.FormatUint(uint64(pid), 10))
+			builder.WriteByte('\n')
+		}
+		if err := os.WriteFile(os.Getenv(processTreeMarker), []byte(builder.String()), 0o600); err != nil {
+			os.Exit(8)
 		}
 		os.Exit(0)
 	case "job-membership":
@@ -274,4 +293,107 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+var procGetConsoleProcessList = winapi.NewLazySystemDLL("kernel32.dll").NewProc("GetConsoleProcessList")
+
+// currentConsoleProcessList is GetConsoleProcessList for this process.
+func currentConsoleProcessList() ([]uint32, error) {
+	pids := make([]uint32, 64)
+	count, _, err := procGetConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids)))
+	if count == 0 {
+		return nil, err
+	}
+	if int(count) > len(pids) {
+		return nil, errors.New("console process list exceeds the fixed buffer")
+	}
+	return pids[:count], nil
+}
+
+// TestProcessTreeLaunchFlagsGiveSandboxedPipeSpawnsAPrivateConsole pins H8's
+// flag decisions hermetically: a sandboxed pipe-backed launch adds
+// CREATE_NO_WINDOW (a hidden console of its own, not DETACHED_PROCESS and not
+// a visible CREATE_NEW_CONSOLE), an Unconfined one does not, and a ConPTY
+// launch never carries it whatever it inherited.
+func TestProcessTreeLaunchFlagsGiveSandboxedPipeSpawnsAPrivateConsole(t *testing.T) {
+	base := uint32(winapi.CREATE_SUSPENDED | winapi.CREATE_NEW_PROCESS_GROUP)
+	private := pipeLaunchCreationFlags(base, true)
+	if private&winapi.CREATE_NO_WINDOW == 0 || private&(winapi.DETACHED_PROCESS|winapi.CREATE_NEW_CONSOLE) != 0 || private&base != base {
+		t.Fatalf("sandboxed pipe flags = %#x", private)
+	}
+	if shared := pipeLaunchCreationFlags(base|winapi.CREATE_NO_WINDOW, false); shared&winapi.CREATE_NO_WINDOW != 0 || shared&base != base {
+		t.Fatalf("unconfined pipe flags = %#x", shared)
+	}
+	conpty := conPTYLaunchCreationFlags(base | winapi.CREATE_NO_WINDOW)
+	if conpty&winapi.CREATE_NO_WINDOW != 0 || conpty&winapi.EXTENDED_STARTUPINFO_PRESENT == 0 || conpty&winapi.CREATE_UNICODE_ENVIRONMENT == 0 || conpty&base != base {
+		t.Fatalf("ConPTY flags = %#x", conpty)
+	}
+	for _, test := range []struct {
+		options processTreeOptions
+		want    bool
+	}{
+		{processTreeOptions{Sandboxed: true}, true},
+		{processTreeOptions{Sandboxed: true, Supervised: true}, true},
+		{processTreeOptions{}, false},
+		{processTreeOptions{Supervised: true}, false},
+	} {
+		tree, err := newProcessTree(exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$"), test.options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tree.privateConsole != test.want {
+			t.Errorf("options %+v privateConsole = %v, want %v", test.options, tree.privateConsole, test.want)
+		}
+		tree.close()
+	}
+}
+
+// TestProcessTreeSandboxedInterruptIsTypedUnsupported: with a private console
+// there is no safe CTRL_BREAK path, so interrupt fails closed with
+// ErrProcessSignalUnsupported and never reaches GenerateConsoleCtrlEvent.
+func TestProcessTreeSandboxedInterruptIsTypedUnsupported(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$")
+	tree, err := newProcessTree(cmd, processTreeOptions{Sandboxed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.close()
+	cmd.Process = &os.Process{Pid: 4}
+	if err := tree.sendInterrupt(); !errors.Is(err, ErrProcessSignalUnsupported) {
+		t.Fatalf("sandboxed interrupt = %v, want ErrProcessSignalUnsupported", err)
+	}
+}
+
+// TestProcessTreeSandboxedChildDoesNotShareTheHostConsole proves H8 against
+// a real child: the processes attached to the sandboxed child's console never
+// include this test process.
+func TestProcessTreeSandboxedChildDoesNotShareTheHostConsole(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "console-processes")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessTreeHelper$")
+	cmd.Env = append(os.Environ(), processTreeHelperMode+"=console-processes", processTreeMarker+"="+marker)
+	tree, err := newProcessTree(cmd, processTreeOptions{Sandboxed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.close()
+	if err := tree.start(cmd); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.SysProcAttr.CreationFlags&winapi.CREATE_NO_WINDOW == 0 {
+		t.Fatal("sandboxed pipe-backed launch did not request a private console")
+	}
+	if err := cmd.Wait(); err != nil {
+		data, _ := os.ReadFile(marker)
+		t.Fatalf("payload failed: %v (%s)", err, data)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := strconv.Itoa(os.Getpid())
+	for _, line := range strings.Fields(string(data)) {
+		if line == self {
+			t.Fatalf("sandboxed child shares this process's console: attached processes %q", data)
+		}
+	}
 }

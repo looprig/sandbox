@@ -31,6 +31,11 @@ type processTree struct {
 	assigned bool
 	// lifetime is fixed at construction; see lifetimeContainment.
 	lifetime LifetimeContainment
+	// privateConsole is fixed at construction: a sandboxed pipe-backed
+	// child is launched on its own hidden console (pipeLaunchCreationFlags)
+	// instead of this process's, and cooperative interrupt is therefore
+	// unavailable for it (sendInterrupt). See privateConsoleForSpawn.
+	privateConsole bool
 
 	// conPTY, once set by openTerminal (terminal_windows.go), is the pending
 	// ConPTY launch start must drive through startConPTY instead of the plain
@@ -69,12 +74,14 @@ func newProcessTree(cmd *exec.Cmd, options processTreeOptions) (*processTree, er
 	// CREATE_NEW_PROCESS_GROUP makes the child's own PID its console process-
 	// group ID, distinct from this sandbox's own group: sendInterrupt (below)
 	// needs that so a targeted CTRL_BREAK_EVENT reaches only this run's tree,
-	// never this process's own console session. It also means a Ctrl+C
+	// never this process's own console session. (A sandboxed pipe-backed
+	// child additionally gets a private console at start; see
+	// privateConsoleForSpawn.) It also means a Ctrl+C
 	// delivered to the sandbox's own console no longer implicitly reaches a
 	// confined child — teardown for this tree is only ever the explicit
 	// Job/signal machinery below, exactly as intended.
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED | windows.CREATE_NEW_PROCESS_GROUP
-	tree := &processTree{cmd: cmd, job: job, lifetime: windowsProcessTreeLifetime(options)}
+	tree := &processTree{cmd: cmd, job: job, lifetime: windowsProcessTreeLifetime(options), privateConsole: privateConsoleForSpawn(options)}
 	cmd.Cancel = tree.terminate
 	return tree, nil
 }
@@ -95,6 +102,11 @@ func (tree *processTree) start(cmd *exec.Cmd) error {
 		// unconfined containment mechanism.
 		return tree.startConPTY(cmd, pending)
 	}
+	// The console decision is made here, on the pipe-backed path only:
+	// CREATE_NO_WINDOW must never reach a ConPTY launch (above), where it
+	// would give the child a hidden console of its own instead of the
+	// pseudo console the attribute list attaches.
+	cmd.SysProcAttr.CreationFlags = pipeLaunchCreationFlags(cmd.SysProcAttr.CreationFlags, tree.privateConsole)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -371,7 +383,7 @@ func (launch *conPTYLaunch) createSuspended() error {
 	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above),
 	// exactly like the plain path, preserving sendInterrupt's own
 	// CTRL_BREAK_EVENT targeting unchanged for a ConPTY-backed Process too.
-	flags := cmd.SysProcAttr.CreationFlags | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
+	flags := conPTYLaunchCreationFlags(cmd.SysProcAttr.CreationFlags)
 	// StartupInfo.Flags deliberately does NOT include STARTF_USESTDHANDLES: a
 	// ConPTY-attached child's console I/O routes entirely through the
 	// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute above, never through
@@ -583,6 +595,71 @@ func (tree *processTree) lifetimeContainment() LifetimeContainment {
 	return tree.lifetime
 }
 
+// privateConsoleForSpawn decides, at construction, whether a pipe-backed
+// spawn gets its own console. Every sandboxed (restricted-tier) spawn does
+// (review H8). A child that shares this process's console can
+// WriteConsoleInput into it — straight into an agent's TUI, the Windows
+// counterpart of TIOCSTI — and GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) every
+// process on it, this host included. CREATE_NO_WINDOW gives the child a new,
+// hidden console instead: unlike DETACHED_PROCESS it still has one, so
+// cmd.exe and console programs start normally, and its descendants inherit
+// that console, never this one. An Unconfined spawn keeps the shared console
+// and its working CTRL_BREAK interrupt: it runs with this process's own
+// unrestricted token, so the console is no boundary for it.
+func privateConsoleForSpawn(options processTreeOptions) bool {
+	return options.Sandboxed
+}
+
+// pipeLaunchCreationFlags is the creation-flag set for a pipe-backed
+// (cmd.Start) launch: base plus CREATE_NO_WINDOW for a private console.
+// CREATE_NEW_CONSOLE is deliberately not used (it would show a window), nor
+// DETACHED_PROCESS (no console at all: console programs then allocate one
+// themselves or fail, and nothing could ever deliver them a control event).
+func pipeLaunchCreationFlags(base uint32, privateConsole bool) uint32 {
+	if privateConsole {
+		return base | windows.CREATE_NO_WINDOW
+	}
+	return base &^ windows.CREATE_NO_WINDOW
+}
+
+// conPTYLaunchCreationFlags is the creation-flag set for a ConPTY launch.
+// A ConPTY child already has a private console, the pseudo console;
+// CREATE_NO_WINDOW is stripped because combined with
+// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE it would attach a hidden console of
+// its own instead, and the terminal would see none of the child's I/O.
+func conPTYLaunchCreationFlags(base uint32) uint32 {
+	return (base &^ windows.CREATE_NO_WINDOW) | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
+}
+
+// errPrivateConsoleInterruptUnsupported is sendInterrupt's answer for a
+// sandboxed pipe-backed child (privateConsoleForSpawn). It wraps
+// ErrProcessSignalUnsupported, so Signal's documented fail-closed contract
+// holds: interrupt is never silently mapped onto a forceful primitive, and
+// ProcessSignalTerminate / ProcessSignalKill still terminate the whole Job.
+//
+// The cooperative path Win32 would allow is deliberately not taken.
+// GenerateConsoleCtrlEvent reaches only processes on the CALLER's console, so
+// delivering CTRL_BREAK to the child's private console would take
+// FreeConsole(); AttachConsole(childPID); GenerateConsoleCtrlEvent(...);
+// FreeConsole(); and then re-attaching to the original console. That dance
+// is process-global and unsafe from a Go host: (1) the console a process is
+// attached to is per-process state, so every other goroutine's console I/O —
+// an agent TUI rendering on this very console — breaks for its duration;
+// (2) FreeConsole invalidates the standard console handles os.Stdin/Stdout/
+// Stderr hold, and nothing re-binds them after a re-attach; (3) there is no
+// API to re-attach to "the console this process had": AttachConsole takes a
+// process ID attached to it, and a host that inherited its console from a
+// parent that has since exited (or created it with AllocConsole) has no
+// such PID, and one launched with no console (a service, a GUI) never had
+// one; (4) the host must also ignore its own CTRL_BREAK while attached
+// (SetConsoleCtrlHandler(nil, TRUE)) and restore that after, another
+// process-global toggle that races any concurrent interrupt of a sibling
+// spawn. A helper process could do it in isolation, but the restricted tier
+// has no installed companion binary to be that helper. The ConPTY path is
+// unaffected: conPTYSignaler interrupts by writing ^C into its own pseudo
+// console's input.
+var errPrivateConsoleInterruptUnsupported = fmt.Errorf("%w: a sandboxed Windows child runs on its own hidden console, which this process cannot deliver a console control event to; terminate or kill it instead", ErrProcessSignalUnsupported)
+
 // sendInterrupt requests cooperative interruption by delivering a
 // CTRL_BREAK_EVENT console control event to this run's own process group —
 // the closest cooperative-interrupt primitive Windows actually offers.
@@ -595,7 +672,14 @@ func (tree *processTree) lifetimeContainment() LifetimeContainment {
 // group ID. Like every ProcessSignalInterrupt dispatch, this never itself
 // decides the process is terminal — only Process.Wait's own confirmed exit
 // does that.
+//
+// It applies only to an Unconfined spawn, which shares this process's
+// console. A sandboxed pipe-backed spawn has a private console and answers
+// errPrivateConsoleInterruptUnsupported.
 func (tree *processTree) sendInterrupt() error {
+	if tree != nil && tree.privateConsole {
+		return errPrivateConsoleInterruptUnsupported
+	}
 	if tree == nil || tree.cmd == nil || tree.cmd.Process == nil {
 		return nil
 	}
