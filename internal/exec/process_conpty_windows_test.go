@@ -247,14 +247,15 @@ func conPTYReadUntilEOF(t *testing.T, r io.Reader, timeout time.Duration) (strin
 // this file's own top-of-file doc comment) and its echoed response arrives
 // back on Stdout. It checks ExitCode, not just that Wait returns promptly:
 // closing Stdin here must deliver EOF via conPTYTerminal.Write's veofByte
-// interception — closing the retained input pipe write end (see terminal_
-// windows.go's own "VEOF/EOF design decision" doc comment) — rather than
-// tearing down the pseudo console, so findstr exits 0 by observing EOF on
-// its own read; a torn-down pseudo console killing the child instead would
-// also make Wait return promptly, just with a non-zero/negative exit
-// instead of a clean 0, silently masking a regression in that design
-// decision exactly like the Unix analogue's own doc comment explains for
-// SIGHUP.
+// translation — the console's own Ctrl-Z/Enter end of input, with the input
+// pipe left open (see terminal_windows.go's own "VEOF/EOF design decision"
+// doc comment) — rather than tearing down the pseudo console, so findstr
+// exits 0 by observing EOF on its own read; a torn-down pseudo console
+// killing the child instead would also make Wait return promptly, just with
+// a non-zero exit (0xC000013A, STATUS_CONTROL_C_EXIT: the second Windows CI
+// run, when VEOF closed the input pipe) instead of a clean 0, silently
+// masking a regression in that design decision exactly like the Unix
+// analogue's own doc comment explains for SIGHUP.
 func TestProcessConPTYInteractive(t *testing.T) {
 	proc := startConPTYProcess(t, `findstr "^"`)
 	if _, err := proc.Stdin().Write([]byte("hello-conpty\r\n")); err != nil {
@@ -335,33 +336,36 @@ func TestProcessConPTYResize(t *testing.T) {
 	conPTYProcessWait(t, proc, 10*time.Second, 0, "set /p must read the written line and exit cleanly")
 }
 
-// TestProcessConPTYEOF proves closing Stdin delivers EOF to the child by
-// closing the pseudo console's retained input pipe write end (see terminal_
-// windows.go's conPTYTerminal.Write) rather than tearing down the whole
-// pseudo console, and the child observes that as its own read returning EOF
-// and exits cleanly. ExitCode is checked, not just Wait's promptness — see
-// TestProcessConPTYInteractive's own doc comment for why that matters.
+// TestProcessConPTYEOF proves closing Stdin with no input written delivers
+// EOF to the child — conPTYTerminal.Write's translation of VEOF into the
+// console's Ctrl-Z/Enter end-of-input sequence (terminal_windows.go) —
+// rather than tearing down the whole pseudo console, and the child observes
+// that as its own read returning EOF and exits cleanly. ExitCode is checked,
+// not just Wait's promptness — see TestProcessConPTYInteractive's own doc
+// comment for why that matters.
+//
+// The child is `sort`, not this file's usual `findstr "^"`: findstr exits 1
+// when no line matched, which an EMPTY input guarantees, so its exit code
+// cannot tell a clean EOF from a failure here. sort reads standard input to
+// EOF — its documentation is the canonical "type Ctrl-Z, then Enter" — and
+// exits 0 on empty input.
 func TestProcessConPTYEOF(t *testing.T) {
-	proc := startConPTYProcess(t, `findstr "^"`)
+	proc := startConPTYProcess(t, "sort")
 	if err := proc.Stdin().Close(); err != nil {
 		t.Fatalf("Stdin.Close: %v", err)
 	}
-	conPTYProcessWait(t, proc, 10*time.Second, 0, "closing Stdin must propagate EOF through the pseudo console's input pipe and the child must observe it cleanly")
+	conPTYProcessWait(t, proc, 10*time.Second, 0, "closing Stdin must deliver the console's Ctrl-Z/Enter end of input and the child must observe it cleanly (a timeout means the console did not treat it as EOF; 0xC000013A means the pseudo console was hung up instead)")
 }
 
 // TestProcessConPTYCtrlD proves the exact one-byte veofByte (0x04) write
-// this file's "VEOF/EOF design decision" documents (terminal_windows.go) end
-// the child's own read call — via conPTYTerminal.Write's interception
-// closing the retained input pipe write end — even with NO explicit
+// this file's "VEOF/EOF design decision" documents (terminal_windows.go) ends
+// the child's own read call — via conPTYTerminal.Write's translation into
+// the console's Ctrl-Z/Enter end-of-input sequence — even with NO explicit
 // Stdin.Close() call, mirroring TestProcessPTYCtrlD's own structure exactly
-// (process_pty_unix_test.go). Unlike that Unix test, this does not (and
-// cannot) prove the pseudo console stays open for FURTHER writes afterward:
-// closing the input pipe is, on this platform, an irreversible action for
-// this Process's whole input channel — see this file's own top-of-file doc
-// comment and conPTYTerminal.Write's doc comment for why that one-shot-ness
-// is an accepted, platform-inherent difference from Unix's repeatable VEOF,
-// not exercised by production code, which only ever sends this byte once,
-// via Stdin().Close().
+// (process_pty_unix_test.go). The input pipe stays open, so, as on Unix, VEOF
+// is repeatable and later writes still reach the console;
+// TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput proves
+// that at the pipe level.
 func TestProcessConPTYCtrlD(t *testing.T) {
 	proc := startConPTYProcess(t, `findstr "^"`)
 	if _, err := proc.Stdin().Write([]byte("before-eof\r\n")); err != nil {
@@ -378,7 +382,7 @@ func TestProcessConPTYCtrlD(t *testing.T) {
 // actually reaches a ConPTY-attached child, via conPTYSignaler
 // (terminal_windows.go): writing conPTYInterruptByte (0x03) into the pseudo
 // console's own input stream, which the console host translates into a real
-// CTRL_C_EVENT delivered to the attached process — NOT via *processTree's
+// CTRL_C_EVENT delivered to every attached process — NOT via *processTree's
 // own sendInterrupt (GenerateConsoleCtrlEvent), which cannot reach a
 // ConPTY-attached child at all (see conPTYSignaler's own doc comment for
 // exactly why: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attaches the child to the
@@ -392,20 +396,49 @@ func TestProcessConPTYCtrlD(t *testing.T) {
 // itself is what routes through the pseudo console's input stream on
 // Windows, because no terminal-independent primitive can reach a
 // ConPTY-attached child (see conPTYInterruptByte's own doc comment).
-// portableSleepCommand's underlying ping.exe has no custom console-control-
-// event handler, so only a genuinely delivered CTRL_C_EVENT (the console's
-// own default unhandled-event action is termination) explains a prompt exit
-// here.
+//
+// Two things the second Windows CI run's timeout taught this test:
+//
+//   - The launch must not carry CREATE_NEW_PROCESS_GROUP: the root of a new
+//     process group starts with CTRL+C disabled, inherited by its children,
+//     so every process on the pseudo console ignored the ^C
+//     (conPTYLaunchCreationFlags now strips it).
+//   - A console control event reaches only the processes attached to the
+//     console WHEN the host raises it, exactly like a real Ctrl+C typed
+//     before a program has started. The test therefore interrupts only
+//     after ping itself has written its banner through the pseudo console,
+//     which proves ping (and cmd.exe before it) is attached. ping.exe ends on
+//     CTRL_C_EVENT (Ctrl+Break only prints statistics), so a prompt exit is
+//     explained only by a delivered Ctrl+C.
+//
+// A timeout reports the output seen before the interrupt and whether THIS
+// process ignores CTRL+C (RTL_USER_PROCESS_PARAMETERS.ConsoleFlags bit 0),
+// which children inherit and nothing on the child's side can undo.
 func TestProcessConPTYInterrupt(t *testing.T) {
-	proc := startConPTYProcess(t, portableSleepCommand(30))
+	ping := filepath.Join(os.Getenv("SystemRoot"), "System32", "ping.exe")
+	proc := startConPTYProcess(t, ping+" -n 31 127.0.0.1")
+	banner := conPTYProcessReadUntilContains(t, proc, "Pinging", 10*time.Second)
 	if err := proc.Signal(context.Background(), ProcessSignalInterrupt); err != nil {
 		t.Fatalf("Signal(Interrupt): %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := proc.Wait(ctx); err != nil {
-		t.Fatalf("Wait after in-band interrupt did not return in time (Ctrl-C was not really delivered through the pseudo console's input stream): %v", err)
+		t.Fatalf("Wait after in-band interrupt did not return in time (Ctrl-C was not really delivered through the pseudo console's input stream): %v; "+
+			"this test process's ConsoleFlags = %#x (bit 0 set: CTRL+C is ignored here, and children inherit that); output before the interrupt: %q",
+			err, currentConsoleFlags(), banner)
 	}
+}
+
+// currentConsoleFlags is this process's RTL_USER_PROCESS_PARAMETERS
+// ConsoleFlags; bit 0 means CTRL+C is ignored (SetConsoleCtrlHandler(NULL,
+// TRUE), or started as the root of a new process group).
+func currentConsoleFlags() uint32 {
+	peb := windows.RtlGetCurrentPeb()
+	if peb == nil || peb.ProcessParameters == nil {
+		return 0
+	}
+	return peb.ProcessParameters.ConsoleFlags
 }
 
 // TestProcessConPTYOutputEOFNormalization proves Process.Stdout's Read
@@ -598,19 +631,22 @@ func TestConPTYPipeReadNormalizesBrokenPipeToEOF(t *testing.T) {
 	}
 }
 
-// TestConPTYTerminalWriteVEOFByteClosesInputIdempotently is a direct
-// unit-level proof of conPTYTerminal.Write's own contract (terminal_
-// windows.go, "The VEOF/EOF design decision"): an ordinary write is passed
-// through unchanged and really reaches the peer; an exact one-byte veofByte
-// write closes the retained input pipe write end instead of forwarding the
-// byte as data, observably (the peer's own read reports io.EOF afterward);
-// and repeating that exact write — or following it with a real Close() —
-// is safe, never a double-close panic/error. It never allocates a pseudo
-// console at all (console stays its zero value): this proves Write/Close's
-// own pipe-handling logic directly, mirroring
-// TestTerminalMasterReadNormalizesEIOToEOF's (process_pty_unix_test.go) own
+// TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput is a
+// direct unit-level proof of conPTYTerminal.Write's own contract
+// (terminal_windows.go, "The VEOF/EOF design decision"): an ordinary write is
+// passed through unchanged; an exact one-byte veofByte write puts the
+// console's own end-of-input sequence (conPTYEOFSequence, Ctrl-Z then Enter,
+// preceded by one Enter after an LF) on the input pipe and reports one byte
+// written; and it does NOT close the
+// input pipe — a second VEOF and an ordinary write after it both still reach
+// the peer, as on Unix, because closing the pipe hangs up the whole pseudo
+// console (the second Windows CI run's 0xC000013A). A longer buffer that
+// merely contains 0x04 is not translated. Only Close ends the input stream.
+// It never allocates a pseudo console (console stays its zero value), so it
+// proves Write/Close's own pipe handling directly, mirroring
+// TestTerminalMasterReadNormalizesEIOToEOF's (process_pty_unix_test.go)
 // "exercise the mechanism itself, not only transitively" precedent.
-func TestConPTYTerminalWriteVEOFByteClosesInputIdempotently(t *testing.T) {
+func TestConPTYTerminalWriteVEOFByteSendsConsoleEOFWithoutClosingInput(t *testing.T) {
 	var inRead, inWrite, outRead, outWrite windows.Handle
 	if err := windows.CreatePipe(&inRead, &inWrite, nil, 0); err != nil {
 		t.Fatalf("CreatePipe(input): %v", err)
@@ -631,29 +667,51 @@ func TestConPTYTerminalWriteVEOFByteClosesInputIdempotently(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = terminal.Close() })
 
+	expectPeer := func(want string) {
+		t.Helper()
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(inReader, got); err != nil || string(got) != want {
+			t.Fatalf("peer read = (%q, %v), want %q", got, err, want)
+		}
+	}
 	if n, err := terminal.Write([]byte("hi")); err != nil || n != 2 {
 		t.Fatalf("ordinary write = (%d, %v), want (2, nil)", n, err)
 	}
-	ordinary := make([]byte, 2)
-	if _, err := io.ReadFull(inReader, ordinary); err != nil || string(ordinary) != "hi" {
-		t.Fatalf("peer read of ordinary write = (%q, %v), want (\"hi\", nil)", ordinary, err)
+	expectPeer("hi")
+	for round := 1; round <= 2; round++ {
+		if n, err := terminal.Write([]byte{veofByte}); err != nil || n != 1 {
+			t.Fatalf("VEOF write %d = (%d, %v), want (1, nil)", round, n, err)
+		}
+		expectPeer(conPTYEOFSequence)
 	}
+	if n, err := terminal.Write([]byte("after\r")); err != nil || n != 6 {
+		t.Fatalf("write after VEOF = (%d, %v), want (6, nil): VEOF must not close the input pipe", n, err)
+	}
+	expectPeer("after\r")
+	// A Unix-style line end leaves LF last: VEOF then submits whatever the
+	// LF left in the console's line before the Ctrl-Z, so EOF still arrives.
+	for _, line := range []string{"unix\n", "crlf\r\n"} {
+		if _, err := terminal.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+		expectPeer(line)
+		if n, err := terminal.Write([]byte{veofByte}); err != nil || n != 1 {
+			t.Fatalf("VEOF after %q = (%d, %v), want (1, nil)", line, n, err)
+		}
+		expectPeer(conPTYEOFAfterLFSequence)
+	}
+	embedded := []byte{'a', veofByte, 'b'}
+	if n, err := terminal.Write(embedded); err != nil || n != len(embedded) {
+		t.Fatalf("embedded-0x04 write = (%d, %v), want (%d, nil)", n, err, len(embedded))
+	}
+	expectPeer(string(embedded))
 
-	n, err := terminal.Write([]byte{veofByte})
-	if err != nil || n != 1 {
-		t.Fatalf("first VEOF write = (%d, %v), want (1, nil)", n, err)
+	if err := terminal.Close(); err != nil {
+		t.Fatalf("Close = %v, want nil", err)
 	}
-	n, err = terminal.Write([]byte{veofByte})
-	if err != nil || n != 1 {
-		t.Fatalf("second VEOF write = (%d, %v), want (1, nil) — must be idempotent", n, err)
-	}
-
 	buf := make([]byte, 8)
 	if _, err := inReader.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("peer read after VEOF = %v, want io.EOF (the write end should really be closed)", err)
-	}
-	if err := terminal.Close(); err != nil {
-		t.Fatalf("Close after an earlier VEOF write = %v, want nil (input is already closed; Close must not double-close it)", err)
+		t.Fatalf("peer read after Close = %v, want io.EOF (Close, and only Close, ends the input stream)", err)
 	}
 }
 

@@ -248,7 +248,7 @@ func TestFacadeExportsTheConsumedSurface(t *testing.T) {
 	if result.ExitCode != 0 {
 		// %#x as well: a Windows child that dies during initialisation
 		// reports an NTSTATUS (0xC0000142 is STATUS_DLL_INIT_FAILED).
-		t.Fatalf("Process.Wait ExitCode = %d (%#x), want 0", result.ExitCode, uint32(result.ExitCode))
+		t.Fatalf("Process.Wait ExitCode = %d (%#x), want 0%s", result.ExitCode, uint32(result.ExitCode), windowsInitFailureHint(result.ExitCode))
 	}
 	var _ sandbox.ProcessResult = result
 	if err := proc.Close(context.Background()); err != nil {
@@ -359,3 +359,16 @@ func TestFacadeExportsTheConsumedSentinels(t *testing.T) {
 // TestFacadeInitIsCallable pins Init at the root import path, which is where
 // every consumer's main() calls it.
 func TestFacadeInitIsCallable(t *testing.T) { sandbox.Init() }
+
+// windowsInitFailureHint names the likely cause of a Windows child that died
+// in DLL initialisation (STATUS_DLL_INIT_FAILED, 0xC0000142) — the second
+// Windows CI run's restricted-tier failure — and is empty for any other
+// code. internal/windows' TestRestrictedTokenChildInitializationMatrix logs
+// the variants that tell the causes apart.
+func windowsInitFailureHint(code int) string {
+	if uint32(code) != 0xC0000142 {
+		return ""
+	}
+	return " (STATUS_DLL_INIT_FAILED: the child's DLL initialisation failed before it ran; under the restricted tier's WRITE_RESTRICTED token, " +
+		"usually the window station/desktop or its console host refusing the restricting SIDs' write check — see internal/windows' TestRestrictedTokenChildInitializationMatrix)"
+}

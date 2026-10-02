@@ -324,8 +324,12 @@ func TestProcessTreeLaunchFlagsGiveSandboxedPipeSpawnsAPrivateConsole(t *testing
 	if shared := pipeLaunchCreationFlags(base|winapi.CREATE_NO_WINDOW, false); shared&winapi.CREATE_NO_WINDOW != 0 || shared&base != base {
 		t.Fatalf("unconfined pipe flags = %#x", shared)
 	}
+	// A ConPTY launch keeps CREATE_SUSPENDED but drops CREATE_NEW_PROCESS_GROUP,
+	// whose root starts with CTRL+C disabled and would make the in-band ^C
+	// interrupt a no-op (conPTYLaunchCreationFlags).
 	conpty := conPTYLaunchCreationFlags(base | winapi.CREATE_NO_WINDOW)
-	if conpty&winapi.CREATE_NO_WINDOW != 0 || conpty&winapi.EXTENDED_STARTUPINFO_PRESENT == 0 || conpty&winapi.CREATE_UNICODE_ENVIRONMENT == 0 || conpty&base != base {
+	if conpty&winapi.CREATE_NO_WINDOW != 0 || conpty&winapi.CREATE_NEW_PROCESS_GROUP != 0 || conpty&winapi.CREATE_SUSPENDED == 0 ||
+		conpty&winapi.EXTENDED_STARTUPINFO_PRESENT == 0 || conpty&winapi.CREATE_UNICODE_ENVIRONMENT == 0 {
 		t.Fatalf("ConPTY flags = %#x", conpty)
 	}
 	for _, test := range []struct {

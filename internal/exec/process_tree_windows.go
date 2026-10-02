@@ -384,10 +384,11 @@ func (launch *conPTYLaunch) createSuspended() error {
 
 	// EXTENDED_STARTUPINFO_PRESENT is required for ProcThreadAttributeList to
 	// take effect at all; CREATE_UNICODE_ENVIRONMENT is required because
-	// envBlock above is UTF-16. cmd.SysProcAttr.CreationFlags already carries
-	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above),
-	// exactly like the plain path, preserving sendInterrupt's own
-	// CTRL_BREAK_EVENT targeting unchanged for a ConPTY-backed Process too.
+	// envBlock above is UTF-16. cmd.SysProcAttr.CreationFlags carries
+	// CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP (newProcessTree, above);
+	// conPTYLaunchCreationFlags keeps CREATE_SUSPENDED and drops the process
+	// group, which would disable the in-band ^C that is a ConPTY child's only
+	// interrupt (see its doc comment).
 	flags := conPTYLaunchCreationFlags(cmd.SysProcAttr.CreationFlags)
 	// StartupInfo.Flags carries STARTF_USESTDHANDLES with all three standard
 	// handles set to INVALID_HANDLE_VALUE. Without it, CreateProcess hands the
@@ -691,8 +692,21 @@ func pipeLaunchCreationFlags(base uint32, privateConsole bool) uint32 {
 // CREATE_NO_WINDOW is stripped because combined with
 // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE it would attach a hidden console of
 // its own instead, and the terminal would see none of the child's I/O.
+//
+// CREATE_NEW_PROCESS_GROUP (which newProcessTree sets for every spawn) is
+// stripped too. CreateProcess documents that the root of a new process group
+// starts with CTRL+C DISABLED — as if it had called
+// SetConsoleCtrlHandler(NULL, TRUE) — and that this is inherited by its
+// descendants. A ConPTY child's only interrupt is the in-band ^C
+// conPTYSignaler writes, which the console host turns into a CTRL_C_EVENT;
+// with the flag, every process on the pseudo console ignored that event and
+// the second Windows CI run's TestProcessConPTYInterrupt waited out its
+// whole timeout. The group exists only for the pipe-backed path's targeted
+// GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid), which can never reach a
+// pseudo console anyway (it reaches only the caller's own console), and the
+// child is the only client of its pseudo console, so no isolation is lost.
 func conPTYLaunchCreationFlags(base uint32) uint32 {
-	return (base &^ windows.CREATE_NO_WINDOW) | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
+	return (base &^ (windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP)) | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT
 }
 
 // errPrivateConsoleInterruptUnsupported is sendInterrupt's answer for a
