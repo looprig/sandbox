@@ -10,7 +10,6 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -23,12 +22,6 @@ import (
 	"github.com/looprig/sandbox/pkg/profile"
 	win "golang.org/x/sys/windows"
 )
-
-type restrictedPreparedLease struct {
-	sid     SID
-	journal *RestrictedJournal
-	release func() error
-}
 
 type restrictedCompileDependencies struct {
 	prepare              func(Config, *RestrictedRuntime, policy.Effective) (restrictedPreparedLease, error)
@@ -51,94 +44,6 @@ type restrictedBackend struct {
 	config  Config
 	runtime *RestrictedRuntime
 	deps    restrictedCompileDependencies
-}
-
-// restrictedGrantAuthority is one executor's base lease, carried on that
-// executor's compiled spec as enforce.Spec.GrantAuthority. The executor
-// returns it to this backend unchanged with every grant compile, so a grant
-// always borrows the SID, journal and ACL projections of the lease it was
-// issued under — never another executor's.
-//
-// Borrows keep the lease alive: a transient grant spec's token still names
-// the base SID and relies on the base projections, so releasing the base
-// spec while a grant spec is outstanding only marks the authority retiring;
-// the lease itself is released by whichever of the two lets go last, exactly
-// once. A retiring authority lends nothing new.
-type restrictedGrantAuthority struct {
-	mu       sync.Mutex
-	base     policy.Effective
-	sid      SID
-	journal  *RestrictedJournal
-	release  func() error
-	borrows  int
-	retiring bool
-	released bool
-
-	releaseErr error
-}
-
-func newRestrictedGrantAuthority(base policy.Effective, lease restrictedPreparedLease) *restrictedGrantAuthority {
-	return &restrictedGrantAuthority{base: policy.Clone(base), sid: lease.sid, journal: lease.journal, release: lease.release}
-}
-
-// borrow lends the base lease to one grant compile. base must be the policy
-// the authority was compiled from (compared on normalised clones, as the
-// elevated tier's authority does), which refuses an authority presented on
-// behalf of a different executor.
-func (authority *restrictedGrantAuthority) borrow(base policy.Effective) (SID, *RestrictedJournal, func() error, error) {
-	if authority == nil {
-		return SID{}, nil, nil, errors.New("sandbox: restricted base lease is unavailable")
-	}
-	authority.mu.Lock()
-	defer authority.mu.Unlock()
-	if authority.retiring || authority.released || authority.journal == nil {
-		return SID{}, nil, nil, errors.New("sandbox: restricted base lease is unavailable: it is released or retiring")
-	}
-	if !reflect.DeepEqual(authority.base, policy.Clone(base)) {
-		return SID{}, nil, nil, errors.New("sandbox: restricted base lease belongs to another executor")
-	}
-	authority.borrows++
-	var once sync.Once
-	var releaseErr error
-	giveBack := func() error {
-		once.Do(func() {
-			authority.mu.Lock()
-			authority.borrows--
-			releaseErr = authority.releaseIfIdleLocked()
-			authority.mu.Unlock()
-		})
-		return releaseErr
-	}
-	return authority.sid, authority.journal, giveBack, nil
-}
-
-// retire is the base spec's Release: idempotent, and it releases the lease
-// now only when no grant spec still borrows it.
-func (authority *restrictedGrantAuthority) retire() error {
-	if authority == nil {
-		return nil
-	}
-	authority.mu.Lock()
-	defer authority.mu.Unlock()
-	authority.retiring = true
-	return authority.releaseIfIdleLocked()
-}
-
-// releaseIfIdleLocked releases the lease once it is retiring and unborrowed,
-// exactly once, and reports that one release's result to every later caller
-// that reaches it. The lease release runs under mu so a concurrent borrow can
-// never observe a half-released lease.
-func (authority *restrictedGrantAuthority) releaseIfIdleLocked() error {
-	if !authority.retiring || authority.borrows != 0 {
-		return nil
-	}
-	if !authority.released {
-		authority.released = true
-		if authority.release != nil {
-			authority.releaseErr = authority.release()
-		}
-	}
-	return authority.releaseErr
 }
 
 // autoBackend prefers the installed tier. It falls back only when that tier is
@@ -417,7 +322,9 @@ func validateRestrictedGrantClassesWithoutReopen(p policy.Effective) error {
 
 func restrictedCompileReport(p policy.Effective) profile.CompileReport {
 	entries := []profile.ReportEntry{
-		{Feature: "windows.token", Status: "Narrowed", Detail: "restricted-token defense in depth; no end-to-end boundary claimed"},
+		{Feature: "windows.token", Status: "Narrowed", Detail: "restricted-token defense in depth; no end-to-end boundary claimed. " +
+			"Restricting SIDs: the executor, its grants, and the session logon SID for window-station/desktop access (WRITE_RESTRICTED, so they gate writes only; " +
+			"the logon SID also passes writes to whatever the logon session's objects grant it)"},
 		{Feature: "windows.filesystem.write", Status: "Narrowed", Detail: "restricting SID ACL projection; a same-user COM/WMI broker can write outside it, and WRITE_RESTRICTED does not restrict an owner's DELETE, WRITE_DAC or WRITE_OWNER. " +
 			"No-delete-sharing handles are retained only on the projected roots, write-denied carveouts and their ancestor directories; every other workspace file stays renameable and deletable for the lease, and an object the user moves out of a root keeps its inherited allow for this lease's one-shot SID (inert after the lease: that SID is never reissued)"},
 		{Feature: "windows.job", Status: "Narrowed", Detail: "direct process tree only; a same-user COM/WMI broker can start a process outside the Job. " +

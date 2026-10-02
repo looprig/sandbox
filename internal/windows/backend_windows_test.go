@@ -225,8 +225,20 @@ func TestRestrictedGrantCompileReusesBaseLeaseAndTransientReleaseKeepsItActive(t
 	if baseReleases != 0 {
 		t.Fatalf("transient release released the base lease: releases=%d", baseReleases)
 	}
-	if _, _, _, _, err := backend.CompileWithGrantAuthority(baseSpec.GrantAuthority, policy.Effective{}, policy.Effective{}, nil); err != nil {
+	// The probe grant spec borrows the base lease like any other grant, so it
+	// must be released before the base: an outstanding borrow keeps the lease
+	// alive past the base Release by contract (restricted_authority.go), which
+	// is what the second Windows CI run's "base releases = 0, want 1" was
+	// observing when this probe was dropped unreleased.
+	probe, _, _, _, err := backend.CompileWithGrantAuthority(baseSpec.GrantAuthority, policy.Effective{}, policy.Effective{}, nil)
+	if err != nil {
 		t.Fatalf("base authority unusable after a transient release: %v", err)
+	}
+	if err := probe.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if baseReleases != 0 {
+		t.Fatalf("probe grant release released the base lease: releases=%d", baseReleases)
 	}
 	if err := baseSpec.Release(); err != nil {
 		t.Fatal(err)
@@ -318,8 +330,16 @@ func TestRestrictedBackendLeasesArePerExecutor(t *testing.T) {
 	if releases[first] != 1 || releases[second] != 0 {
 		t.Fatalf("releases after first executor closed = %v, want only the first lease released", releases)
 	}
-	if _, _, _, _, err := backend.CompileWithGrantAuthority(secondSpec.GrantAuthority, basePolicy(`C:\two`), basePolicy(`C:\two`), nil); err != nil {
+	// Released before the second base, for the reason given in
+	// TestRestrictedGrantCompileReusesBaseLeaseAndTransientReleaseKeepsItActive:
+	// an unreleased probe's borrow would (correctly) keep the second lease
+	// alive past secondSpec.Release.
+	probe, _, _, _, err := backend.CompileWithGrantAuthority(secondSpec.GrantAuthority, basePolicy(`C:\two`), basePolicy(`C:\two`), nil)
+	if err != nil {
 		t.Fatalf("second executor's authority after the first released: %v", err)
+	}
+	if err := probe.Release(); err != nil {
+		t.Fatal(err)
 	}
 	if err := secondSpec.Release(); err != nil {
 		t.Fatal(err)

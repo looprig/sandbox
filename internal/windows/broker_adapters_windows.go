@@ -1166,7 +1166,9 @@ func createBrokerRestrictedTokenWith(creator restrictedTokenCreator, source win.
 	if err != nil {
 		return 0, err
 	}
-	if err := validateRestrictedToken(token, tokenRestrictionFull, integrity, disabled, privileges, parsed); err != nil {
+	// No logon SID: the elevated tier's account runs on its own private
+	// desktop (design §9.2), whose DACL names its own trustees.
+	if err := validateRestrictedToken(token, tokenRestrictionFull, integrity, disabled, privileges, parsed, nil); err != nil {
 		_ = token.Close()
 		return 0, err
 	}

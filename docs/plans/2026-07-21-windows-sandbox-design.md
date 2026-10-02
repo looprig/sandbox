@@ -502,7 +502,20 @@ dangerous groups, and calls `CreateRestrictedToken` with:
 - `DISABLE_MAX_PRIVILEGE`;
 - `LUA_TOKEN`;
 - `WRITE_RESTRICTED`; and
-- the executor and grant capability SIDs as restricting SIDs.
+- the executor and grant capability SIDs, plus the session's logon SID
+  (`S-1-5-5-X-Y`), as restricting SIDs.
+
+The logon SID is there because every console client connects to its window
+station and desktop for write-class rights (`DESKTOP_CREATEWINDOW` and the
+like) during DLL initialisation, and the interactive `WinSta0\Default` DACL
+grants those to the logon SID and to none of this module's trustees: without
+it the restricted check refuses and the child dies with
+`STATUS_DLL_INIT_FAILED` (0xC0000142) before running. Under `WRITE_RESTRICTED`
+it widens only writes, and only to objects whose DACL names the logon SID
+(the session's window station, desktop and per-session objects; a token's
+default DACL gives it read/execute only). It is taken from the source token,
+never treated as a module trustee or an ACL-projection trustee, and a source
+token without exactly one logon SID (a service session) fails closed.
 
 The backend does not lower integrity because doing so would require invasive
 low-integrity labels on normal workspaces. It denies raw-device and dangerous

@@ -61,7 +61,7 @@ func TestCreateRestrictedTokenShape(t *testing.T) {
 	}
 	assertTokenType(t, token, xwindows.TokenPrimary)
 	assertIntegrityUnchanged(t, source, token)
-	assertOnlyRestrictingSIDs(t, token, executorSID, grantSID)
+	assertOnlyRestrictingSIDs(t, token, executorSID, grantSID, mustSourceLogonSID(t, source))
 	assertSIDsNotNormalGroups(t, token, executorSID, grantSID)
 	assertDangerousGroupsDisabled(t, source, token)
 	assertSafeRuntimeGroupPreserved(t, source, token)
@@ -136,6 +136,14 @@ func TestTierConstructorsPassTheirOwnRestrictionFlags(t *testing.T) {
 	if restricted.calls != 1 || restricted.flags != disableMaxPrivilege|luaToken|writeRestricted {
 		t.Fatalf("restricted-tier flags = %#x (calls %d), want DISABLE_MAX_PRIVILEGE|LUA_TOKEN|WRITE_RESTRICTED", restricted.flags, restricted.calls)
 	}
+	// The restricted tier's list is the executor followed by the source's
+	// logon SID, which appears exactly once (window-station/desktop access,
+	// see tokenLogonSID); the broker's list never carries it.
+	logon := mustSourceLogonSID(t, source)
+	executorSID := mustTestSID(t, executor.String())
+	if len(restricted.restricting) != 2 || !xwindows.EqualSid(restricted.restricting[0].Sid, executorSID) || countSID(restricted.restricting, logon) != 1 {
+		t.Fatalf("restricted-tier restricting SIDs = %v, want [%s %s] with the logon SID exactly once", sidList(restricted.restricting), executorSID, logon)
+	}
 
 	broker := &recordingRestrictedTokenCreator{err: injected}
 	if token, err := createBrokerRestrictedTokenWith(broker, source, []SID{restrictedCodeSID(), installation, executor}); !errors.Is(err, injected) || token != 0 {
@@ -147,6 +155,120 @@ func TestTierConstructorsPassTheirOwnRestrictionFlags(t *testing.T) {
 	if broker.flags&writeRestricted != 0 {
 		t.Fatal("elevated broker token requested WRITE_RESTRICTED")
 	}
+	if len(broker.restricting) != 3 || countSID(broker.restricting, logon) != 0 {
+		t.Fatalf("broker restricting SIDs = %v, want its three trustees and no logon SID", sidList(broker.restricting))
+	}
+}
+
+// TestRestrictedTokenValidatorRequiresTheLogonSID drives the read-back
+// validator against two real tokens issued from this process's token: one
+// whose restricting list omits the logon SID (refused: the restricted tier's
+// children could not open their desktop) and one that carries it (accepted).
+func TestRestrictedTokenValidatorRequiresTheLogonSID(t *testing.T) {
+	var source xwindows.Token
+	if err := xwindows.OpenProcessToken(xwindows.CurrentProcess(), xwindows.TOKEN_DUPLICATE|xwindows.TOKEN_QUERY, &source); err != nil {
+		t.Fatalf("open process token: %v", err)
+	}
+	defer source.Close()
+	if restricted, err := source.IsRestricted(); err != nil || restricted {
+		t.Fatalf("token prerequisite unavailable: current process token restricted=%v err=%v", restricted, err)
+	}
+	executor, err := ExecutorSID("logon-validator-installation", "logon-validator-executor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executorSID := mustTestSID(t, executor.String())
+	logon := mustSourceLogonSID(t, source)
+	integrity, err := tokenIntegritySID(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privileges, err := tokenPrivilegeList(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name        string
+		restricting []xwindows.SIDAndAttributes
+		wantErr     string
+	}{
+		{"without logon SID", []xwindows.SIDAndAttributes{{Sid: executorSID}}, "restricting SID count is 1, want 2"},
+		{"with logon SID", []xwindows.SIDAndAttributes{{Sid: executorSID}, {Sid: logon}}, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			token, err := issueRestrictedToken(win32RestrictedTokenCreator{}, source, tokenRestrictionWriteOnly, nil, test.restricting)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer token.Close()
+			err = validateRestrictedToken(token, tokenRestrictionWriteOnly, integrity, nil, privileges, []*xwindows.SID{executorSID}, logon)
+			switch {
+			case test.wantErr == "" && err != nil:
+				t.Fatalf("validator refused a token carrying the logon SID: %v", err)
+			case test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)):
+				t.Fatalf("validator = %v, want an error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestTokenLogonSIDSelectsExactlyOneLogonGroup(t *testing.T) {
+	logon := mustTestSID(t, "S-1-5-5-0-123456")
+	other := mustTestSID(t, "S-1-5-5-0-654321")
+	users := mustTestSID(t, "S-1-5-32-545")
+	logonAttributes := uint32(xwindows.SE_GROUP_LOGON_ID | xwindows.SE_GROUP_ENABLED | xwindows.SE_GROUP_MANDATORY)
+	got, err := tokenLogonSID([]xwindows.SIDAndAttributes{{Sid: users, Attributes: xwindows.SE_GROUP_ENABLED}, {Sid: logon, Attributes: logonAttributes}})
+	if err != nil || !xwindows.EqualSid(got, logon) {
+		t.Fatalf("tokenLogonSID = %v, %v; want %s", got, err, logon)
+	}
+	for _, test := range []struct {
+		name   string
+		groups []xwindows.SIDAndAttributes
+	}{
+		{"none", []xwindows.SIDAndAttributes{{Sid: users, Attributes: xwindows.SE_GROUP_ENABLED}}},
+		// S-1-5-5-X-Y text without the attribute is not the token's logon group.
+		{"logon-shaped but unmarked", []xwindows.SIDAndAttributes{{Sid: logon, Attributes: xwindows.SE_GROUP_ENABLED}}},
+		{"two", []xwindows.SIDAndAttributes{{Sid: logon, Attributes: logonAttributes}, {Sid: other, Attributes: logonAttributes}}},
+		{"marked but not S-1-5-5", []xwindows.SIDAndAttributes{{Sid: users, Attributes: logonAttributes}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := tokenLogonSID(test.groups); err == nil {
+				t.Fatalf("tokenLogonSID accepted %s: %s", test.name, got)
+			}
+		})
+	}
+}
+
+// mustSourceLogonSID is source's logon SID, as tokenLogonSID reads it.
+func mustSourceLogonSID(t *testing.T, source xwindows.Token) *xwindows.SID {
+	t.Helper()
+	groups, err := source.GetTokenGroups()
+	if err != nil {
+		t.Fatalf("read source groups: %v", err)
+	}
+	logon, err := tokenLogonSID(groups.AllGroups())
+	if err != nil {
+		t.Fatalf("source logon SID: %v", err)
+	}
+	return logon
+}
+
+func countSID(groups []xwindows.SIDAndAttributes, sid *xwindows.SID) int {
+	count := 0
+	for _, group := range groups {
+		if xwindows.EqualSid(group.Sid, sid) {
+			count++
+		}
+	}
+	return count
+}
+
+func sidList(groups []xwindows.SIDAndAttributes) []string {
+	list := make([]string, 0, len(groups))
+	for _, group := range groups {
+		list = append(list, group.Sid.String())
+	}
+	return list
 }
 
 // TestRestrictionContractReadBackAndValidators runs on any Windows host: both
@@ -266,7 +388,7 @@ func TestModuleTrusteeMatchesWindowsDerivation(t *testing.T) {
 		t.Fatalf("create token with Windows-derived module trustee: %v", err)
 	}
 	defer token.Close()
-	assertOnlyRestrictingSIDs(t, token, groupSID)
+	assertOnlyRestrictingSIDs(t, token, groupSID, mustSourceLogonSID(t, source))
 }
 
 func TestRestrictingSIDCollisionChecksIncludeTokenUser(t *testing.T) {

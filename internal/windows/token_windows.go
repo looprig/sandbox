@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	xwindows "golang.org/x/sys/windows"
@@ -43,6 +44,13 @@ type win32RestrictedTokenCreator struct{}
 // this is the restricted tier's token, never the elevated broker's). The
 // token's integrity level is deliberately preserved. Source must grant
 // TOKEN_DUPLICATE and TOKEN_QUERY.
+//
+// The restricting list Windows receives is restrictingSIDs plus ONE further
+// SID this function adds itself: source's own logon SID (S-1-5-5-X-Y, see
+// tokenLogonSID). restrictingSIDs stay module trustees only — the logon SID
+// never passes through parseRestrictingSIDs, the SID type, the trustee
+// collision checks or any ACL projection — so it can never become an ACE
+// trustee or be counted as a projection SID.
 func CreateRestrictedToken(source xwindows.Token, restrictingSIDs []SID) (xwindows.Token, error) {
 	return createRestrictedTokenWith(win32RestrictedTokenCreator{}, source, restrictingSIDs)
 }
@@ -92,6 +100,10 @@ func createRestrictedTokenWith(creator restrictedTokenCreator, source xwindows.T
 	if err := ensureRestrictingSIDsAreNew(sourceUser.User.Sid, sourceGroups.AllGroups(), parsedRestrictingSIDs); err != nil {
 		return 0, err
 	}
+	logonSID, err := tokenLogonSID(sourceGroups.AllGroups())
+	if err != nil {
+		return 0, err
+	}
 
 	dangerousSIDs, err := dangerousGroupSIDs()
 	if err != nil {
@@ -103,10 +115,11 @@ func createRestrictedTokenWith(creator restrictedTokenCreator, source xwindows.T
 			disabledGroups = append(disabledGroups, xwindows.SIDAndAttributes{Sid: sid})
 		}
 	}
-	restrictingGroups := make([]xwindows.SIDAndAttributes, len(parsedRestrictingSIDs))
-	for index, sid := range parsedRestrictingSIDs {
-		restrictingGroups[index] = xwindows.SIDAndAttributes{Sid: sid}
+	restrictingGroups := make([]xwindows.SIDAndAttributes, 0, len(parsedRestrictingSIDs)+1)
+	for _, sid := range parsedRestrictingSIDs {
+		restrictingGroups = append(restrictingGroups, xwindows.SIDAndAttributes{Sid: sid})
 	}
+	restrictingGroups = append(restrictingGroups, xwindows.SIDAndAttributes{Sid: logonSID})
 
 	token, err := issueRestrictedToken(creator, source, tokenRestrictionWriteOnly, disabledGroups, restrictingGroups)
 	runtime.KeepAlive(sourceGroups)
@@ -114,7 +127,7 @@ func createRestrictedTokenWith(creator restrictedTokenCreator, source xwindows.T
 	if err != nil {
 		return 0, err
 	}
-	if err := validateRestrictedToken(token, tokenRestrictionWriteOnly, sourceIntegrity, disabledGroups, sourcePrivileges, parsedRestrictingSIDs); err != nil {
+	if err := validateRestrictedToken(token, tokenRestrictionWriteOnly, sourceIntegrity, disabledGroups, sourcePrivileges, parsedRestrictingSIDs, logonSID); err != nil {
 		token.Close()
 		return 0, err
 	}
@@ -223,6 +236,67 @@ func ensureRestrictingSIDsAreNew(user *xwindows.SID, groups []xwindows.SIDAndAtt
 	return nil
 }
 
+// logonSIDPrefix is the authority and first sub-authority every logon SID
+// carries: SECURITY_NT_AUTHORITY (5), SECURITY_LOGON_IDS_RID (5), followed by
+// the two halves of the logon session's identifier.
+const logonSIDPrefix = "S-1-5-5-"
+
+// tokenLogonSID returns a copy of the one logon SID among groups: the group
+// whose attributes carry SE_GROUP_LOGON_ID, which must read S-1-5-5-X-Y.
+//
+// Why the restricted tier's token needs it. A WRITE_RESTRICTED token passes a
+// write-class access check only if BOTH the normal check and a second check
+// over the restricting SIDs alone grant it. Every console client's
+// initialisation connects to its window station and desktop (user32's, and
+// the console host's that Windows starts for a child with no console it can
+// share — the restricted tier's pipe-backed CREATE_NO_WINDOW spawn) and asks
+// for write-class rights such as DESKTOP_CREATEWINDOW. The interactive
+// session's WinSta0 and its Default desktop grant those rights to the logon
+// SID, and to almost nothing else; they never grant this module's
+// executor/grant trustees. With only those trustees in the restricting list,
+// the second check refuses, the client's DLL initialisation fails, and the
+// child dies with STATUS_DLL_INIT_FAILED (0xC0000142) before its first
+// instruction — the second Windows CI run's facade and policy-enforcement
+// failures. Chromium's restricted tokens add the logon SID for the same
+// reason.
+//
+// What it widens. The logon SID gates writes only (WRITE_RESTRICTED), so the
+// child additionally passes the restricted write check exactly where an
+// object's DACL grants the logon SID a write-class right: the logon
+// session's own window station and desktop, and per-session objects created
+// for it. A token's default DACL grants the logon SID only GENERIC_READ |
+// GENERIC_EXECUTE, so the processes, pipes and other objects the user's own
+// programs create are not among them, and files almost never name a logon
+// SID. Workspace writes remain governed by the executor/grant ACL projection.
+//
+// A token with no logon SID — a service or batch session that was given
+// none — fails closed: such a session has no interactive window station the
+// SID could open, and guessing another restricting SID instead would widen
+// writes without a reason. More than one is refused as ambiguous.
+func tokenLogonSID(groups []xwindows.SIDAndAttributes) (*xwindows.SID, error) {
+	var found *xwindows.SID
+	for _, group := range groups {
+		if group.Attributes&xwindows.SE_GROUP_LOGON_ID != xwindows.SE_GROUP_LOGON_ID {
+			continue
+		}
+		if group.Sid == nil || !group.Sid.IsValid() || !strings.HasPrefix(group.Sid.String(), logonSIDPrefix) {
+			return nil, fmt.Errorf("windows sandbox: source token's SE_GROUP_LOGON_ID group %v is not a logon SID (%sX-Y)", group.Sid, logonSIDPrefix)
+		}
+		if found != nil {
+			return nil, fmt.Errorf("windows sandbox: source token carries more than one logon SID (%s and %s); the restricted tier needs exactly one for window-station/desktop access", found, group.Sid)
+		}
+		copied, err := group.Sid.Copy()
+		if err != nil {
+			return nil, fmt.Errorf("windows sandbox: copy source logon SID: %w", err)
+		}
+		found = copied
+	}
+	if found == nil {
+		return nil, errors.New("windows sandbox: source token carries no logon SID (S-1-5-5-X-Y); the restricted tier adds it to the restricting SIDs so its children can open the session's window station and desktop, and a session without one (a service or batch logon) cannot run restricted-tier children")
+	}
+	return found, nil
+}
+
 // ensureModuleTrusteesAbsentFromCurrentToken prevents ACL projection from
 // granting authority to a principal already carried by the host token. It must
 // run before any ACE is applied; CreateRestrictedToken repeats the check at
@@ -248,7 +322,13 @@ func ensureModuleTrusteesAbsentFromCurrentToken(sids []SID) error {
 	return ensureRestrictingSIDsAreNew(user.User.Sid, groups.AllGroups(), parsed)
 }
 
-func validateRestrictedToken(token xwindows.Token, restriction tokenRestriction, sourceIntegrity *xwindows.SID, disabledGroups []xwindows.SIDAndAttributes, sourcePrivileges []xwindows.LUIDAndAttributes, restrictingSIDs []*xwindows.SID) error {
+// validateRestrictedToken reads the issued token back. restrictingSIDs are
+// the module trustees, which must be restricting SIDs and never normal
+// groups; logonSID, when non-nil (the restricted tier only), is the source's
+// logon SID, which must also be a restricting SID — and is, by construction,
+// a normal group too, which is why it is checked apart from the trustees.
+// The restricting list must hold exactly these and nothing else.
+func validateRestrictedToken(token xwindows.Token, restriction tokenRestriction, sourceIntegrity *xwindows.SID, disabledGroups []xwindows.SIDAndAttributes, sourcePrivileges []xwindows.LUIDAndAttributes, restrictingSIDs []*xwindows.SID, logonSID *xwindows.SID) error {
 	restricted, err := token.IsRestricted()
 	if err != nil {
 		return fmt.Errorf("windows sandbox: read restricted-token status: %w", err)
@@ -280,13 +360,20 @@ func validateRestrictedToken(token xwindows.Token, restriction tokenRestriction,
 	}
 	defer runtime.KeepAlive(restrictedGroupInfo.buffer)
 	restrictedGroups := restrictedGroupInfo.groups
-	if len(restrictedGroups) != len(restrictingSIDs) {
-		return fmt.Errorf("windows sandbox: restricting SID count is %d, want %d", len(restrictedGroups), len(restrictingSIDs))
+	want := len(restrictingSIDs)
+	if logonSID != nil {
+		want++
+	}
+	if len(restrictedGroups) != want {
+		return fmt.Errorf("windows sandbox: restricting SID count is %d, want %d (%d module trustees, logon SID expected %t)", len(restrictedGroups), want, len(restrictingSIDs), logonSID != nil)
 	}
 	for _, sid := range restrictingSIDs {
 		if !sidInGroups(restrictedGroups, sid) {
 			return fmt.Errorf("windows sandbox: restricting SID %s is absent from result", sid)
 		}
+	}
+	if logonSID != nil && !sidInGroups(restrictedGroups, logonSID) {
+		return fmt.Errorf("windows sandbox: logon SID %s is absent from the restricting SIDs", logonSID)
 	}
 	normalGroups, err := token.GetTokenGroups()
 	if err != nil {
