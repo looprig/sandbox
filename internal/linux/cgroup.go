@@ -498,6 +498,77 @@ func lifetimeCgroupPlan(ancestor string, limits policy.Limits) CompiledCgroup {
 	return cg
 }
 
+// cgroupHierarchyRoot is where the cgroup v2 (or hybrid) hierarchy is mounted
+// on every distribution this backend supports.
+const cgroupHierarchyRoot = "/sys/fs/cgroup"
+
+// cgroupWriteCarveouts returns the cgroup paths whose write access must be
+// withheld from the target's Landlock ruleset (review M13): the cgroup
+// hierarchy root, plus the delegated Ancestor when it lies outside it, for
+// each one that exists AND that the policy would otherwise let the target
+// write — in practice only a HostWrite-Allow policy, whose write rule on "/"
+// reaches cgroupfs.
+//
+// Without it a supervised Rung-2 target could write its own pid into the
+// delegated Ancestor's (or any writable ancestor's) cgroup.procs, leaving the
+// lifetime scope whose cgroup.kill + empty cgroup.procs read is the
+// LifetimeContainment=Enforced proof; or raise its own scope's pids.max and
+// memory.max, undoing the resource limits. The kernel's own delegation model
+// does not stop either: the scope's files are owned by the invoking uid.
+// CLONE_NEWCGROUP would (a write to a non-delegatable file of a cgroup
+// namespace's root is EPERM, and migration is bounded by the namespace root),
+// but creating a cgroup namespace needs CAP_SYS_ADMIN in the caller's user
+// namespace — exactly what Rung 2 runs without — so it is not used.
+func cgroupWriteCarveouts(entries []policy.FSEntry, ancestor string) []string {
+	candidates := []string{cgroupHierarchyRoot}
+	if ancestor != "" && ancestor != cgroupHierarchyRoot && !policy.PathUnder(cgroupHierarchyRoot, ancestor) {
+		candidates = append(candidates, filepath.Clean(ancestor))
+	}
+	var out []string
+	for _, path := range candidates {
+		if policy.ResolveFS(entries, path)&policy.WriteAccess == 0 {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+// appendCgroupWriteCarveouts adds a write-only deny per carveout to a COPY of
+// entries. A write deny beneath a covering write allow compiles exactly like
+// the .git/.looprig carveouts: Landlock enumerates the siblings at each
+// ancestor and grants the carveout itself only the allow's read/execute, so
+// every cgroupfs file — cgroup.procs, pids.max, memory.max, cgroup.kill — is
+// write-refused (EACCES) in the target. The input slice is never mutated.
+func appendCgroupWriteCarveouts(entries []policy.FSEntry, carveouts []string) []policy.FSEntry {
+	if len(carveouts) == 0 {
+		return entries
+	}
+	out := append([]policy.FSEntry(nil), entries...)
+	for _, path := range carveouts {
+		out = append(out, policy.FSEntry{Path: path, Denied: policy.WriteAccess})
+	}
+	return out
+}
+
+// cgroupCarveoutReport records each applied cgroup write carveout (review
+// M13). Nothing is reported when the policy never granted write there.
+func cgroupCarveoutReport(carveouts []string) []profile.ReportEntry {
+	if len(carveouts) == 0 {
+		return nil
+	}
+	return []profile.ReportEntry{{
+		Feature: "cgroup-write-carveout",
+		Status:  "Enforced",
+		Detail: "the policy grants write on the cgroup hierarchy (" + strings.Join(carveouts, ", ") + "), so Landlock withholds write there: " +
+			"the target cannot move itself out of its transient or lifetime scope through an ancestor's cgroup.procs, nor raise its own pids.max/memory.max; " +
+			"write beneath the covering allow is enumerated around it at spawn (snapshot semantics, §7.5)",
+	}}
+}
+
 // FormatCPUMax renders a MaxCPUPct as a cgroup v2 cpu.max value ("<quota>
 // <period>", microseconds). 100% ⇒ one full core (quota == period); values above
 // 100 permit more than one core's worth on a multi-core host.
