@@ -4,6 +4,7 @@ package windows
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -56,4 +57,36 @@ type staticOfflineSIDSource struct {
 
 func (s staticOfflineSIDSource) OfflineAccountSID(context.Context, validatedSetup, setupManifest) (string, bool, error) {
 	return s.sid, s.found, nil
+}
+
+func TestBrokerLeaseRecoveryInspectorReportsQuarantineFromRunningBroker(t *testing.T) {
+	manifest := setupManifest{InstallationID: "installation", HostPath: `C:\ProgramData\Looprig\slots\1\sandbox-host.exe`}
+	running := staticSetupInspector{readiness: setupDependencyReadiness{service: true, accounts: true}}
+	probed := 0
+	probe := func(pending bool, err error) func(context.Context, setupManifest) (bool, error) {
+		return func(_ context.Context, got setupManifest) (bool, error) {
+			probed++
+			if got.InstallationID != manifest.InstallationID {
+				t.Fatalf("probe manifest = %#v", got)
+			}
+			return pending, err
+		}
+	}
+	readiness, err := (brokerLeaseRecoverySetupInspector{base: running, probe: probe(true, nil)}).Inspect(context.Background(), validatedSetup{}, manifest)
+	if err != nil || !readiness.leaseRecovery || !readiness.service || !readiness.accounts {
+		t.Fatalf("quarantine readiness = %#v, %v", readiness, err)
+	}
+	readiness, err = (brokerLeaseRecoverySetupInspector{base: running, probe: probe(false, nil)}).Inspect(context.Background(), validatedSetup{}, manifest)
+	if err != nil || readiness.leaseRecovery {
+		t.Fatalf("healthy broker readiness = %#v, %v", readiness, err)
+	}
+	readiness, err = (brokerLeaseRecoverySetupInspector{base: running, probe: probe(true, errors.New("pipe busy"))}).Inspect(context.Background(), validatedSetup{}, manifest)
+	if err != nil || readiness.leaseRecovery || !readiness.service {
+		t.Fatalf("probe failure readiness = %#v, %v", readiness, err)
+	}
+	stopped := staticSetupInspector{readiness: setupDependencyReadiness{accounts: true}}
+	before := probed
+	if _, err := (brokerLeaseRecoverySetupInspector{base: stopped, probe: probe(true, nil)}).Inspect(context.Background(), validatedSetup{}, manifest); err != nil || probed != before {
+		t.Fatalf("stopped service was probed (%d -> %d): %v", before, probed, err)
+	}
 }

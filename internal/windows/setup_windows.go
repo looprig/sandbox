@@ -47,12 +47,60 @@ func PlatformBackend(config Config, runtime *RestrictedRuntime) (enforce.Backend
 }
 
 func Inspect(ctx context.Context, config SetupConfig) (SetupStatus, error) {
-	return inspectSetup(ctx, config, productionSetupDependencyInspector())
+	return inspectSetup(ctx, config, brokerLeaseRecoverySetupInspector{
+		base: productionSetupDependencyInspector(), probe: probeInstalledBrokerLeaseRecovery,
+	})
 }
 
 type setupDependencyReadiness struct {
 	service, accounts, credentials, firewallEffective, firewallUnchanged, runtimeBaseline bool
-	portPID                                                                               map[uint16]uint32
+	// leaseRecovery: the running broker reports a quarantined ACL lease.
+	leaseRecovery bool
+	portPID       map[uint16]uint32
+}
+
+// brokerLeaseRecoverySetupInspector decorates the installed-state inspector
+// with the one fact only the running broker knows: whether it retains a lease
+// it could not roll back (design §13). It asks only a service the base
+// inspector already found running. A probe failure is not turned into a
+// setup problem here: the broker refuses new work itself while quarantined,
+// and service health is the base inspector's fact to report.
+type brokerLeaseRecoverySetupInspector struct {
+	base  setupDependencyInspector
+	probe func(context.Context, setupManifest) (bool, error)
+}
+
+func (i brokerLeaseRecoverySetupInspector) Inspect(ctx context.Context, setup validatedSetup, manifest setupManifest) (setupDependencyReadiness, error) {
+	if i.base == nil || i.probe == nil {
+		return setupDependencyReadiness{}, errors.New("sandbox: incomplete Windows broker lease inspector")
+	}
+	readiness, err := i.base.Inspect(ctx, setup, manifest)
+	if err != nil || !readiness.service {
+		return readiness, err
+	}
+	if pending, probeErr := i.probe(ctx, manifest); probeErr == nil {
+		readiness.leaseRecovery = pending
+	}
+	return readiness, nil
+}
+
+// probeInstalledBrokerLeaseRecovery asks the authenticated installed broker
+// for its status; a recovery-pending result is the quarantine signal.
+func probeInstalledBrokerLeaseRecovery(ctx context.Context, manifest setupManifest) (bool, error) {
+	pipe, err := installedBrokerPipeName(manifest.InstallationID)
+	if err != nil {
+		return false, err
+	}
+	client, transport, err := connectAuthenticatedBrokerClient(ctx, pipe, filepath.Clean(manifest.HostPath))
+	if err != nil {
+		return false, err
+	}
+	defer transport.Close()
+	_, err = client.Status()
+	if errors.Is(err, errBrokerLeaseRecoveryPending) {
+		return true, nil
+	}
+	return false, err
 }
 
 type setupDependencyInspector interface {
@@ -217,6 +265,7 @@ func inspectSetup(ctx context.Context, config SetupConfig, dependencies setupDep
 			facts.FirewallUnchanged = readiness.firewallUnchanged
 			facts.PortPID = readiness.portPID
 			facts.RuntimeBaselineReady = readiness.runtimeBaseline
+			facts.LeaseRecovery = readiness.leaseRecovery
 		}
 	}
 	select {

@@ -192,6 +192,11 @@ func (factory *brokerBackedElevatedLeaseFactory) Acquire(ctx context.Context) (_
 		return nil, errors.Join(cause, session.close())
 	}
 	generation, err := session.client.Status()
+	if errors.Is(err, errBrokerLeaseRecoveryPending) {
+		// Fail closed for new work while the broker retains a lease it could
+		// not roll back; Inspect reports it as SetupProblemLeaseRecoveryPending.
+		return fail(fmt.Errorf("%w: %w", ErrSetupStale, err))
+	}
 	if err != nil || generation == 0 || (factory.config.Generation != 0 && generation != factory.config.Generation) {
 		return fail(errors.Join(errors.New("windows sandbox: broker generation does not match verified setup"), err))
 	}
@@ -590,6 +595,13 @@ func validateBrokerTokenHandle(raw uint64, config elevatedBrokerLeaseConfig, acc
 	restricted, err := token.IsRestricted()
 	if err != nil || !restricted {
 		return 0, errors.Join(errors.New("windows sandbox: broker token is not restricted"), err)
+	}
+	// IsRestricted is also true for a WRITE_RESTRICTED token, whose restricting
+	// SIDs never see a read. Checking the contract here, in the client, means a
+	// regressed or substituted broker cannot get a write-restricted token
+	// launched under an elevated ReadBoundary claim.
+	if err := requireTokenRestriction(token, tokenRestrictionFull); err != nil {
+		return 0, fmt.Errorf("windows sandbox: broker token: %w", err)
 	}
 	tokenType, err := tokenUint32Information(token, win.TokenType)
 	if err != nil || tokenType != win.TokenPrimary {

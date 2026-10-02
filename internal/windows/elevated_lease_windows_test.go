@@ -331,3 +331,30 @@ func TestExactBrokerRestrictingSIDSetRequiresRuntimeInstallationAndExecution(t *
 		t.Fatal("restricting SID superset accepted")
 	}
 }
+
+func TestBrokerBackedElevatedLeaseRefusesWhileBrokerRecoveryPending(t *testing.T) {
+	client := &fakeElevatedLeaseClient{generation: 7, lease: ACLLeaseID{9}, err: brokerClientResultError{result: brokerResultRecoveryPending}}
+	closed := 0
+	deps := elevatedBrokerLeaseDependencies{
+		connect: func(context.Context, string, string) (elevatedBrokerLeaseSession, error) {
+			return elevatedBrokerLeaseSession{client: client, close: func() error { closed++; return nil }}, nil
+		},
+		objects: func(policy.Effective) ([]brokerObjectReference, func() error, []string, error) {
+			return []brokerObjectReference{testBrokerLeaseObject()}, func() error { return nil }, nil, nil
+		},
+		token: func(raw uint64, _ elevatedBrokerLeaseConfig, _ brokerAccountKind) (win.Token, error) {
+			return win.Token(raw), nil
+		},
+	}
+	factory, err := acquireBrokerBackedElevatedLease(context.Background(), testElevatedLeaseConfig(), testElevatedLeasePolicy(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer factory.Release()
+	if _, err := factory.Acquire(context.Background()); !errors.Is(err, ErrSetupStale) || !errors.Is(err, errBrokerLeaseRecoveryPending) {
+		t.Fatalf("acquire during broker quarantine = %v", err)
+	}
+	if client.acquireCalls != 0 || closed != 1 {
+		t.Fatalf("acquire calls = %d, closed = %d", client.acquireCalls, closed)
+	}
+}

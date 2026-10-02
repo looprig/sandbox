@@ -15,6 +15,10 @@ import (
 var (
 	errBrokerLeaseReplay      = errors.New("windows sandbox: broker lease request replayed")
 	errBrokerLeaseUnavailable = errors.New("windows sandbox: broker lease is unavailable")
+	// errBrokerLeaseRecoveryPending reports that at least one lease could not
+	// be rolled back and is quarantined (design §13). New leases and tokens are
+	// refused until a retry rolls it back.
+	errBrokerLeaseRecoveryPending = errors.New("windows sandbox: broker lease recovery is pending")
 )
 
 type brokerConnection interface {
@@ -111,8 +115,14 @@ type windowsBroker struct {
 	tokens          brokerRestrictedTokenIssuer
 	desktops        brokerDesktopManager
 	leases          map[ACLLeaseID]*brokerLease
-	acquiredNonces  map[[brokerNonceSize]byte]struct{}
-	generation      uint64
+	// quarantined holds leases whose rollback or release record failed. Each
+	// keeps its journal record (Released is never written for it), its SID is
+	// never reissued (the one-shot generator retires every SID it hands out),
+	// and while any remain the broker refuses new leases and tokens. Status,
+	// reconcile requests and every service start retry them.
+	quarantined    map[ACLLeaseID]*brokerLease
+	acquiredNonces map[[brokerNonceSize]byte]struct{}
+	generation     uint64
 }
 
 func newWindowsBroker(installationSID SID, sids *OneShotSIDGenerator, journal *brokerLeaseJournal, acl brokerACLMechanism, tokens brokerRestrictedTokenIssuer, desktops brokerDesktopManager, leaseEntropy io.Reader) (*windowsBroker, error) {
@@ -122,10 +132,14 @@ func newWindowsBroker(installationSID SID, sids *OneShotSIDGenerator, journal *b
 	if leaseEntropy == nil {
 		leaseEntropy = rand.Reader
 	}
-	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, desktops: desktops, leases: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
+	broker := &windowsBroker{installationSID: installationSID, sids: sids, leaseEntropy: leaseEntropy, journal: journal, acl: acl, tokens: tokens, desktops: desktops, leases: make(map[ACLLeaseID]*brokerLease), quarantined: make(map[ACLLeaseID]*brokerLease), acquiredNonces: make(map[[brokerNonceSize]byte]struct{})}
 	// Reconciliation is a constructor invariant: no status or token operation
-	// can be served by an instance that has not resolved its durable cleanup log.
-	if err := broker.reconcile(); err != nil {
+	// can be served by an instance that has not resolved its durable cleanup
+	// log. A lease that cannot be rolled back yet is resolved by quarantine,
+	// not by refusing to start: a fatal error here would put the service in an
+	// SCM restart loop that can never clear (design §13). An unreadable journal
+	// is still fatal, because then no lease can be accounted for at all.
+	if err := broker.reconcile(); err != nil && !errors.Is(err, errBrokerLeaseRecoveryPending) {
 		return nil, fmt.Errorf("reconcile broker leases at startup: %w", err)
 	}
 	return broker, nil
@@ -150,6 +164,7 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 	var err error
 	switch request.Kind {
 	case brokerMessageStatus:
+		err = broker.retryQuarantined()
 		broker.generation++
 		response.Generation = broker.generation
 	case brokerMessageAcquireLease:
@@ -179,6 +194,9 @@ func (broker *windowsBroker) Handle(connection brokerConnection, request brokerF
 }
 
 func (broker *windowsBroker) acquire(connection brokerConnection, references []brokerObjectReference) (ACLLeaseID, error) {
+	if len(broker.quarantined) != 0 {
+		return ACLLeaseID{}, errBrokerLeaseRecoveryPending
+	}
 	binding := connection.LeaseBinding()
 	if _, replayed := broker.acquiredNonces[binding.Nonce]; replayed {
 		return ACLLeaseID{}, errBrokerLeaseReplay
@@ -266,6 +284,9 @@ func (broker *windowsBroker) issueToken(binding brokerLeaseBinding, id ACLLeaseI
 	if !sameBrokerBinding(lease.binding, binding) || lease.tokenIssued || (account != brokerAccountOffline && account != brokerAccountOnline) {
 		return brokerIssuedToken{}, errBrokerClientUnauthorized
 	}
+	if len(broker.quarantined) != 0 {
+		return brokerIssuedToken{}, errBrokerLeaseRecoveryPending
+	}
 	token, err := broker.tokens.IssueRestricted(account, broker.installationSID, lease.restricting)
 	if err != nil {
 		return brokerIssuedToken{}, err
@@ -307,34 +328,87 @@ func (broker *windowsBroker) release(binding brokerLeaseBinding, id ACLLeaseID) 
 	if !sameBrokerBinding(lease.binding, binding) {
 		return errBrokerClientUnauthorized
 	}
-	if err := broker.rollback(lease); err != nil {
-		return err
-	}
-	if err := broker.writeEvent(lease, brokerLeaseEventReleased, 0, brokerACLMutation{}); err != nil {
-		return err
-	}
-	delete(broker.leases, id)
-	return nil
+	return broker.retire(lease)
 }
 
+// reconcile rolls back every lease the journal still holds. It continues past
+// a lease that cannot be rolled back, quarantining it, and repeats passes
+// while any lease is released: identical installation-SID ACEs from two
+// leases can only be removed in reverse application order, which one pass in
+// map order cannot guarantee.
 func (broker *windowsBroker) reconcile() error {
 	recovered, err := broker.journal.recover()
 	if err != nil {
 		return err
 	}
+	pending := make(map[ACLLeaseID]*brokerLease, len(recovered))
 	for id, record := range recovered {
 		lease := broker.leases[id]
 		if lease == nil {
+			lease = broker.quarantined[id]
+		}
+		if lease == nil {
 			lease = &brokerLease{id: id, binding: record.Binding, restricting: record.SID, mutations: record.Mutations}
 		}
-		if err := broker.rollback(lease); err != nil {
-			return err
-		}
-		if err := broker.writeEvent(lease, brokerLeaseEventReleased, 0, brokerACLMutation{}); err != nil {
-			return err
-		}
-		delete(broker.leases, id)
+		pending[id] = lease
 	}
+	// A quarantined lease absent from the journal already has a durable
+	// Released record (an ambiguous write that in fact landed), so its
+	// rollback had succeeded and nothing remains to retry.
+	for id := range broker.quarantined {
+		if _, journaled := recovered[id]; !journaled {
+			delete(broker.quarantined, id)
+		}
+	}
+	return broker.retireUntilStable(pending)
+}
+
+// retryQuarantined retries only the in-memory quarantine. It is cheap enough
+// for every status request, which every execution makes before acquiring.
+func (broker *windowsBroker) retryQuarantined() error {
+	if len(broker.quarantined) == 0 {
+		return nil
+	}
+	pending := make(map[ACLLeaseID]*brokerLease, len(broker.quarantined))
+	for id, lease := range broker.quarantined {
+		pending[id] = lease
+	}
+	return broker.retireUntilStable(pending)
+}
+
+func (broker *windowsBroker) retireUntilStable(pending map[ACLLeaseID]*brokerLease) error {
+	for len(pending) != 0 {
+		released := false
+		for id, lease := range pending {
+			if broker.retire(lease) == nil {
+				delete(pending, id)
+				released = true
+			}
+		}
+		if !released {
+			break
+		}
+	}
+	if len(broker.quarantined) != 0 {
+		return fmt.Errorf("%w: %d lease(s) retained for retry", errBrokerLeaseRecoveryPending, len(broker.quarantined))
+	}
+	return nil
+}
+
+// retire rolls a lease back and durably records its release. Any failure
+// moves the lease to quarantine instead of leaving it in the live set: the
+// broker keeps serving status and release, refuses new work, and retries.
+func (broker *windowsBroker) retire(lease *brokerLease) error {
+	err := broker.rollback(lease)
+	if err == nil {
+		err = broker.writeEvent(lease, brokerLeaseEventReleased, 0, brokerACLMutation{})
+	}
+	delete(broker.leases, lease.id)
+	if err != nil {
+		broker.quarantined[lease.id] = lease
+		return errors.Join(errBrokerLeaseRecoveryPending, err)
+	}
+	delete(broker.quarantined, lease.id)
 	return nil
 }
 
@@ -352,25 +426,15 @@ func (broker *windowsBroker) Disconnect(binding brokerLeaseBinding) error {
 		if !sameBrokerBinding(lease.binding, binding) {
 			continue
 		}
-		if err := broker.rollback(lease); err != nil {
-			result = errors.Join(result, err)
-			continue
+		if err := broker.retire(lease); err != nil {
+			result = errors.Join(result, fmt.Errorf("lease %x: %w", id[:], err))
 		}
-		if err := broker.writeEvent(lease, brokerLeaseEventReleased, 0, brokerACLMutation{}); err != nil {
-			result = errors.Join(result, err)
-			continue
-		}
-		delete(broker.leases, id)
 	}
 	return result
 }
 
 func (broker *windowsBroker) abort(lease *brokerLease, cause error) error {
-	rollbackErr := broker.rollback(lease)
-	if rollbackErr == nil {
-		rollbackErr = broker.writeEvent(lease, brokerLeaseEventReleased, 0, brokerACLMutation{})
-	}
-	return errors.Join(cause, rollbackErr)
+	return errors.Join(cause, broker.retire(lease))
 }
 
 func (broker *windowsBroker) rollback(lease *brokerLease) error {
@@ -482,6 +546,8 @@ func brokerResultForError(err error) brokerResult {
 		return brokerResultUnauthorized
 	case errors.Is(err, errBrokerFrameMalformed):
 		return brokerResultInvalidRequest
+	case errors.Is(err, errBrokerLeaseRecoveryPending):
+		return brokerResultRecoveryPending
 	default:
 		return brokerResultUnavailable
 	}

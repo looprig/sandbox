@@ -23,6 +23,8 @@ func TestBrokerProtocolRoundTripOperations(t *testing.T) {
 		{Kind: brokerMessageStatus, Direction: brokerResponse, Nonce: nonce, Result: brokerResultOK, Generation: 4},
 		{Kind: brokerMessageAcquireLease, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, Result: brokerResultOK},
 		{Kind: brokerMessageIssueRestrictedToken, Direction: brokerResponse, Nonce: nonce, LeaseID: lease, TokenHandle: 72, Desktop: `Sandbox-72\Default`, Result: brokerResultOK},
+		{Kind: brokerMessageStatus, Direction: brokerResponse, Nonce: nonce, Result: brokerResultRecoveryPending, Generation: 5},
+		{Kind: brokerMessageAcquireLease, Direction: brokerResponse, Nonce: nonce, Result: brokerResultRecoveryPending},
 	}
 	for _, original := range tests {
 		encoded, err := encodeBrokerFrame(original)
@@ -329,5 +331,16 @@ func TestBrokerObjectAllowsExactDirectoryWithoutInheritance(t *testing.T) {
 	object.Scope = brokerScopeExact
 	if err := validateBrokerObject(object); err != nil {
 		t.Fatalf("exact directory reference rejected: %v", err)
+	}
+}
+
+func TestBrokerProtocolResultSetEndsAtRecoveryPending(t *testing.T) {
+	frame := brokerFrame{Kind: brokerMessageStatus, Direction: brokerResponse, Nonce: testBrokerNonce(), Result: brokerResultRecoveryPending, Generation: 1}
+	if err := validateBrokerFrame(frame); err != nil {
+		t.Fatalf("recovery-pending status rejected: %v", err)
+	}
+	frame.Result = brokerResultRecoveryPending + 1
+	if err := validateBrokerFrame(frame); err == nil {
+		t.Fatal("result beyond the v1 set accepted")
 	}
 }

@@ -95,6 +95,10 @@ const (
 	brokerResultUnauthorized
 	brokerResultLeaseNotFound
 	brokerResultUnavailable
+	// brokerResultRecoveryPending: a lease whose rollback failed is
+	// quarantined, so the broker refuses new leases and tokens. Version 1 has
+	// not shipped, so this completes the v1 result set.
+	brokerResultRecoveryPending
 )
 
 // brokerObjectReference transports only a duplicated object handle and the
@@ -350,7 +354,7 @@ func validateBrokerFrame(frame brokerFrame) error {
 	if !frame.Kind.valid() || frame.Direction > brokerResponse || frame.Nonce == ([brokerNonceSize]byte{}) {
 		return errBrokerFrameMalformed
 	}
-	if frame.Account > brokerAccountOnline || frame.Result > brokerResultUnavailable || len(frame.Objects) > maxBrokerObjects {
+	if frame.Account > brokerAccountOnline || frame.Result > brokerResultRecoveryPending || len(frame.Objects) > maxBrokerObjects {
 		return errBrokerFrameMalformed
 	}
 	for _, object := range frame.Objects {

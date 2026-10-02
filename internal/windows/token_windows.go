@@ -11,14 +11,6 @@ import (
 	xwindows "golang.org/x/sys/windows"
 )
 
-const (
-	disableMaxPrivilege = 0x00000001
-	luaToken            = 0x00000004
-	writeRestricted     = 0x00000008
-
-	restrictedTokenFlags = disableMaxPrivilege | luaToken | writeRestricted
-)
-
 var createRestrictedTokenProc = xwindows.NewLazySystemDLL("advapi32.dll").NewProc("CreateRestrictedToken")
 
 var dangerousGroupSIDStrings = []string{
@@ -47,10 +39,15 @@ type win32RestrictedTokenCreator struct{}
 // It does not take ownership of source. The caller owns the returned token.
 //
 // Dangerous source groups are disabled, maximum privileges are removed, and
-// restrictingSIDs participate only in write access checks. The token's
-// integrity level is deliberately preserved. Source must grant TOKEN_DUPLICATE
-// and TOKEN_QUERY.
+// restrictingSIDs participate only in write access checks (WRITE_RESTRICTED:
+// this is the restricted tier's token, never the elevated broker's). The
+// token's integrity level is deliberately preserved. Source must grant
+// TOKEN_DUPLICATE and TOKEN_QUERY.
 func CreateRestrictedToken(source xwindows.Token, restrictingSIDs []SID) (xwindows.Token, error) {
+	return createRestrictedTokenWith(win32RestrictedTokenCreator{}, source, restrictingSIDs)
+}
+
+func createRestrictedTokenWith(creator restrictedTokenCreator, source xwindows.Token, restrictingSIDs []SID) (xwindows.Token, error) {
 	if source == 0 {
 		return 0, errors.New("windows sandbox: source token is invalid")
 	}
@@ -111,21 +108,50 @@ func CreateRestrictedToken(source xwindows.Token, restrictingSIDs []SID) (xwindo
 		restrictingGroups[index] = xwindows.SIDAndAttributes{Sid: sid}
 	}
 
-	token, err := issueRestrictedToken(win32RestrictedTokenCreator{}, source, disabledGroups, restrictingGroups)
+	token, err := issueRestrictedToken(creator, source, tokenRestrictionWriteOnly, disabledGroups, restrictingGroups)
 	runtime.KeepAlive(sourceGroups)
 	runtime.KeepAlive(parsedRestrictingSIDs)
 	if err != nil {
 		return 0, err
 	}
-	if err := validateRestrictedToken(token, sourceIntegrity, disabledGroups, sourcePrivileges, parsedRestrictingSIDs); err != nil {
+	if err := validateRestrictedToken(token, tokenRestrictionWriteOnly, sourceIntegrity, disabledGroups, sourcePrivileges, parsedRestrictingSIDs); err != nil {
 		token.Close()
 		return 0, err
 	}
 	return token, nil
 }
 
-func issueRestrictedToken(creator restrictedTokenCreator, source xwindows.Token, disabled, restricting []xwindows.SIDAndAttributes) (xwindows.Token, error) {
-	return creator.Create(source, restrictedTokenFlags, disabled, restricting)
+// issueRestrictedToken is the single CreateRestrictedToken call site for both
+// tiers. The restriction contract is an explicit argument, never a shared
+// default: the restricted tier needs WRITE_RESTRICTED and the elevated broker
+// must not carry it (see tokenRestriction).
+func issueRestrictedToken(creator restrictedTokenCreator, source xwindows.Token, restriction tokenRestriction, disabled, restricting []xwindows.SIDAndAttributes) (xwindows.Token, error) {
+	flags, err := restriction.createFlags()
+	if err != nil {
+		return 0, err
+	}
+	return creator.Create(source, flags, disabled, restricting)
+}
+
+// tokenWriteRestricted reports whether Windows applies the token's
+// restricting SIDs to write access checks only. IsRestricted is true for both
+// contracts, so it cannot make this distinction.
+func tokenWriteRestricted(token xwindows.Token) (bool, error) {
+	info, err := readTokenInformation(token, tokenAccessInformationClass)
+	if err != nil {
+		return false, err
+	}
+	return tokenAccessInformationWriteRestricted(info)
+}
+
+// requireTokenRestriction reads the token's restriction contract back from
+// Windows and refuses a token minted for the other tier.
+func requireTokenRestriction(token xwindows.Token, restriction tokenRestriction) error {
+	observed, err := tokenWriteRestricted(token)
+	if err != nil {
+		return fmt.Errorf("windows sandbox: read token restriction flags: %w", err)
+	}
+	return restriction.verify(observed)
 }
 
 func (win32RestrictedTokenCreator) Create(source xwindows.Token, flags uint32, disabled, restricting []xwindows.SIDAndAttributes) (xwindows.Token, error) {
@@ -222,13 +248,16 @@ func ensureModuleTrusteesAbsentFromCurrentToken(sids []SID) error {
 	return ensureRestrictingSIDsAreNew(user.User.Sid, groups.AllGroups(), parsed)
 }
 
-func validateRestrictedToken(token xwindows.Token, sourceIntegrity *xwindows.SID, disabledGroups []xwindows.SIDAndAttributes, sourcePrivileges []xwindows.LUIDAndAttributes, restrictingSIDs []*xwindows.SID) error {
+func validateRestrictedToken(token xwindows.Token, restriction tokenRestriction, sourceIntegrity *xwindows.SID, disabledGroups []xwindows.SIDAndAttributes, sourcePrivileges []xwindows.LUIDAndAttributes, restrictingSIDs []*xwindows.SID) error {
 	restricted, err := token.IsRestricted()
 	if err != nil {
 		return fmt.Errorf("windows sandbox: read restricted-token status: %w", err)
 	}
 	if !restricted {
 		return errors.New("windows sandbox: Windows returned a token that is not restricted")
+	}
+	if err := requireTokenRestriction(token, restriction); err != nil {
+		return err
 	}
 	tokenType, err := tokenUint32Information(token, xwindows.TokenType)
 	if err != nil {

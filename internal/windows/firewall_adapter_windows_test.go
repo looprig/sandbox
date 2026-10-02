@@ -55,14 +55,67 @@ func TestWindowsFirewallPolicyUsesLocalModifyState(t *testing.T) {
 	}
 }
 
+func TestWindowsFirewallPolicyRequiresEveryProfileEnabled(t *testing.T) {
+	api := &fakeNetFwAutomation{modifyState: netFwModifyStateOK}
+	effective, err := (windowsFirewallPolicy{api: api}).LocalRulesEffective()
+	if err != nil || !effective {
+		t.Fatalf("all profiles enabled: effective = %v, err = %v", effective, err)
+	}
+	if !reflect.DeepEqual(api.queried, []int32{netFwProfileDomain, netFwProfilePrivate, netFwProfilePublic}) {
+		t.Fatalf("queried profiles = %v, want domain, private, public", api.queried)
+	}
+	for _, profile := range []int32{netFwProfileDomain, netFwProfilePrivate, netFwProfilePublic} {
+		api := &fakeNetFwAutomation{modifyState: netFwModifyStateOK, disabled: map[int32]bool{profile: true}}
+		if effective, err := (windowsFirewallPolicy{api: api}).LocalRulesEffective(); err != nil || effective {
+			t.Fatalf("profile %d disabled: effective = %v, err = %v", profile, effective, err)
+		}
+	}
+	api = &fakeNetFwAutomation{modifyState: netFwModifyStateOK, enabledErr: errors.New("injected enabled-state error")}
+	if effective, err := (windowsFirewallPolicy{api: api}).LocalRulesEffective(); err == nil || effective {
+		t.Fatalf("enabled-state error: effective = %v, err = %v", effective, err)
+	}
+}
+
+// A disabled profile is visible through setup inspection as an overridden
+// firewall, and installation refuses before writing any rule.
+func TestDisabledFirewallProfileFailsSetupClosed(t *testing.T) {
+	rules, err := offlineFirewallRules("installation", "S-1-5-21-1-2-3-1001", []uint16{9001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeNetFwAutomation{modifyState: netFwModifyStateOK, disabled: map[int32]bool{netFwProfilePublic: true}, rules: make(map[string]netFwRuleRecord)}
+	policy := windowsFirewallPolicy{api: api}
+	if err := installOfflineFirewall(policy, "installation", "S-1-5-21-1-2-3-1001", []uint16{9001}); !errors.Is(err, errFirewallPolicyOverridden) || len(api.rules) != 0 {
+		t.Fatalf("install with a disabled profile = %v, rules written = %d", err, len(api.rules))
+	}
+	delete(api.disabled, netFwProfilePublic)
+	if err := installOfflineFirewall(policy, "installation", "S-1-5-21-1-2-3-1001", []uint16{9001}); err != nil {
+		t.Fatalf("install with every profile enabled: %v", err)
+	}
+	api.disabled[netFwProfileDomain] = true
+	effective, unchanged, err := inspectOfflineFirewall(policy, rules)
+	if err != nil || effective || unchanged {
+		t.Fatalf("inspection with a disabled profile = effective %v unchanged %v err %v", effective, unchanged, err)
+	}
+}
+
 type fakeNetFwAutomation struct {
 	modifyState int32
 	modifyErr   error
-	rules       map[string]netFwRuleRecord
+	// disabled lists profiles whose firewall is off; every other profile is on.
+	disabled   map[int32]bool
+	enabledErr error
+	queried    []int32
+	rules      map[string]netFwRuleRecord
 }
 
 func (a *fakeNetFwAutomation) LocalPolicyModifyState() (int32, error) {
 	return a.modifyState, a.modifyErr
+}
+
+func (a *fakeNetFwAutomation) FirewallEnabled(profile int32) (bool, error) {
+	a.queried = append(a.queried, profile)
+	return !a.disabled[profile], a.enabledErr
 }
 
 func (a *fakeNetFwAutomation) ReadRule(name string) (netFwRuleRecord, bool, error) {

@@ -119,6 +119,9 @@ func statusFromInspection(facts setupInspection) SetupStatus {
 	if m.State == setupStateRecoveryPending {
 		add(SetupProblemLeaseRecoveryPending, "setup", "", "setup recovery is pending", 0, 0)
 	}
+	if facts.LeaseRecovery {
+		add(SetupProblemLeaseRecoveryPending, "broker-leases", "", "broker retains an ACL lease it could not roll back; new elevated work is refused until a retry succeeds", 0, 0)
+	}
 	if m.State != setupStateReady {
 		add(SetupProblemManifestMissing, "manifest", "", "setup has not reached ready state", 0, 0)
 	}
@@ -138,7 +141,7 @@ func statusFromInspection(facts setupInspection) SetupStatus {
 		add(SetupProblemCredentialUnavailable, "credentials", "", "credential state is unavailable", 0, 0)
 	}
 	if !facts.FirewallEffective {
-		add(SetupProblemFirewallOverridden, "firewall", "", "firewall policy is overridden", 0, 0)
+		add(SetupProblemFirewallOverridden, "firewall", "", "firewall is disabled for a profile or its policy is overridden", 0, 0)
 	} else if !facts.FirewallUnchanged {
 		add(SetupProblemFirewallRuleChanged, "firewall", "", "firewall rules have changed", 0, 0)
 	}

@@ -681,7 +681,7 @@ func (win32BrokerACLMechanism) Rollback(mutation brokerACLMutation) error {
 	// candidate; the complete journaled identity must match before removal.
 	object, err := openWin32ACLObject(mutation.Path, mutation.Object.Kind == ACLObjectDirectory, false)
 	if err != nil {
-		return err
+		return resolveAbsentBrokerRollbackTarget(mutation, err, brokerObjectExistsByIdentity)
 	}
 	defer object.close()
 	snapshot, err := object.snapshot()
@@ -700,6 +700,110 @@ func (win32BrokerACLMechanism) Rollback(mutation brokerACLMutation) error {
 		return errors.Join(errors.New("windows sandbox: broker ACL rollback read-back mismatch"), err)
 	}
 	return nil
+}
+
+// resolveAbsentBrokerRollbackTarget decides a rollback whose path no longer
+// opens. An ACE lives in its object's security descriptor, so a deleted object
+// takes the lease's ACE with it and the mutation is already rolled back. A
+// missing path alone does not prove deletion, though: a renamed or moved
+// object still carries the ACE under another name. The journaled identity is
+// therefore looked up by file ID, and only an object that no longer exists
+// counts as rolled back. Anything undecidable stays an error, which keeps the
+// lease quarantined for a later retry rather than orphaning a live ACE.
+func resolveAbsentBrokerRollbackTarget(mutation brokerACLMutation, openErr error, exists func(string, ACLObjectIdentity) (bool, error)) error {
+	if !brokerRollbackPathAbsent(openErr) {
+		return openErr
+	}
+	present, err := exists(mutation.Path, mutation.Object)
+	switch {
+	case err != nil:
+		return errors.Join(openErr, fmt.Errorf("look up rollback target by identity: %w", err))
+	case present:
+		return errors.Join(ErrRestrictedTargetChanged, fmt.Errorf("rollback target %q moved while its lease ACE is still applied", mutation.Path))
+	default:
+		return nil
+	}
+}
+
+// brokerRollbackPathAbsent recognizes an open that failed because nothing (or
+// only a delete-pending object) answers to the path. The no-follow walk opens
+// components with NtCreateFile, so NTSTATUS values are matched as well as
+// their Win32 equivalents.
+func brokerRollbackPathAbsent(err error) bool {
+	var status win.NTStatus
+	if errors.As(err, &status) {
+		return status == win.STATUS_OBJECT_NAME_NOT_FOUND || status == win.STATUS_OBJECT_PATH_NOT_FOUND || status == win.STATUS_DELETE_PENDING
+	}
+	return errors.Is(err, win.ERROR_FILE_NOT_FOUND) || errors.Is(err, win.ERROR_PATH_NOT_FOUND) || errors.Is(err, win.ERROR_DELETE_PENDING)
+}
+
+const extendedFileIDType = 2 // FILE_ID_TYPE ExtendedFileIdType: a FILE_ID_128
+
+// fileIDDescriptor is FILE_ID_DESCRIPTOR with the FILE_ID_128 union member.
+// The union holds a LARGE_INTEGER, so it is 8-byte aligned at offset 8.
+type fileIDDescriptor struct {
+	Size uint32
+	Type uint32
+	ID   [16]byte
+	_    [0]uint64
+}
+
+var procOpenFileByID = win.NewLazySystemDLL("kernel32.dll").NewProc("OpenFileById")
+
+func openFileByID(volume win.Handle, id [16]byte) (win.Handle, error) {
+	descriptor := fileIDDescriptor{Size: uint32(unsafe.Sizeof(fileIDDescriptor{})), Type: extendedFileIDType, ID: id}
+	handle, _, callErr := procOpenFileByID.Call(uintptr(volume), uintptr(unsafe.Pointer(&descriptor)),
+		win.FILE_READ_ATTRIBUTES, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, 0,
+		win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT)
+	if win.Handle(handle) == win.InvalidHandle {
+		return win.InvalidHandle, syscallErr(callErr)
+	}
+	return win.Handle(handle), nil
+}
+
+// brokerObjectExistsByIdentity reports whether the journaled object still
+// exists anywhere on its volume. The volume root must carry the journaled
+// volume serial, and opening the root by its own ID must succeed first, so a
+// malformed descriptor or an unsupported filesystem can never be mistaken for
+// "deleted". NTFS answers an unused file reference with
+// ERROR_INVALID_PARAMETER; ReFS may answer ERROR_FILE_NOT_FOUND.
+func brokerObjectExistsByIdentity(path string, identity ACLObjectIdentity) (bool, error) {
+	if !canonicalBrokerPath(path) {
+		return false, errors.New("windows sandbox: rollback path is not canonical")
+	}
+	rootPath, err := win.UTF16PtrFromString(path[:3])
+	if err != nil {
+		return false, err
+	}
+	root, err := win.CreateFile(rootPath, win.FILE_READ_ATTRIBUTES,
+		win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, nil, win.OPEN_EXISTING,
+		win.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return false, fmt.Errorf("open rollback volume root: %w", err)
+	}
+	defer win.CloseHandle(root)
+	var rootID fileIDInfo
+	if err := win.GetFileInformationByHandleEx(root, win.FileIdInfo, (*byte)(unsafe.Pointer(&rootID)), uint32(unsafe.Sizeof(rootID))); err != nil {
+		return false, fmt.Errorf("identify rollback volume root: %w", err)
+	}
+	if rootID.VolumeSerialNumber != identity.VolumeSerial {
+		return false, errors.New("windows sandbox: rollback target's volume is no longer mounted at its drive letter")
+	}
+	control, err := openFileByID(root, rootID.FileID)
+	if err != nil {
+		return false, fmt.Errorf("open volume root by file ID: %w", err)
+	}
+	_ = win.CloseHandle(control)
+	handle, err := openFileByID(root, identity.FileID)
+	switch {
+	case err == nil:
+		_ = win.CloseHandle(handle)
+		return true, nil
+	case errors.Is(err, win.ERROR_INVALID_PARAMETER), errors.Is(err, win.ERROR_FILE_NOT_FOUND):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 type brokerCredentialSource interface {
@@ -832,7 +936,16 @@ func (process *windowsBrokerClientProcess) DuplicateClientHandle(source win.Hand
 	return duplicate, nil
 }
 
+// createBrokerRestrictedToken issues the elevated tier's account token. It is
+// FULLY restricted (no WRITE_RESTRICTED, design §9.2): the restricting-SID
+// list is checked for reads as well as writes, which is what makes the
+// broker's deny-read ACEs, and so the elevated ReadBoundary claim, effective.
+// Validation reads the contract back and refuses a write-restricted result.
 func createBrokerRestrictedToken(source win.Token, trustees []SID) (win.Token, error) {
+	return createBrokerRestrictedTokenWith(win32RestrictedTokenCreator{}, source, trustees)
+}
+
+func createBrokerRestrictedTokenWith(creator restrictedTokenCreator, source win.Token, trustees []SID) (win.Token, error) {
 	if len(trustees) != 3 || !trustees[0].isRestrictedCode() ||
 		trustees[1].kind != sidKindInstallation || !trustees[1].isModuleTrustee() ||
 		!trustees[2].isRestrictedTierTrustee() {
@@ -887,11 +1000,11 @@ func createBrokerRestrictedToken(source win.Token, trustees []SID) (win.Token, e
 	for index, sid := range parsed {
 		restricting[index] = win.SIDAndAttributes{Sid: sid}
 	}
-	token, err := issueRestrictedToken(win32RestrictedTokenCreator{}, source, disabled, restricting)
+	token, err := issueRestrictedToken(creator, source, tokenRestrictionFull, disabled, restricting)
 	if err != nil {
 		return 0, err
 	}
-	if err := validateRestrictedToken(token, integrity, disabled, privileges, parsed); err != nil {
+	if err := validateRestrictedToken(token, tokenRestrictionFull, integrity, disabled, privileges, parsed); err != nil {
 		_ = token.Close()
 		return 0, err
 	}

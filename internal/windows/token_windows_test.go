@@ -5,6 +5,7 @@ package windows
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -55,6 +56,9 @@ func TestCreateRestrictedTokenShape(t *testing.T) {
 		t.Fatal("created token is not restricted")
 	}
 
+	if writeOnly, err := tokenWriteRestricted(token); err != nil || !writeOnly {
+		t.Fatalf("restricted-tier token write-restricted = %v, %v; want true", writeOnly, err)
+	}
 	assertTokenType(t, token, xwindows.TokenPrimary)
 	assertIntegrityUnchanged(t, source, token)
 	assertOnlyRestrictingSIDs(t, token, executorSID, grantSID)
@@ -69,23 +73,139 @@ func TestRestrictedTokenCallUsesExactFlagsAndLists(t *testing.T) {
 	restrictingSID := mustTestSID(t, "S-1-5-21-314159-265358-979323-1001")
 	disabled := []xwindows.SIDAndAttributes{{Sid: disabledSID}}
 	restricting := []xwindows.SIDAndAttributes{{Sid: restrictingSID}}
+	for _, test := range []struct {
+		name        string
+		restriction tokenRestriction
+		want        uint32
+	}{
+		{"restricted tier", tokenRestrictionWriteOnly, disableMaxPrivilege | luaToken | writeRestricted},
+		{"elevated broker", tokenRestrictionFull, disableMaxPrivilege | luaToken},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &recordingRestrictedTokenCreator{returnToken: xwindows.Token(42)}
+			got, err := issueRestrictedToken(fake, xwindows.Token(7), test.restriction, disabled, restricting)
+			if err != nil {
+				t.Fatalf("issue restricted token: %v", err)
+			}
+			if got != 42 || fake.source != 7 {
+				t.Fatalf("token/source = %d/%d, want 42/7", got, fake.source)
+			}
+			if fake.flags != test.want {
+				t.Fatalf("flags = %#x, want %#x", fake.flags, test.want)
+			}
+			if len(fake.disabled) != 1 || !xwindows.EqualSid(fake.disabled[0].Sid, disabledSID) {
+				t.Fatalf("disabled groups = %#v, want Administrators", fake.disabled)
+			}
+			if len(fake.restricting) != 1 || !xwindows.EqualSid(fake.restricting[0].Sid, restrictingSID) {
+				t.Fatalf("restricting groups = %#v, want executor SID", fake.restricting)
+			}
+		})
+	}
 	fake := &recordingRestrictedTokenCreator{returnToken: xwindows.Token(42)}
+	if _, err := issueRestrictedToken(fake, xwindows.Token(7), tokenRestriction(0), disabled, restricting); err == nil || fake.calls != 0 {
+		t.Fatalf("unspecified restriction reached CreateRestrictedToken: calls=%d err=%v", fake.calls, err)
+	}
+}
 
-	got, err := issueRestrictedToken(fake, xwindows.Token(7), disabled, restricting)
+// TestTierConstructorsPassTheirOwnRestrictionFlags drives both production
+// constructors up to the CreateRestrictedToken call. The recording creator
+// fails the call so no fabricated handle is ever validated or closed.
+func TestTierConstructorsPassTheirOwnRestrictionFlags(t *testing.T) {
+	var source xwindows.Token
+	if err := xwindows.OpenProcessToken(xwindows.CurrentProcess(), xwindows.TOKEN_DUPLICATE|xwindows.TOKEN_QUERY, &source); err != nil {
+		t.Fatalf("open process token: %v", err)
+	}
+	defer source.Close()
+	if restricted, err := source.IsRestricted(); err != nil || restricted {
+		t.Fatalf("token-flag prerequisite unavailable: current process token restricted=%v err=%v", restricted, err)
+	}
+	executor, err := ExecutorSID("tier-flags-installation", "tier-flags-executor")
 	if err != nil {
-		t.Fatalf("issue restricted token: %v", err)
+		t.Fatal(err)
 	}
-	if got != 42 || fake.source != 7 {
-		t.Fatalf("token/source = %d/%d, want 42/7", got, fake.source)
+	installation, err := InstallationSID("tier-flags-installation")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if fake.flags != disableMaxPrivilege|luaToken|writeRestricted {
-		t.Fatalf("flags = %#x, want DISABLE_MAX_PRIVILEGE|LUA_TOKEN|WRITE_RESTRICTED", fake.flags)
+	injected := errors.New("injected CreateRestrictedToken failure")
+
+	restricted := &recordingRestrictedTokenCreator{err: injected}
+	if token, err := createRestrictedTokenWith(restricted, source, []SID{executor}); !errors.Is(err, injected) || token != 0 {
+		t.Fatalf("restricted-tier constructor = %d, %v; want injected failure", token, err)
 	}
-	if len(fake.disabled) != 1 || !xwindows.EqualSid(fake.disabled[0].Sid, disabledSID) {
-		t.Fatalf("disabled groups = %#v, want Administrators", fake.disabled)
+	if restricted.calls != 1 || restricted.flags != disableMaxPrivilege|luaToken|writeRestricted {
+		t.Fatalf("restricted-tier flags = %#x (calls %d), want DISABLE_MAX_PRIVILEGE|LUA_TOKEN|WRITE_RESTRICTED", restricted.flags, restricted.calls)
 	}
-	if len(fake.restricting) != 1 || !xwindows.EqualSid(fake.restricting[0].Sid, restrictingSID) {
-		t.Fatalf("restricting groups = %#v, want executor SID", fake.restricting)
+
+	broker := &recordingRestrictedTokenCreator{err: injected}
+	if token, err := createBrokerRestrictedTokenWith(broker, source, []SID{restrictedCodeSID(), installation, executor}); !errors.Is(err, injected) || token != 0 {
+		t.Fatalf("broker constructor = %d, %v; want injected failure", token, err)
+	}
+	if broker.calls != 1 || broker.flags != disableMaxPrivilege|luaToken {
+		t.Fatalf("broker flags = %#x (calls %d), want DISABLE_MAX_PRIVILEGE|LUA_TOKEN", broker.flags, broker.calls)
+	}
+	if broker.flags&writeRestricted != 0 {
+		t.Fatal("elevated broker token requested WRITE_RESTRICTED")
+	}
+}
+
+// TestRestrictionContractReadBackAndValidators runs on any Windows host: both
+// token shapes are derived from the unprivileged current-process token, and
+// the elevated validators must refuse the write-restricted one.
+func TestRestrictionContractReadBackAndValidators(t *testing.T) {
+	var source xwindows.Token
+	if err := xwindows.OpenProcessToken(xwindows.CurrentProcess(), xwindows.TOKEN_DUPLICATE|xwindows.TOKEN_QUERY, &source); err != nil {
+		t.Fatalf("open process token: %v", err)
+	}
+	defer source.Close()
+	if restricted, err := source.IsRestricted(); err != nil || restricted {
+		t.Fatalf("token-shape prerequisite unavailable: current process token restricted=%v err=%v", restricted, err)
+	}
+	executor, err := ExecutorSID("contract-installation", "contract-executor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := InstallationSID("contract-installation")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeOnly, err := CreateRestrictedToken(source, []SID{executor})
+	if err != nil {
+		t.Fatalf("create restricted-tier token: %v", err)
+	}
+	defer writeOnly.Close()
+	full, err := createBrokerRestrictedToken(source, []SID{restrictedCodeSID(), installation, executor})
+	if err != nil {
+		t.Fatalf("create fully restricted broker token: %v", err)
+	}
+	defer full.Close()
+
+	if got, err := tokenWriteRestricted(writeOnly); err != nil || !got {
+		t.Fatalf("restricted-tier token write-restricted = %v, %v; want true", got, err)
+	}
+	if got, err := tokenWriteRestricted(full); err != nil || got {
+		t.Fatalf("broker token write-restricted = %v, %v; want false", got, err)
+	}
+	if err := requireTokenRestriction(writeOnly, tokenRestrictionFull); err == nil {
+		t.Fatal("full-restriction check accepted a WRITE_RESTRICTED token")
+	}
+	if err := requireTokenRestriction(full, tokenRestrictionWriteOnly); err == nil {
+		t.Fatal("restricted-tier check accepted a fully restricted token")
+	}
+
+	api := nativeElevatedRunnerProcessAPI{}
+	if err := api.VerifyToken(writeOnly); err == nil || !strings.Contains(err.Error(), "write-restricted") {
+		t.Fatalf("runner VerifyToken accepted a WRITE_RESTRICTED token: %v", err)
+	}
+	if err := api.VerifyToken(full); err != nil {
+		t.Fatalf("runner VerifyToken refused a fully restricted token: %v", err)
+	}
+	// validateBrokerTokenHandle checks the contract before the account, so a
+	// write-restricted token is refused for that reason specifically.
+	config := elevatedBrokerLeaseConfig{InstallationID: "contract-installation", OfflineSID: "S-1-5-21-1-2-3-1001", OnlineSID: "S-1-5-21-1-2-3-1002"}
+	if _, err := validateBrokerTokenHandle(uint64(writeOnly), config, brokerAccountOffline); err == nil || !strings.Contains(err.Error(), "write-restricted") {
+		t.Fatalf("client broker-token validation accepted a WRITE_RESTRICTED token: %v", err)
 	}
 }
 
@@ -178,6 +298,8 @@ func TestDangerousGroupSIDListIsPinned(t *testing.T) {
 
 type recordingRestrictedTokenCreator struct {
 	returnToken xwindows.Token
+	err         error
+	calls       int
 	source      xwindows.Token
 	flags       uint32
 	disabled    []xwindows.SIDAndAttributes
@@ -185,10 +307,14 @@ type recordingRestrictedTokenCreator struct {
 }
 
 func (f *recordingRestrictedTokenCreator) Create(source xwindows.Token, flags uint32, disabled, restricting []xwindows.SIDAndAttributes) (xwindows.Token, error) {
+	f.calls++
 	f.source = source
 	f.flags = flags
 	f.disabled = append([]xwindows.SIDAndAttributes(nil), disabled...)
 	f.restricting = append([]xwindows.SIDAndAttributes(nil), restricting...)
+	if f.err != nil {
+		return 0, f.err
+	}
 	return f.returnToken, nil
 }
 

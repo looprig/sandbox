@@ -74,6 +74,51 @@ func TestOleDispatchPropertyPutUsesDispatchABI(t *testing.T) {
 	}
 }
 
+func TestNetFwFirewallEnabledIsParameterizedPropertyGet(t *testing.T) {
+	const (
+		getIDsAddress = uintptr(0x3333)
+		invokeAddress = uintptr(0x4444)
+		memberID      = int32(19)
+	)
+	vtable := [7]uintptr{}
+	vtable[5] = getIDsAddress
+	vtable[6] = invokeAddress
+	vtablePointer := uintptr(unsafe.Pointer(&vtable[0]))
+	object := unsafe.Pointer(&vtablePointer)
+	enabled := uint64(^uint16(0))
+	caller := func(address uintptr, args ...uintptr) uintptr {
+		switch address {
+		case getIDsAddress:
+			*(*int32)(pointerBits(args[5])) = memberID
+			return 0
+		case invokeAddress:
+			if int32(args[1]) != memberID || args[4] != dispatchPropertyGet {
+				t.Fatalf("Invoke member/flags = %d/%d", int32(args[1]), args[4])
+			}
+			params := (*oleDispatchParams)(pointerBits(args[5]))
+			if params.ArgCount != 1 || params.NamedArgIDCount != 0 || params.NamedArgIDs != nil {
+				t.Fatalf("DISPPARAMS = %#v", *params)
+			}
+			if params.Args.Type != vtI4 || params.Args.Value != uint64(netFwProfilePrivate) {
+				t.Fatalf("profile argument = %#v", *params.Args)
+			}
+			*(*oleVariant)(pointerBits(args[6])) = oleVariant{Type: vtBool, Value: enabled}
+			return 0
+		default:
+			t.Fatalf("unexpected ABI address %#x", address)
+			return 0
+		}
+	}
+	dispatch := &oleDispatch{object: object, invoke: caller}
+	if got, err := readNetFwFirewallEnabled(dispatch, netFwProfilePrivate); err != nil || !got {
+		t.Fatalf("enabled profile = %v, %v", got, err)
+	}
+	enabled = 0
+	if got, err := readNetFwFirewallEnabled(dispatch, netFwProfilePrivate); err != nil || got {
+		t.Fatalf("disabled profile = %v, %v", got, err)
+	}
+}
+
 func TestOleDispatchRejectsFailedHRESULTAndWrongVariantType(t *testing.T) {
 	vtable := [7]uintptr{}
 	vtable[5] = 1

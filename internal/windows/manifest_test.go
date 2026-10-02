@@ -54,6 +54,7 @@ func TestSetupStatusStatesAndTypedProblems(t *testing.T) {
 		{"absent", func(f *setupInspection) { f.Manifest = nil }, SetupProblemManifestMissing},
 		{"staging", func(f *setupInspection) { f.Manifest.State = setupStateStaging }, SetupProblemManifestMissing},
 		{"recovery", func(f *setupInspection) { f.Manifest.State = setupStateRecoveryPending }, SetupProblemLeaseRecoveryPending},
+		{"broker lease quarantine", func(f *setupInspection) { f.LeaseRecovery = true }, SetupProblemLeaseRecoveryPending},
 		{"owner", func(f *setupInspection) { f.OwnerSID = "S-1-5-21-2" }, SetupProblemOwnerMismatch},
 		{"hash", func(f *setupInspection) { f.HostSHA256 = strings.Repeat("cd", 32) }, SetupProblemHostBinaryStale},
 		{"service", func(f *setupInspection) { f.ServiceReady = false }, SetupProblemServiceUnavailable},
