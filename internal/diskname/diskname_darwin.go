@@ -71,6 +71,10 @@ func vnodePath(path string) (string, error) {
 	var pinner runtime.Pinner
 	pinner.Pin(&buf[0])
 	defer pinner.Unpin()
+	// #nosec G103 -- F_GETPATH takes the output buffer through fcntl's int
+	// argument; the buffer is pinned above for the duration of the call and the
+	// pointer is never converted back, so no Go object can move or be collected
+	// underneath the kernel write.
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETPATH, int(uintptr(unsafe.Pointer(&buf[0])))); err != nil {
 		return "", err
 	}
