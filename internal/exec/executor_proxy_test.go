@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"github.com/looprig/sandbox/pkg/network"
@@ -53,6 +54,86 @@ func TestProxyTargetGrantCompilesListenerAndInjectsExecutionCredential(t *testin
 	port, _ := strconv.ParseUint(portText, 10, 16)
 	if pol.Net.ProxyPort != uint16(port) || pol.Net.Open || pol.Net.Loopback || len(pol.Net.Ports) != 0 {
 		t.Fatalf("proxy policy = %+v, want exact listener port only", pol.Net)
+	}
+}
+
+// TestUngrantedSpawnCarriesNoProxyCredential pins review H6's secondary
+// mitigation. On darwin a confined child can read the initial environment of
+// any same-user, non-platform process (Seatbelt does not mediate
+// KERN_PROCARGS2), so a proxy credential is exposed to sibling spawns for as
+// long as the process holding it lives. The credential must therefore exist
+// only where it is needed: a route-configured executor whose Network is
+// Gated runs an ungranted command with NO proxy variable at all (not even a
+// credential-less URL), and the credential a granted run did receive is
+// per-execution and refused by the proxy once that run released it.
+func TestUngrantedSpawnCarriesNoProxyCredential(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	workspace := mustCanonicalGrantRoot(t, t.TempDir())
+	profile := mustProfile(t, ProfileConfig{
+		WorkspaceRoot: workspace, WorkspaceRead: Allow, WorkspaceWrite: Allow,
+		HostRead: Allow, HostWrite: Deny, Network: Gated, Command: Allow,
+	})
+	route, _ := NewDirectEgressRoute()
+	backend := &captureBackend{bits: GuaranteeWriteBoundary | GuaranteeNetworkBoundary | GuaranteeAddressNetwork | GuaranteeTargetNetwork | GuaranteeEnvScrub}
+	set, err := NewExecutorSet(profile, WithScratchRoot(t.TempDir()), WithMaxExecutors(1), WithEgressRoute(route),
+		withExecutorSetConfig(withBackend(backend), withClock(func() time.Time { return now })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = set.Close() })
+	executor, err := set.For("proxy-scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := portableEnvironmentCommand()
+
+	out, code, err := executor.RunCommand(context.Background(), workspace, command)
+	if err != nil || code != 0 {
+		t.Fatalf("ungranted run = code %d err %v out %q", code, err, out)
+	}
+	for name, value := range parsedEnvironment(out) {
+		if strings.Contains(strings.ToUpper(name), "PROXY") || strings.Contains(value, executor.proxy.Addr()) {
+			t.Fatalf("ungranted spawn received proxy variable %s=%q", name, value)
+		}
+	}
+
+	// Positive control: the granted run in the same executor does receive a
+	// credential, and it stops working the moment that run has released it.
+	token := issueTestGrant(t, executor, now, "exec-scoped", command, workspace,
+		"network", "", "network.proxy-target.v1", "tcp:example.test:443")
+	out, code, err = executor.RunCommandWithGrants(context.Background(), "exec-scoped", workspace, command, []string{token})
+	if err != nil || code != 0 {
+		t.Fatalf("granted run = code %d err %v out %q", code, err, out)
+	}
+	proxyURL, err := url.Parse(parsedEnvironment(out)["HTTP_PROXY"])
+	if err != nil || proxyURL.User == nil {
+		t.Fatalf("granted run carried no credentialed proxy URL: %q (%v)", parsedEnvironment(out)["HTTP_PROXY"], err)
+	}
+	request, err := http.NewRequest(http.MethodConnect, "http://"+executor.proxy.Addr(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "example.test:443"
+	password, _ := proxyURL.User.Password()
+	request.SetBasicAuth(proxyURL.User.Username(), password)
+	request.Header.Set("Proxy-Authorization", request.Header.Get("Authorization"))
+	request.Header.Del("Authorization")
+	conn, err := net.DialTimeout("tcp", executor.proxy.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := request.Write(conn); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("a released execution's credential got %s from the proxy, want 407", response.Status)
 	}
 }
 
