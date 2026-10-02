@@ -412,8 +412,22 @@ func TestPlatformUnconfinedProfileExplicitlyUsesNullBackend(t *testing.T) {
 // t.Parallel: envNameFold is package state.
 func useWindowsEnvFold(t *testing.T) {
 	t.Helper()
+	useEnvFold(t, strings.ToUpper)
+}
+
+// useUnixEnvFold substitutes the identity fold for the rest of the test, so
+// the Unix contract is exercised on every host — including Windows, whose
+// real envNameFold is the upper-case fold (the first Windows CI run failed
+// TestApplySetFoldsCase's "identity" case for exactly that reason).
+func useUnixEnvFold(t *testing.T) {
+	t.Helper()
+	useEnvFold(t, func(name string) string { return name })
+}
+
+func useEnvFold(t *testing.T, fold func(string) string) {
+	t.Helper()
 	saved := envNameFold
-	envNameFold = strings.ToUpper
+	envNameFold = fold
 	t.Cleanup(func() { envNameFold = saved })
 }
 
@@ -458,10 +472,15 @@ func TestEnvNameMatchesFoldsCase(t *testing.T) {
 // Set keys that fold together collapse to the lexically first key.
 func TestApplySetFoldsCase(t *testing.T) {
 	// Identity fold (Unix): differently cased names are different variables.
-	unix := applySet([]string{"Temp=old"}, map[string]string{"TEMP": "new"})
-	if !slices.Equal(unix, []string{"Temp=old", "TEMP=new"}) {
-		t.Fatalf("identity fold: applySet = %v, want Temp kept and TEMP appended", unix)
-	}
+	// The fold is substituted explicitly, not taken from the host, so this
+	// half proves the Unix contract on Windows too.
+	t.Run("identity fold", func(t *testing.T) {
+		useUnixEnvFold(t)
+		unix := applySet([]string{"Temp=old"}, map[string]string{"TEMP": "new"})
+		if !slices.Equal(unix, []string{"Temp=old", "TEMP=new"}) {
+			t.Fatalf("identity fold: applySet = %v, want Temp kept and TEMP appended", unix)
+		}
+	})
 
 	useWindowsEnvFold(t)
 	got := applySet([]string{"Temp=old", "Path=/bin", "TEMP=older"}, map[string]string{"TEMP": "new"})

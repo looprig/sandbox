@@ -787,6 +787,10 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 			return nil, err
 		}
 	}
+	// A Windows shell spawn must reach cmd.exe as a raw command line, not
+	// CommandLineToArgvW-escaped argv (shell_cmdline.go) — on the pipe path and
+	// the ConPTY path alike, which honours the same field; a no-op elsewhere.
+	applyShellCommandLine(cmd)
 	if p.options.TTY {
 		// Session/controlling-terminal setup only (Setsid/Setctty on Unix;
 		// unreachable everywhere else — see ttySupported in PrepareProcess)
@@ -839,29 +843,41 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	handleCleanup, err := configureChildHandleList(cmd)
-	if err != nil {
-		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
-		return nil, err
-	}
-	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
-
 	inR, inW, err := os.Pipe()
 	if err != nil {
 		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
 		return nil, err
 	}
+	// stdin is wired BEFORE the handle list is configured so the Windows
+	// configurator narrows it like the two output streams (an earlier version
+	// set it afterwards, so the child inherited the pipe read end with its full
+	// CreatePipe access instead of FILE_READ_DATA|SYNCHRONIZE).
 	cmd.Stdin = inR
+	configuredCleanup, err := configureChildHandleList(cmd)
+	if err != nil {
+		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
+		return nil, err
+	}
+	handleCleanup := releaseChildHandleList(configuredCleanup)
+	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
 
 	// Re-check as close to the actual OS spawn as this function gets, so a
 	// cancellation that lands after Start's own entry check but before the
 	// fork/exec syscall still aborts the handoff instead of racing it.
 	if err := ctx.Err(); err != nil {
+		handleCleanup()
 		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
 		return nil, err
 	}
 
-	if err := lease.start(cmd, tree); err != nil {
+	err = lease.start(cmd, tree)
+	// The handle list's parent-held duplicates (Windows) are released the
+	// moment Start returns, exactly like Executor.run: a surviving duplicate of
+	// an output write end would hold this Process's Stdout/Stderr open past the
+	// child's exit, and one of stdin's read end would keep a write to Stdin
+	// from ever failing once the child is gone (releaseChildHandleList).
+	handleCleanup()
+	if err != nil {
 		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close(), inR.Close(), inW.Close())
 		return nil, err
 	}
@@ -904,6 +920,17 @@ func (p *PreparedProcess) startConfined(ctx context.Context) (*Process, error) {
 // exactly as before this interface existed.
 type processTreeTerminalOpener interface {
 	openTerminal(cmd *exec.Cmd) (processTerminal, func() error, error)
+}
+
+// terminalExitHangup is an optional processTerminal capability for a terminal
+// whose output stream does not end on its own when the child exits. A Unix
+// PTY master reports EOF/EIO once the last slave reference closes, so
+// terminalMaster never implements it. A Windows pseudo console keeps its
+// output pipe open for as long as the pseudo console exists, so
+// conPTYTerminal implements it to close the pseudo console after the spawn's
+// tree is proven empty (startConfinedTTY wires it into spawn cleanup).
+type terminalExitHangup interface {
+	hangupAfterExit()
 }
 
 // openConfinedTerminal opens the terminal endpoint startConfinedTTY attaches
@@ -984,6 +1011,20 @@ func (p *PreparedProcess) startConfinedTTY(ctx context.Context, cmd *exec.Cmd, t
 	// running under confinement, so it must not be abandoned mid-handoff.
 	if closeErr := closeSlave(); closeErr != nil {
 		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error { return closeErr })
+	}
+	if hangup, ok := terminal.(terminalExitHangup); ok {
+		// A terminal whose output does not end by itself when the child exits
+		// (Windows ConPTY: the console host keeps the output pipe open) is
+		// hung up once the spawn's tree is proven empty, so Stdout reaches EOF
+		// just as a Unix master does. Spawn cleanup runs only after that proof
+		// (supervise -> terminateAndWait -> release), and the hangup runs on
+		// its own goroutine because it may wait for the output pump: release —
+		// and the execution lease behind it — must never block on a caller
+		// that is not reading Stdout.
+		spawn.spawnCleanup = append(spawn.spawnCleanup, func() error {
+			go hangup.hangupAfterExit()
+			return nil
+		})
 	}
 	proc := newPTYProcess(cmd, terminal, pumpR, pumpW, p.options.TerminateGrace)
 	attachLifetime(proc, lifetime)

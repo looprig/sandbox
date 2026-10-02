@@ -496,6 +496,9 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 			return nil, -1, err
 		}
 	}
+	// A Windows shell spawn must reach cmd.exe as a raw command line, not
+	// CommandLineToArgvW-escaped argv (shell_cmdline.go); a no-op elsewhere.
+	applyShellCommandLine(cmd)
 	tree, err := e.processTree(cmd, processTreeOptions{
 		Sandboxed: s.policy.Isolation != profile.Unconfined,
 		Limits:    s.policy.Limits,
@@ -518,15 +521,22 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	// the shared "prepared process" spawning mechanics this run adopts.
 	// Everything above and below this block — grant verification, path handle
 	// resolution, quarantine, confinement (configure/tree) — is unchanged.
-	outR, outW, errR, errW, err := wireOutputPipes(cmd)
+	rawOutR, outW, rawErrR, errW, err := wireOutputPipes(cmd)
 	if err != nil {
 		return nil, -1, err
 	}
-	handleCleanup, err := configureChildHandleList(cmd)
+	// The read ends are closed from two places on a cut-short drain: by
+	// waitOutputDrain when it has to fall back to Close (Windows pipes take no
+	// deadline) and later by the pipe-backed Process's own Close in spawn
+	// cleanup. drainReadEnd makes the second close a no-op instead of a
+	// spurious os.ErrClosed teardown error.
+	outR, errR := newDrainReadEnd(rawOutR), newDrainReadEnd(rawErrR)
+	configuredCleanup, err := configureChildHandleList(cmd)
 	if err != nil {
 		_ = errors.Join(outR.Close(), outW.Close(), errR.Close(), errW.Close())
 		return nil, -1, err
 	}
+	handleCleanup := releaseChildHandleList(configuredCleanup)
 	spawn.spawnCleanup = append([]func() error{func() error { handleCleanup(); return nil }}, spawn.spawnCleanup...)
 
 	var output bytes.Buffer
@@ -537,6 +547,11 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 	exitCode := -1
 
 	err = lease.start(cmd, tree)
+	// Release the handle list's parent-held stream duplicates now, whether or
+	// not Start succeeded: the child (if any) already holds its own copies,
+	// and on Windows a surviving duplicate of an output write end would keep
+	// the drain below from ever observing EOF (releaseChildHandleList).
+	handleCleanup()
 	if err != nil {
 		// Nothing was started: no child holds any of these descriptors, so the
 		// parent's copies of all four must be released here rather than
@@ -670,16 +685,22 @@ func (e *Executor) run(lease *executionLease, dir string, innerArgv []string, s 
 // with whatever they have already copied, and then joins them. It reports
 // whether the drain had to be cut short.
 //
-// A read deadline rather than Close: the read ends are also owned by the
-// pipe-backed Process whose own Close runs later in spawn cleanup, and a
-// second Close of the same *os.File would surface as a spurious teardown
-// error. os.Pipe returns pollable descriptors on darwin and Linux, so the
-// deadline is honoured by a Read already parked in the poller. If a
-// descriptor were somehow not pollable, SetReadDeadline fails and the reads
-// are closed instead (that Process.Close may then report ErrClosed, which is
-// preferable to a hang). Writers are untouched: the detached holder keeps
-// its write end and simply meets EPIPE/SIGPIPE on its next write.
-func waitOutputDrain(drainWG *sync.WaitGroup, grace time.Duration, readEnds ...*os.File) bool {
+// A read deadline is preferred over Close: os.Pipe returns pollable
+// descriptors on darwin and Linux, so the deadline is honoured by a Read
+// already parked in the poller and the descriptor stays valid for the
+// pipe-backed Process that also owns it. On Windows an os.Pipe handle is not
+// pollable and SetReadDeadline answers os.ErrNoDeadline, so the read end is
+// closed instead (internal/poll cancels the pending synchronous ReadFile with
+// CancelIoEx on close, which is what releases the blocked drain). Every read
+// end run passes here is a drainReadEnd, so the Process.Close that runs later
+// in spawn cleanup finds it already closed and reports nothing. Writers are
+// untouched: the detached holder keeps its write end and simply meets
+// EPIPE/SIGPIPE (a broken-pipe error on Windows) on its next write.
+//
+// Reaching the fallback at all means a writer outlived the run's whole
+// process tree, so run reports ErrOutputDrainIncomplete; a run whose writers
+// all exited drains to EOF well inside the grace and never gets here.
+func waitOutputDrain(drainWG *sync.WaitGroup, grace time.Duration, readEnds ...deadlineReadEnd) bool {
 	drained := make(chan struct{})
 	go func() {
 		drainWG.Wait()
@@ -702,6 +723,33 @@ func waitOutputDrain(drainWG *sync.WaitGroup, grace time.Duration, readEnds ...*
 	}
 	<-drained
 	return true
+}
+
+// deadlineReadEnd is the slice of *os.File waitOutputDrain needs: expire a
+// blocked Read, or close the read end when the descriptor takes no deadline.
+type deadlineReadEnd interface {
+	SetReadDeadline(time.Time) error
+	Close() error
+}
+
+// drainReadEnd is a synchronous run's output-pipe read end with an idempotent
+// Close. run hands the same read end to its drain goroutine (as the Process's
+// Stdout/Stderr), to waitOutputDrain's close fallback, and to the pipe-backed
+// Process whose Close runs in spawn cleanup; only the first Close reaches the
+// OS and every later one returns that first result, so a cut-short drain on
+// Windows is reported once, as ErrOutputDrainIncomplete, and never again as
+// "close |0: file already closed".
+type drainReadEnd struct {
+	*os.File
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newDrainReadEnd(file *os.File) *drainReadEnd { return &drainReadEnd{File: file} }
+
+func (r *drainReadEnd) Close() error {
+	r.closeOnce.Do(func() { r.closeErr = r.File.Close() })
+	return r.closeErr
 }
 
 // drainCombinedOutput copies everything read from src into dst, serialized by
@@ -1421,7 +1469,23 @@ type retainedGrantPathBackend interface {
 	CompileWithRetainedPathHandles(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
 }
 
+// grantAuthorityBackend is a backend whose base spec carries per-executor
+// state that EVERY grant compile must reuse, with or without path handles —
+// the Windows restricted tier, whose base lease (SID, ACL projections) is one
+// per executor and is found only through the GrantAuthority on that
+// executor's own spec. A backend implementing it is asked for every grant
+// compile that has an authority to present; the others keep the
+// handle-count-based routing below.
+type grantAuthorityBackend interface {
+	CompileWithGrantAuthority(any, policy.Effective, policy.Effective, []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error)
+}
+
 func compileBackendWithGrantPaths(b enforce.Backend, authority any, base, pol policy.Effective, handles []*policy.PathHandle) (enforce.Spec, profile.CompileReport, uint8, uint64, error) {
+	if authority != nil {
+		if authorityBackend, ok := b.(grantAuthorityBackend); ok {
+			return authorityBackend.CompileWithGrantAuthority(authority, policy.Clone(base), pol, handles)
+		}
+	}
 	if len(handles) != 0 {
 		if retained, ok := b.(retainedGrantPathBackend); ok {
 			return retained.CompileWithRetainedPathHandles(authority, policy.Clone(base), pol, handles)
