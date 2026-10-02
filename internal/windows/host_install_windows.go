@@ -251,14 +251,42 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+// setupReadExecuteMask is the exact access mask protectSetupPath grants the
+// installing owner and the sandbox trustee, and the only one
+// realBrokerInstallPathVerifier accepts for them: FILE_GENERIC_READ |
+// FILE_GENERIC_EXECUTE (SDDL "FRFX"), i.e. READ_CONTROL | SYNCHRONIZE |
+// FILE_READ_DATA | FILE_READ_EA | FILE_EXECUTE | FILE_READ_ATTRIBUTES. It is
+// precisely what GENERIC_READ|GENERIC_EXECUTE maps to under the file
+// object's generic mapping, so it grants the same authority the former
+// "GRGX" did — but as specific rights, which the kernel stores verbatim.
+const setupReadExecuteMask = uint32(0x001200a9)
+
 func protectSetupPath(path, ownerSID, sandboxSID string, directory bool) error {
+	// SDDL ace_flags are concatenated two-letter tokens ("OICI"); the former
+	// "(CI)(OI)" was icacls syntax, which the SDDL parser rejects, so every
+	// directory protection (state root, slots, staging) failed before it
+	// reached SetNamedSecurityInfo. No hosted test exercised the directory
+	// form until TestProtectSetupPathDirectoryRoundTripsThroughVerifier.
 	inherit := ""
 	if directory {
-		inherit = "(CI)(OI)"
+		inherit = "OICI"
 	}
 	// Only SYSTEM and Administrators may modify protected installation state.
 	// The installing owner and sandbox trustee receive read/execute only.
-	sddl := fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;%s;GRGX;;;%s)(A;%s;GRGX;;;%s)", inherit, ownerSID, inherit, sandboxSID)
+	//
+	// Read/execute is written as the SPECIFIC rights FRFX, never as the
+	// generic GRGX. When a DACL is set on a file object the kernel maps
+	// generic rights in every ACE that applies to the object to specific
+	// rights (file generic mapping), and an inheritable ACE carrying generic
+	// rights is stored as a mapped effective ACE plus a separate inherit-only
+	// generic ACE. Either way the stored DACL no longer equals what was
+	// written, so the exact verifier (realBrokerInstallPathVerifier) rejected
+	// the object protectSetupPath had just protected — the first hosted
+	// Windows run failed TestInstalledPathVerifierRejectsInstallerWriteAuthority
+	// with a protected four-ACE DACL whose owner ACE matched no expected
+	// shape. Specific rights round-trip byte-for-byte, so writer and verifier
+	// now agree on one exact mask.
+	sddl := fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;%s;FRFX;;;%s)(A;%s;FRFX;;;%s)", inherit, ownerSID, inherit, sandboxSID)
 	sd, err := win.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err

@@ -428,9 +428,15 @@ func (realBrokerInstallPathVerifier) Verify(path string, expectation installedPa
 			seenSystem = true
 		case sid.IsWellKnown(win.WinBuiltinAdministratorsSid) && mask == setupFileAllAccess && ace.Header.AceFlags == 0:
 			seenAdministrators = true
-		case sid.Equals(wantOwner) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+		// The owner and sandbox trustee must hold exactly the specific
+		// read/execute mask protectSetupPath writes (see setupReadExecuteMask
+		// for why it is specific rather than GENERIC_READ|GENERIC_EXECUTE:
+		// setting a file DACL maps generic rights on effective ACEs through
+		// the file generic mapping, so the generic form written was not the
+		// form read back here, and a protected object was rejected).
+		case sid.Equals(wantOwner) && mask == setupReadExecuteMask && ace.Header.AceFlags == wantFlags:
 			seenOwner = true
-		case sid.Equals(wantSandbox) && mask == uint32(win.GENERIC_READ|win.GENERIC_EXECUTE) && ace.Header.AceFlags == wantFlags:
+		case sid.Equals(wantSandbox) && mask == setupReadExecuteMask && ace.Header.AceFlags == wantFlags:
 			seenSandbox = true
 		default:
 			return errors.New("sandbox: installed broker object DACL grants unexpected authority")

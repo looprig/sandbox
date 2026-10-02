@@ -87,6 +87,10 @@ type brokerTestACL struct {
 	applyHook func()
 	// trustees records every SID set the broker asked a plan for.
 	trustees [][]SID
+	// rollbackJournalOps records, for every Rollback, how many journal store
+	// operations had happened when it ran, so a test can prove a rollback
+	// precedes the Released append+flush rather than only that both happened.
+	rollbackJournalOps []int
 }
 
 func (acl *brokerTestACL) Plan(object brokerAuthorizedObject, trustees []SID) ([]brokerACLMutation, error) {
@@ -129,6 +133,9 @@ func (acl *brokerTestACL) Apply(mutation brokerACLMutation) error {
 }
 func (acl *brokerTestACL) Rollback(mutation brokerACLMutation) error {
 	acl.operations = append(acl.operations, "rollback:"+mutation.SID.String())
+	if acl.store != nil {
+		acl.rollbackJournalOps = append(acl.rollbackJournalOps, len(acl.store.operations))
+	}
 	if acl.rollbackErr != nil {
 		return acl.rollbackErr
 	}

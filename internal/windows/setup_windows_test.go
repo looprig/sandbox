@@ -696,7 +696,10 @@ func TestInstalledPathVerifierRejectsInstallerWriteAuthority(t *testing.T) {
 	if err := (realBrokerInstallPathVerifier{}).Verify(path, expectation); err != nil {
 		t.Fatalf("exact protected DACL rejected: %v", err)
 	}
-	sd, err := win.SecurityDescriptorFromString(fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)(A;;GRGX;;;%s)", owner, sandboxSID.String()))
+	// Identical to protectSetupPath's file DACL except that the installing
+	// owner holds FA (write authority) instead of FRFX: a protected,
+	// Administrators-owned, four-ACE DACL that must still be refused.
+	sd, err := win.SecurityDescriptorFromString(fmt.Sprintf("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)(A;;FRFX;;;%s)", owner, sandboxSID.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,5 +718,43 @@ func TestInstalledPathVerifierRejectsInstallerWriteAuthority(t *testing.T) {
 	}
 	if err := (realBrokerInstallPathVerifier{}).Verify(path, expectation); err == nil {
 		t.Fatal("protected installer-writable DACL was accepted")
+	}
+}
+
+// TestProtectSetupPathDirectoryRoundTripsThroughVerifier pins the directory
+// half of the writer/verifier contract the file test above covers: every
+// installed directory (state root, slots, generation) is protected with
+// protectSetupPath(..., true) and later checked with a directory expectation,
+// so the two must agree on the exact stored DACL — OICI flags on the owner and
+// sandbox ACEs, FRFX as specific rights so the inheritable ACEs are stored as
+// written rather than split. It also proves a file-shaped expectation (no
+// inheritance flags) is refused for the directory.
+func TestProtectSetupPathDirectoryRoundTripsThroughVerifier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "protected-root")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	user, err := win.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := user.User.Sid.String()
+	sandboxSID, err := InstallationSID("verifier-directory-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protectSetupPath(path, owner, sandboxSID.String(), true); err != nil {
+		if errors.Is(err, win.ERROR_ACCESS_DENIED) || errors.Is(err, win.ERROR_INVALID_OWNER) {
+			t.Skipf("ALLOWED_WINDOWS_LIMITATION: host denies temporary-directory DACL control: %v", err)
+		}
+		t.Fatal(err)
+	}
+	directory := installedPathExpectation{ownerSID: owner, sandboxSID: sandboxSID.String(), directory: true}
+	if err := (realBrokerInstallPathVerifier{}).Verify(path, directory); err != nil {
+		t.Fatalf("exact protected directory DACL rejected: %v", err)
+	}
+	file := installedPathExpectation{ownerSID: owner, sandboxSID: sandboxSID.String()}
+	if err := (realBrokerInstallPathVerifier{}).Verify(path, file); err == nil {
+		t.Fatal("inheritable directory DACL satisfied a file expectation")
 	}
 }

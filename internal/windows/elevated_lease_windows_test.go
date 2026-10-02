@@ -155,8 +155,28 @@ func TestElevatedRuntimeVocabularyFailsClosed(t *testing.T) {
 	}
 }
 
+// canonicalTestDir returns t.TempDir() in the handle-resolved canonical form
+// the policy layer hands every backend. compileElevatedBrokerObjects names
+// each object by its handle's final DOS path and resolves the object's
+// authority with policy.ResolveFS(effective.FS, thatPath), so it relies on
+// the Effective it receives already being canonical (the profile layer
+// canonicalises before compile). A raw t.TempDir() is not: on a GitHub-hosted
+// runner %TEMP% is the 8.3 short form C:\Users\RUNNER~1\..., while the
+// handle resolves to C:\Users\runneradmin\.... Feeding the short form made
+// ResolveFS match nothing, so the object compiled to Access=0/Denied=3 and
+// the grant object could not even be found by path — a fixture defect, not
+// a compiler one.
+func canonicalTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := policy.CanonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCompileElevatedBrokerObjectsPinsExactIdentityAndPolicy(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "input.txt")
+	target := filepath.Join(canonicalTestDir(t), "input.txt")
 	if err := os.WriteFile(target, []byte("input"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -184,8 +204,8 @@ func TestCompileElevatedBrokerObjectsPinsExactIdentityAndPolicy(t *testing.T) {
 }
 
 func TestElevatedGrantLeaseRetainsValidatedHandleAndComposesBaseObjects(t *testing.T) {
-	basePath := filepath.Join(t.TempDir(), "base.txt")
-	grantPath := filepath.Join(t.TempDir(), "grant.txt")
+	basePath := filepath.Join(canonicalTestDir(t), "base.txt")
+	grantPath := filepath.Join(canonicalTestDir(t), "grant.txt")
 	for _, path := range []string{basePath, grantPath} {
 		if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 			t.Fatal(err)

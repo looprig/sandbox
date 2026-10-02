@@ -75,7 +75,17 @@ func TestElevatedRunnerRejectsCallerSelectedDesktopBeforeJobCreation(t *testing.
 	if execution, err := launcher.Launch(spec); err == nil || execution != nil {
 		t.Fatal("interactive desktop was accepted")
 	}
-	if got := strings.Join(api.events, ","); got != "verify-host,verify-token,close-token" {
+	// A desktop refusal is a pre-Job failure, so Launch retires ReleaseLease
+	// directly ("release") before its deferred cleanup consumes the token
+	// ("close-token") — the same contract
+	// TestElevatedRunnerLaunchRejectsBeforeDesktopAndConsumesToken pins for an
+	// invalid host identity. What this test owns is that the refusal lands
+	// after both identity checks and before any Job, request or process: no
+	// "job" event may appear.
+	if got := strings.Join(api.recorded(), ","); got != "verify-host,verify-token,release,close-token" {
 		t.Fatalf("events = %q", got)
+	}
+	if !api.released {
+		t.Fatal("caller-selected desktop refusal did not retire the broker lease/active registration")
 	}
 }

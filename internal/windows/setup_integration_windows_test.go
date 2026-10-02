@@ -107,35 +107,70 @@ func setupRemovalFixture(t *testing.T) (validatedSetup, setupManifest, *removalA
 	return setup, manifest, accounts, service, credentials, firewall
 }
 
+// cleanRemovalLeases is the lease reconciler these integration fixtures wire
+// into setupRemovalMechanisms.leases, which removeInstalledSetup has required
+// since the M14 removal rewrite (stop broker -> reconcile leases -> firewall
+// rules -> service/accounts/credentials -> state root). Without it removal
+// refuses up front with "incomplete Windows setup removal mechanisms" and
+// touches nothing — which is what both tests below hit on the first hosted
+// Windows run, before they reached anything they own. It reports a clean
+// journal (no residue), and it checks the one ordering edge only these
+// fixtures can see from inside the reconciler: the broker is already stopped
+// and no firewall rule has been removed yet. The full order is pinned by
+// TestRemoveInstalledSetupStopsBrokerBeforeLeasesAndFirewall.
+func cleanRemovalLeases(t *testing.T, service *removalServiceAPI, firewall *removalFirewallPolicy, wantRules int, calls *int) func(validatedSetup) ([]SetupProblem, error) {
+	t.Helper()
+	return func(validatedSetup) ([]SetupProblem, error) {
+		*calls++
+		if !service.stopped {
+			t.Error("lease journal reconciled while the broker was still running")
+		}
+		if len(firewall.rules) != wantRules {
+			t.Errorf("firewall rules removed before lease reconciliation: %d left, want %d", len(firewall.rules), wantRules)
+		}
+		return nil, nil
+	}
+}
+
 func TestSetupIntegrationPartialCleanupRetainsRecoveryAuthority(t *testing.T) {
 	setup, manifest, accounts, service, credentials, firewall := setupRemovalFixture(t)
 	firewall.readErr = errors.New("injected firewall inventory failure")
 	var removed []string
+	reconciled := 0
 	err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
 		accounts: accounts, services: service, credentials: credentials, firewall: firewall,
 		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		leases:            cleanRemovalLeases(t, service, firewall, len(firewall.rules), &reconciled),
 		removeDir:         func(path string) error { removed = append(removed, path); return nil },
 	})
 	if err == nil {
 		t.Fatal("partial cleanup failure was hidden")
 	}
+	if reconciled != 1 {
+		t.Fatalf("lease reconciler ran %d times, want 1", reconciled)
+	}
 	if len(removed) != 0 {
 		t.Fatalf("manifest/generation removed before dependency cleanup succeeded: %v", removed)
 	}
-	if !service.deleted || len(accounts.deleted) != 2 || !slices.Equal(credentials.removed, []string{"offline", "online"}) {
-		t.Fatalf("independent cleanup did not continue: service=%t accounts=%v credentials=%v", service.deleted, accounts.deleted, credentials.removed)
+	if !service.stopped || !service.deleted || len(accounts.deleted) != 2 || !slices.Equal(credentials.removed, []string{"offline", "online"}) {
+		t.Fatalf("independent cleanup did not continue: stopped=%t service=%t accounts=%v credentials=%v", service.stopped, service.deleted, accounts.deleted, credentials.removed)
 	}
 }
 
 func TestSetupIntegrationSuccessfulRemovalOrdersResidueLast(t *testing.T) {
 	setup, manifest, accounts, service, credentials, firewall := setupRemovalFixture(t)
 	var removed []string
+	reconciled := 0
 	if err := removeInstalledSetup(context.Background(), setup, manifest, setupRemovalMechanisms{
 		accounts: accounts, services: service, credentials: credentials, firewall: firewall,
 		validateArtifacts: func(validatedSetup, setupManifest) error { return nil },
+		leases:            cleanRemovalLeases(t, service, firewall, len(firewall.rules), &reconciled),
 		removeDir:         func(path string) error { removed = append(removed, path); return nil },
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if reconciled != 1 || !service.stopped || !service.deleted {
+		t.Fatalf("removal skipped a step: reconciled=%d stopped=%t deleted=%t", reconciled, service.stopped, service.deleted)
 	}
 	want := []string{setup.stateRoot}
 	if !slices.Equal(removed, want) || len(firewall.rules) != 0 {
